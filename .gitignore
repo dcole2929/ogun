@@ -1,0 +1,27 @@
+# dependencies
+node_modules/
+.pnpm-store/
+
+# build output
+dist/
+build/
+*.tsbuildinfo
+
+# env & secrets
+.env
+.env.*
+!.env.example
+
+# local runtime state
+.ogun/local/
+*.log
+
+# test & tooling
+coverage/
+.turbo/
+.vitest/
+
+# editors / os
+.DS_Store
+.idea/
+*.swp
