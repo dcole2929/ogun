@@ -311,20 +311,21 @@ stream-normalizing code twice, and it drifts.
 ```ts
 type RuntimeSpec = {
   provider: 'cli' | 'claude' | 'codex'
-  command?: string[]          // argv; prompt appended as final arg
   model?: string
-  parse?: 'text' | 'json'
-  sessionFlag?: string        // '--resume' (claude) | '--session'
-  dirFlag?: string
-  stream?: boolean
-  usage?: {                   // how to extract token counts
-    inputKeys?: string[]
-    outputKeys?: string[]
-    cacheInputKeys?: string[]
-    textPattern?: string
-  }
+  // argv builders, not a flag list — resume is structurally different per runtime
+  start:  (ctx: JobCtx) => string[]
+  resume: (ctx: JobCtx, sessionId: string) => string[]
+  parseEvent: (line: string) => RunEvent | null   // JSONL → normalized
+  resultFile?: 'last-message'                     // authoritative final output
+  stdin: 'close'                                  // see gotcha below
 }
 ```
+
+**`resume` is an argv builder, not a `sessionFlag` string.** [corrected] The obvious
+design — a flag name appended to the base command — does not survive contact with
+codex. Claude resumes with a flag (`claude --resume <id> …`); codex resumes with a
+*subcommand* (`codex exec resume <id> <prompt>`). Templating one flag name cannot
+express that, so each preset supplies its own argv construction.
 
 Model names are **roles**, not tiers: workers reference `worker` and `reviewer`, and a
 router maps names to specs. The routing logic follows from where cost and risk sit —
@@ -339,10 +340,60 @@ over. Instead, every agent action is normalized into one event type as it happen
 the run-detail timeline, the CLI, and any future consumer all render an identical
 session.
 
-Claude Code gives this natively via `--output-format stream-json`.
-**[open] Codex event format** — unknown until `codex` is installed. Normalizing two
-dissimilar streams into one `RunEvent` is the real work of supporting both; spike it
-before committing.
+#### Verified event formats
+
+[settled] Both were spiked against real runs (codex-cli 0.147.0, Claude Code 2.1.226).
+Both emit clean JSONL; the shapes differ but map onto one `RunEvent` without loss.
+
+Claude Code (`-p --output-format stream-json --verbose`) is **API-message shaped** —
+one line per message, content blocks inside. Codex (`exec --json`) is **item-lifecycle
+shaped** — a thread containing turns containing items, each with started/completed.
+
+| `RunEvent` | Claude Code | Codex |
+|---|---|---|
+| `run.started` | `system` / `init` | `thread.started` + `turn.started` |
+| session id | `system.init.session_id` | `thread.started.thread_id` |
+| `agent.message` | `assistant` with a `text` block | `item.completed` type `agent_message` |
+| `tool.started` | `assistant` with a `tool_use` block | `item.started` type `command_execution` |
+| `tool.completed` | `user` with a `tool_result` block | `item.completed` (carries `exit_code`, `aggregated_output`) |
+| `run.completed` | `result` / `success` | `turn.completed` |
+| usage | `result.usage` + `modelUsage` | `turn.completed.usage` |
+| cost estimate | `result.total_cost_usd` | *not reported* |
+| rate limit | `rate_limit_event` | *not reported* |
+
+Correlating a tool call to its result differs: Claude splits them across two messages
+joined by `tool_use.id` → `tool_result.tool_use_id`; codex pairs them by `item.id`.
+Both are stable keys, so the normalizer just uses a different one per preset.
+
+**Granularity is per-message, not per-token.** Neither runtime emits deltas in
+headless mode — each line is a complete message or a completed item. The timeline
+shows each tool call and each assistant message as it happens, which is what a
+run-detail view needs, but it is not a typewriter stream.
+
+Three findings that change how we drive these:
+
+1. **Codex hangs forever if stdin is left open.** It reports *"Reading additional
+   input from stdin…"* and waits. The harness must close stdin (`< /dev/null`) on
+   every invocation — hence `stdin: 'close'` in the spec. This cost a 300-second
+   timeout to discover and would have looked like a hung agent in production.
+2. **Codex's `--output-schema` constrains *every* assistant message, not just the
+   last.** Observed directly: with a findings schema attached, codex emitted a
+   schema-valid `{"findings":[]}` as items 0 and 1 *before running any tools*, then
+   investigated, then emitted the real answer as item 4. A harness that parses the
+   first schema-valid message gets a confidently empty result. **Use
+   `-o/--output-last-message <file>` as the authoritative output** — that file
+   correctly held only the final answer.
+3. **`total_cost_usd` from Claude is a list-price estimate, not a charge.** It is
+   populated on a subscription run (a trivial two-turn job reported $0.089). Useful
+   as a relative signal for comparing workers; not a bill. Codex reports no cost at
+   all, which is another reason §4.3's budgets count tokens and runs.
+
+Claude's `rate_limit_event` is worth wiring into Foreman directly — it is a real
+signal of remaining subscription headroom rather than our token-count proxy. Codex
+has no equivalent, so the proxy stays as the fallback.
+
+**Verdict: both runtimes in phase 1.** Normalization is a day of work against two
+well-structured formats, not the open-ended risk it looked like before the spike.
 
 ### 4.8 Skills
 
@@ -774,7 +825,7 @@ sandbox, manual trigger from the UI. Foreman creates a **one-node CycleRun** —
 same path a nightly cycle will take, with a graph of one. **Verify gate** (tool checks
 + reviewer-profile agent lenses) gating findings persistence. Findings persisted with
 fingerprints. Run detail page with a live event timeline. Both `claude` and `codex`
-runtimes (pending the codex event-format spike). No cron, no retry, no fan-in, no
+runtimes — event formats verified, see §4.7. No cron, no retry, no fan-in, no
 publishing.
 
 **Phase 2 — the factory runs itself.** Foreman: cron, missed-run catchup, schedule
@@ -796,11 +847,13 @@ canvas, auto-merge, agent memory, model auto-selection, remote runner mesh.
 
 ## 10. Open questions
 
-1. **Codex event format.** Blocked on installing `codex`. Determines whether
-   `RunEvent` normalization is a day or a week, and therefore whether both runtimes
-   land in phase 1.
-2. **Image staleness policy.** Rebuild on Dockerfile/lockfile change is obvious; what
+1. **Image staleness policy.** Rebuild on Dockerfile/lockfile change is obvious; what
    the age-based trigger should be is not.
+2. **Codex sandbox mode inside a container.** Codex ships its own sandbox
+   (`-s read-only | workspace-write | danger-full-access`, landlock/seccomp on Linux).
+   Nesting it inside our container is redundant at best and may not work at all, so
+   `--dangerously-bypass-approvals-and-sandbox` is probably right *because* the
+   container is the boundary. Untested under Docker.
 3. **Re-adjudication mechanism.** The approach (show prior unresolved findings
    verbatim, classify) is a proposal, not a decision. Revisit at implementation.
 4. **Triage prompt and calibration.** What the severity scale actually is, and how
