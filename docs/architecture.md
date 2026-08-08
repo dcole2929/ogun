@@ -397,19 +397,56 @@ well-structured formats, not the open-ended risk it looked like before the spike
 
 ### 4.8 Skills
 
-Adopt the existing `SKILL.md` convention rather than inventing a format. Resolution
-order:
+Adopt the existing `SKILL.md` convention rather than inventing a format, and build on
+[mattpocock/skills](https://github.com/mattpocock/skills) rather than starting from
+zero. That collection already covers the disciplines a factory needs — `tdd`,
+`diagnosing-bugs`, `code-review`, `research`, `prototype`,
+`improve-codebase-architecture`, `grill-with-docs`, `to-spec`, `to-tickets`,
+`implement` — and splits them along a distinction we want anyway:
+
+- **User-invoked** skills orchestrate a workflow you ask for.
+- **Model-invoked** skills embed a discipline an agent reaches for on its own.
+
+Install editable (`npx skills@latest add mattpocock/skills`) rather than as a managed
+plugin, so project-specific skills can be layered on and edited in place.
+
+**Discovery.** Skills resolve from, in increasing precedence:
 
 ```
-built-in (ogun://security-review)
+mattpocock/skills baseline (installed, editable)
    ↓
-global   (~/.ogun/skills/)
+global    ~/.ogun/skills/
    ↓
-project  (repo/.ogun/skills/, repo/.claude/skills/)
+project   <repo>/.agents/skills/  and  <repo>/.claude/skills/
 ```
 
-Repo-local wins. Skills are read from disk on every trigger tick, so editing a skill
-takes effect on the next run with no restart.
+`.agents/skills/` is the canonical location for skills Ogun runs; `.claude/skills/` is
+what an interactive Claude Code session picks up. Projects that want both keep them in
+sync. Skills are read from disk on every trigger tick, so an edit takes effect on the
+next run with no restart — but note that a skill only reaches an automated run once it
+lands on the default branch, since the workspace is a clone at a pinned SHA.
+
+**A skill carries its own worker config.** Beside `SKILL.md`, an `agents/*.yaml`
+supplies what Ogun needs to schedule it:
+
+```yaml
+interface:
+  display_name: "Adversarial Review"
+  short_description: "Probe the default branch with adversarial campaigns"
+  default_prompt: "Use the running-software-factory-adversarial-reviews skill."
+policy:
+  allow_implicit_invocation: false
+```
+
+`default_prompt` is the job's prompt (§5.1). **`allow_implicit_invocation: false` is
+the important line** — a factory skill must never be auto-triggered by an agent
+mid-task. It runs when Ogun says so, and only then.
+
+**Thin skills over a shared procedure.** The pattern worth copying: each review skill
+carries only its mission, evidence standard, taxonomy, and severity ladder, then
+delegates to one shared `running-a-review.md` that owns orientation, novelty rules,
+finding classification, publication, and cleanup. Seventeen reviewers stay consistent
+because there is one procedure, not seventeen.
 
 ### 4.9 Workers
 
@@ -477,14 +514,58 @@ verify:
 Tool checks can be Ogun's own CLI — that keeps the expensive checks rare and the
 cheap ones deterministic.
 
+**The CLI owns every format the agent touches.** [settled] Schema definition, history
+checking, issue rendering, and publication are `ogun` subcommands the skill invokes —
+never prose instructions asking an agent to produce well-formed JSON. This is
+principle 4 at the boundary that matters most: an agent that free-hands its output
+format produces a different shape every night, and nothing downstream can depend on
+it. The skill says *what* to look for; the CLI decides what a finding looks like.
+
 ### 4.11 Findings
 
 The part that determines whether this is usable in week two.
 
-**Stable identity.** Finding ID is a deterministic hash of
-`(worker, skill_version, file, normalized_content)` — and **deliberately excludes the
-line number**, because rebases and unrelated edits shift lines and would mint a
-spurious new ID for an unchanged finding.
+**Stable identity is a semantic fingerprint, not a hash.** [corrected] A hash of
+normalized content dedupes exact repeats and nothing else. A hierarchical path
+dedupes *meaning* and supports prefix matching:
+
+```
+<area>/<surface>/<invariant>/<technique>
+
+security/public-orders/account-isolation/cross-account-id-swap
+observability/order-create/correlation/forced-storage-failure
+test-integrity/api-key-revocation/assertion-sensitivity/production-mutation
+```
+
+Human-readable in a UI, sortable, and a cooldown can cover a whole surface by prefix
+rather than one exact string. Note what it excludes: no line number, because rebases
+and unrelated edits shift lines and would mint a spurious new identity for an
+unchanged finding.
+
+The agent proposes the fingerprint; a deterministic check validates its shape and
+enforces cooldowns. Renaming an attempt does not make it new — that comparison is
+semantic and belongs to the history step, not to string equality.
+
+**Every substantive attempt is recorded, not just the ones that found something.**
+A no-finding run, a blocked run, and an inconclusive run each produce a durable
+record. Otherwise "we looked and it was clean" is indistinguishable from "we never
+looked," and coverage silently rots.
+
+**Repeats need an explicit budget.** A revisit carries `revisit_of` and a concrete
+`revisit_reason`, and is permitted only when relevant code changed, prior friction was
+fixed, a merged finding needs verification, or the cooldown elapsed with no
+higher-value novel work available. Without that gate, cooldowns just get worked
+around.
+
+**Dedupe against open work, not only history.** An open finding already accounts for
+its surface — don't investigate it again. A closed one permits a single
+fix-verification revisit; if it's still broken, that's a new related finding. A
+cancelled or duplicate finding is treated as though it never existed.
+
+**Keep history out of the reviewer's context.** Delegate the search to a subagent
+pinned to a cheap model: give it the review type, current SHA, and candidate themes,
+and let it grep a derived compact index and open only the full records that matter.
+The index is derived and disposable — the run records are the source of truth.
 
 **Status lifecycle.** `open | triaged | fixed | wontfix | duplicate | gated |
 overflow`, plus
@@ -553,11 +634,62 @@ triage in phase 2, cycles in phase 3.
 **[open]** How PR lifecycle state is represented once modifier workers exist —
 GitHub is authoritative per §4.4, but the specific mechanism (labels, checks,
 review state, or some combination) is undecided. Phase 3 concern.
-- **[deferred]** GitHub-repo-as-findings-sink. Interesting as an exporter (findings as
-  markdown files, triage in PRs, history for free) but wrong for operational data:
-  git has no cheap atomic claim, latency is seconds, and run events are
-  high-frequency appends. Keep findings storage free of Postgres-specific assumptions
-  so this stays possible.
+
+### 4.14 Architecture decision records
+
+Decisions get their own files under `docs/adr/`, numbered and named as an assertion of
+what was decided:
+
+```
+docs/adr/0007-runner-and-control-plane-talk-over-http.md
+```
+
+```markdown
+---
+status: accepted
+---
+
+# Runner and control plane talk over HTTP
+
+<why the current situation forced a decision>
+<what we're doing, in prose>
+
+## Considered Options
+- **In-process function calls.** Rejected — …
+- **Shared database, no API.** Rejected — …
+
+## Consequences
+- …
+```
+
+The `## Considered Options` section is what makes an ADR worth writing: it records the
+alternatives *and why they lost*, which is exactly the context that evaporates in six
+months and gets re-litigated. A decision without its rejected options is just a
+config file in prose.
+
+**ADRs are an agent output, not only a human one.** An architecture-review worker that
+finds a structural problem should be able to propose an ADR — a draft with `status:
+proposed` — rather than filing a finding that says "consider restructuring X." A
+design-interview skill (`grill-with-docs`) writes them inline as understanding
+sharpens. Ogun's job is to make them a first-class artifact kind alongside findings
+and changes, so a proposed ADR lands as a reviewable diff.
+
+Workers read ADRs too. A reviewer that doesn't know a decision was deliberate will
+keep flagging it — the single largest source of noise a reviewer can produce is
+re-litigating settled architecture.
+- **Run-record export to a git repo.** [corrected] Previously deferred as "wrong for
+  operational data." That's true of a *queue* — git has no cheap atomic claim — and of
+  high-frequency event appends. It is not true of immutable, one-file-per-run records,
+  which are an excellent fit: append-only, diffable, greppable, and durable
+  independent of the database. A proven layout:
+
+  ```
+  runs/<review-type>/<year>/<month>/<run-id>.json
+  ```
+
+  Postgres remains the operational store; this is an export, and a duplicate path
+  should fail rather than overwrite so a concurrent run can't silently replace a
+  record. Worth building once run volume justifies it.
 
 ---
 
@@ -762,7 +894,7 @@ changes             id, run_id, branch, base_sha, patch, files_changed,
                     -- artifact record only; PR lifecycle state lives in GitHub
 coverage            id, cycle_run_id, worker_id, selected, ran, outcome, reason
 artifacts           id, run_id, kind, ref
-                    -- kind=transcript points at a file on disk, never inlined
+                    -- kind=transcript|patch|adr-draft; large blobs on disk, never inlined
 
 runners             id, name, labels[], last_seen_at, max_concurrency
 ```
