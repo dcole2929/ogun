@@ -60,6 +60,12 @@ TypeScript on Node 22. Hono for the API, Vite + React for the UI, Postgres via
 Drizzle, croner for scheduling, Zod for config and structured-output validation,
 Docker for sandboxing. Claude Code and Codex CLIs as the agent runtimes.
 
+Both runtimes have been spiked end to end and their headless JSONL event formats
+mapped onto a single normalized event type — Claude Code is API-message shaped, codex
+is item-lifecycle shaped, and both carry enough to drive one timeline. The mapping,
+along with three gotchas the spike turned up, is in
+[§4.7](docs/architecture.md#47-runtimes).
+
 ## The name
 
 [Ogun](https://en.wikipedia.org/wiki/Ogun) is the Yoruba orisha of iron, metalwork,
