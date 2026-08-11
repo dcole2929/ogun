@@ -119,6 +119,8 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
           title: f.title,
           body: f.body,
           status: 'open',
+          ...(f.revisitOf ? { revisitOf: f.revisitOf } : {}),
+          ...(f.revisitReason ? { revisitReason: f.revisitReason } : {}),
           firstSeenRun: report.runId,
           lastSeenRun: report.runId,
           seenCount: 1,
@@ -134,6 +136,10 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
             severity: f.severity,
             title: f.title,
             body: f.body,
+            ...(f.revisitOf ? { revisitOf: f.revisitOf } : {}),
+            ...(f.revisitReason ? { revisitReason: f.revisitReason } : {}),
+            status: reopenClause,
+            statusReason: reopenReasonClause,
             updatedAt: new Date(),
           },
         })
@@ -177,6 +183,34 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
 
   return { ok: true, outcome, jobState, findingsWritten: raw.length, coverage: coverageOutcome }
 }
+
+/**
+ * A re-sighting is not always just a repeat, and the difference matters per status:
+ *
+ *   fixed              -> reopen. The fix did not hold, or the bug regressed. Leaving it
+ *                         `fixed` hides a confirmed-broken row from the one query the
+ *                         review protocol tells every reviewer to run first.
+ *   gated | overflow   -> reopen. Those mean triage set it aside, not that anyone
+ *                         decided anything. A fresh sighting is new evidence.
+ *   wontfix | duplicate-> hold. Those are human decisions, and a reviewer re-reporting
+ *                         something does not overrule one. The seen count still bumps,
+ *                         so the pressure is visible without the row nagging.
+ *   open | triaged     -> unchanged.
+ *
+ * Found by ogun's own adversarial-review worker on its first real run.
+ */
+const reopenClause = sql`case
+  when ${findings.status} in ('fixed', 'gated', 'overflow') then 'open'
+  else ${findings.status}
+end`
+
+const reopenReasonClause = sql`case
+  when ${findings.status} = 'fixed'
+    then 'reopened: reported again after being marked fixed'
+  when ${findings.status} in ('gated', 'overflow')
+    then 'reopened: reported again after being set aside by triage'
+  else ${findings.statusReason}
+end`
 
 const gateSummary = (report: RunReport): string | undefined => {
   const failed = report.gates.filter((g) => !g.passed)

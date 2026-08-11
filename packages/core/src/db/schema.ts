@@ -231,6 +231,13 @@ export const findings = pgTable(
     body: text('body').notNull(),
     status: text('status').notNull().default('open'),
     statusReason: text('status_reason'),
+    /**
+     * Set when a reviewer re-reports a finding under the revisit budget (§4.11). These
+     * were previously validated on the way in and then dropped, which made a
+     * confirmed-still-broken re-report indistinguishable from a routine repeat.
+     */
+    revisitOf: text('revisit_of'),
+    revisitReason: text('revisit_reason'),
     firstSeenRun: uuid('first_seen_run').references(() => runs.id, { onDelete: 'set null' }),
     lastSeenRun: uuid('last_seen_run').references(() => runs.id, { onDelete: 'set null' }),
     seenCount: integer('seen_count').notNull().default(1),

@@ -153,3 +153,106 @@ describe('run lifecycle', { skip: reachable ? false : 'no control plane running'
     assert.match(cov?.reason ?? '', /breaker open/)
   })
 })
+
+/**
+ * Regression test for the first finding ogun's own adversarial reviewer produced
+ * against ogun: the upsert bumped seenCount but never touched status, so a `fixed`
+ * finding that came back stayed invisible to `--status open,triaged` forever.
+ */
+describe('re-sighting a finding', { skip: reachable ? false : 'no control plane running' }, () => {
+  const { db, close } = createDb(url)
+  const slug = `resight-${Date.now()}`
+  let projectId = ''
+  let cycleId = ''
+
+  before(async () => {
+    const [p] = await db.insert(schema.projects).values({ slug }).returning()
+    projectId = p!.id
+    await db.insert(schema.workers).values({
+      projectId,
+      name: 'reviewer',
+      skillRef: 'adversarial-review',
+      runtime: 'claude',
+      versionHash: 'v1',
+      config: {},
+    })
+    const [c] = await db
+      .insert(schema.cycles)
+      .values({ projectId, name: 'reviewer', definition: singleWorkerCycle('reviewer') })
+      .returning()
+    cycleId = c!.id
+  })
+
+  after(async () => {
+    await db.delete(schema.projects).where(eq(schema.projects.id, projectId))
+    await close()
+  })
+
+  const report = async (extra: Partial<{ revisitOf: string; revisitReason: string }> = {}) => {
+    const { cycleRunId } = await startCycleRun(db, { cycleId, trigger: 'test' })
+    const [job] = await db.select().from(schema.jobs).where(eq(schema.jobs.cycleRunId, cycleRunId))
+    const [run] = await db
+      .insert(schema.runs)
+      .values({ jobId: job!.id, runnerId: 'test' })
+      .returning()
+    await finalizeRun(db, {
+      runId: run!.id,
+      outcome: 'approved',
+      gates: [],
+      findings: {
+        findings: [
+          {
+            fingerprint: 'security/orders/isolation/id-swap',
+            title: 'Order lookup trusts a client id',
+            body: 'detail',
+            severity: 'high',
+            citations: [{ path: 'src/orders.ts', line: 12 }],
+            ...extra,
+          },
+        ],
+      },
+      coverage: { outcome: 'found' },
+      artifacts: [],
+    })
+  }
+
+  const current = async () => {
+    const [row] = await db
+      .select()
+      .from(schema.findings)
+      .where(eq(schema.findings.projectId, projectId))
+    return row!
+  }
+
+  const setStatus = async (status: string) =>
+    db
+      .update(schema.findings)
+      .set({ status })
+      .where(eq(schema.findings.projectId, projectId))
+
+  test('a fixed finding that comes back reopens', async () => {
+    await report()
+    await setStatus('fixed')
+    await report({ revisitOf: 'prior run', revisitReason: 'verifying the merged fix' })
+
+    const row = await current()
+    assert.equal(row.status, 'open', 'a regression must not stay invisible to the inbox')
+    assert.match(row.statusReason ?? '', /reported again after being marked fixed/)
+    assert.equal(row.seenCount, 2)
+    assert.equal(row.revisitReason, 'verifying the merged fix', 'revisit metadata must survive')
+  })
+
+  test('a wontfix finding stays dismissed but still counts', async () => {
+    await setStatus('wontfix')
+    await report()
+    const row = await current()
+    assert.equal(row.status, 'wontfix', 'a reviewer does not get to overrule a human decision')
+    assert.equal(row.seenCount, 3, 'the pressure is still visible in the count')
+  })
+
+  test('a gated finding reopens — triage setting it aside is not a decision', async () => {
+    await setStatus('gated')
+    await report()
+    assert.equal((await current()).status, 'open')
+  })
+})
