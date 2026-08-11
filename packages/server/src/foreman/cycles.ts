@@ -79,7 +79,11 @@ export async function startCycleRun(
         workerId: worker.id,
         selected: true,
         ran: false,
-        outcome: verdict.allowed ? 'not-selected' : 'blocked',
+        // `pending`, not `not-selected`: this worker *was* selected. The row exists
+        // from the moment the batch does so a crashed run leaves evidence it was
+        // supposed to happen, but calling it not-selected would be a false entry in
+        // the one table whose entire job is to be true (principle 6).
+        outcome: verdict.allowed ? 'pending' : 'blocked',
         ...(verdict.allowed ? {} : { reason: verdict.reason }),
       })
     }

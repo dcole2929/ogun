@@ -46,6 +46,7 @@ const OUTCOME_TONE: Record<string, string> = {
   clean: 'green',
   found: 'blue',
   'gate-failed': 'red',
+  pending: 'blue',
   errored: 'red',
 }
 

@@ -37,6 +37,8 @@ export const CYCLE_STATES = ['running', 'complete', 'degraded', 'failed'] as con
 export type CycleState = (typeof CYCLE_STATES)[number]
 
 export const COVERAGE_OUTCOMES = [
+  /** Selected and admitted, but no run has reported yet. Not the same as clean. */
+  'pending',
   'found',
   'clean',
   'gate-failed',
