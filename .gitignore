@@ -28,3 +28,5 @@ coverage/
 
 # runtime scratch
 .ogun/work/
+images/base/cli/
+apps/web/dist/
