@@ -3,9 +3,9 @@
 A local-first software factory — scheduled AI workers that review, maintain, and
 eventually implement code across a set of repositories.
 
-> **Status: design.** No code yet. The architecture is worked out in
-> [`docs/architecture.md`](docs/architecture.md); this repo exists to hold it while
-> phase 1 gets built.
+> **Status: phase 1 works.** Trigger a worker, watch it run in a container, get
+> findings. No cron and no write path yet. The design is in
+> [`docs/architecture.md`](docs/architecture.md).
 
 ## The idea
 
@@ -46,6 +46,28 @@ WSL2 host — always-on, systemd
 
 The control plane and the runner talk over HTTP even on one machine, so moving the
 control plane to a server later is a URL change rather than a rewrite.
+
+## Running it
+
+```sh
+asdf install                     # node 26
+pnpm install
+pnpm db:up && pnpm db:migrate    # postgres in a container on :5433
+
+pnpm ogun runner init            # writes ~/.ogun/runner.json — add your repos to it
+pnpm ogun image build            # builds ogun/base
+pnpm ogun runner doctor          # what this machine can actually run
+
+pnpm server                      # control plane + UI on :7777
+pnpm runner                      # claims and executes jobs
+
+pnpm ogun project sync           # register a repo with a .ogun/config.yaml
+pnpm ogun trigger ogun adversarial-review
+```
+
+`pnpm ogun` on its own lists everything. Ogun is registered as a project in its own
+repo, so the first thing you can point it at is itself — which is how the first real
+run found a `high` in the findings-status logic.
 
 ## Design
 

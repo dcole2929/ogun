@@ -3,9 +3,10 @@
 A local-first software factory: scheduled AI workers that review, maintain, and
 eventually implement code across a set of repositories.
 
-Status: design. Nothing is built yet. Decisions marked **[settled]** are ones we've
-argued through; **[deferred]** are deliberate non-goals for now; **[open]** still need
-an answer.
+Status: phase 1 is built and the loop runs end to end. Decisions marked **[settled]**
+are ones we've argued through; **[deferred]** are deliberate non-goals for now;
+**[open]** still need an answer. Where the implementation diverged from what was
+designed, the divergence is recorded here rather than quietly dropped.
 
 ---
 
@@ -297,10 +298,20 @@ operation — fetch, push, PR creation — happens on the host after the contain
 That makes the never-pushes rule structural rather than policed: there is no
 credential and no remote to push to.
 
-**Egress cannot be `none`.** The agent runtime itself calls out — `api.anthropic.com`
-for claude, OpenAI's endpoint for codex. So a reviewer container is a tight allowlist
-containing exactly those hosts, not an airgap. Modifiers add package registries.
-Everything else is denied by default.
+**Egress cannot be `none` for an agent run.** The runtime itself calls out —
+`api.anthropic.com` for claude, OpenAI's endpoint for codex — so a reviewer container
+cannot be an airgap.
+
+**The host allowlist is not built.** [open] What ships is `egress: open | none`, and
+reviewers run `open`. A real per-host allowlist needs either a filtering proxy, which is
+a sibling container and therefore ruled out above, or `iptables` inside the container,
+which needs `NET_ADMIN` plus a privilege drop after the rules are installed and fails
+anyway against endpoints whose IPs rotate. Both are real options; neither is cheap.
+
+Recording this as a gap rather than describing it as done. The structural protections —
+no socket, no `gh`, no credential, no remote — are what actually stop a container
+reaching GitHub, and they hold regardless. An allowlist would add defence against
+exfiltration through the model API itself, which is a harder and different problem.
 
 ### 4.7 Runtimes
 
@@ -498,6 +509,12 @@ no diff. The reviewer analog grades *findings quality*:
 
 Per-worker overrides: `skipDefaultLenses: [...]`, or `lensProfile: none` for
 non-code work.
+
+**Only the tool checks are wired.** [open] `schema` and `grounded` run and can fail a
+run; agent lenses are resolved and recorded as skipped with that stated as the reason,
+rather than silently reported as passed. Grading findings quality with a model is a
+prompt-calibration problem, not a plumbing one, and guessing at the rubric before there
+is a week of real reviewer output to calibrate against would bake in the wrong one.
 
 ```yaml
 # alongside a skill
@@ -922,12 +939,22 @@ ogun/
     web/          vite + react + react-router + tanstack query
   images/
     base/         Dockerfile for ogun/base
+  .ogun/          ogun's own project config — it reviews itself
+  .agents/skills/ the skills ogun runs
 
 ~/.ogun/          machine-local: runner.json, global skills, cache volumes
 ```
 
-Stack: Node 22 (via fnm), Hono, Vite + React (no Next), Postgres + Drizzle, croner,
+Stack: Node 26 (via asdf), Hono, Vite + React (no Next), Postgres + Drizzle, croner,
 Zod for all config and structured-output validation, Docker.
+
+**No build step for the server, runner, or CLI.** [settled] Node 26 strips types
+natively, so `node packages/server/src/main.ts` runs TypeScript directly and `tsc` is
+typecheck-only. The cost is a dialect restriction — `erasableSyntaxOnly`, so no enums
+and no parameter properties — which is a fair trade for deleting a compile step from
+every edit-run cycle. Vite still builds the web app, and the CLI is bundled with esbuild
+into the sandbox image so it carries no `node_modules` and cannot drift from the
+validator on the way in.
 
 A CLI is a peer to the UI, not an afterthought — `ogun runner doctor` (which runtimes
 and tools are present on this machine), `ogun run <worker>`, `ogun runs`,
@@ -952,13 +979,20 @@ Only WSL2 matters today, but the constraints are real:
 
 ## 9. Phasing
 
-**Phase 1 — the loop works.** One project, one `adversarial-review` worker, container
-sandbox, manual trigger from the UI. Foreman creates a **one-node CycleRun** — the
-same path a nightly cycle will take, with a graph of one. **Verify gate** (tool checks
-+ reviewer-profile agent lenses) gating findings persistence. Findings persisted with
-fingerprints. Run detail page with a live event timeline. Both `claude` and `codex`
-runtimes — event formats verified, see §4.7. No cron, no retry, no fan-in, no
-publishing.
+**Phase 1 — the loop works.** ✅ Built. One project, one `adversarial-review` worker,
+container sandbox, manual trigger from the UI or `ogun trigger`. Foreman creates a
+one-node CycleRun — the same path a nightly cycle will take, with a graph of one.
+Verify gate gating findings persistence. Findings persisted with semantic fingerprints.
+Run detail page with a live SSE timeline. Both runtimes normalized onto one event type.
+No cron, no retry, no fan-in, no publishing.
+
+Two things landed differently than specced, both recorded above: agent lenses in the
+verify gate record as skipped rather than running (tool checks are wired, §4.10), and
+egress is `open | none` rather than a host allowlist (§4.6).
+
+The first real run found a genuine `high` in Ogun's own finalize path — a finding marked
+`fixed` that regressed stayed `fixed` and never reappeared in the inbox. That is the
+loop doing the thing it exists to do, on day one.
 
 **Phase 2 — the factory runs itself.** Foreman: cron, missed-run catchup, schedule
 re-scan, the job queue, concurrency cap, failure breaker. Second and third workers.
