@@ -1,0 +1,234 @@
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { execFile } from 'node:child_process'
+import { join } from 'node:path'
+import { promisify } from 'node:util'
+import {
+  verifySchema,
+  type ClaimedJob,
+  type GateResult,
+  type RunEvent,
+  type RunnerConfig,
+  type RunOutcome,
+  type RunReport,
+} from '@ogun/core'
+import { ControlPlane, EventFlusher } from './client.ts'
+import { createSandbox, GUEST_WORKSPACE, type Sandbox } from './sandbox/index.ts'
+import { newParserState, resolveModel, resolveRuntime } from './runtimes/index.ts'
+import { materializeWorkspace, resolveHeadSha, stageAll } from './workspace.ts'
+import { runVerifyGate } from './verify.ts'
+
+const run = promisify(execFile)
+
+/** Where a reviewer is told to write its findings, workspace-relative. */
+export const OUTPUT_PATH = '.ogun-out/findings.json'
+
+/**
+ * The runner's loop, once per job (§5.2):
+ *
+ *   prepare   -> materialize workspace, check the image
+ *   provision -> sandbox, ONCE per job rather than per round
+ *   deliver   -> round 0 only in v1; the `for round` shape stays so phase 3 is an
+ *                unwrapping rather than a rewrite
+ *   grade     -> verify gate
+ *   record    -> one report; the control plane writes it in one transaction
+ */
+export async function executeJob(
+  cp: ControlPlane,
+  config: RunnerConfig,
+  job: ClaimedJob,
+): Promise<RunOutcome> {
+  const startedAt = Date.now()
+  const flusher = new EventFlusher(cp, job.runId)
+  let sandbox: Sandbox | undefined
+  let cleanup: (() => Promise<void>) | undefined
+
+  const fail = async (detail: string, gates: GateResult[] = []): Promise<RunOutcome> => {
+    await flusher.flush()
+    await cp
+      .report({
+        runId: job.runId,
+        outcome: 'error',
+        detail,
+        durationMs: Date.now() - startedAt,
+        gates,
+        coverage: { outcome: 'errored', reason: detail },
+        artifacts: [],
+      })
+      .catch((err) => console.error('[runner] failed to report failure', err))
+    return 'error'
+  }
+
+  try {
+    const sourceRepo = config.projects[job.projectSlug]
+    if (!sourceRepo) {
+      // The repo registry is per-runner, so this is a real and expected condition on a
+      // machine that simply doesn't have this project checked out (§4.5).
+      return await fail(`runner has no path registered for project "${job.projectSlug}"`)
+    }
+
+    const baseSha = await resolveHeadSha(sourceRepo, job.projectDefaultBranch)
+    const workspace = await materializeWorkspace({
+      sourceRepo,
+      scratch: config.scratch,
+      runId: job.runId,
+      ref: baseSha,
+    })
+    cleanup = workspace.cleanup
+
+    await mkdir(join(workspace.path, '.ogun-out'), { recursive: true })
+
+    const spec = resolveRuntime(job.runtime)
+    const model = resolveModel(job.runtime, job.model)
+    await cp.started(job.runId, {
+      repoSha: workspace.sha,
+      runtime: job.runtime,
+      ...(model ? { model } : {}),
+    })
+
+    sandbox = createSandbox({
+      kind: job.sandbox === 'worktree' ? 'worktree' : 'container',
+      name: `ogun-${job.runId.slice(0, 12)}`,
+      hostWorkspace: workspace.path,
+      guestWorkspace: job.sandbox === 'worktree' ? workspace.path : GUEST_WORKSPACE,
+      permissions: job.permissions as 'observer' | 'reviewer' | 'modifier',
+      runtime: spec.provider,
+      timeoutMs: job.timeoutMs,
+      image: process.env.OGUN_IMAGE_OVERRIDE ?? imageFor(job),
+      allowSandboxDowngrade: false,
+    })
+    await sandbox.provision()
+
+    const guestRoot = job.sandbox === 'worktree' ? workspace.path : GUEST_WORKSPACE
+    const ctx = {
+      prompt: composePrompt(job, guestRoot),
+      ...(model ? { model } : {}),
+      workspace: guestRoot,
+      outputFile: `${guestRoot}/.ogun-out/last-message.txt`,
+      permissions: job.permissions as 'observer' | 'reviewer' | 'modifier',
+    }
+
+    // v1 runs exactly one round. Keeping the loop makes phase 3's retry an unwrapping.
+    const maxRounds = 1
+    const parser = newParserState()
+    let lastEvent: RunEvent | undefined
+
+    for (let round = 0; round < maxRounds; round++) {
+      const handle = sandbox.exec(spec.start(ctx))
+      for await (const line of handle.lines) {
+        const events = spec.parseLine(line, parser)
+        if (events.length === 0) continue
+        lastEvent = events.at(-1)
+        flusher.push(events)
+      }
+      const { code, stderr } = await handle.done
+      await flusher.flush()
+      if (code !== 0) {
+        return await fail(`${job.runtime} exited ${code}: ${stderr.slice(-1500)}`)
+      }
+      if (parser.sessionId) await cp.started(job.runId, { sessionId: parser.sessionId })
+    }
+
+    // The agent may have created files; stage them or the grounding check will call a
+    // real new file a hallucination (§5.3).
+    await stageAll(workspace.path).catch(() => undefined)
+
+    const raw = await sandbox.readFile(OUTPUT_PATH)
+    const output = raw === null ? undefined : safeJsonParse(raw)
+    const gates = await runVerifyGate({
+      config: job.verify ? verifySchema.parse(job.verify) : undefined,
+      permissions: job.permissions as 'observer' | 'reviewer' | 'modifier',
+      output,
+      knownPaths: await trackedPaths(workspace.path),
+      sandbox,
+    })
+
+    const transcriptRef = await writeTranscript(config, job, workspace.path)
+    const usage = usageFrom(lastEvent)
+
+    const report: RunReport = {
+      runId: job.runId,
+      outcome: 'approved',
+      durationMs: Date.now() - startedAt,
+      ...(usage ? { usage } : {}),
+      gates,
+      ...(output !== undefined ? { findings: output as never } : {}),
+      coverage: { outcome: 'clean' },
+      artifacts: transcriptRef ? [{ kind: 'transcript', ref: transcriptRef }] : [],
+    }
+    const result = (await cp.report(report)) as { outcome?: RunOutcome }
+    return result.outcome ?? 'approved'
+  } catch (err) {
+    return await fail(err instanceof Error ? err.message : String(err))
+  } finally {
+    await flusher.flush().catch(() => undefined)
+    await sandbox?.dispose().catch(() => undefined)
+    if (process.env.OGUN_KEEP_WORKSPACES !== '1') await cleanup?.().catch(() => undefined)
+  }
+}
+
+/**
+ * The job already carries its prompt — often as short as "Use the
+ * staging-error-reviews skill." (§5.1). All this adds is where to put the answer,
+ * because the CLI owns the format and the agent must not free-hand it (§4.10).
+ */
+function composePrompt(job: ClaimedJob, guestRoot: string): string {
+  return [
+    job.prompt,
+    '',
+    `Write your findings to ${guestRoot}/${OUTPUT_PATH} by running \`ogun findings write\`.`,
+    'Do not hand-write that file and do not invent a format — the CLI owns the schema.',
+    'If you looked and found nothing, still write the file with an empty findings array:',
+    'a clean result and a run that never happened are different facts.',
+  ].join('\n')
+}
+
+/** Each project has its own image; absent one, `ogun/base` — enough for a reviewer and
+ *  not enough for a modifier (§5.1). */
+const imageFor = (job: ClaimedJob): string =>
+  job.permissions === 'modifier'
+    ? `ogun/project-${job.projectSlug}:latest`
+    : (process.env.OGUN_BASE_IMAGE ?? 'ogun/base:latest')
+
+async function trackedPaths(workspace: string): Promise<Set<string>> {
+  const { stdout } = await run('git', ['-C', workspace, 'ls-files'], {
+    maxBuffer: 32 * 1024 * 1024,
+  })
+  return new Set(stdout.split('\n').filter(Boolean))
+}
+
+/** Transcripts are large and rarely read: to disk with a pointer, never into postgres. */
+async function writeTranscript(
+  config: RunnerConfig,
+  job: ClaimedJob,
+  workspace: string,
+): Promise<string | undefined> {
+  const dir = join(config.scratch, 'transcripts', job.runId)
+  await mkdir(dir, { recursive: true })
+  const ref = join(dir, 'output.json')
+  const raw = await readFile(join(workspace, OUTPUT_PATH), 'utf8').catch(() => null)
+  if (raw === null) return undefined
+  await writeFile(ref, raw, { mode: 0o600 })
+  return ref
+}
+
+const safeJsonParse = (raw: string): unknown => {
+  try {
+    return JSON.parse(raw)
+  } catch {
+    return { __unparseable: raw.slice(0, 2000) }
+  }
+}
+
+function usageFrom(event: RunEvent | undefined): RunReport['usage'] {
+  const u = event?.payload?.usage as
+    | { inputTokens?: number; outputTokens?: number; costUsdEstimate?: number }
+    | undefined
+  if (!u) return undefined
+  return {
+    ...(u.inputTokens !== undefined ? { inputTokens: u.inputTokens } : {}),
+    ...(u.outputTokens !== undefined ? { outputTokens: u.outputTokens } : {}),
+    ...(u.costUsdEstimate !== undefined
+      ? { costCents: Math.round(u.costUsdEstimate * 100) }
+      : {}),
+  }
+}
