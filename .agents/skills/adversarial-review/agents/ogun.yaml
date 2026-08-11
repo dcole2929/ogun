@@ -1,0 +1,8 @@
+interface:
+  display_name: "Adversarial Review"
+  short_description: "Probe the default branch for issues a normal review would pass over"
+  default_prompt: "Use the adversarial-review skill."
+policy:
+  # A factory skill must never be auto-triggered by an agent mid-task. It runs when
+  # Ogun says so, and only then.
+  allow_implicit_invocation: false

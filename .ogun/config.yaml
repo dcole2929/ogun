@@ -1,0 +1,20 @@
+project:
+  name: ogun
+  defaultBranch: main
+
+workers:
+  adversarial-review:
+    skill: adversarial-review
+    runtime: claude
+    model: worker
+    permissions: reviewer
+    sandbox: container
+    # Phase 1 has no cron; the schedule is recorded so phase 2 has something to read.
+    schedule: "0 3 * * *"
+    onMissed: skip
+
+policies:
+  directPush: false
+  allowSandboxDowngrade: false
+  maxConcurrentModifiers: 1
+  failureBreakerThreshold: 3

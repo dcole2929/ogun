@@ -1,0 +1,11 @@
+{
+  "name": "@ogun/cli",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "bin": { "ogun": "./src/main.ts" },
+  "dependencies": {
+    "@ogun/core": "workspace:*",
+    "zod": "^4.0.0"
+  }
+}
