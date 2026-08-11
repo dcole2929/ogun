@@ -1,0 +1,25 @@
+{
+  "name": "ogun",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json && pnpm --filter @ogun/web typecheck",
+    "db:up": "docker compose up -d",
+    "db:down": "docker compose down",
+    "db:generate": "pnpm --filter @ogun/core db:generate",
+    "db:migrate": "pnpm --filter @ogun/core db:migrate",
+    "server": "node --env-file-if-exists=.env packages/server/src/main.ts",
+    "runner": "node --env-file-if-exists=.env packages/runner/src/main.ts",
+    "ogun": "node --env-file-if-exists=.env packages/cli/src/main.ts",
+    "web": "pnpm --filter @ogun/web dev",
+    "test": "node --test --experimental-test-module-mocks packages/*/test/*.test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}

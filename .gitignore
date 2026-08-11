@@ -25,3 +25,6 @@ coverage/
 .DS_Store
 .idea/
 *.swp
+
+# runtime scratch
+.ogun/work/
