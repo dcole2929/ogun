@@ -18,6 +18,8 @@ export const RUN_OUTCOMES = [
 export type RunOutcome = (typeof RUN_OUTCOMES)[number]
 
 export const JOB_STATES = [
+  /** Waiting on a dependency inside its cycle. Phase 1 never produces one. */
+  'blocked',
   'queued',
   'claimed',
   'running',
