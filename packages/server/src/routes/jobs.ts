@@ -127,12 +127,13 @@ jobsRoutes.get('/', async (c) => {
   return c.json({ jobs: rows })
 })
 
+/** Only a queued job can be cancelled; one already claimed belongs to a runner. */
 jobsRoutes.post('/:id/cancel', async (c) => {
   const { db } = c.var.ctx
-  await c.var.ctx.db
+  const cancelled = await db
     .update(jobs)
     .set({ state: 'skipped' })
     .where(and(eq(jobs.id, c.req.param('id')), eq(jobs.state, 'queued')))
-  void db
-  return c.json({ ok: true })
+    .returning({ id: jobs.id })
+  return c.json({ cancelled: cancelled.length > 0 })
 })

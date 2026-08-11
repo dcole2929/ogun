@@ -1,6 +1,6 @@
 import { Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
-import { and, asc, desc, eq, gt, sql } from 'drizzle-orm'
+import { and, asc, desc, eq, gt } from 'drizzle-orm'
 import { schema } from '@ogun/core/db'
 import {
   eventBatchSchema,
@@ -177,6 +177,5 @@ runsRoutes.get('/:id/events', async (c) => {
     .from(runEvents)
     .where(eq(runEvents.runId, c.req.param('id')))
     .orderBy(asc(runEvents.seq))
-  void sql
   return c.json({ events: rows })
 })

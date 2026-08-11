@@ -6,7 +6,7 @@ import type { Env } from '../context.ts'
 import { startCycleRun } from '../foreman/cycles.ts'
 import { resetBreaker } from '../foreman/admission.ts'
 
-const { cycles, jobs, projects, runs, workers } = schema
+const { cycles, jobs, projects, workers } = schema
 
 export const triggerRoutes = new Hono<Env>()
 
@@ -56,7 +56,6 @@ triggerRoutes.post('/', async (c) => {
     .select({ id: jobs.id, state: jobs.state, nodeKey: jobs.nodeKey })
     .from(jobs)
     .where(eq(jobs.cycleRunId, result.cycleRunId))
-  void runs
   return c.json({ ...result, jobs: queued })
 })
 

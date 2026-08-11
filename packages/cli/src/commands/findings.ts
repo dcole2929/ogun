@@ -3,7 +3,6 @@ import { dirname, resolve } from 'node:path'
 import {
   findingsDocumentSchema,
   parseFingerprint,
-  rawFindingSchema,
   type FindingsDocument,
 } from '@ogun/core'
 import { bold, cyan, dim, fail, green, red, severityColor, table } from '../output.ts'
@@ -180,8 +179,6 @@ const argValue = (args: string[], flag: string): string | undefined => {
   const i = args.indexOf(flag)
   return i === -1 ? undefined : args[i + 1]
 }
-
-void rawFindingSchema
 
 const EXAMPLE = `{
   "findings": [

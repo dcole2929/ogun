@@ -1,5 +1,5 @@
 import type { RunEvent } from '@ogun/core'
-import { nextSeq, type ParserState, type RuntimeSpec } from './types.ts'
+import { nextSeq, type RuntimeSpec } from './types.ts'
 
 /**
  * Codex headless is item-lifecycle shaped: a thread containing turns containing items,
@@ -114,7 +114,6 @@ export const codexRuntime: RuntimeSpec = {
         emit('run.failed', { error: d.error ?? d.message ?? 'codex reported a failure' })
         break
     }
-    void (state as ParserState)
     return out
   },
 }
