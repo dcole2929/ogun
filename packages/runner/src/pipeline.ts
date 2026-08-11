@@ -12,7 +12,7 @@ import {
   type RunReport,
 } from '@ogun/core'
 import { ControlPlane, EventFlusher } from './client.ts'
-import { createSandbox, GUEST_WORKSPACE, type Sandbox } from './sandbox/index.ts'
+import { createSandbox, GUEST_WORKSPACE, safeJoin, type Sandbox } from './sandbox/index.ts'
 import { newParserState, resolveModel, resolveRuntime } from './runtimes/index.ts'
 import { materializeWorkspace, resolveHeadSha, stageAll } from './workspace.ts'
 import { runVerifyGate } from './verify.ts'
@@ -139,6 +139,7 @@ export async function executeJob(
       permissions: job.permissions as 'observer' | 'reviewer' | 'modifier',
       output,
       knownPaths: await trackedPaths(workspace.path),
+      lineCountOf: (path) => countLines(workspace.path, path),
       sandbox,
     })
 
@@ -194,6 +195,23 @@ async function trackedPaths(workspace: string): Promise<Set<string>> {
     maxBuffer: 32 * 1024 * 1024,
   })
   return new Set(stdout.split('\n').filter(Boolean))
+}
+
+/**
+ * Only files a finding actually cites get read, so this costs one open per citation
+ * rather than a walk of the tree. Path is already known-tracked by the caller, but it
+ * still goes through the containment check — it originated in a sandbox.
+ */
+async function countLines(workspace: string, relPath: string): Promise<number | null> {
+  try {
+    const abs = await safeJoin(workspace, relPath)
+    const text = await readFile(abs, 'utf8')
+    // A trailing newline does not make a final empty line.
+    return text.length === 0 ? 0 : text.replace(/\n$/, '').split('\n').length
+  } catch {
+    // Unreadable is not the same as wrong; the caller treats null as "cannot judge".
+    return null
+  }
 }
 
 /** Transcripts are large and rarely read: to disk with a pointer, never into postgres. */

@@ -85,16 +85,34 @@ export async function checkCitations(args: string[]): Promise<void> {
 
   const { stdout } = await run('git', ['ls-files'], { maxBuffer: 32 * 1024 * 1024 })
   const tracked = new Set(stdout.split('\n').filter(Boolean))
+  const lineCounts = new Map<string, number>()
 
   const bad: string[] = []
   for (const f of doc.findings) {
     for (const c of f.citations) {
       const path = c.path.replace(/^\.\//, '').replace(/^\/workspace\//, '')
-      if (!tracked.has(path)) bad.push(`${f.fingerprint} cites ${c.path}`)
+      if (!tracked.has(path)) {
+        bad.push(`${f.fingerprint} cites ${c.path}, which is not in the tree`)
+        continue
+      }
+      // The line half matters as much as the path: a confabulated finding names a real
+      // file at an invented location, and a path-only check waves that through.
+      const end = c.endLine ?? c.line
+      if (end === undefined) continue
+      let lines = lineCounts.get(path)
+      if (lines === undefined) {
+        const text = await readFile(path, 'utf8').catch(() => null)
+        if (text === null) continue
+        lines = text.length === 0 ? 0 : text.replace(/\n$/, '').split('\n').length
+        lineCounts.set(path, lines)
+      }
+      if (end > lines) {
+        bad.push(`${f.fingerprint} cites ${c.path}:${end}, but that file has ${lines} lines`)
+      }
     }
   }
   if (bad.length > 0) {
-    console.error(red('citations that do not exist in the reviewed tree:'))
+    console.error(red('citations that do not hold up:'))
     for (const b of bad) console.error(`  ${b}`)
     process.exit(1)
   }

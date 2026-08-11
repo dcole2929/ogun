@@ -17,6 +17,8 @@ export type VerifyInput = {
   output: unknown
   /** Paths present in the reviewed tree, for the grounding check. */
   knownPaths: Set<string>
+  /** Line count of a tracked file. Only cited files are read, not the whole tree. */
+  lineCountOf: (path: string) => Promise<number | null>
   sandbox: Sandbox
 }
 
@@ -118,26 +120,46 @@ function schemaCheck(input: VerifyInput): GateResult {
 }
 
 /**
- * Does every cited path actually exist in what was reviewed? Cheap, catches
+ * Does every cited `file:line` actually exist in what was reviewed? Cheap, catches
  * hallucinated findings, and runs before any expensive step (§4.11).
+ *
+ * The line half of that is not decoration. A path-only check passes a citation of
+ * `real-file.ts:9999`, which is the exact shape a confabulated finding takes: the model
+ * knows a plausible filename and invents a location in it. Found by ogun's own reviewer
+ * on its second run, when the check validated paths and silently ignored `line`.
+ *
+ * Only cited files are read, so the cost is proportional to findings, not repo size.
  */
-function groundingCheck(input: VerifyInput): GateResult {
+async function groundingCheck(input: VerifyInput): Promise<GateResult> {
   const parsed = findingsDocumentSchema.safeParse(input.output)
   if (!parsed.success) {
     return { name: 'grounded', method: 'tool', passed: false, detail: 'output is not parseable' }
   }
+
   const bad: string[] = []
   for (const f of parsed.data.findings) {
     for (const c of f.citations) {
-      if (!input.knownPaths.has(normalize(c.path))) bad.push(`${f.fingerprint} -> ${c.path}`)
+      const path = normalize(c.path)
+      if (!input.knownPaths.has(path)) {
+        bad.push(`${f.fingerprint} cites ${c.path}, which is not in the tree`)
+        continue
+      }
+      const end = c.endLine ?? c.line
+      if (end === undefined) continue
+      const lines = await input.lineCountOf(path)
+      if (lines === null) continue
+      if (end > lines) {
+        bad.push(`${f.fingerprint} cites ${c.path}:${end}, but that file has ${lines} lines`)
+      }
     }
   }
+
   if (bad.length > 0) {
     return {
       name: 'grounded',
       method: 'tool',
       passed: false,
-      detail: `cited files not present in the reviewed tree: ${bad.slice(0, 5).join(', ')}`,
+      detail: bad.slice(0, 5).join('; '),
     }
   }
   return { name: 'grounded', method: 'tool', passed: true }
