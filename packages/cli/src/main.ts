@@ -16,6 +16,7 @@ import { skillNew } from './commands/skill-new.ts'
 import { workersList } from './commands/workers.ts'
 import { runnerInit, runnerInvite, runnerJoin } from './commands/runner.ts'
 import { tokenNew } from './commands/token.ts'
+import { runnerStart, serverStart } from './commands/serve.ts'
 
 const serverUrl = process.env.OGUN_SERVER_URL ?? 'http://localhost:7777'
 const [command, sub, ...rest] = process.argv.slice(2)
@@ -27,15 +28,16 @@ const [command, sub, ...rest] = process.argv.slice(2)
  */
 const usage = `${bold('ogun')} — a local-first software factory
 
-${bold('setup')}
-  ogun runner init                 write ~/.ogun/runner.json for this machine
+${bold('running it')}
+  ogun server                      start the control plane and web UI
+  ogun runner start                start a runner on this machine
   ogun runner doctor               what this machine can actually run
   ogun image build [project-dir]   build ogun/base, or a project image
 
-${bold('more machines')}   (invite runs HERE, join runs on the OTHER machine)
-  ogun token new                   admin secret, for a control plane on a network
-  ogun runner invite <name>        mint a token, print the command to run over there
-  ogun runner join <url> --token   paste that command on the new machine
+${bold('adding a machine')}
+  ogun token new                   admin secret, once, on the control plane
+  ogun runner invite               on the CONTROL PLANE — mints a join token
+  ogun runner join <url> --token   on the NEW MACHINE — paste what invite printed
 
 ${bold('projects')}
   ogun project sync [dir]          read .ogun/config.yaml and register it
@@ -67,16 +69,22 @@ try {
   switch (command) {
     case 'runner':
       if (sub === 'doctor') await doctor(serverUrl)
+      else if (sub === 'start') runnerStart(rest)
       else if (sub === 'init') await runnerInit(rest)
       else if (sub === 'invite') await runnerInvite(rest, serverUrl)
       else if (sub === 'join') await runnerJoin(rest)
-      else fail('usage: ogun runner init | doctor | invite <name> | join <url> --token <t>')
+      else fail('usage: ogun runner start | doctor | init | invite | join <url> --token <t>')
       break
 
     case 'project':
       if (sub === 'sync') await projectSync(rest, serverUrl)
       else if (sub === 'list' || sub === undefined) await projectList(serverUrl)
       else fail('usage: ogun project sync [dir] | ogun project list')
+      break
+
+    case 'server':
+      if (sub === undefined || sub === 'start') serverStart(rest)
+      else fail('usage: ogun server')
       break
 
     case 'token':

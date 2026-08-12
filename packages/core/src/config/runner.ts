@@ -21,6 +21,8 @@ export const runnerConfigSchema = z.object({
    *
    * OGUN_TOKEN still overrides, for a systemd unit that prefers a secret file.
    */
-  token: z.string().optional(),
+  // nullish rather than optional: a hand-edited file with an explicit null is a
+  // plausible thing to find, and is the same statement as omitting the key.
+  token: z.string().nullish().transform((v) => v ?? undefined),
 })
 export type RunnerConfig = z.infer<typeof runnerConfigSchema>

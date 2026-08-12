@@ -12,8 +12,8 @@
     "db:down": "docker compose down",
     "db:generate": "pnpm --filter @ogun/core db:generate",
     "db:migrate": "pnpm --filter @ogun/core db:migrate",
-    "server": "node --env-file-if-exists=.env packages/server/src/main.ts",
-    "runner": "node --env-file-if-exists=.env packages/runner/src/main.ts",
+    "server": "node packages/cli/src/main.ts server",
+    "runner": "node packages/cli/src/main.ts runner start",
     "ogun": "node --env-file-if-exists=.env packages/cli/src/main.ts",
     "web": "pnpm --filter @ogun/web dev",
     "test": "node --test packages/*/test/*.test.ts && pnpm --filter @ogun/web test"

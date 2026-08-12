@@ -1,8 +1,14 @@
-import { loadRunnerConfig } from '@ogun/core'
+import { loadRunnerConfig, RunnerConfigError } from '@ogun/core'
 import { ControlPlane } from './client.ts'
 import { executeJob } from './pipeline.ts'
 
-const config = await loadRunnerConfig()
+const config = await loadRunnerConfig().catch((err) => {
+  if (err instanceof RunnerConfigError) {
+    console.error(`\nogun-runner: ${err.message}\n`)
+    process.exit(1)
+  }
+  throw err
+})
 const serverUrl = process.env.OGUN_SERVER_URL ?? config.serverUrl
 // Env first so a systemd unit can supply it from a secret store, then runner.json,
 // which is where `ogun runner join` puts it.

@@ -169,10 +169,32 @@ function parseFrontmatter(md: string): { name?: string; description?: string } {
   return out
 }
 
+export class RunnerConfigError extends Error {}
+
 export async function loadRunnerConfig(path?: string): Promise<RunnerConfig> {
   const file = expandHome(path ?? process.env.OGUN_RUNNER_CONFIG ?? '~/.ogun/runner.json')
-  const raw = JSON.parse(await readFile(file, 'utf8'))
-  const config = runnerConfigSchema.parse(raw)
+
+  // This file is hand-edited — you add repository paths to it — so a raw ZodError stack
+  // is the wrong thing to show. Name the file and the field.
+  const text = await readFile(file, 'utf8').catch(() => {
+    throw new RunnerConfigError(`${file} not found — run \`ogun runner join\` or \`ogun runner init\``)
+  })
+  let raw: unknown
+  try {
+    raw = JSON.parse(text)
+  } catch (err) {
+    throw new RunnerConfigError(`${file} is not valid JSON: ${(err as Error).message}`)
+  }
+  const parsed = runnerConfigSchema.safeParse(raw)
+  if (!parsed.success) {
+    throw new RunnerConfigError(
+      `${file} is not valid:\n` +
+        parsed.error.issues
+          .map((i) => `  ${i.path.join('.') || '(root)'}: ${i.message}`)
+          .join('\n'),
+    )
+  }
+  const config = parsed.data
   return {
     ...config,
     scratch: expandHome(config.scratch),
