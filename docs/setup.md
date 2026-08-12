@@ -12,7 +12,7 @@ Skills resolve from three places, **later wins**:
 
 | | where | travels with | use for |
 |---|---|---|---|
-| `builtin` | Ogun's own `.agents/skills/` | the Ogun install | universal disciplines |
+| `builtin` | Ogun's `skills/` | the Ogun install | universal disciplines |
 | `machine` | `~/.ogun/skills/` | nothing — this box only | experiments |
 | `project` | the repo's `.agents/skills/`, `.claude/skills/`, `.codex/skills/` | the repo | most skills |
 
@@ -39,6 +39,10 @@ clone (temp):  .claude/skills/nightly-review/      if the worker's runtime is cl
                (git-excluded, and deleted with the workspace)
 ```
 
+Ogun's own `.agents/skills/` is **not** the library — that is Ogun reviewing itself,
+exactly the relationship any project has to its own skills. What Ogun *ships* lives in
+`skills/`.
+
 Why per runtime: measured with the agents' own search tools disabled, so only native
 discovery could answer —
 
@@ -55,7 +59,7 @@ so a repo that already has skills does not have to move them.
 ### Adding a skill to a project
 
 ```sh
-cd ~/dev/heirchive
+cd ~/dev/your-project
 ogun skill new staging-error-review    # scaffolds .agents/skills/staging-error-review/
 $EDITOR .agents/skills/staging-error-review/SKILL.md
 ogun project sync                      # index it
@@ -109,55 +113,68 @@ changes on reboot.
 ogun token new
 ```
 
-Prints a token starting `ogun_`. This is the admin secret: it can define workers, so it
-stays on this machine. Start the server with it:
+Prints a token starting `ogun_`. This is the admin secret: it can define workers, and
+defining a worker is defining what runs on the host. It never leaves this machine.
 
 ```sh
-OGUN_TOKEN=ogun_… OGUN_BIND=0.0.0.0 pnpm server
+OGUN_TOKEN=ogun_… OGUN_BIND=0.0.0.0 ogun server
 ```
 
-### 2. On the CONTROL PLANE — invite the other machine
+### 2. On the CONTROL PLANE — mint a join token
 
 ```sh
-OGUN_TOKEN=ogun_… ogun runner invite macbook
+OGUN_TOKEN=ogun_… ogun runner invite
 ```
 
-**You choose the name.** Nothing is discovered — `macbook` is just what that machine will
-be called in the UI and in run history. Pick anything memorable.
+**No machine name.** The machine has not joined yet, and it is the thing that knows its
+own hostname — naming it here would be guessing, and would leave a row for a machine that
+may never appear. It prints the command for step 3.
 
-This mints a *second, different* token starting `ogr_`, scoped to that machine, and prints
-the command for step 3. It is shown once; only its hash is stored, so a lost one is
-re-issued rather than recovered.
+The token starts `ogr_`, is single use, and is shown once. Only its hash is stored, which
+is what makes storing it safe.
 
-### 3. On the OTHER MACHINE — join
+### 3. On the NEW MACHINE — join
 
-Paste what step 2 printed:
+Paste exactly what step 2 printed:
 
 ```sh
-ogun runner join http://<control-plane>:7777 \
-  --token ogr_… \
-  --name macbook
+ogun runner join http://<control-plane>:7777 --token ogr_…
 ```
 
-This checks the address is reachable and the token is accepted, then writes
+The machine names itself from its hostname; pass `--name` to override. This checks the
+address is reachable and the token is valid, registers the machine, and writes
 `~/.ogun/runner.json` (mode 0600) with the URL, the detected labels, and the token.
 
-### 4. On the OTHER MACHINE — say where its repos are, and start
+That token is now this machine's permanent credential. It can claim work and report on
+it, and nothing else.
+
+### 4. On the NEW MACHINE — start it
 
 ```sh
-$EDITOR ~/.ogun/runner.json     # fill in "projects": { "heirchive": "/Users/doug/dev/heirchive" }
-ogun runner doctor              # confirms binaries, credentials, and reachability
-pnpm runner
+ogun runner start
 ```
 
-No environment variable — `join` stored the token. `OGUN_TOKEN` still overrides if you
-would rather keep it in a systemd unit or a secret store.
+Nothing else. No environment variable — `join` stored the token. `OGUN_TOKEN` still
+overrides if you would rather keep it in a systemd unit.
+
+### Repositories are cloned, not registered
+
+A runner does not need to know about a project in advance. It clones from the project's
+remote, so a machine that joined a minute ago can work on anything.
+
+Registering a local path is an **optimisation**, not a requirement: it clones from disk
+instead, which is faster, needs no network, and works offline.
+
+```jsonc
+// ~/.ogun/runner.json — optional
+"projects": { "ogun": "/Users/doug/dev/ogun" }
+```
 
 ### Why paths are per machine
 
-`/home/doug/dev/heirchive` and `/Users/doug/dev/heirchive` are the same project. No
-absolute path is ever stored centrally, so each runner keeps its own map in
-`runner.json`. A runner simply skips a project it has no path for.
+`/home/doug/dev/x` and `/Users/doug/dev/x` are the same project. No absolute path is ever
+stored centrally, so each runner keeps its own map in `runner.json` — and a runner with no
+entry falls back to cloning from the remote.
 
 ### The two tokens
 
@@ -177,7 +194,7 @@ prompt. Revoke one machine from the Runners page without touching the others.
 Triggering a worker does not send work anywhere. It puts a row in the queue:
 
 ```
-ogun trigger heirchive nightly-review
+ogun trigger my-project nightly-review
    → job: queued, claimed_by: null, requires: {claude, docker}
 
 runner polls          → takes it     claimed_by: macbook

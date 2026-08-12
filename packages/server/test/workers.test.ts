@@ -117,10 +117,16 @@ describe('worker api', { skip: reachable ? false : 'no control plane running' },
   let root = ''
   let configPath = ''
 
+  // Works against a control plane on localhost with no token, and against one bound
+  // wider with OGUN_TOKEN set — the same rule the CLI follows.
+  const auth: Record<string, string> = process.env.OGUN_TOKEN?.trim()
+    ? { authorization: `Bearer ${process.env.OGUN_TOKEN.trim()}` }
+    : {}
+
   const send = (path: string, body: unknown, method = 'POST') =>
     fetch(`${base}${path}`, {
       method,
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', ...auth },
       body: JSON.stringify(body),
     })
 
@@ -170,7 +176,7 @@ describe('worker api', { skip: reachable ? false : 'no control plane running' },
   })
 
   const state = async (name: string) => {
-    const res = await fetch(`${base}/api/workers?project=${slug}`)
+    const res = await fetch(`${base}/api/workers?project=${slug}`, { headers: auth })
     const body = (await res.json()) as {
       workers: Array<{ worker: { id: string; name: string; runtime: string; modelRole: string } }>
       editable: Record<string, boolean>
@@ -229,7 +235,10 @@ describe('worker api', { skip: reachable ? false : 'no control plane running' },
 
   test('deleting removes it from the file and from the index', async () => {
     const { worker } = await state('from-ui')
-    const res = await fetch(`${base}/api/workers/${worker!.id}`, { method: 'DELETE' })
+    const res = await fetch(`${base}/api/workers/${worker!.id}`, {
+      method: 'DELETE',
+      headers: auth,
+    })
     assert.equal(res.status, 200)
     assert.ok(!(await readFile(configPath, 'utf8')).includes('from-ui'))
     assert.equal((await state('from-ui')).worker, undefined)

@@ -99,6 +99,7 @@ jobsRoutes.post('/claim', async (c) => {
         cycleRunId: found.job.cycleRunId,
         projectSlug: found.project.slug,
         projectDefaultBranch: found.project.defaultBranch,
+        ...(found.project.remoteUrl ? { remoteUrl: found.project.remoteUrl } : {}),
         workerId: found.worker.id,
         workerName: found.worker.name,
         workerVersion: found.worker.versionHash,

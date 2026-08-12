@@ -26,7 +26,10 @@ export type MaterializedWorkspace = {
  * and the only thing that changes.
  */
 export async function materializeWorkspace(input: {
-  sourceRepo: string
+  /** A path on this machine, when the repo is checked out here. */
+  sourceRepo?: string
+  /** Where to clone from when it is not. */
+  remoteUrl?: string
   scratch: string
   runId: string
   ref?: string
@@ -34,8 +37,33 @@ export async function materializeWorkspace(input: {
   const path = join(input.scratch, 'workspaces', input.runId)
   await mkdir(path, { recursive: true })
 
-  await run('git', ['clone', '--local', '--no-hardlinks', input.sourceRepo, path])
-  if (input.ref) await run('git', ['-C', path, 'checkout', '--detach', input.ref])
+  if (input.sourceRepo) {
+    await run('git', ['clone', '--local', '--no-hardlinks', input.sourceRepo, path])
+  } else if (input.remoteUrl) {
+    /**
+     * No local checkout, so clone from the remote. This is the seam the design always
+     * anticipated, and it means a runner needs no prior knowledge of a repository — a
+     * fresh machine can join and immediately work on any project, with a local path as
+     * an optimisation rather than a prerequisite.
+     *
+     * Shallow by default: a reviewer reads the current tree, and a full history clone of
+     * a large repository on every run is a lot of network for something discarded after.
+     */
+    const depth = process.env.OGUN_CLONE_DEPTH ?? '50'
+    await run('git', [
+      'clone',
+      ...(depth === 'full' ? [] : ['--depth', depth]),
+      ...(input.ref ? ['--branch', input.ref] : []),
+      input.remoteUrl,
+      path,
+    ])
+  } else {
+    throw new Error('no local path and no remote url — nothing to materialize from')
+  }
+
+  // A remote clone already checked out the branch; a local one is still on whatever HEAD
+  // pointed at. Detaching pins the SHA either way, which is what repo_sha has to mean.
+  if (input.ref && input.sourceRepo) await run('git', ['-C', path, 'checkout', '--detach', input.ref])
 
   const { stdout } = await run('git', ['-C', path, 'rev-parse', 'HEAD'])
   const sha = stdout.trim()

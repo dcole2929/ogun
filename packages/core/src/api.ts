@@ -31,6 +31,8 @@ export const claimedJobSchema = z.object({
   cycleRunId: z.string(),
   projectSlug: z.string(),
   projectDefaultBranch: z.string(),
+  /** Where to clone from when this runner has no local checkout. */
+  remoteUrl: z.string().optional(),
   workerId: z.string(),
   workerName: z.string(),
   workerVersion: z.string(),

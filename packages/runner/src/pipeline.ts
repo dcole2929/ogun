@@ -71,36 +71,45 @@ export async function executeJob(
   }
 
   try {
-    const sourceRepo = config.projects[job.projectSlug]
-    if (!sourceRepo) {
-      // The repo registry is per-runner, so this is a real and expected condition on a
-      // machine that simply doesn't have this project checked out (§4.5).
-      return await fail(`runner has no path registered for project "${job.projectSlug}"`)
-    }
-
-    // Checked explicitly: git's own "not a git repository" gives no clue which project
-    // or path is meant, and a directory holding several repos is an easy mistake to make.
-    if (!existsSync(join(sourceRepo, '.git'))) {
+    /**
+     * A local checkout is an optimisation, not a requirement. If this machine has the
+     * repo, clone from disk — fast, offline, no credentials. Otherwise clone from the
+     * remote, so a freshly joined runner can work on a project it has never seen.
+     */
+    const localPath = config.projects[job.projectSlug]
+    if (localPath && !existsSync(join(localPath, '.git'))) {
+      // Explicit because git's own message names no project, and pointing at a directory
+      // that contains repositories rather than at one is an easy mistake.
       return await fail(
-        `${sourceRepo} is not a git repository — "${job.projectSlug}" in this runner's ` +
+        `${localPath} is not a git repository — "${job.projectSlug}" in this runner's ` +
           'projects map should point at the repo itself, not a directory containing repos.',
       )
     }
-
-    let baseSha: string
-    try {
-      baseSha = await resolveHeadSha(sourceRepo, job.projectDefaultBranch)
-    } catch {
+    if (!localPath && !job.remoteUrl) {
       return await fail(
-        `${sourceRepo} has no branch "${job.projectDefaultBranch}" — set project.defaultBranch ` +
-          'in .ogun/config.yaml to whichever branch this project actually uses.',
+        `no way to obtain "${job.projectSlug}": this runner has no local path for it, and ` +
+          'the project has no remote url. Add one, or register a path in ~/.ogun/runner.json.',
       )
     }
+
+    let baseSha: string | undefined
+    if (localPath) {
+      try {
+        baseSha = await resolveHeadSha(localPath, job.projectDefaultBranch)
+      } catch {
+        return await fail(
+          `${localPath} has no branch "${job.projectDefaultBranch}" — set project.defaultBranch ` +
+            'in .ogun/config.yaml to whichever branch this project actually uses.',
+        )
+      }
+    }
+
     const workspace = await materializeWorkspace({
-      sourceRepo,
+      ...(localPath ? { sourceRepo: localPath } : {}),
+      ...(job.remoteUrl ? { remoteUrl: job.remoteUrl } : {}),
       scratch: config.scratch,
       runId: job.runId,
-      ref: baseSha,
+      ref: baseSha ?? job.projectDefaultBranch,
     })
     cleanup = workspace.cleanup
 

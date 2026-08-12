@@ -54,25 +54,27 @@ asdf install                     # node 26
 pnpm install
 pnpm db:up && pnpm db:migrate    # postgres in a container on :5433
 
-pnpm ogun runner init            # writes ~/.ogun/runner.json — add your repos to it
-pnpm ogun image build            # builds ogun/base
-pnpm ogun runner doctor          # what this machine can actually run
+ogun runner init            # writes ~/.ogun/runner.json for this machine
+ogun image build            # builds ogun/base
+ogun runner doctor          # what this machine can actually run
 
-pnpm server                      # control plane + UI on :7777
-pnpm runner                      # claims and executes jobs
+ogun server                 # control plane + UI on :7777
+ogun runner start           # claims and executes jobs
 
-pnpm ogun project sync           # register a repo with a .ogun/config.yaml
-pnpm ogun trigger ogun adversarial-review
+ogun project sync           # register a repo with a .ogun/config.yaml
+ogun trigger ogun adversarial-review
 ```
+
+Adding a second machine is two commands — see [`docs/setup.md`](docs/setup.md).
 
 ```sh
-pnpm ogun skill new <name>       # scaffold .agents/skills/<name>/
-pnpm ogun skills                 # every skill, and which workers bind it
-pnpm ogun skills show <name>     # read one, including its SKILL.md
-pnpm ogun workers                # every worker
+ogun skill new <name>       # scaffold .agents/skills/<name>/
+ogun skills                 # every skill, and which workers bind it
+ogun skills show <name>     # read one, including its SKILL.md
+ogun workers                # every worker
 ```
 
-`pnpm ogun` on its own lists everything. To use it from other repos, symlink the
+`ogun` on its own lists everything. To use it from other repos, symlink the
 launcher — it finds a new enough Node regardless of what that repo pins:
 
 ```sh
