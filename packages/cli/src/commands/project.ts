@@ -34,6 +34,10 @@ export async function projectSync(args: string[], serverUrl: string): Promise<vo
       name: s.name,
       sourcePath: s.sourcePath,
       versionHash: s.versionHash,
+      origin: s.origin,
+      body: s.body,
+      referencePaths: s.referencePaths,
+      allowImplicitInvocation: s.agentConfig.policy.allow_implicit_invocation,
       ...(s.agentConfig.interface.display_name
         ? { displayName: s.agentConfig.interface.display_name }
         : s.frontmatter.name
@@ -60,6 +64,8 @@ export async function projectSync(args: string[], serverUrl: string): Promise<vo
     fail(`sync failed: ${res ? await res.text() : `could not reach ${serverUrl}`}`)
   }
 
+  const result = (await res.json()) as { removed?: string[]; shadowed?: string[] }
+
   console.log(green(`synced ${payload.slug}`))
   console.log(
     table([
@@ -75,6 +81,15 @@ export async function projectSync(args: string[], serverUrl: string): Promise<vo
   )
   if (skills.length > 0) {
     console.log(dim(`\nskills: ${skills.map((s) => s.name).join(', ')}`))
+  }
+  if (result.removed?.length) {
+    console.log(dim(`removed (gone from config.yaml): ${result.removed.join(', ')}`))
+  }
+  if (result.shadowed?.length) {
+    console.log(
+      `\nnot applied: ${result.shadowed.join(', ')} — a worker created in the UI already`,
+    )
+    console.log('owns that name. Delete it there, or rename one of them.')
   }
   // A skill only reaches an automated run once it lands on the default branch, since
   // the workspace is a clone at a pinned SHA (§4.8). Worth saying out loud.

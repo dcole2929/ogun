@@ -8,6 +8,7 @@ import { RunDetailPage } from './pages/RunDetail.tsx'
 import { FindingsPage } from './pages/Findings.tsx'
 import { WorkersPage } from './pages/Workers.tsx'
 import { CoveragePage } from './pages/Coverage.tsx'
+import { SkillDetailPage, SkillsPage } from './pages/Skills.tsx'
 
 const client = new QueryClient({
   defaultOptions: {
@@ -33,6 +34,7 @@ function Shell() {
           <NavLink to="/findings">Findings</NavLink>
           <NavLink to="/runs">Runs</NavLink>
           <NavLink to="/workers">Workers</NavLink>
+          <NavLink to="/skills">Skills</NavLink>
           <NavLink to="/coverage">Coverage</NavLink>
         </nav>
       </aside>
@@ -45,6 +47,8 @@ function Shell() {
           <Route path="/runs" element={<RunsPage />} />
           <Route path="/runs/:id" element={<RunDetailPage />} />
           <Route path="/workers" element={<WorkersPage />} />
+          <Route path="/skills" element={<SkillsPage />} />
+          <Route path="/skills/:project/:name" element={<SkillDetailPage />} />
           <Route path="/coverage" element={<CoveragePage />} />
         </Routes>
       </main>

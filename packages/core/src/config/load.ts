@@ -49,6 +49,10 @@ export type DiscoveredSkill = {
   versionHash: string
   agentConfig: SkillAgentConfig
   frontmatter: { name?: string; description?: string }
+  /** The SKILL.md text. Shipped to the control plane so a UI can show it. */
+  body: string
+  /** Files under references/, repo-relative. Where a shared procedure lives (§4.8). */
+  referencePaths: string[]
 }
 
 /**
@@ -78,19 +82,34 @@ export async function discoverSkills(projectRoot: string): Promise<DiscoveredSki
 
       const md = await readFile(skillMd, 'utf8')
       const agentConfig = await readAgentConfig(dir)
+      const sourcePath = source.origin === 'project' ? dir.slice(source.base.length + 1) : dir
+      const references = await listReferences(dir, sourcePath)
       byName.set(entry.name, {
         name: entry.name,
         dir,
-        sourcePath:
-          source.origin === 'project' ? dir.slice(source.base.length + 1) : dir,
+        sourcePath,
         origin: source.origin,
-        versionHash: hashContent(md, JSON.stringify(agentConfig)),
+        versionHash: hashContent(md, JSON.stringify(agentConfig), references.join(',')),
         agentConfig,
         frontmatter: parseFrontmatter(md),
+        body: md,
+        referencePaths: references,
       })
     }
   }
   return [...byName.values()].sort((a, b) => a.name.localeCompare(b.name))
+}
+
+/** Only one level deep — a skill's references are a flat set of documents, and walking
+ *  arbitrarily deep would sweep up whatever else someone parked in the directory. */
+async function listReferences(skillDir: string, sourcePath: string): Promise<string[]> {
+  const dir = join(skillDir, 'references')
+  if (!(await exists(dir))) return []
+  const entries = await readdir(dir, { withFileTypes: true })
+  return entries
+    .filter((e) => e.isFile())
+    .map((e) => `${sourcePath}/references/${e.name}`)
+    .sort()
 }
 
 async function readAgentConfig(skillDir: string): Promise<SkillAgentConfig> {

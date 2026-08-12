@@ -41,6 +41,17 @@ export const skills = pgTable(
     displayName: text('display_name'),
     shortDescription: text('short_description'),
     defaultPrompt: text('default_prompt'),
+    /** project | global — where it was discovered, which is also its precedence. */
+    origin: text('origin').notNull().default('project'),
+    /**
+     * The SKILL.md text, so the UI can show what a worker will actually do without the
+     * server reaching into a project's filesystem (§4.5). An index of git, not a second
+     * source of truth: `ogun project sync` overwrites it wholesale every time.
+     */
+    body: text('body'),
+    /** Reference files beside SKILL.md, repo-relative. The shared procedure lives here. */
+    referencePaths: text('reference_paths').array().notNull().default(sql`'{}'::text[]`),
+    allowImplicitInvocation: boolean('allow_implicit_invocation').notNull().default(false),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [uniqueIndex('skills_project_name_idx').on(t.projectId, t.name)],
@@ -61,6 +72,16 @@ export const workers = pgTable(
     modelRole: text('model_role').notNull().default('worker'),
     permissions: text('permissions').notNull().default('reviewer'),
     sandbox: text('sandbox').notNull().default('container'),
+    /**
+     * `config` — defined in the repo's .ogun/config.yaml. Git owns it; sync rewrites it.
+     * `ui`     — created here. Sync never touches one, or every edit would be undone by
+     *            the next `ogun project sync`.
+     *
+     * Both are real workers. The difference is only who is allowed to overwrite them
+     * (§4.1: git is the source of truth for what is committed — not for what you are
+     * still experimenting with).
+     */
+    origin: text('origin').notNull().default('config'),
     /**
      * Bumped when the worker's resolved config changes. With skill_version on every
      * run it answers: did this finding stop appearing because we fixed the code, or

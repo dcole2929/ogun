@@ -8,6 +8,8 @@ import { jobsRoutes } from './routes/jobs.ts'
 import { runsRoutes } from './routes/runs.ts'
 import { projectsRoutes } from './routes/projects.ts'
 import { findingsRoutes } from './routes/findings.ts'
+import { skillsRoutes } from './routes/skills.ts'
+import { workersRoutes } from './routes/workers.ts'
 import { triggerRoutes } from './routes/trigger.ts'
 
 export function createApp(ctx: AppContext) {
@@ -26,6 +28,8 @@ export function createApp(ctx: AppContext) {
   app.route('/api/runs', runsRoutes)
   app.route('/api/projects', projectsRoutes)
   app.route('/api/findings', findingsRoutes)
+  app.route('/api/skills', skillsRoutes)
+  app.route('/api/workers', workersRoutes)
   app.route('/api/trigger', triggerRoutes)
 
   app.onError((err, c) => {

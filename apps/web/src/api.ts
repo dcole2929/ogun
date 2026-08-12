@@ -60,6 +60,67 @@ export type CoverageRow = {
   worker: { name: string }
 }
 
+export type SkillSummary = {
+  skill: {
+    id: string
+    name: string
+    displayName: string | null
+    shortDescription: string | null
+    defaultPrompt: string | null
+    sourcePath: string
+    origin: string
+    referencePaths: string[]
+    allowImplicitInvocation: boolean
+    versionHash: string
+    bodyLength: number
+  }
+  project: { slug: string } | null
+  workers: Array<{ id: string; name: string; runtime: string; enabled: boolean; origin: string }>
+}
+
+export type SkillDetail = {
+  skill: SkillSummary['skill'] & { body: string | null }
+  workers: Array<{
+    id: string
+    name: string
+    runtime: string
+    permissions: string
+    sandbox: string
+    enabled: boolean
+    origin: string
+  }>
+  project: { slug: string }
+}
+
+export type WorkerRow = {
+  worker: {
+    id: string
+    name: string
+    skillRef: string
+    runtime: string
+    modelRole: string
+    permissions: string
+    sandbox: string
+    origin: string
+    enabled: boolean
+    versionHash: string
+    config: Record<string, unknown>
+  }
+  project: { slug: string }
+}
+
+export type WorkerInput = {
+  projectSlug: string
+  name: string
+  skill: string
+  runtime: string
+  model: string
+  permissions: string
+  sandbox: string
+  prompt?: string
+  enabled: boolean
+}
+
 const json = async <T,>(path: string, init?: RequestInit): Promise<T> => {
   const res = await fetch(path, init)
   if (!res.ok) throw new Error(`${path}: ${res.status} ${await res.text().catch(() => '')}`)
@@ -87,6 +148,28 @@ export const api = {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ status, reason }),
     }),
+  skills: (project?: string) =>
+    json<{ skills: SkillSummary[] }>(`/api/skills${project ? `?project=${project}` : ''}`),
+  skill: (project: string, name: string) => json<SkillDetail>(`/api/skills/${project}/${name}`),
+
+  allWorkers: (project?: string) =>
+    json<{ workers: WorkerRow[] }>(`/api/workers${project ? `?project=${project}` : ''}`),
+  createWorker: (input: WorkerInput) =>
+    json<{ worker: WorkerRow['worker'] }>('/api/workers', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(input),
+    }),
+  updateWorker: (id: string, input: Partial<WorkerInput>) =>
+    json<{ worker: WorkerRow['worker'] }>(`/api/workers/${id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(input),
+    }),
+  deleteWorker: (id: string) =>
+    json<{ deleted: string }>(`/api/workers/${id}`, { method: 'DELETE' }),
+  workerYaml: (id: string) => json<{ yaml: string }>(`/api/workers/${id}/yaml`),
+
   trigger: (projectSlug: string, worker: string) =>
     json<{ cycleRunId: string; jobs: Array<{ nodeKey: string; state: string }> }>('/api/trigger', {
       method: 'POST',

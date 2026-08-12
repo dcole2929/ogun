@@ -15,6 +15,13 @@
       "when": 1786488355043,
       "tag": "0001_add_revisit_tracking",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1786492964189,
+      "tag": "0002_skill_bodies_and_worker_origin",
+      "breakpoints": true
     }
   ]
 }

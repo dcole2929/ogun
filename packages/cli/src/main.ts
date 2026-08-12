@@ -11,6 +11,8 @@ import {
   validateFindings,
 } from './commands/findings.ts'
 import { imageBuild } from './commands/image.ts'
+import { skillsList, skillsShow } from './commands/skills.ts'
+import { workersList } from './commands/workers.ts'
 import { runnerInit } from './commands/runner.ts'
 
 const serverUrl = process.env.OGUN_SERVER_URL ?? 'http://localhost:7777'
@@ -31,6 +33,11 @@ ${bold('setup')}
 ${bold('projects')}
   ogun project sync [dir]          read .ogun/config.yaml and register it
   ogun project list
+
+${bold('what can run')}
+  ogun skills                      every skill, and which workers bind it
+  ogun skills show <name>          read one, including its SKILL.md
+  ogun workers                     every worker, and where it is defined
 
 ${bold('running')}
   ogun trigger <project> <worker>  queue a run now
@@ -60,6 +67,16 @@ try {
       if (sub === 'sync') await projectSync(rest, serverUrl)
       else if (sub === 'list' || sub === undefined) await projectList(serverUrl)
       else fail('usage: ogun project sync [dir] | ogun project list')
+      break
+
+    case 'skills':
+      if (sub === 'show') await skillsShow(rest, serverUrl)
+      else if (sub === 'list' || sub === undefined) await skillsList(rest, serverUrl)
+      else await skillsShow([sub, ...rest], serverUrl)
+      break
+
+    case 'workers':
+      await workersList([sub, ...rest].filter(Boolean) as string[], serverUrl)
       break
 
     case 'trigger':

@@ -30,3 +30,4 @@ coverage/
 .ogun/work/
 images/base/cli/
 apps/web/dist/
+apps/web/test-build/

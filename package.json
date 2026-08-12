@@ -16,7 +16,7 @@
     "runner": "node --env-file-if-exists=.env packages/runner/src/main.ts",
     "ogun": "node --env-file-if-exists=.env packages/cli/src/main.ts",
     "web": "pnpm --filter @ogun/web dev",
-    "test": "node --test --experimental-test-module-mocks packages/*/test/*.test.ts"
+    "test": "node --test packages/*/test/*.test.ts && pnpm --filter @ogun/web test"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
