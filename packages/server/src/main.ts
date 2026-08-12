@@ -19,7 +19,7 @@ try {
   throw err
 }
 
-const ctx = createContext()
+const ctx = createContext(undefined, Boolean(auth.token))
 const server = serve(
   { fetch: createApp(ctx, auth.token).fetch, port, hostname: auth.bind },
   (info) => {

@@ -9,7 +9,7 @@ export class ControlPlane {
   readonly #baseUrl: string
   readonly #token: string | undefined
 
-  constructor(baseUrl: string, token = process.env.OGUN_TOKEN?.trim() || undefined) {
+  constructor(baseUrl: string, token = process.env.OGUN_RUNNER_TOKEN?.trim() || undefined) {
     this.#baseUrl = baseUrl
     this.#token = token
   }

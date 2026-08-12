@@ -1,13 +1,16 @@
 import { loadLocalConfig } from '@ogun/core'
 
 /**
- * On the machine running the control plane, the CLI reads the admin token from the same
- * local file the server writes — so neither of them needs it in the environment, and
- * there is no step where you copy a secret from one command into another.
+ * The CLI is an admin client: it defines workers and triggers runs, so it carries the
+ * admin token, never a runner's.
  *
- * From elsewhere, OGUN_TOKEN. A control plane on localhost needs nothing at all.
+ * On the machine running the control plane it reads the same local file the server
+ * writes, so neither needs it in the environment. From another machine, set
+ * OGUN_ADMIN_TOKEN. A control plane on localhost needs nothing at all.
  */
 export async function authHeaders(): Promise<Record<string, string>> {
-  const token = process.env.OGUN_TOKEN?.trim() || (await loadLocalConfig().catch(() => null))?.server.token
+  const token =
+    process.env.OGUN_ADMIN_TOKEN?.trim() ||
+    (await loadLocalConfig().catch(() => null))?.server.token
   return token ? { authorization: `Bearer ${token}` } : {}
 }

@@ -214,3 +214,21 @@ test('everything that changes what runs is admin-scoped', () => {
     assert.equal(scopeForPath(path), 'admin', path)
   }
 })
+
+/**
+ * The two credentials must not share an environment variable name. They did, and the
+ * consequence was quiet: on a one-machine setup, exporting the admin token for the CLI
+ * also handed it to the runner — which *works*, because admin satisfies runner scope,
+ * and so silently undoes the entire reason runner tokens cannot define workers.
+ */
+test('the admin token comes from OGUN_ADMIN_TOKEN, not a shared name', async () => {
+  const shared = await resolveAuth({ OGUN_TOKEN: 'ogun_shared' } as NodeJS.ProcessEnv)
+  assert.equal(shared.token, undefined, 'the old ambiguous name must not be honoured')
+
+  const explicit = await resolveAuth({
+    OGUN_ADMIN_TOKEN: 'ogun_explicit',
+    OGUN_BIND: '0.0.0.0',
+  } as NodeJS.ProcessEnv)
+  assert.equal(explicit.token, 'ogun_explicit')
+  assert.equal(explicit.generated, false, 'an explicit token must not be overwritten')
+})

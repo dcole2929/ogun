@@ -20,7 +20,10 @@ if (!local.runner) {
 
 const runner = local.runner
 const serverUrl = process.env.OGUN_SERVER_URL ?? runner.serverUrl
-const cp = new ControlPlane(serverUrl, process.env.OGUN_TOKEN?.trim() || runner.token)
+// OGUN_RUNNER_TOKEN, so a shell that exports the admin token for the CLI does not
+// silently hand it to the runner as well — which would work, and would quietly undo the
+// whole reason runner tokens cannot define workers.
+const cp = new ControlPlane(serverUrl, process.env.OGUN_RUNNER_TOKEN?.trim() || runner.token)
 
 // What the job pipeline needs: where repos are on this disk, and somewhere to work.
 const context = { projects: local.projects, scratch: runner.scratch }

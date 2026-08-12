@@ -15,7 +15,7 @@ const { runners } = schema
  *
  * There are two scopes, and the split matters:
  *
- *   admin  — the shared OGUN_TOKEN. Can do everything, including define a worker.
+ *   admin  — OGUN_ADMIN_TOKEN, or generated and stored. Can do everything.
  *   runner — a per-machine enrollment token. Can claim jobs and report on them, and
  *            nothing else. A compromised runner cannot rewrite config.yaml and hand
  *            itself a new prompt to execute.
@@ -42,7 +42,10 @@ export type AuthConfig = {
  */
 export async function resolveAuth(env = process.env): Promise<AuthConfig> {
   const bind = env.OGUN_BIND ?? '127.0.0.1'
-  const fromEnv = env.OGUN_TOKEN?.trim() || undefined
+  // OGUN_ADMIN_TOKEN, not OGUN_TOKEN. The runner reads its own credential from the
+  // environment too, and one name meaning two different secrets depending on which
+  // process happens to read it is how a runner ends up holding the admin token.
+  const fromEnv = env.OGUN_ADMIN_TOKEN?.trim() || undefined
   if (fromEnv) return { bind, token: fromEnv, generated: false }
 
   // A localhost control plane needs no token: nothing off this machine can reach it.

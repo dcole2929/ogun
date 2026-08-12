@@ -3,7 +3,7 @@ import { existsSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
-import { loadRunnerConfig } from '@ogun/core'
+import { loadLocalConfig, localConfigPath } from '@ogun/core'
 import { bold, cyan, dim, green, red, yellow } from '../output.ts'
 import { authHeaders } from '../auth.ts'
 
@@ -51,18 +51,21 @@ export async function doctor(serverUrl: string): Promise<void> {
 
   let config
   try {
-    config = await loadRunnerConfig()
+    const local = await loadLocalConfig()
+    config = local
     checks.push({
-      name: 'runner config',
-      ok: true,
-      detail: `${config.runnerId}, ${Object.keys(config.projects).length} project(s)`,
+      name: 'joined',
+      ok: Boolean(local.runner),
+      detail: local.runner
+        ? `${local.runner.id} -> ${local.runner.serverUrl}`
+        : 'not set up as a runner — `ogun runner init`, or `ogun runner join <url>`',
       fatal: true,
     })
   } catch (err) {
     checks.push({
-      name: 'runner config',
+      name: 'local config',
       ok: false,
-      detail: `${(err as Error).message} — run \`ogun runner init\``,
+      detail: (err as Error).message,
       fatal: true,
     })
   }
@@ -85,22 +88,26 @@ export async function doctor(serverUrl: string): Promise<void> {
   }
 
   if (config) {
-    console.log(bold('\nprojects on this runner'))
+    console.log(bold('\nlocal checkouts'))
     const entries = Object.entries(config.projects)
-    if (entries.length === 0) console.log(dim('  none registered'))
+    if (entries.length === 0) {
+      console.log(dim('  none — projects are cloned from their remote instead'))
+      console.log(dim('  `ogun project add .` inside a repo to use a local copy'))
+    }
     for (const [slug, path] of entries) {
       const present = existsSync(join(path, '.git'))
       console.log(
         `  ${present ? green('ok  ') : red('FAIL')}  ${cyan(slug.padEnd(20))} ${dim(path)}`,
       )
     }
-    const labels = new Set(config.labels)
+    const labels = new Set(config.runner?.labels ?? [])
     const derived = derivedLabels(checks)
     const missing = [...derived].filter((l) => !labels.has(l))
     if (missing.length > 0) {
       console.log(
         yellow(
-          `\n  this machine could advertise: ${missing.join(', ')} — add them to labels in ~/.ogun/runner.json`,
+          `\n  this machine could advertise: ${missing.join(', ')} — they are detected at` +
+            `\n  join time, so re-run \`ogun runner init\` to pick them up`,
         ),
       )
     }

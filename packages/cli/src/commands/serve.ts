@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { resolve } from 'node:path'
-import { dim, fail } from '../output.ts'
+import { fail } from '../output.ts'
 
 const repoRoot = resolve(fileURLToPath(new URL('../../../..', import.meta.url)))
 
@@ -40,7 +40,4 @@ function run(entry: string, args: string[], label: string): void {
   })
 }
 
-export const serveHelp = dim(
-  'The control plane binds to localhost unless OGUN_BIND says otherwise, and refuses a\n' +
-    'wider bind without OGUN_TOKEN — see `ogun token new`.',
-)
+

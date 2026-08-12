@@ -35,7 +35,7 @@ export async function tokenShow(args: string[]): Promise<void> {
   console.log(dim(`  stored in ${localConfigPath()}`))
   console.log(bold('\nUse it to'))
   console.log('  · unlock the web UI from another device')
-  console.log(`  · run the CLI from another machine: ${dim('export OGUN_TOKEN=…')}`)
+  console.log(`  · run the CLI from another machine: ${dim('export OGUN_ADMIN_TOKEN=…')}`)
   console.log(
     dim(
       '\nRunners do not need this and should not have it — they get their own token from' +
@@ -56,8 +56,8 @@ export async function tokenRotate(): Promise<void> {
   console.log(
     dim(
       'Restart `ogun server` for this to take effect. Every browser session and every\n' +
-        'exported OGUN_TOKEN stops working; runner tokens are unaffected, since they are\n' +
-        'separate credentials.',
+        'exported OGUN_ADMIN_TOKEN stops working; runner tokens are unaffected, since\n' +
+        'they are separate credentials.',
     ),
   )
 }

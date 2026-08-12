@@ -48,7 +48,10 @@ runnersRoutes.get('/', async (c) => {
     addresses: reachableAddresses(),
     /** Why an address may not work from another machine, when we can tell in advance. */
     reachabilityWarning: reachabilityWarning(),
-    tokenRequired: Boolean(process.env.OGUN_TOKEN?.trim()),
+    // Answered from what the server is actually enforcing. Reading the environment
+    // said "no token" whenever one had been generated and stored rather than exported,
+    // which is now the normal case.
+    tokenRequired: c.var.ctx.adminTokenConfigured,
   })
 })
 
