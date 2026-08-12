@@ -1,4 +1,5 @@
 import { bold, cyan, dim, fail, green, table, yellow } from '../output.ts'
+import { authHeaders } from '../auth.ts'
 
 /**
  * `ogun workers` — the `WHERE` column is the one that matters. A `config` worker is
@@ -10,7 +11,7 @@ export async function workersList(args: string[], serverUrl: string): Promise<vo
   const url = new URL('/api/workers', serverUrl)
   if (project) url.searchParams.set('project', project)
 
-  const res = await fetch(url).catch(() => null)
+  const res = await fetch(url, { headers: authHeaders() }).catch(() => null)
   if (!res?.ok) fail(`could not reach the control plane at ${serverUrl}`)
   const { workers } = (await res.json()) as {
     workers: Array<{

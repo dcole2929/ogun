@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { loadRunnerConfig } from '@ogun/core'
 import { bold, cyan, dim, green, red, yellow } from '../output.ts'
+import { authHeaders } from '../auth.ts'
 
 const run = promisify(execFile)
 
@@ -37,7 +38,7 @@ export async function doctor(serverUrl: string): Promise<void> {
     fatal: false,
   })
 
-  const reachable = await fetch(`${serverUrl}/api/health`).then(
+  const reachable = await fetch(`${serverUrl}/api/health`, { headers: authHeaders() }).then(
     (r) => r.ok,
     () => false,
   )

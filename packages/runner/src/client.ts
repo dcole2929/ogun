@@ -7,9 +7,19 @@ import { claimResponseSchema } from '@ogun/core'
  */
 export class ControlPlane {
   readonly #baseUrl: string
+  readonly #token: string | undefined
 
-  constructor(baseUrl: string) {
+  constructor(baseUrl: string, token = process.env.OGUN_TOKEN?.trim() || undefined) {
     this.#baseUrl = baseUrl
+    this.#token = token
+  }
+
+  /** Absent for a localhost control plane, which needs no token. */
+  get #headers(): Record<string, string> {
+    return {
+      'content-type': 'application/json',
+      ...(this.#token ? { authorization: `Bearer ${this.#token}` } : {}),
+    }
   }
 
   async claim(runnerId: string, labels: string[], capacity: number): Promise<ClaimedJob[]> {
@@ -36,10 +46,17 @@ export class ControlPlane {
     )
   }
 
+  async authorized(): Promise<boolean> {
+    return fetch(`${this.#baseUrl}/api/projects`, { headers: this.#headers }).then(
+      (r) => r.status !== 401,
+      () => false,
+    )
+  }
+
   private async post(path: string, body: unknown): Promise<unknown> {
     const res = await fetch(`${this.#baseUrl}${path}`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: this.#headers,
       body: JSON.stringify(body),
     })
     if (!res.ok) {

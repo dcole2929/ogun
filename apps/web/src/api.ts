@@ -157,6 +157,16 @@ export const api = {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ status, reason }),
     }),
+  runners: () =>
+    json<{
+      runners: Array<{
+        id: string
+        labels: string[]
+        maxConcurrency: number
+        lastSeenAt: string
+        online: boolean
+      }>
+    }>('/api/runners'),
   skills: (project?: string) =>
     json<{ skills: SkillSummary[] }>(`/api/skills${project ? `?project=${project}` : ''}`),
   skill: (project: string, name: string) => json<SkillDetail>(`/api/skills/${project}/${name}`),

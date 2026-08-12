@@ -6,6 +6,7 @@ import {
   type FindingsDocument,
 } from '@ogun/core'
 import { bold, cyan, dim, fail, green, red, severityColor, table } from '../output.ts'
+import { authHeaders } from '../auth.ts'
 
 /**
  * The CLI owns every format the agent touches (§4.10). A skill never asks an agent to
@@ -142,7 +143,7 @@ export async function findingsList(args: string[], serverUrl: string): Promise<v
   if (project) url.searchParams.set('project', project)
   url.searchParams.set('status', status)
 
-  const res = await fetch(url).catch(() => null)
+  const res = await fetch(url, { headers: authHeaders() }).catch(() => null)
   if (!res?.ok) fail(`could not reach the control plane at ${serverUrl}`)
   const { findings } = (await res.json()) as {
     findings: Array<{

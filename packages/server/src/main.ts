@@ -1,15 +1,33 @@
 import { serve } from '@hono/node-server'
 import { createApp } from './app.ts'
 import { createContext } from './context.ts'
+import { assertBindIsSafe, InsecureBind, LOCAL_BINDS, resolveAuth } from './auth.ts'
 import { sweepStaleClaims } from './foreman/sweep.ts'
 
 const port = Number(process.env.OGUN_PORT ?? 7777)
 const staleAfterMs = Number(process.env.OGUN_STALE_CLAIM_MS ?? 45 * 60_000)
+const auth = resolveAuth()
+
+try {
+  assertBindIsSafe(auth)
+} catch (err) {
+  if (err instanceof InsecureBind) {
+    console.error(`\nogun-server: ${err.message}\n`)
+    process.exit(1)
+  }
+  throw err
+}
 
 const ctx = createContext()
-const server = serve({ fetch: createApp(ctx).fetch, port }, (info) => {
-  console.log(`ogun-server listening on http://localhost:${info.port}`)
-})
+const server = serve(
+  { fetch: createApp(ctx, auth.token).fetch, port, hostname: auth.bind },
+  (info) => {
+    console.log(`ogun-server listening on http://${auth.bind}:${info.port}`)
+    if (!LOCAL_BINDS.has(auth.bind)) {
+      console.log('  reachable from the network, token required')
+    }
+  },
+)
 
 const sweep = setInterval(() => {
   sweepStaleClaims(ctx.db, staleAfterMs)

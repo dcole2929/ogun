@@ -16,6 +16,15 @@ console.log(
 const inFlight = new Set<string>()
 let stopping = false
 
+if (!(await cp.authorized())) {
+  console.error(
+    `\nogun-runner: ${serverUrl} rejected this runner.\n` +
+      '  A control plane bound beyond localhost requires a shared secret.\n' +
+      '  Set OGUN_TOKEN to the same value the server was started with.\n',
+  )
+  process.exit(1)
+}
+
 const tick = async (): Promise<void> => {
   const capacity = config.maxConcurrentJobs - inFlight.size
   if (capacity <= 0 || stopping) return

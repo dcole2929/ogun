@@ -4,6 +4,7 @@ import { dirname, resolve } from 'node:path'
 import { promisify } from 'node:util'
 import { discoverSkills, expandHome, loadProjectConfig } from '@ogun/core'
 import { bold, cyan, dim, fail, green, table } from '../output.ts'
+import { authHeaders } from '../auth.ts'
 
 const run = promisify(execFile)
 
@@ -59,7 +60,7 @@ export async function projectSync(args: string[], serverUrl: string): Promise<vo
 
   const res = await fetch(`${serverUrl}/api/projects/sync`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', ...authHeaders() },
     body: JSON.stringify(payload),
   }).catch(() => null)
   if (!res?.ok) {
@@ -100,7 +101,7 @@ export async function projectSync(args: string[], serverUrl: string): Promise<vo
 }
 
 export async function projectList(serverUrl: string): Promise<void> {
-  const res = await fetch(`${serverUrl}/api/projects`).catch(() => null)
+  const res = await fetch(`${serverUrl}/api/projects`, { headers: authHeaders() }).catch(() => null)
   if (!res?.ok) fail(`could not reach the control plane at ${serverUrl}`)
   const { projects } = (await res.json()) as {
     projects: Array<{ slug: string; defaultBranch: string; remoteUrl: string | null }>

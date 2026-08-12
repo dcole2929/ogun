@@ -1,4 +1,5 @@
 import { bold, cyan, dim, fail, outcomeColor, table } from '../output.ts'
+import { authHeaders } from '../auth.ts'
 
 type RunRow = {
   run: {
@@ -18,7 +19,7 @@ type RunRow = {
 }
 
 export async function runsList(serverUrl: string): Promise<void> {
-  const res = await fetch(`${serverUrl}/api/runs?limit=30`).catch(() => null)
+  const res = await fetch(`${serverUrl}/api/runs?limit=30`, { headers: authHeaders() }).catch(() => null)
   if (!res?.ok) fail(`could not reach the control plane at ${serverUrl}`)
   const { runs } = (await res.json()) as { runs: RunRow[] }
   if (runs.length === 0) {
@@ -50,7 +51,7 @@ export async function trigger(args: string[], serverUrl: string): Promise<void> 
 
   const res = await fetch(`${serverUrl}/api/trigger`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', ...authHeaders() },
     body: JSON.stringify({ projectSlug, worker }),
   }).catch(() => null)
   if (!res?.ok) fail(`trigger failed: ${res ? await res.text() : `could not reach ${serverUrl}`}`)
@@ -76,7 +77,7 @@ export async function trigger(args: string[], serverUrl: string): Promise<void> 
 export async function coverage(args: string[], serverUrl: string): Promise<void> {
   const project = args[0]
   if (!project) fail('usage: ogun coverage <project>')
-  const res = await fetch(`${serverUrl}/api/projects/${project}/coverage`).catch(() => null)
+  const res = await fetch(`${serverUrl}/api/projects/${project}/coverage`, { headers: authHeaders() }).catch(() => null)
   if (!res?.ok) fail(`could not read coverage for ${project}`)
   const { coverage: rows } = (await res.json()) as {
     coverage: Array<{

@@ -4,18 +4,21 @@ import { logger } from 'hono/logger'
 import { serveStatic } from '@hono/node-server/serve-static'
 import { existsSync } from 'node:fs'
 import type { AppContext, Env } from './context.ts'
+import { bearerAuth } from './auth.ts'
 import { jobsRoutes } from './routes/jobs.ts'
 import { runsRoutes } from './routes/runs.ts'
 import { projectsRoutes } from './routes/projects.ts'
 import { findingsRoutes } from './routes/findings.ts'
 import { skillsRoutes } from './routes/skills.ts'
+import { runnersRoutes } from './routes/runners.ts'
 import { workersRoutes } from './routes/workers.ts'
 import { triggerRoutes } from './routes/trigger.ts'
 
-export function createApp(ctx: AppContext) {
+export function createApp(ctx: AppContext, token?: string) {
   const app = new Hono<Env>()
 
   app.use('*', logger())
+  app.use('/api/*', bearerAuth(token))
   // The UI is served from this same origin in production; cors is for `pnpm web` dev.
   app.use('/api/*', cors())
   app.use('*', async (c, next) => {
@@ -29,6 +32,7 @@ export function createApp(ctx: AppContext) {
   app.route('/api/projects', projectsRoutes)
   app.route('/api/findings', findingsRoutes)
   app.route('/api/skills', skillsRoutes)
+  app.route('/api/runners', runnersRoutes)
   app.route('/api/workers', workersRoutes)
   app.route('/api/trigger', triggerRoutes)
 
