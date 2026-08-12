@@ -67,6 +67,20 @@ export class LocalConfigError extends Error {}
 export const localConfigPath = (): string =>
   expandHome(process.env.OGUN_CONFIG ?? '~/.ogun/config.json')
 
+/**
+ * Paths in this file are hand-edited, so `~` has to work. Expanded on read rather than on
+ * write, so the stored file stays portable between machines with different home
+ * directories — and because an unexpanded one reaches Docker as a literal `~`, which it
+ * rejects as an invalid volume name after the container has already been built.
+ */
+const expandPaths = (config: LocalConfig): LocalConfig => ({
+  ...config,
+  projects: Object.fromEntries(
+    Object.entries(config.projects).map(([slug, path]) => [slug, expandHome(path)]),
+  ),
+  ...(config.runner ? { runner: { ...config.runner, scratch: expandHome(config.runner.scratch) } } : {}),
+})
+
 export async function loadLocalConfig(path = localConfigPath()): Promise<LocalConfig> {
   const text = await readFile(path, 'utf8').catch(() => null)
   if (text === null) return localConfigSchema.parse({})
@@ -86,7 +100,7 @@ export async function loadLocalConfig(path = localConfigPath()): Promise<LocalCo
         parsed.error.issues.map((i) => `  ${i.path.join('.') || '(root)'}: ${i.message}`).join('\n'),
     )
   }
-  return parsed.data
+  return expandPaths(parsed.data)
 }
 
 /** Read-modify-write, preserving anything this version does not know about. */
