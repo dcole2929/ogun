@@ -65,6 +65,12 @@ pnpm ogun project sync           # register a repo with a .ogun/config.yaml
 pnpm ogun trigger ogun adversarial-review
 ```
 
+```sh
+pnpm ogun skills                 # every skill, and which workers bind it
+pnpm ogun skills show <name>     # read one, including its SKILL.md
+pnpm ogun workers                # every worker, and where it is defined
+```
+
 `pnpm ogun` on its own lists everything. Ogun is registered as a project in its own
 repo, so the first thing you can point it at is itself — which is how the first real
 run found a `high` in the findings-status logic.

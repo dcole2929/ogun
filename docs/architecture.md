@@ -86,8 +86,33 @@ database connection. **[settled]**
 ### 4.1 Control plane
 
 Hono API + React UI + Postgres, one Node process serving both. Owns: project/worker/
-skill/cycle definitions (indexed from git — git is the source of truth), the job
-queue, run history, findings, the runner registry.
+skill/cycle definitions, the job queue, run history, findings, the runner registry.
+
+**Git is the source of truth for what is committed — not for what you are still
+trying.** [settled] Every worker carries an `origin`:
+
+| | `config` | `ui` |
+|---|---|---|
+| Declared in | `.ogun/config.yaml` | the browser |
+| `ogun project sync` | rewrites it, and deletes it when it leaves the file | never touches it |
+| Editable via the API | no — 409, edit the file | yes |
+| Reproducible on another machine | yes | only after you export it |
+
+Both run identically; the difference is only who may overwrite them. The alternative —
+having the UI write YAML back into the repo — would require the control plane to hold a
+filesystem path for every project, which is exactly what §4.5 avoids because those paths
+differ per machine. So promotion is explicit instead: `GET /api/workers/:id/yaml` renders
+the block to paste into `config.yaml`.
+
+A config worker and a UI worker share one name space, and config loses the tie. Sync
+reports the collision rather than applying quietly, because the failure it prevents —
+your UI edits vanishing on the next sync — is silent by nature.
+
+**Skills are indexed, never authored here.** Sync ships each `SKILL.md` body, its
+reference paths, and `allow_implicit_invocation` to the control plane so the UI can show
+what a worker will actually do without reaching into a project's filesystem. That row is
+an index of git, overwritten wholesale on every sync; editing a skill happens in the
+repo.
 
 Does **not** own: skill content (git), credentials (env/secrets), workspaces (disk),
 raw model output beyond structured records + log refs.
@@ -436,6 +461,14 @@ what an interactive Claude Code session picks up. Projects that want both keep t
 sync. Skills are read from disk on every trigger tick, so an edit takes effect on the
 next run with no restart — but note that a skill only reaches an automated run once it
 lands on the default branch, since the workspace is a clone at a pinned SHA.
+
+**A skill is not a worker, and naming them the same thing hides that.** The skill is
+the durable artifact — instructions, committed to git, reusable. A worker is a thin
+binding of one skill to a runtime, a model role, a permission profile, and a sandbox.
+Two workers can bind the same skill and differ only in which model runs it. Naming the
+first worker after its skill is a convenient default and it is what the UI prefills, but
+it made "is `adversarial-review` a skill or a worker?" an unanswerable question for
+longer than it should have been.
 
 **A skill carries its own worker config.** Beside `SKILL.md`, an `agents/*.yaml`
 supplies what Ogun needs to schedule it:
