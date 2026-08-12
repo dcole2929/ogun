@@ -43,6 +43,13 @@
       "when": 1786568365966,
       "tag": "0005_join_invites",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1786574581008,
+      "tag": "0006_runner_identity_and_timestamps",
+      "breakpoints": true
     }
   ]
 }

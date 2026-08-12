@@ -1,5 +1,5 @@
 import { Hono } from 'hono'
-import { and, arrayContained, eq, sql } from 'drizzle-orm'
+import { and, arrayContained, eq, isNull, sql } from 'drizzle-orm'
 import { schema } from '@ogun/core/db'
 import { claimRequestSchema, claimedJobSchema, type ClaimedJob } from '@ogun/core'
 import type { Env } from '../context.ts'
@@ -19,18 +19,28 @@ jobsRoutes.post('/claim', async (c) => {
   const body = claimRequestSchema.parse(await c.req.json())
 
   // A claim is also the heartbeat, and the moment a pending enrollment becomes real.
+  const runner = await db.query.runners.findFirst({
+    where: and(eq(runners.name, body.runnerName), isNull(runners.revokedAt)),
+  })
+  if (!runner) {
+    // Registration happens at join, so a claim from an unknown name means the runner was
+    // revoked or forgotten out from under a still-running process. Saying so beats
+    // silently re-creating the row it was removed from.
+    return c.json(
+      { error: `no live runner called "${body.runnerName}" — re-run \`ogun runner join\`` },
+      404,
+    )
+  }
   await db
-    .insert(runners)
-    .values({ id: body.runnerId, labels: body.labels, maxConcurrency: body.capacity })
-    .onConflictDoUpdate({
-      target: runners.id,
-      set: {
-        labels: body.labels,
-        maxConcurrency: body.capacity,
-        lastSeenAt: new Date(),
-        pending: false,
-      },
+    .update(runners)
+    .set({
+      labels: body.labels,
+      maxConcurrency: body.capacity,
+      lastSeenAt: new Date(),
+      updatedAt: new Date(),
+      pending: false,
     })
+    .where(eq(runners.id, runner.id))
 
   if (!(await hasCapacity(db, globalLimits))) return c.json({ jobs: [] })
 
@@ -44,7 +54,7 @@ jobsRoutes.post('/claim', async (c) => {
   const claimed = await db.execute(sql`
     update ${jobs} set
       state = 'claimed',
-      claimed_by = ${body.runnerId},
+      claimed_by = ${body.runnerName},
       claimed_at = now(),
       attempts = ${jobs.attempts} + 1
     where ${jobs.id} in (
@@ -83,7 +93,8 @@ jobsRoutes.post('/claim', async (c) => {
       .insert(runs)
       .values({
         jobId: found.job.id,
-        runnerId: body.runnerId,
+        runnerId: runner.id,
+        runnerName: runner.name,
         runtime: found.worker.runtime,
         model: found.worker.modelRole,
         workerVersion: found.worker.versionHash,

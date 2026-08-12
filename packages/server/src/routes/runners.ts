@@ -34,6 +34,9 @@ runnersRoutes.get('/', async (c) => {
   return c.json({
     runners: rows.map((r) => ({
       id: r.id,
+      name: r.name,
+      createdAt: r.createdAt,
+      updatedAt: r.updatedAt,
       labels: r.labels,
       maxConcurrency: r.maxConcurrency,
       lastSeenAt: r.lastSeenAt,
@@ -163,7 +166,9 @@ runnersRoutes.post('/join', async (c) => {
    * the local config was lost. Refusing there would strand the one-box case with an
    * error whose only remedy is revoking a machine that is not gone.
    */
-  const taken = await db.query.runners.findFirst({ where: eq(runners.id, body.name) })
+  const taken = await db.query.runners.findFirst({
+    where: and(eq(runners.name, body.name), isNull(runners.revokedAt)),
+  })
   if (taken && !taken.revokedAt && adminTokenConfigured) {
     const age = Date.now() - taken.lastSeenAt.getTime()
     const seen = taken.pending
@@ -184,16 +189,23 @@ runnersRoutes.post('/join', async (c) => {
   // its own — which is the property that makes a lost laptop a revocation rather than a
   // rotation across every machine.
   const values = {
-    id: body.name,
+    name: body.name,
     labels: body.labels,
     maxConcurrency: body.maxConcurrency,
     // Null on a localhost control plane: there is no credential because none is needed.
     tokenHash: invite?.tokenHash ?? null,
     enrolledAt: new Date(),
+    updatedAt: new Date(),
     revokedAt: null,
     pending: true,
   }
-  await db.insert(runners).values(values).onConflictDoUpdate({ target: runners.id, set: values })
+  // `taken` is the live row with this name, when one exists — re-registering the same
+  // machine updates it in place rather than minting a second identity for it.
+  if (taken && !taken.revokedAt) {
+    await db.update(runners).set(values).where(eq(runners.id, taken.id))
+  } else {
+    await db.insert(runners).values(values)
+  }
 
   if (invite) {
     await db
@@ -218,7 +230,7 @@ runnersRoutes.delete('/:id', async (c) => {
     .where(eq(runners.id, c.req.param('id')))
     .returning()
   if (!row) return c.json({ error: 'no such runner' }, 404)
-  return c.json({ revoked: row.id })
+  return c.json({ revoked: row.name })
 })
 
 /**
@@ -237,7 +249,7 @@ runnersRoutes.delete('/:id/forget', async (c) => {
     return c.json({ error: 'revoke it first — a live runner would just re-register' }, 409)
   }
   await db.delete(runners).where(eq(runners.id, existing.id))
-  return c.json({ forgotten: existing.id })
+  return c.json({ forgotten: existing.name })
 })
 
 /**

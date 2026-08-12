@@ -11,13 +11,14 @@ import { COVERAGE_OUTCOMES } from './outcomes.ts'
  */
 
 export const runnerHeartbeatSchema = z.object({
-  runnerId: z.string().min(1),
+  runnerName: z.string().min(1),
   labels: z.array(z.string()),
   maxConcurrency: z.number().int().positive(),
 })
 
 export const claimRequestSchema = z.object({
-  runnerId: z.string().min(1),
+  /** The name this machine registered under. Its real id lives on the control plane. */
+  runnerName: z.string().min(1),
   /** Capability labels this runner advertises; a job's `requires` must be a subset. */
   labels: z.array(z.string()),
   /** How many slots the runner has free right now. */

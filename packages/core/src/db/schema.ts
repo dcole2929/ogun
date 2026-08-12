@@ -41,6 +41,7 @@ export const skills = pgTable(
     displayName: text('display_name'),
     shortDescription: text('short_description'),
     defaultPrompt: text('default_prompt'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     /** project | global — where it was discovered, which is also its precedence. */
     origin: text('origin').notNull().default('project'),
     /**
@@ -81,6 +82,8 @@ export const workers = pgTable(
     config: jsonb('config').notNull().$type<Record<string, unknown>>(),
     enabled: boolean('enabled').notNull().default(true),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    /** Bumped on every sync, so "did this change?" is answerable without diffing config. */
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [uniqueIndex('workers_project_name_idx').on(t.projectId, t.name)],
 )
@@ -169,7 +172,10 @@ export const runs = pgTable(
     jobId: uuid('job_id')
       .notNull()
       .references(() => jobs.id, { onDelete: 'cascade' }),
-    runnerId: text('runner_id').notNull(),
+    /** Null once that runner is forgotten; the name below survives it. */
+    runnerId: uuid('runner_id').references(() => runners.id, { onDelete: 'set null' }),
+    /** Snapshot, so history stays readable after a rename or a forget. */
+    runnerName: text('runner_name').notNull(),
     startedAt: timestamp('started_at', { withTimezone: true }).notNull().defaultNow(),
     endedAt: timestamp('ended_at', { withTimezone: true }),
     outcome: text('outcome'),
@@ -318,7 +324,14 @@ export const artifacts = pgTable(
 )
 
 export const runners = pgTable('runners', {
-  id: text('id').primaryKey(),
+  /**
+   * A real identity, separate from the name. The name is a label you chose and may want
+   * to change; the id is what a run points at, so renaming a machine does not orphan its
+   * history and a name freed by revocation can be reused without the old runs silently
+   * re-attaching to the new machine.
+   */
+  id: uuid('id').primaryKey().defaultRandom(),
+  name: text('name').notNull(),
   labels: text('labels').array().notNull().default(sql`'{}'::text[]`),
   maxConcurrency: integer('max_concurrency').notNull().default(2),
   lastSeenAt: timestamp('last_seen_at', { withTimezone: true }).notNull().defaultNow(),
@@ -335,7 +348,15 @@ export const runners = pgTable('runners', {
   revokedAt: timestamp('revoked_at', { withTimezone: true }),
   /** Never connected yet — the enrollment command has been issued but not run. */
   pending: boolean('pending').notNull().default(false),
-})
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  // Unique among live runners only, so revoking frees the name for reuse while the old
+  // row keeps its own identity.
+  uniqueIndex('runners_live_name_idx')
+    .on(t.name)
+    .where(sql`${t.revokedAt} is null`),
+])
 
 /**
  * A join token minted on the control plane and not yet used.

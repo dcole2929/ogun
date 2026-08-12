@@ -22,8 +22,8 @@ export class ControlPlane {
     }
   }
 
-  async claim(runnerId: string, labels: string[], capacity: number): Promise<ClaimedJob[]> {
-    const res = await this.post('/api/jobs/claim', { runnerId, labels, capacity })
+  async claim(runnerName: string, labels: string[], capacity: number): Promise<ClaimedJob[]> {
+    const res = await this.post('/api/jobs/claim', { runnerName, labels, capacity })
     return claimResponseSchema.parse(res).jobs
   }
 

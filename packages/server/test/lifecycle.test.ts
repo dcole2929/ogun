@@ -53,7 +53,7 @@ describe('run lifecycle', { skip: reachable ? false : 'no control plane running'
     if (job?.state === 'skipped') return { skipped: true as const, cycleRunId }
     const [run] = await db
       .insert(schema.runs)
-      .values({ jobId: job!.id, runnerId: 'test' })
+      .values({ jobId: job!.id, runnerName: 'test' })
       .returning()
     const result = await finalizeRun(db, { ...report, runId: run!.id })
     return { skipped: false as const, cycleRunId, result }
@@ -193,7 +193,7 @@ describe('re-sighting a finding', { skip: reachable ? false : 'no control plane 
     const [job] = await db.select().from(schema.jobs).where(eq(schema.jobs.cycleRunId, cycleRunId))
     const [run] = await db
       .insert(schema.runs)
-      .values({ jobId: job!.id, runnerId: 'test' })
+      .values({ jobId: job!.id, runnerName: 'test' })
       .returning()
     await finalizeRun(db, {
       runId: run!.id,
