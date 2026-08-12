@@ -11,6 +11,7 @@ import { CoveragePage } from './pages/Coverage.tsx'
 import { SkillDetailPage, SkillsPage } from './pages/Skills.tsx'
 import { RunnersPage } from './pages/Runners.tsx'
 import { TokenGate } from './TokenGate.tsx'
+import { SettingsPage } from './pages/Settings.tsx'
 
 const client = new QueryClient({
   defaultOptions: {
@@ -39,6 +40,7 @@ function Shell() {
           <NavLink to="/skills">Skills</NavLink>
           <NavLink to="/coverage">Coverage</NavLink>
           <NavLink to="/runners">Runners</NavLink>
+          <NavLink to="/settings">Settings</NavLink>
         </nav>
       </aside>
       <main className="main">
@@ -54,6 +56,7 @@ function Shell() {
           <Route path="/skills/:project/:name" element={<SkillDetailPage />} />
           <Route path="/coverage" element={<CoveragePage />} />
           <Route path="/runners" element={<RunnersPage />} />
+          <Route path="/settings" element={<SettingsPage />} />
         </Routes>
       </main>
     </div>

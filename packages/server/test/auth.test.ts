@@ -1,5 +1,5 @@
 import { strict as assert } from 'node:assert'
-import { test } from 'node:test'
+import { describe, test } from 'node:test'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -242,39 +242,53 @@ test('the admin token comes from OGUN_ADMIN_TOKEN, not a shared name', async () 
  * Two machines answering to one name would share a claim identity and a run history,
  * and neither would be attributable. `runner init` originally never contacted the
  * control plane at all, so nothing could have noticed.
+ *
+ * The rule is conditional, and the test says which mode it is checking rather than
+ * assuming one: a control plane with no admin token is reachable only from its own
+ * machine, so a collision there cannot mean "another machine" and always means "me
+ * again" — re-running init, or reconnecting after the local config was lost.
  */
-test('a runner name is unique across the control plane', { skip: reachable ? false : 'no control plane' }, async () => {
-  const name = `dup-${Date.now()}`
-  const register = () =>
+describe('runner names', { skip: reachable ? false : 'no control plane' }, () => {
+  const register = (name: string) =>
     fetch('http://localhost:7777/api/runners/join', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ name, labels: ['claude'], maxConcurrency: 1 }),
     })
 
-  const first = await register()
-  assert.equal(first.status, 201, 'the first machine registers')
+  const revoke = (name: string) =>
+    fetch(`http://localhost:7777/api/runners/${name}`, { method: 'DELETE' })
 
-  const second = await register()
-  assert.equal(second.status, 409, 'the second must be refused, not silently take over')
-  assert.match((await second.json() as { error: string }).error, /already registered/)
+  const isProtected = async () =>
+    (await fetch('http://localhost:7777/api/runners')).status === 401
 
-  await fetch(`http://localhost:7777/api/runners/${name}`, { method: 'DELETE' })
-})
+  test('a name is claimed on first registration', async () => {
+    const name = `first-${Date.now()}`
+    assert.equal((await register(name)).status, 201)
+    await revoke(name)
+  })
 
-test('a revoked name can be reused', { skip: reachable ? false : 'no control plane' }, async () => {
-  // Otherwise re-registering a machine after replacing its disk means picking a new name
-  // forever.
-  const name = `reuse-${Date.now()}`
-  const register = () =>
-    fetch('http://localhost:7777/api/runners/join', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ name, labels: [], maxConcurrency: 1 }),
-    })
+  test('re-registering follows whether this control plane is protected', async () => {
+    if (await isProtected()) {
+      assert.ok(true, 'protected: covered by the enrollment tests, which hold a token')
+      return
+    }
+    const name = `dup-${Date.now()}`
+    assert.equal((await register(name)).status, 201)
+    assert.equal(
+      (await register(name)).status,
+      201,
+      'unprotected: only this machine can reach it, so a collision is this machine again',
+    )
+    await revoke(name)
+  })
 
-  assert.equal((await register()).status, 201)
-  await fetch(`http://localhost:7777/api/runners/${name}`, { method: 'DELETE' })
-  assert.equal((await register()).status, 201, 'a revoked name is free again')
-  await fetch(`http://localhost:7777/api/runners/${name}`, { method: 'DELETE' })
+  test('a revoked name is free again', async () => {
+    // Otherwise re-registering a rebuilt machine means picking a new name forever.
+    const name = `reuse-${Date.now()}`
+    assert.equal((await register(name)).status, 201)
+    await revoke(name)
+    assert.equal((await register(name)).status, 201)
+    await revoke(name)
+  })
 })

@@ -156,9 +156,15 @@ runnersRoutes.post('/join', async (c) => {
    * Names are unique. Two machines answering to one name would share a claim identity
    * and a run history, and neither would be attributable — so the second one is refused
    * rather than quietly taking over the first one's row.
+   *
+   * Except on an unprotected control plane, where there is nothing to protect against:
+   * it is only reachable from this machine, so a collision cannot mean "another machine"
+   * and always means "me again" — re-running `ogun runner init`, or reconnecting after
+   * the local config was lost. Refusing there would strand the one-box case with an
+   * error whose only remedy is revoking a machine that is not gone.
    */
   const taken = await db.query.runners.findFirst({ where: eq(runners.id, body.name) })
-  if (taken && !taken.revokedAt) {
+  if (taken && !taken.revokedAt && adminTokenConfigured) {
     const age = Date.now() - taken.lastSeenAt.getTime()
     const seen = taken.pending
       ? 'has never connected'
@@ -221,6 +227,10 @@ runnersRoutes.delete('/:id', async (c) => {
  */
 export function reachabilityWarning(): string | null {
   if (!isWsl()) return null
+  // Only relevant when you are trying to reach this from elsewhere. On a localhost bind
+  // nothing is supposed to, so the warning would just be noise on the Settings page.
+  const bind = process.env.OGUN_BIND ?? '127.0.0.1'
+  if (bind !== '0.0.0.0' && bind !== '::') return null
   const addrs = reachableAddresses()
   const hasOverlay = addrs.some((a) => a.includes('://100.'))
   if (hasOverlay) return null

@@ -12,6 +12,7 @@ import { FindingsPage } from '../src/pages/Findings.tsx'
 import { RunsPage } from '../src/pages/Runs.tsx'
 import { CoveragePage } from '../src/pages/Coverage.tsx'
 import { RunnersPage } from '../src/pages/Runners.tsx'
+import { SettingsPage } from '../src/pages/Settings.tsx'
 
 /**
  * A smoke test, not a snapshot. It renders every page with no data and no server, which
@@ -38,6 +39,7 @@ test('every page renders with no data', () => {
     ['runs', <RunsPage />],
     ['coverage', <CoveragePage />],
     ['runners', <RunnersPage />],
+    ['settings', <SettingsPage />],
   ] as const) {
     const html = render(el)
     assert.ok(html.length > 0, `${name} rendered nothing`)

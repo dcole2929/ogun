@@ -12,6 +12,7 @@ import { projectsRoutes } from './routes/projects.ts'
 import { findingsRoutes } from './routes/findings.ts'
 import { skillsRoutes } from './routes/skills.ts'
 import { runnersRoutes } from './routes/runners.ts'
+import { systemRoutes } from './routes/system.ts'
 import { workersRoutes } from './routes/workers.ts'
 import { triggerRoutes } from './routes/trigger.ts'
 
@@ -66,6 +67,7 @@ export function createApp(ctx: AppContext, token?: string) {
   app.route('/api/findings', findingsRoutes)
   app.route('/api/skills', skillsRoutes)
   app.route('/api/runners', runnersRoutes)
+  app.route('/api/system', systemRoutes)
   app.route('/api/workers', workersRoutes)
   app.route('/api/trigger', triggerRoutes)
 
