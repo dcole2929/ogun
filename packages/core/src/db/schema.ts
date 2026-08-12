@@ -338,6 +338,25 @@ export const runners = pgTable('runners', {
 })
 
 /**
+ * A join token minted on the control plane and not yet used.
+ *
+ * Separate from `runners` because an invite is not a machine: nobody has joined yet, and
+ * the machine is the thing that knows its own name. Creating a runner row up front would
+ * mean inventing a name for something that may never connect.
+ */
+export const invites = pgTable('invites', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  tokenHash: text('token_hash').notNull().unique(),
+  /** For the operator's benefit — "the mac". Not a machine name. */
+  note: text('note'),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  /** Single use: set when a machine joins, along with the name it chose for itself. */
+  usedAt: timestamp('used_at', { withTimezone: true }),
+  usedBy: text('used_by'),
+  revokedAt: timestamp('revoked_at', { withTimezone: true }),
+})
+
+/**
  * Breaker state lives here, not in process memory (§4.3). On WSL2 an in-memory breaker
  * resets on every Windows update — exactly when you'd want it to hold.
  */

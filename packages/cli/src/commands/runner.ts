@@ -64,29 +64,29 @@ async function detectLabels(): Promise<string[]> {
 
 
 /**
- * `ogun runner invite <name>` — run this **on the control plane**. Mints a credential
- * for a machine that does not have one yet, and prints the command to run over there.
+ * `ogun runner invite` — run this **on the control plane**. Mints a join token.
  *
- * Named invite/join rather than add/join because `add` reads as something you do on the
- * machine being added, which is the opposite of where it runs.
+ * Takes no machine name. The machine has not joined yet and it is the thing that knows
+ * its own hostname; asking here would be guessing, and would leave a row for a machine
+ * that may never appear.
  */
 export async function runnerInvite(args: string[], serverUrl: string): Promise<void> {
-  const name = args.find((a) => !a.startsWith('--'))
-  if (!name) fail('usage: ogun runner invite <name> [--labels claude,codex,docker] [--url <server>]')
-
-  const labels = (argValue(args, '--labels') ?? '').split(',').filter(Boolean)
-  const res = await fetch(`${serverUrl}/api/runners`, {
+  const note = argValue(args, '--note')
+  const res = await fetch(`${serverUrl}/api/runners/invites`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', ...authHeaders() },
     body: JSON.stringify({
-      id: name,
-      labels,
+      ...(note ? { note } : {}),
       ...(argValue(args, '--url') ? { serverUrl: argValue(args, '--url') } : {}),
     }),
   }).catch(() => null)
 
   if (!res?.ok) {
-    fail(res ? ((await res.json()) as { error?: string }).error ?? 'enrollment failed' : `could not reach ${serverUrl}`)
+    fail(
+      res
+        ? ((await res.json()) as { error?: string }).error ?? 'could not mint a join token'
+        : `could not reach ${serverUrl}`,
+    )
   }
   const body = (await res!.json()) as { token: string; command: string }
 
@@ -95,33 +95,31 @@ export async function runnerInvite(args: string[], serverUrl: string): Promise<v
     .then((d) => d.reachabilityWarning)
     .catch(() => null)
 
-  console.log(green(`invited ${name}`))
-  if (warning) {
-    console.log(`\n${dim(warning)}\n`)
-  }
-  console.log(bold('\nRun this on that machine:\n'))
-  console.log(`  ${body.command.split('\n').join('\n  ')}`)
+  if (warning) console.log(`${dim(warning)}\n`)
+  console.log(bold('Run this on the machine you want to add:\n'))
+  console.log(`  ${cyan(body.command)}\n`)
   console.log(
     dim(
       [
-        '',
-        'The token is shown once — only its hash is stored here, so a lost one is',
-        're-issued rather than recovered. It can claim work and report on it; it cannot',
-        'define a worker.',
+        'Single use, and shown once — only its hash is stored, so a lost token is',
+        're-issued rather than recovered. That machine picks its own name; pass',
+        '--name to override its hostname. Once joined, this becomes its permanent',
+        'credential: it can claim work and report on it, and nothing else.',
       ].join('\n'),
     ),
   )
 }
 
 /**
- * `ogun runner join <url> --token <t>` — run this **on the new machine**, with the
- * command `ogun runner invite` printed. Writes runner.json so `pnpm runner` needs no
- * further arguments.
+ * `ogun runner join <url> --token <t>` — run this **on the machine being added**, with
+ * the command `ogun runner invite` printed.
+ *
+ * The name defaults to this machine's hostname, because this is the machine.
  */
 export async function runnerJoin(args: string[]): Promise<void> {
-  const url = args.find((a) => a.startsWith('http'))
+  const url = args.find((a) => a.startsWith('http'))?.replace(/\/$/, '')
   const token = argValue(args, '--token')
-  const name = argValue(args, '--name') ?? hostname()
+  const name = (argValue(args, '--name') ?? hostname()).toLowerCase().replace(/\..*$/, '')
   if (!url || !token) {
     fail('usage: ogun runner join <control-plane-url> --token <token> [--name <name>]')
   }
@@ -130,23 +128,33 @@ export async function runnerJoin(args: string[]): Promise<void> {
     (r) => r.ok,
     () => false,
   )
-  // Fail here rather than at the first claim: a wrong address at enrollment time is the
-  // single most likely mistake, and it is silent otherwise.
+  // Checked here rather than at the first claim: a wrong address is the most likely
+  // mistake in this whole flow, and it is otherwise silent.
   if (!reachable) {
     fail(
-      `cannot reach ${url}. Check the address is one this machine can see — the control ` +
-        'plane must be bound to something other than localhost for that.',
+      `cannot reach ${url} from this machine.\n` +
+        '  The control plane must be bound beyond localhost, and reachable from here —\n' +
+        '  on WSL2 that needs mirrored networking, a mesh VPN, or a port proxy.',
     )
   }
 
+  const labels = await detectLabels()
+  const res = await fetch(`${url}/api/runners/join`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+    body: JSON.stringify({ id: name, labels, maxConcurrency: 2 }),
+  }).catch(() => null)
+  if (!res?.ok) {
+    fail(res ? ((await res.json()) as { error?: string }).error ?? 'join refused' : 'join failed')
+  }
+
   const path = expandHome(process.env.OGUN_RUNNER_CONFIG ?? '~/.ogun/runner.json')
-  // Preserved rather than overwritten: joining a control plane must not discard the
-  // repository paths already registered on this machine.
+  // Preserved rather than overwritten: joining must not discard repository paths already
+  // registered on this machine.
   const existing: Record<string, unknown> = await readFile(path, 'utf8')
     .then((t) => JSON.parse(t) as Record<string, unknown>)
     .catch(() => ({}))
 
-  const labels = await detectLabels()
   const config = {
     ...existing,
     runnerId: name,
@@ -156,29 +164,28 @@ export async function runnerJoin(args: string[]): Promise<void> {
     maxConcurrentJobs: (existing.maxConcurrentJobs as number) ?? 2,
     serverUrl: url,
     pollIntervalMs: (existing.pollIntervalMs as number) ?? 3000,
-    // Persisted so `pnpm runner` needs nothing else. The file is 0600.
+    // Persisted so starting the runner needs nothing else. The file is 0600.
     token,
   }
   await mkdir(dirname(path), { recursive: true })
   await mkdir(resolve(expandHome('~/.ogun/work')), { recursive: true })
   await writeFile(path, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 })
 
-  const authorized = await fetch(`${url}/api/jobs/claim`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
-    body: JSON.stringify({ runnerId: name, labels, capacity: 1 }),
-  }).then(
-    (r) => r.status !== 401 && r.status !== 403,
-    () => false,
+  console.log(green(`joined ${url} as ${bold(name)}`))
+  console.log(dim(`  ${path}  —  url, labels, and token (mode 0600)`))
+  console.log(dim(`  labels: ${labels.join(', ') || '(none detected — see `ogun runner doctor`)'}`))
+  console.log(`\nStart it:\n`)
+  console.log(`  ${cyan('ogun runner start')}`)
+  console.log(
+    dim(
+      [
+        '',
+        'Repositories are cloned from their remote automatically. If a repo is already',
+        'checked out here, add its path under "projects" in that file and the runner',
+        'will use the local copy instead — faster, and works offline.',
+      ].join('\n'),
+    ),
   )
-  if (!authorized) fail('the control plane rejected that token — re-issue it with `ogun runner invite`')
-
-  console.log(green(`joined ${url} as ${name}`))
-  console.log(dim(`  wrote ${path}  (url, labels, and token — mode 0600)`))
-  console.log(dim(`  labels: ${labels.join(', ') || '(none detected)'}`))
-  console.log(`\nTwo things left:\n`)
-  console.log(`  1. add this machine's repositories under ${bold('projects')} in that file`)
-  console.log(`  2. ${cyan('pnpm runner')}`)
 }
 
 const argValue = (args: string[], flag: string): string | undefined => {

@@ -87,8 +87,19 @@ const RUNNER_ROUTES = [
   /^\/api\/runs\/[^/]+\/(started|events|report)$/,
 ]
 
-export const scopeForPath = (path: string): Scope =>
-  RUNNER_ROUTES.some((r) => r.test(path)) ? 'runner' : 'admin'
+/**
+ * Reachable while holding only an invite. `/join` is how a machine turns an invite into
+ * a runner credential, so requiring a runner credential to reach it would be circular.
+ * It validates the invite itself, and refuses a used or revoked one.
+ */
+const ENROLLMENT_ROUTES = [/^\/api\/runners\/join$/]
+
+export const scopeForPath = (path: string): Scope | 'enrollment' =>
+  ENROLLMENT_ROUTES.some((r) => r.test(path))
+    ? 'enrollment'
+    : RUNNER_ROUTES.some((r) => r.test(path))
+      ? 'runner'
+      : 'admin'
 
 /**
  * `required` is the *minimum* scope, given as a value or derived from the path. An admin
@@ -96,13 +107,15 @@ export const scopeForPath = (path: string): Scope =>
  */
 export function requireScope(
   adminToken: string | undefined,
-  required: Scope | ((path: string) => Scope),
+  required: Scope | ((path: string) => Scope | 'enrollment'),
 ): MiddlewareHandler<Env> {
   return async (c, next) => {
     const scope = typeof required === 'function' ? required(c.req.path) : required
     // No admin token configured means localhost-only, where everything is trusted.
     if (!adminToken) return next()
     if (c.req.path === '/api/health') return next()
+    // The route checks the invite itself; it cannot require a credential it issues.
+    if (scope === 'enrollment') return next()
 
     const presented = presentedToken(c.req.header('authorization'), c.req.header('x-ogun-token'))
     if (!presented) return c.json({ error: 'unauthorized' }, 401)

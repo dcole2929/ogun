@@ -1,13 +1,13 @@
 import { Hono } from 'hono'
 import { readFileSync } from 'node:fs'
 import { networkInterfaces } from 'node:os'
-import { desc, eq } from 'drizzle-orm'
+import { and, desc, eq, isNull } from 'drizzle-orm'
 import { z } from 'zod'
 import { schema } from '@ogun/core/db'
 import type { Env } from '../context.ts'
 import { hashToken, mintToken } from '../auth.ts'
 
-const { runners } = schema
+const { invites, runners } = schema
 
 /**
  * One control plane, N machines.
@@ -52,57 +52,117 @@ runnersRoutes.get('/', async (c) => {
   })
 })
 
-const enrollSchema = z.object({
-  id: z
-    .string()
-    .min(1)
-    .max(64)
-    .regex(/^[a-z0-9]+(?:[-.][a-z0-9]+)*$/, 'must be a lowercase slug, e.g. macbook or dev-box'),
-  /** What the operator says this machine can do; the runner overwrites it on first claim. */
-  labels: z.array(z.string()).default([]),
+const inviteSchema = z.object({
+  /** Optional note for your own benefit — "the mac", "the NAS". Never a machine name. */
+  note: z.string().max(200).optional(),
   serverUrl: z.string().optional(),
 })
 
 /**
- * Mints a token and returns it **once**. Only the hash is stored, so a lost token is
- * re-issued rather than recovered — which is the property that makes storing it safe.
+ * Mints a join token. **No machine name is required or accepted here**, because the
+ * machine has not joined yet and it is the thing that knows its own name — asking the
+ * control plane to guess it is backwards, and produces a row for a machine that may
+ * never appear.
+ *
+ * The token is returned once; only its hash is stored, which is what makes storing it
+ * safe. A lost one is re-issued rather than recovered.
  */
-runnersRoutes.post('/', async (c) => {
+runnersRoutes.post('/invites', async (c) => {
   const { db } = c.var.ctx
-  const body = enrollSchema.parse(await c.req.json())
+  const body = inviteSchema.parse(await c.req.json().catch(() => ({})))
 
-  const existing = await db.query.runners.findFirst({ where: eq(runners.id, body.id) })
-  if (existing && !existing.revokedAt) {
+  const token = mintToken('ogr')
+  await db.insert(invites).values({
+    tokenHash: hashToken(token),
+    ...(body.note ? { note: body.note } : {}),
+  })
+
+  const url = body.serverUrl ?? reachableAddresses()[0] ?? 'http://localhost:7777'
+  return c.json({ token, command: joinCommand(url, token) }, 201)
+})
+
+/** Outstanding invites — a token minted but not yet used by any machine. */
+runnersRoutes.get('/invites', async (c) => {
+  const rows = await c.var.ctx.db.select().from(invites).orderBy(desc(invites.createdAt))
+  return c.json({
+    invites: rows
+      .filter((i) => !i.usedAt && !i.revokedAt)
+      .map((i) => ({ id: i.id, note: i.note, createdAt: i.createdAt })),
+  })
+})
+
+runnersRoutes.delete('/invites/:id', async (c) => {
+  const [row] = await c.var.ctx.db
+    .update(invites)
+    .set({ revokedAt: new Date() })
+    .where(eq(invites.id, c.req.param('id')))
+    .returning()
+  if (!row) return c.json({ error: 'no such invite' }, 404)
+  return c.json({ revoked: row.id })
+})
+
+const joinSchema = z.object({
+  /** Chosen by the machine, defaulting to its hostname. It is the thing that knows. */
+  id: z
+    .string()
+    .min(1)
+    .max(64)
+    .regex(/^[a-z0-9]+(?:[-._][a-z0-9]+)*$/i, 'must be a hostname-like slug'),
+  labels: z.array(z.string()).default([]),
+  maxConcurrency: z.number().int().positive().default(2),
+})
+
+/**
+ * Redeem a join token. Called by the runner, presenting the invite as its bearer token —
+ * this is the one route an unenrolled machine may reach, since by definition it has no
+ * runner credential yet.
+ *
+ * The invite is single use. A token that enrolled one machine and could then enroll ten
+ * more is a shared secret wearing an invite's clothes.
+ */
+runnersRoutes.post('/join', async (c) => {
+  const { db } = c.var.ctx
+  const presented = (c.req.header('authorization') ?? '').replace(/^Bearer /, '')
+  const body = joinSchema.parse(await c.req.json())
+
+  const invite = await db.query.invites.findFirst({
+    where: and(eq(invites.tokenHash, hashToken(presented)), isNull(invites.revokedAt)),
+  })
+  if (!invite) return c.json({ error: 'that join token is not valid' }, 401)
+  if (invite.usedAt) {
     return c.json(
-      { error: `a runner named "${body.id}" is already enrolled — revoke it first to re-issue` },
+      { error: `that join token was already used by "${invite.usedBy}" — mint a new one` },
       409,
     )
   }
 
-  const token = mintToken('ogr')
+  const taken = await db.query.runners.findFirst({ where: eq(runners.id, body.id) })
+  if (taken && !taken.revokedAt) {
+    return c.json(
+      { error: `a runner called "${body.id}" is already connected — join with --name <other>` },
+      409,
+    )
+  }
+
+  // The invite becomes this machine's credential. One token, one machine, revocable on
+  // its own — which is the property that makes a lost laptop a revocation rather than a
+  // rotation across every machine.
   const values = {
     id: body.id,
     labels: body.labels,
-    tokenHash: hashToken(token),
+    maxConcurrency: body.maxConcurrency,
+    tokenHash: invite.tokenHash,
     enrolledAt: new Date(),
     revokedAt: null,
     pending: true,
   }
+  await db.insert(runners).values(values).onConflictDoUpdate({ target: runners.id, set: values })
   await db
-    .insert(runners)
-    .values(values)
-    .onConflictDoUpdate({ target: runners.id, set: values })
+    .update(invites)
+    .set({ usedAt: new Date(), usedBy: body.id })
+    .where(eq(invites.id, invite.id))
 
-  const url = body.serverUrl ?? reachableAddresses()[0] ?? 'http://localhost:7777'
-  return c.json(
-    {
-      runner: { id: body.id },
-      // Shown once. The UI has to make that clear, because there is no second chance.
-      token,
-      command: enrollCommand(body.id, url, token),
-    },
-    201,
-  )
+  return c.json({ runner: { id: body.id, labels: body.labels } }, 201)
 })
 
 /** Revoked, not deleted, so this machine's runs keep a name to point at. */
@@ -158,12 +218,12 @@ const isWsl = (): boolean => {
   }
 }
 
-const enrollCommand = (id: string, url: string, token: string): string =>
-  [
-    `ogun runner join ${url} \\`,
-    `  --token ${token} \\`,
-    `  --name ${id}`,
-  ].join('\n')
+/**
+ * `--name` is deliberately absent: the runner defaults to its own hostname, and can pass
+ * `--name` itself if the operator over there wants something else.
+ */
+const joinCommand = (url: string, token: string): string =>
+  `ogun runner join ${url} --token ${token}`
 
 /**
  * A runner on another machine cannot reach `localhost`, so the paste command needs a
