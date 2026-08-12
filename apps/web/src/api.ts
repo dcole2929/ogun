@@ -164,9 +164,24 @@ export const api = {
         labels: string[]
         maxConcurrency: number
         lastSeenAt: string
+        enrolledAt: string | null
+        revokedAt: string | null
+        pending: boolean
+        enrolled: boolean
         online: boolean
       }>
+      /** Addresses this control plane believes it is reachable at. */
+      addresses: string[]
+      tokenRequired: boolean
     }>('/api/runners'),
+  enrollRunner: (input: { id: string; labels: string[]; serverUrl?: string }) =>
+    json<{ runner: { id: string }; token: string; command: string }>('/api/runners', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(input),
+    }),
+  revokeRunner: (id: string) =>
+    json<{ revoked: string }>(`/api/runners/${id}`, { method: 'DELETE' }),
   skills: (project?: string) =>
     json<{ skills: SkillSummary[] }>(`/api/skills${project ? `?project=${project}` : ''}`),
   skill: (project: string, name: string) => json<SkillDetail>(`/api/skills/${project}/${name}`),

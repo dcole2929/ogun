@@ -322,6 +322,19 @@ export const runners = pgTable('runners', {
   labels: text('labels').array().notNull().default(sql`'{}'::text[]`),
   maxConcurrency: integer('max_concurrency').notNull().default(2),
   lastSeenAt: timestamp('last_seen_at', { withTimezone: true }).notNull().defaultNow(),
+  /**
+   * sha256 of the enrollment token. Per-runner rather than one shared secret so a lost
+   * laptop is one revocation rather than a rotation across every machine.
+   *
+   * Null for a runner that connected before enrollment existed, or on a localhost
+   * control plane where no token is required at all.
+   */
+  tokenHash: text('token_hash'),
+  enrolledAt: timestamp('enrolled_at', { withTimezone: true }),
+  /** Set rather than deleted, so a revoked runner's runs keep a name to point at. */
+  revokedAt: timestamp('revoked_at', { withTimezone: true }),
+  /** Never connected yet — the enrollment command has been issued but not run. */
+  pending: boolean('pending').notNull().default(false),
 })
 
 /**

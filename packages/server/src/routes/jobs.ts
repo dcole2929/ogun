@@ -18,12 +18,18 @@ jobsRoutes.post('/claim', async (c) => {
   const { db } = c.var.ctx
   const body = claimRequestSchema.parse(await c.req.json())
 
+  // A claim is also the heartbeat, and the moment a pending enrollment becomes real.
   await db
     .insert(runners)
     .values({ id: body.runnerId, labels: body.labels, maxConcurrency: body.capacity })
     .onConflictDoUpdate({
       target: runners.id,
-      set: { labels: body.labels, lastSeenAt: new Date() },
+      set: {
+        labels: body.labels,
+        maxConcurrency: body.capacity,
+        lastSeenAt: new Date(),
+        pending: false,
+      },
     })
 
   if (!(await hasCapacity(db, globalLimits))) return c.json({ jobs: [] })
