@@ -88,25 +88,45 @@ database connection. **[settled]**
 Hono API + React UI + Postgres, one Node process serving both. Owns: project/worker/
 skill/cycle definitions, the job queue, run history, findings, the runner registry.
 
-**Git is the source of truth for what is committed — not for what you are still
-trying.** [settled] Every worker carries an `origin`:
+**Git is the source of truth for worker definitions, and the control plane edits the
+file.** [settled] A worker lives in exactly one place: `.ogun/config.yaml`, in the repo.
+Creating one in the UI writes that file and re-indexes from it. There is no second
+place a worker can exist, and no "which copy wins" question.
 
-| | `config` | `ui` |
-|---|---|---|
-| Declared in | `.ogun/config.yaml` | the browser |
-| `ogun project sync` | rewrites it, and deletes it when it leaves the file | never touches it |
-| Editable via the API | no — 409, edit the file | yes |
-| Reproducible on another machine | yes | only after you export it |
+Two designs were tried before this one. Keeping UI workers in the database alongside
+file workers meant an `origin` column, a shadowing rule, and a promotion step — three
+concepts to hold, and worker definitions that did not travel with the repo. Routing the
+write through the runner would have worked too, but the runner's job is to clone *out*
+of your repos, never write into them, and widening that was a worse trade than widening
+the server's.
 
-Both run identically; the difference is only who may overwrite them. The alternative —
-having the UI write YAML back into the repo — would require the control plane to hold a
-filesystem path for every project, which is exactly what §4.5 avoids because those paths
-differ per machine. So promotion is explicit instead: `GET /api/workers/:id/yaml` renders
-the block to paste into `config.yaml`.
+What this costs: the control plane needs a local path for a project to edit it. That is
+recoverable rather than fundamental — the rule §4.5 actually protects is *no absolute
+path in the database*, since `/home/doug/dev/x` and `/Users/doug/dev/x` are the same
+project. So the path map is machine-local (`~/.ogun/projects.json`, written by
+`ogun project sync`, same posture as `runner.json`) and never crosses the API. A control
+plane with no local copy reports that it cannot edit and returns the YAML block to paste
+by hand — which is the hosted case, and the seam where `ConfigStore` grows a second
+implementation that writes through the GitHub API.
 
-A config worker and a UI worker share one name space, and config loses the tie. Sync
-reports the collision rather than applying quietly, because the failure it prevents —
-your UI edits vanishing on the next sync — is silent by nature.
+Nothing about the sandbox changes. This is the host-side control plane writing one file;
+no agent gains a capability, and §4.6's never-pushes rule is untouched.
+
+Four properties make editing someone's hand-written file acceptable:
+
+- **Comments, key order, and quoting survive.** Writes go through the YAML Document API,
+  not parse-and-restringify. A UI that silently reformats your file is a UI you stop
+  trusting with your file.
+- **Defaults are omitted.** Only fields differing from the schema default are written, so
+  the diff stays readable instead of accumulating every key at its default value.
+- **The result is validated before it lands**, and the write is atomic via rename. The UI
+  cannot leave a `config.yaml` on disk that the next sync refuses to load, or a truncated
+  one after a crash.
+- **Edits are compare-and-swap** on a content hash, so two tabs — or a tab racing your
+  editor — fail loudly instead of one silently winning.
+
+**The file is written, never committed.** The uncommitted diff *is* the review step, and
+auto-committing to someone's working branch is not the control plane's call.
 
 **Skills are indexed, never authored here.** Sync ships each `SKILL.md` body, its
 reference paths, and `allow_implicit_invocation` to the control plane so the UI can show

@@ -66,12 +66,24 @@ pnpm ogun trigger ogun adversarial-review
 ```
 
 ```sh
+pnpm ogun skill new <name>       # scaffold .agents/skills/<name>/
 pnpm ogun skills                 # every skill, and which workers bind it
 pnpm ogun skills show <name>     # read one, including its SKILL.md
-pnpm ogun workers                # every worker, and where it is defined
+pnpm ogun workers                # every worker
 ```
 
-`pnpm ogun` on its own lists everything. Ogun is registered as a project in its own
+`pnpm ogun` on its own lists everything. To use it from other repos, symlink the
+launcher — it finds a new enough Node regardless of what that repo pins:
+
+```sh
+ln -s ~/dev/ogun/bin/ogun ~/.local/bin/ogun
+```
+
+**Skills are authored in the repo; workers can be created either way.** A skill is
+prose you iterate on, so `ogun skill new` scaffolds it and you edit the files. A worker
+is a handful of fields, so the UI has a form for it — but that form writes
+`.ogun/config.yaml` in your repo and leaves the diff uncommitted for you to review.
+There is one definition of a worker and it is in git. Ogun is registered as a project in its own
 repo, so the first thing you can point it at is itself — which is how the first real
 run found a `high` in the findings-status logic.
 
