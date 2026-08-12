@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { test } from 'node:test'
-import { ensureSkillAvailable, listWorkspaceSkills, nativeSkillDir } from '../src/skills.ts'
+import { ensureSkillAvailable, listAvailableSkills, nativeSkillDir } from '../src/skills.ts'
 
 const run = promisify(execFile)
 
@@ -74,13 +74,13 @@ test('a missing skill is null, so the run can fail loudly', async () => {
   const dir = await workspace({ '.agents/skills/other/SKILL.md': '# other' })
   assert.equal(await ensureSkillAvailable(dir, 'review', 'claude'), null)
   // And the caller can say what *is* available, which is the useful half of the error.
-  assert.deepEqual(await listWorkspaceSkills(dir), ['other'])
+  assert.deepEqual(await listAvailableSkills(dir), ['other'])
 })
 
 test('a directory without SKILL.md is not a skill', async () => {
   const dir = await workspace({ '.agents/skills/notaskill/README.md': 'nope' })
   assert.equal(await ensureSkillAvailable(dir, 'notaskill', 'claude'), null)
-  assert.deepEqual(await listWorkspaceSkills(dir), [])
+  assert.deepEqual(await listAvailableSkills(dir), [])
 })
 
 test('an injected skill never reaches a patch', async () => {
@@ -95,4 +95,54 @@ test('an injected skill never reaches a patch', async () => {
 
   const { stdout } = await run('git', ['-C', dir, 'status', '--porcelain'])
   assert.equal(stdout.trim(), '', 'the injected copy showed up as a change')
+})
+
+/**
+ * "Some skills are universal but many are per repo." Both have to work, and the repo has
+ * to win — what "security review" means is a property of the codebase, not of the tool.
+ */
+test('a skill the repo does not have comes from the builtin library', async () => {
+  const dir = await workspace({ 'README.md': '# empty repo' })
+  const library = await workspace({ 'security-review/SKILL.md': '# universal' })
+
+  const resolved = await ensureSkillAvailable(dir, 'security-review', 'claude', [
+    { root: library, origin: 'builtin' },
+  ])
+  assert.equal(resolved?.origin, 'builtin')
+  assert.equal(await readFile(join(dir, resolved!.path, 'SKILL.md'), 'utf8'), '# universal')
+})
+
+test('a repo skill overrides a builtin of the same name', async () => {
+  const dir = await workspace({ '.agents/skills/security-review/SKILL.md': '# this repo' })
+  const library = await workspace({ 'security-review/SKILL.md': '# universal' })
+
+  const resolved = await ensureSkillAvailable(dir, 'security-review', 'claude', [
+    { root: library, origin: 'builtin' },
+  ])
+  assert.equal(resolved?.origin, 'project', 'the repo must win')
+  assert.equal(await readFile(join(dir, resolved!.path, 'SKILL.md'), 'utf8'), '# this repo')
+})
+
+test('a machine-local skill beats a builtin but loses to the repo', async () => {
+  const machine = await workspace({ 'review/SKILL.md': '# mine' })
+  const library = await workspace({ 'review/SKILL.md': '# universal' })
+  const paths = [
+    { root: machine, origin: 'machine' as const },
+    { root: library, origin: 'builtin' as const },
+  ]
+
+  const empty = await workspace({ 'README.md': 'x' })
+  assert.equal((await ensureSkillAvailable(empty, 'review', 'claude', paths))?.origin, 'machine')
+
+  const withRepo = await workspace({ '.agents/skills/review/SKILL.md': '# repo' })
+  assert.equal((await ensureSkillAvailable(withRepo, 'review', 'claude', paths))?.origin, 'project')
+})
+
+test('the error names skills from every source, not just the repo', async () => {
+  const dir = await workspace({ '.agents/skills/local-only/SKILL.md': '# a' })
+  const library = await workspace({ 'universal/SKILL.md': '# b' })
+  assert.deepEqual(await listAvailableSkills(dir, [{ root: library, origin: 'builtin' }]), [
+    'local-only',
+    'universal',
+  ])
 })

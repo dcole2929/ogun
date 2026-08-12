@@ -39,13 +39,23 @@ export async function loadProjectConfig(root: string): Promise<LoadedProject> {
   return { root, configPath, config, configHash: hashContent(text) }
 }
 
+/**
+ * Where a skill came from, in increasing precedence.
+ *
+ *   builtin — ships with Ogun. Universal disciplines, available in every repo.
+ *   machine — ~/.ogun/skills on this box. Yours, and does not travel to another runner.
+ *   project — in the repo being reviewed. Most skills are this: what "security review"
+ *             means is a property of the codebase, not of the tool.
+ */
+export type SkillOrigin = 'builtin' | 'machine' | 'project'
+
 export type DiscoveredSkill = {
   name: string
   /** Absolute on this machine. Only the repo-relative form is ever persisted. */
   dir: string
   /** Relative to the project root when the skill lives in the repo. */
   sourcePath: string
-  origin: 'global' | 'project'
+  origin: SkillOrigin
   versionHash: string
   agentConfig: SkillAgentConfig
   frontmatter: { name?: string; description?: string }
@@ -58,17 +68,28 @@ export type DiscoveredSkill = {
 /**
  * Discovery order, increasing precedence (§4.8):
  *
- *   global    ~/.ogun/skills/
- *   project   <repo>/.agents/skills/  and  <repo>/.claude/skills/
+ *   builtin   ships with Ogun — universal disciplines
+ *   machine   ~/.ogun/skills/
+ *   project   <repo>/.agents/skills/, .claude/skills/, .codex/skills/
  *
- * `.agents/skills/` is canonical for skills Ogun runs; `.claude/skills/` is what an
- * interactive session picks up. A later directory wins on name collision.
+ * A later directory wins on name collision, so a repo can specialise a built-in skill
+ * by defining its own with the same name. `.agents/skills/` is where `ogun skill new`
+ * writes; the other two are what an interactive Claude or Codex session picks up, and
+ * are read so a repo that already has skills does not have to move them.
  */
-export async function discoverSkills(projectRoot: string): Promise<DiscoveredSkill[]> {
-  const sources: Array<{ dir: string; origin: 'global' | 'project'; base: string }> = [
-    { dir: expandHome('~/.ogun/skills'), origin: 'global', base: expandHome('~/.ogun/skills') },
-    { dir: join(projectRoot, '.agents', 'skills'), origin: 'project', base: projectRoot },
-    { dir: join(projectRoot, '.claude', 'skills'), origin: 'project', base: projectRoot },
+export async function discoverSkills(
+  projectRoot: string,
+  builtinRoots: string[] = [],
+): Promise<DiscoveredSkill[]> {
+  const sources: Array<{ dir: string; origin: SkillOrigin; base: string }> = [
+    // Increasing precedence. A repo may override a built-in of the same name, which is
+    // the point: `security-review` means something different in a payments service than
+    // in a static site, and the repo is where that difference belongs.
+    ...builtinRoots.map((dir) => ({ dir, origin: 'builtin' as const, base: dir })),
+    { dir: expandHome('~/.ogun/skills'), origin: 'machine' as const, base: expandHome('~/.ogun/skills') },
+    { dir: join(projectRoot, '.agents', 'skills'), origin: 'project' as const, base: projectRoot },
+    { dir: join(projectRoot, '.claude', 'skills'), origin: 'project' as const, base: projectRoot },
+    { dir: join(projectRoot, '.codex', 'skills'), origin: 'project' as const, base: projectRoot },
   ]
 
   const byName = new Map<string, DiscoveredSkill>()
@@ -82,6 +103,8 @@ export async function discoverSkills(projectRoot: string): Promise<DiscoveredSki
 
       const md = await readFile(skillMd, 'utf8')
       const agentConfig = await readAgentConfig(dir)
+      // Repo-relative for a project skill; absolute otherwise, since a builtin or a
+      // machine-local skill has no repo to be relative to.
       const sourcePath = source.origin === 'project' ? dir.slice(source.base.length + 1) : dir
       const references = await listReferences(dir, sourcePath)
       byName.set(entry.name, {

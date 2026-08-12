@@ -13,5 +13,14 @@ export const runnerConfigSchema = z.object({
   maxConcurrentJobs: z.number().int().positive().default(2),
   serverUrl: z.string().default('http://localhost:7777'),
   pollIntervalMs: z.number().int().positive().default(3000),
+  /**
+   * This machine's enrollment token, written by `ogun runner join`. Stored here, in a
+   * 0600 file next to the rest of this machine's runner config, so starting the runner
+   * needs no environment variable — a token you have to remember to export is a token
+   * you forget to export.
+   *
+   * OGUN_TOKEN still overrides, for a systemd unit that prefers a secret file.
+   */
+  token: z.string().optional(),
 })
 export type RunnerConfig = z.infer<typeof runnerConfigSchema>

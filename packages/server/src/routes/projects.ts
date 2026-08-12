@@ -29,7 +29,7 @@ const syncSchema = z.object({
         displayName: z.string().optional(),
         shortDescription: z.string().optional(),
         defaultPrompt: z.string().optional(),
-        origin: z.enum(['project', 'global']).default('project'),
+        origin: z.enum(['project', 'machine', 'builtin']).default('project'),
         body: z.string().optional(),
         referencePaths: z.array(z.string()).default([]),
         allowImplicitInvocation: z.boolean().default(false),

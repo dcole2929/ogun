@@ -156,6 +156,8 @@ export async function runnerJoin(args: string[]): Promise<void> {
     maxConcurrentJobs: (existing.maxConcurrentJobs as number) ?? 2,
     serverUrl: url,
     pollIntervalMs: (existing.pollIntervalMs as number) ?? 3000,
+    // Persisted so `pnpm runner` needs nothing else. The file is 0600.
+    token,
   }
   await mkdir(dirname(path), { recursive: true })
   await mkdir(resolve(expandHome('~/.ogun/work')), { recursive: true })
@@ -172,11 +174,11 @@ export async function runnerJoin(args: string[]): Promise<void> {
   if (!authorized) fail('the control plane rejected that token — re-issue it with `ogun runner invite`')
 
   console.log(green(`joined ${url} as ${name}`))
-  console.log(dim(`  wrote ${path}`))
+  console.log(dim(`  wrote ${path}  (url, labels, and token — mode 0600)`))
   console.log(dim(`  labels: ${labels.join(', ') || '(none detected)'}`))
-  console.log(`\nAdd this machine's repositories under ${bold('projects')}, then start it:\n`)
-  console.log(`  ${cyan(`OGUN_TOKEN=${token} pnpm runner`)}`)
-  console.log(dim('\n  Keep the token in your shell profile or a systemd unit; it is per-machine.'))
+  console.log(`\nTwo things left:\n`)
+  console.log(`  1. add this machine's repositories under ${bold('projects')} in that file`)
+  console.log(`  2. ${cyan('pnpm runner')}`)
 }
 
 const argValue = (args: string[], flag: string): string | undefined => {

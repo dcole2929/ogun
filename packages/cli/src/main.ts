@@ -92,8 +92,10 @@ try {
 
     case 'skills':
       if (sub === 'show') await skillsShow(rest, serverUrl)
-      else if (sub === 'list' || sub === undefined) await skillsList(rest, serverUrl)
-      else await skillsShow([sub, ...rest], serverUrl)
+      // `ogun skills --project x` is a list with a filter, not a skill named "--project".
+      else if (sub === undefined || sub === 'list' || sub.startsWith('--')) {
+        await skillsList([sub, ...rest].filter(Boolean) as string[], serverUrl)
+      } else await skillsShow([sub, ...rest], serverUrl)
       break
 
     case 'workers':

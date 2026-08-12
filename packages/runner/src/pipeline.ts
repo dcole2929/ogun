@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { execFile } from 'node:child_process'
 import { join } from 'node:path'
@@ -18,10 +19,15 @@ import {
   readContained,
   type Sandbox,
 } from './sandbox/index.ts'
-import { newParserState, resolveModel, resolveRuntime } from './runtimes/index.ts'
+import { nextSeq, newParserState, resolveModel, resolveRuntime } from './runtimes/index.ts'
 import { materializeWorkspace, resolveHeadSha, stageAll } from './workspace.ts'
 import { runVerifyGate } from './verify.ts'
-import { ensureSkillAvailable, excludeFromGit, listWorkspaceSkills } from './skills.ts'
+import {
+  defaultSearchPaths,
+  ensureSkillAvailable,
+  excludeFromGit,
+  listAvailableSkills,
+} from './skills.ts'
 
 const run = promisify(execFile)
 
@@ -72,7 +78,24 @@ export async function executeJob(
       return await fail(`runner has no path registered for project "${job.projectSlug}"`)
     }
 
-    const baseSha = await resolveHeadSha(sourceRepo, job.projectDefaultBranch)
+    // Checked explicitly: git's own "not a git repository" gives no clue which project
+    // or path is meant, and a directory holding several repos is an easy mistake to make.
+    if (!existsSync(join(sourceRepo, '.git'))) {
+      return await fail(
+        `${sourceRepo} is not a git repository — "${job.projectSlug}" in this runner's ` +
+          'projects map should point at the repo itself, not a directory containing repos.',
+      )
+    }
+
+    let baseSha: string
+    try {
+      baseSha = await resolveHeadSha(sourceRepo, job.projectDefaultBranch)
+    } catch {
+      return await fail(
+        `${sourceRepo} has no branch "${job.projectDefaultBranch}" — set project.defaultBranch ` +
+          'in .ogun/config.yaml to whichever branch this project actually uses.',
+      )
+    }
     const workspace = await materializeWorkspace({
       sourceRepo,
       scratch: config.scratch,
@@ -88,9 +111,15 @@ export async function executeJob(
     // Make the worker's skill discoverable where *this* runtime looks — the two do not
     // agree on a location, so it depends on which one is about to run (§5.1).
     const spec = resolveRuntime(job.runtime)
-    const skill = await ensureSkillAvailable(workspace.path, job.skillRef, spec.provider)
+    const searchPaths = defaultSearchPaths()
+    const skill = await ensureSkillAvailable(
+      workspace.path,
+      job.skillRef,
+      spec.provider,
+      searchPaths,
+    )
     if (!skill) {
-      const available = await listWorkspaceSkills(workspace.path)
+      const available = await listAvailableSkills(workspace.path, searchPaths)
       return await fail(
         `the workspace has no skill named "${job.skillRef}"` +
           (available.length ? ` — it has: ${available.join(', ')}` : ' and no skills at all') +
@@ -132,6 +161,28 @@ export async function executeJob(
     const parser = newParserState()
     let lastEvent: RunEvent | undefined
 
+    /**
+     * Recorded on every run, not only when something was copied. Which skill a run
+     * actually got is the single most useful thing for explaining its behaviour later —
+     * `project` means the repo's own, `builtin` means Ogun's, and the difference changes
+     * what the agent read. Emitted here, before the agent starts, so the timeline shows
+     * it in the order it happened.
+     */
+    flusher.push([
+      {
+        type: 'runner.note',
+        ts: new Date().toISOString(),
+        seq: nextSeq(parser),
+        payload: {
+          note: `skill ${skill.name} (${skill.origin}) at ${skill.path}`,
+          skill: skill.name,
+          origin: skill.origin,
+          path: skill.path,
+          injected: skill.injected,
+        },
+      },
+    ])
+
     for (let round = 0; round < maxRounds; round++) {
       const handle = sandbox.exec(spec.start(ctx))
       for await (const line of handle.lines) {
@@ -171,18 +222,6 @@ export async function executeJob(
     })
 
     const transcriptRef = await writeTranscript(config, job, workspace.path)
-    if (skill.injected) {
-      // Worth recording: it means the repo keeps skills somewhere the runtime does not
-      // search, so an interactive session would not see this skill.
-      flusher.push([
-        {
-          type: 'runner.note',
-          ts: new Date().toISOString(),
-          seq: parser.seq++,
-          payload: { note: `injected skill ${skill.name} into ${skill.path}` },
-        },
-      ])
-    }
     const usage = usageFrom(lastEvent)
 
     const report: RunReport = {

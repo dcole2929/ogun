@@ -4,7 +4,9 @@ import { executeJob } from './pipeline.ts'
 
 const config = await loadRunnerConfig()
 const serverUrl = process.env.OGUN_SERVER_URL ?? config.serverUrl
-const cp = new ControlPlane(serverUrl)
+// Env first so a systemd unit can supply it from a secret store, then runner.json,
+// which is where `ogun runner join` puts it.
+const cp = new ControlPlane(serverUrl, process.env.OGUN_TOKEN?.trim() || config.token)
 
 console.log(
   `ogun-runner "${config.runnerId}" -> ${serverUrl}\n` +

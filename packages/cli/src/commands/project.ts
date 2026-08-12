@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 import { promisify } from 'node:util'
@@ -20,7 +21,7 @@ export async function projectSync(args: string[], serverUrl: string): Promise<vo
     fail(`could not read ${root}/.ogun/config.yaml: ${(err as Error).message}`)
     throw err
   })
-  const skills = await discoverSkills(root)
+  const skills = await discoverSkills(root, [builtinSkillsRoot()])
   const remoteUrl = await gitRemote(root)
   await registerLocalPath(loaded.config.project.name, root)
 
@@ -135,6 +136,15 @@ async function registerLocalPath(slug: string, root: string): Promise<void> {
   const projects = { ...(existing.projects ?? {}), [slug]: root }
   await mkdir(dirname(path), { recursive: true })
   await writeFile(path, `${JSON.stringify({ projects }, null, 2)}\n`, { mode: 0o600 })
+}
+
+/**
+ * Ogun's own `.agents/skills/` is the built-in library — universal disciplines available
+ * in every repo without copying them around. A project defining a skill of the same name
+ * overrides it.
+ */
+export function builtinSkillsRoot(): string {
+  return resolve(fileURLToPath(new URL('../../../..', import.meta.url)), '.agents', 'skills')
 }
 
 const gitRemote = async (root: string): Promise<string | undefined> => {

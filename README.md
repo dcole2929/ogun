@@ -79,11 +79,17 @@ launcher — it finds a new enough Node regardless of what that repo pins:
 ln -s ~/dev/ogun/bin/ogun ~/.local/bin/ogun
 ```
 
-**Skills are authored in the repo; workers can be created either way.** A skill is
-prose you iterate on, so `ogun skill new` scaffolds it and you edit the files. A worker
-is a handful of fields, so the UI has a form for it — but that form writes
-`.ogun/config.yaml` in your repo and leaves the diff uncommitted for you to review.
-There is one definition of a worker and it is in git. Ogun is registered as a project in its own
+**Skills live in the repo being reviewed**, with a small built-in library for universal
+ones. A repo defining a skill by the same name overrides the built-in — what "security
+review" means is a property of the codebase, not of the tool.
+
+**Workers can be created either way.** A skill is prose you iterate on, so
+`ogun skill new` scaffolds it and you edit the files. A worker is a handful of fields, so
+the UI has a form — but that form writes `.ogun/config.yaml` in your repo and leaves the
+diff uncommitted for you to review. There is one definition of a worker and it is in git.
+
+Both of those, plus connecting a second machine, are in
+[`docs/setup.md`](docs/setup.md). Ogun is registered as a project in its own
 repo, so the first thing you can point it at is itself — which is how the first real
 run found a `high` in the findings-status logic.
 
