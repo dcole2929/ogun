@@ -1,7 +1,7 @@
 import { useQuery } from '@tanstack/react-query'
 import { Link } from 'react-router'
 import { api } from '../api.ts'
-import { duration, Empty, Page, Pill, when } from '../ui.tsx'
+import { duration, Empty, exact, Page, Pill, when } from '../ui.tsx'
 
 export function RunsPage() {
   const { data, isLoading, error } = useQuery({ queryKey: ['runs'], queryFn: api.runs })
@@ -31,7 +31,9 @@ export function RunsPage() {
             <tbody>
               {pending.map((p) => (
                 <tr key={p.job.id}>
-                  <td className="muted">{when(p.job.createdAt)}</td>
+                  <td className="muted" title={exact(p.job.createdAt)}>
+                    {when(p.job.createdAt)}
+                  </td>
                   <td className="muted">{p.project.slug}</td>
                   <td>{p.worker.name}</td>
                   <td>
@@ -99,7 +101,7 @@ export function RunsPage() {
           <tbody>
             {runs.map((r) => (
               <tr key={r.run.id}>
-                <td>
+                <td title={exact(r.run.startedAt)}>
                   <Link to={`/runs/${r.run.id}`}>{when(r.run.startedAt)}</Link>
                 </td>
                 <td className="muted">{r.project.slug}</td>

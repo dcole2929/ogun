@@ -218,6 +218,9 @@ export const api = {
     json<{
       runners: Array<{
         id: string
+        name: string
+        createdAt: string
+        updatedAt: string
         labels: string[]
         maxConcurrency: number
         lastSeenAt: string

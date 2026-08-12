@@ -46,6 +46,7 @@ const OUTCOME_TONE: Record<string, string> = {
   clean: 'green',
   found: 'blue',
   'gate-failed': 'red',
+  'not-selected': '',
   pending: 'blue',
   errored: 'red',
 }
@@ -65,6 +66,14 @@ const SEVERITY_TONE: Record<string, string> = {
 export const Severity = ({ value }: { value: string }) => (
   <span className={`pill ${SEVERITY_TONE[value] ?? ''}`}>{value}</span>
 )
+
+/**
+ * The full timestamp, for a `title` beside every relative one. "3 days ago" is the right
+ * default — you read a list to see what is recent — but the moment you care about a
+ * specific run you want the actual time, and hovering is cheaper than a second column.
+ */
+export const exact = (iso: string | null | undefined): string =>
+  iso ? new Date(iso).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'medium' }) : ''
 
 export function when(iso: string | null | undefined): string {
   if (!iso) return '—'

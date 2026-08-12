@@ -1,16 +1,21 @@
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, type FindingRow } from '../api.ts'
-import { Empty, Page, Pill, Severity, when } from '../ui.tsx'
+import { Empty, exact, Page, Pill, Severity, when } from '../ui.tsx'
 
 const SEVERITY_ORDER = ['critical', 'high', 'medium', 'low', 'info']
+
+const ALL_STATUSES = 'open,triaged,fixed,wontfix,duplicate,gated,overflow'
 
 /**
  * The findings inbox. Ranked by severity then recency, because the top of the list is
  * the only part that reliably gets read.
  */
 export function FindingsPage() {
-  const [status, setStatus] = useState('open,triaged')
+  // "all" first, and therefore the default. The inbox is where you look to see what the
+  // factory has said, not only what is still outstanding — a fixed finding you want to
+  // re-read should not require knowing which filter hides it.
+  const [status, setStatus] = useState(ALL_STATUSES)
   const qc = useQueryClient()
   const { data, isLoading, error } = useQuery({
     queryKey: ['findings', status],
@@ -33,11 +38,12 @@ export function FindingsPage() {
       subtitle="One row per issue, not per sighting. Dismissing something keeps it dismissed."
       actions={
         <select value={status} onChange={(e) => setStatus(e.target.value)}>
+          <option value={ALL_STATUSES}>all</option>
           <option value="open,triaged">open</option>
           <option value="fixed">fixed</option>
           <option value="wontfix">wontfix</option>
+          <option value="duplicate">duplicate</option>
           <option value="gated,overflow">gated &amp; overflow</option>
-          <option value="open,triaged,fixed,wontfix,duplicate,gated,overflow">everything</option>
         </select>
       }
     >
@@ -104,7 +110,8 @@ function Finding({
           )}
         </div>
         <div className="muted" style={{ whiteSpace: 'nowrap', fontSize: 12 }}>
-          {row.worker?.name ?? 'unknown'} · {when(f.updatedAt)}
+          {row.worker?.name ?? 'unknown'} ·{' '}
+          <span title={exact(f.updatedAt)}>{when(f.updatedAt)}</span>
         </div>
       </div>
 

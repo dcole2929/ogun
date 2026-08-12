@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '../api.ts'
-import { Empty, Page, when } from '../ui.tsx'
+import { Empty, exact, Page, when } from '../ui.tsx'
 
 /**
  * One control plane, N machines.
@@ -89,6 +89,7 @@ function RunnerTable({ runners }: { runners: NonNullable<Awaited<ReturnType<type
           <th>Can run</th>
           <th>Capacity</th>
           <th>Last seen</th>
+          <th>Added</th>
           <th />
         </tr>
       </thead>
@@ -106,7 +107,7 @@ function RunnerTable({ runners }: { runners: NonNullable<Awaited<ReturnType<type
                 <span className="pill">off</span>
               )}
             </td>
-            <td className="mono">{r.id}</td>
+            <td className="mono">{r.name}</td>
             <td>
               <div className="row" style={{ flexWrap: 'wrap' }}>
                 {r.labels.length === 0 ? (
@@ -121,8 +122,11 @@ function RunnerTable({ runners }: { runners: NonNullable<Awaited<ReturnType<type
               </div>
             </td>
             <td className="muted">{r.maxConcurrency}</td>
-            <td className="muted">
+            <td className="muted" title={exact(r.lastSeenAt)}>
               {r.pending ? <span className="muted">never connected</span> : when(r.lastSeenAt)}
+            </td>
+            <td className="muted" title={exact(r.createdAt)}>
+              {when(r.createdAt)}
             </td>
             <td style={{ textAlign: 'right' }}>
               {/* Revoke stops it claiming and keeps the row; forget removes the row.
