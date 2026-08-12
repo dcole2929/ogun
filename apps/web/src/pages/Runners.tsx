@@ -18,8 +18,9 @@ export function RunnersPage() {
     queryFn: api.runners,
     refetchInterval: 10_000,
   })
-  const runners = data?.runners.filter((r) => !r.revokedAt) ?? []
+  const runners = data?.runners ?? []
   const live = runners.filter((r) => r.online)
+  const revoked = runners.filter((r) => r.revokedAt)
 
   return (
     <Page
@@ -55,7 +56,14 @@ export function RunnersPage() {
 
       {runners.length > 0 && <RunnerTable runners={runners} />}
 
-      {runners.length > 0 && live.length === 0 && (
+      {revoked.length > 0 && (
+        <p className="muted" style={{ fontSize: 12 }}>
+          {revoked.length} revoked — kept so the name is not silently reused. Forget one to
+          remove it; run history keeps its name either way.
+        </p>
+      )}
+
+      {runners.length > 0 && live.length === 0 && revoked.length < runners.length && (
         <p className="error" style={{ fontSize: 13 }}>
           Nothing is online. Queued jobs will wait — they are not lost, but nothing will
           pick them up.
@@ -67,10 +75,9 @@ export function RunnersPage() {
 
 function RunnerTable({ runners }: { runners: NonNullable<Awaited<ReturnType<typeof api.runners>>>['runners'] }) {
   const qc = useQueryClient()
-  const revoke = useMutation({
-    mutationFn: (id: string) => api.revokeRunner(id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['runners'] }),
-  })
+  const invalidate = () => qc.invalidateQueries({ queryKey: ['runners'] })
+  const revoke = useMutation({ mutationFn: api.revokeRunner, onSuccess: invalidate })
+  const forget = useMutation({ mutationFn: api.forgetRunner, onSuccess: invalidate })
   const [confirming, setConfirming] = useState<string | null>(null)
 
   return (
@@ -89,7 +96,9 @@ function RunnerTable({ runners }: { runners: NonNullable<Awaited<ReturnType<type
         {runners.map((r) => (
           <tr key={r.id} style={{ opacity: r.online ? 1 : 0.6 }}>
             <td>
-              {r.pending ? (
+              {r.revokedAt ? (
+                <span className="pill">revoked</span>
+              ) : r.pending ? (
                 <span className="pill yellow">waiting</span>
               ) : r.online ? (
                 <span className="live" />
@@ -116,20 +125,25 @@ function RunnerTable({ runners }: { runners: NonNullable<Awaited<ReturnType<type
               {r.pending ? <span className="muted">never connected</span> : when(r.lastSeenAt)}
             </td>
             <td style={{ textAlign: 'right' }}>
-              {r.enrolled &&
-                (confirming === r.id ? (
-                  <span className="row" style={{ justifyContent: 'flex-end' }}>
-                    <span className="muted" style={{ fontSize: 12 }}>
-                      revoke its token?
-                    </span>
-                    <button className="danger" onClick={() => revoke.mutate(r.id)}>
-                      Revoke
-                    </button>
-                    <button onClick={() => setConfirming(null)}>Cancel</button>
+              {/* Revoke stops it claiming and keeps the row; forget removes the row.
+                  Run history stores the name as text, so forgetting loses nothing. */}
+              {r.revokedAt ? (
+                <button onClick={() => forget.mutate(r.id)} disabled={forget.isPending}>
+                  Forget
+                </button>
+              ) : confirming === r.id ? (
+                <span className="row" style={{ justifyContent: 'flex-end' }}>
+                  <span className="muted" style={{ fontSize: 12 }}>
+                    it stops claiming work — sure?
                   </span>
-                ) : (
-                  <button onClick={() => setConfirming(r.id)}>Revoke</button>
-                ))}
+                  <button className="danger" onClick={() => revoke.mutate(r.id)}>
+                    Revoke
+                  </button>
+                  <button onClick={() => setConfirming(null)}>Cancel</button>
+                </span>
+              ) : (
+                <button onClick={() => setConfirming(r.id)}>Revoke</button>
+              )}
             </td>
           </tr>
         ))}

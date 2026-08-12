@@ -205,7 +205,11 @@ runnersRoutes.post('/join', async (c) => {
   return c.json({ runner: { name: body.name, labels: body.labels } }, 201)
 })
 
-/** Revoked, not deleted, so this machine's runs keep a name to point at. */
+/**
+ * Revoke: the token stops working and the machine can no longer claim, but the row
+ * stays. That is the right default for a machine you are decommissioning — you may want
+ * to see it in the list, and it stops the name being silently reused by something else.
+ */
 runnersRoutes.delete('/:id', async (c) => {
   const { db } = c.var.ctx
   const [row] = await db
@@ -215,6 +219,25 @@ runnersRoutes.delete('/:id', async (c) => {
     .returning()
   if (!row) return c.json({ error: 'no such runner' }, 404)
   return c.json({ revoked: row.id })
+})
+
+/**
+ * Forget: remove the row entirely. Safe because `runs.runner_id` is text with no foreign
+ * key — history keeps the name whether or not the runner still exists — so this loses
+ * nothing but the entry in the list.
+ *
+ * Only for an already-revoked runner. Forgetting a live one would let it silently
+ * re-register on its next claim, which looks like the delete did not work.
+ */
+runnersRoutes.delete('/:id/forget', async (c) => {
+  const { db } = c.var.ctx
+  const existing = await db.query.runners.findFirst({ where: eq(runners.id, c.req.param('id')) })
+  if (!existing) return c.json({ error: 'no such runner' }, 404)
+  if (!existing.revokedAt) {
+    return c.json({ error: 'revoke it first — a live runner would just re-register' }, 409)
+  }
+  await db.delete(runners).where(eq(runners.id, existing.id))
+  return c.json({ forgotten: existing.id })
 })
 
 /**

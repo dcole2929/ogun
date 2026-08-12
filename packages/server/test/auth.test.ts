@@ -256,8 +256,16 @@ describe('runner names', { skip: reachable ? false : 'no control plane' }, () =>
       body: JSON.stringify({ name, labels: ['claude'], maxConcurrency: 1 }),
     })
 
-  const revoke = (name: string) =>
-    fetch(`http://localhost:7777/api/runners/${name}`, { method: 'DELETE' })
+  /**
+   * Hard-delete, not revoke. These run against whatever control plane is up — usually
+   * the real one — so a fixture that only revokes leaves a row behind forever, and the
+   * Runners page slowly fills with `dup-…` from test runs. Cleaning up after yourself
+   * means removing the row, not marking it.
+   */
+  const cleanup = async (name: string) => {
+    await fetch(`http://localhost:7777/api/runners/${name}`, { method: 'DELETE' })
+    await fetch(`http://localhost:7777/api/runners/${name}/forget`, { method: 'DELETE' })
+  }
 
   const isProtected = async () =>
     (await fetch('http://localhost:7777/api/runners')).status === 401
@@ -265,7 +273,7 @@ describe('runner names', { skip: reachable ? false : 'no control plane' }, () =>
   test('a name is claimed on first registration', async () => {
     const name = `first-${Date.now()}`
     assert.equal((await register(name)).status, 201)
-    await revoke(name)
+    await cleanup(name)
   })
 
   test('re-registering follows whether this control plane is protected', async () => {
@@ -280,15 +288,15 @@ describe('runner names', { skip: reachable ? false : 'no control plane' }, () =>
       201,
       'unprotected: only this machine can reach it, so a collision is this machine again',
     )
-    await revoke(name)
+    await cleanup(name)
   })
 
   test('a revoked name is free again', async () => {
     // Otherwise re-registering a rebuilt machine means picking a new name forever.
     const name = `reuse-${Date.now()}`
     assert.equal((await register(name)).status, 201)
-    await revoke(name)
+    await cleanup(name)
     assert.equal((await register(name)).status, 201)
-    await revoke(name)
+    await cleanup(name)
   })
 })

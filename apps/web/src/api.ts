@@ -240,6 +240,8 @@ export const api = {
     }),
   revokeRunner: (id: string) =>
     json<{ revoked: string }>(`/api/runners/${id}`, { method: 'DELETE' }),
+  forgetRunner: (id: string) =>
+    json<{ forgotten: string }>(`/api/runners/${id}/forget`, { method: 'DELETE' }),
   skills: (project?: string) =>
     json<{ skills: SkillSummary[] }>(`/api/skills${project ? `?project=${project}` : ''}`),
   skill: (project: string, name: string) => json<SkillDetail>(`/api/skills/${project}/${name}`),
