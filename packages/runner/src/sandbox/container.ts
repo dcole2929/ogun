@@ -1,9 +1,8 @@
-import { readFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { spawnJsonl } from './exec.ts'
-import { safeJoin } from './paths.ts'
+import { readContained } from './paths.ts'
 import type { Sandbox, SandboxSpec } from './types.ts'
 
 export type ContainerOptions = SandboxSpec & {
@@ -51,12 +50,9 @@ export function createContainerSandbox(opts: ContainerOptions): Sandbox {
       spawnJsonl('docker', [...runArgs, ...containerCommand(opts.runtime, argv)], {
         timeoutMs: opts.timeoutMs,
       }),
-    readFile: async (relPath) => {
-      // Read through the host bind-mount rather than `docker cp`: the container may
-      // already be gone, and the path check has to happen host-side anyway (§5.3).
-      const abs = await safeJoin(opts.hostWorkspace, relPath)
-      return readFile(abs, 'utf8').catch(() => null)
-    },
+    // Read through the host bind-mount rather than `docker cp`: the container may
+    // already be gone, and the path check has to happen host-side anyway (§5.3).
+    readFile: (relPath) => readContained(opts.hostWorkspace, relPath),
     dispose: async () => {
       // --rm handles the normal path; this catches a container left behind by a kill.
       await spawnJsonl('docker', ['rm', '-f', opts.name], { timeoutMs: 15_000 }).done.catch(
@@ -100,11 +96,16 @@ function buildRunArgs(opts: ContainerOptions, image: string): string[] {
   if ((opts.egress ?? 'open') === 'none') args.push('--network', 'none')
 
   /**
-   * Credentials are mounted read-only into a staging path; the entrypoint copies them
-   * to a writable location the agent owns. The CLIs write session state, so a bare
-   * read-only mount at the real path makes them fail — and mounting the real path
-   * writable would let a container corrupt the host's credentials. Worst case here is
-   * burning rate limit, which is the accepted risk (§4.6).
+   * Individual credential files, read-only, into a staging path the entrypoint copies
+   * from. The CLIs write session state, so a read-only mount at the real path makes
+   * them fail; mounting the real path writable would let a container corrupt the host's
+   * credentials.
+   *
+   * Files, not the directory. `~/.claude` is 36MB on a working machine, of which 22MB is
+   * `projects/` — full transcripts of every session in every repo you have ever opened,
+   * which routinely contain secrets from other projects. Handing that to an autonomous
+   * agent is a much larger exposure than the rate limit §4.6 originally named as the
+   * worst case. Both runtimes were verified to authenticate from these files alone.
    */
   for (const [hostPath, guestPath] of credentialMounts(opts.runtime)) {
     if (existsSync(hostPath)) args.push('--volume', `${hostPath}:${guestPath}:ro`)
@@ -120,16 +121,27 @@ function buildRunArgs(opts: ContainerOptions, image: string): string[] {
   return args
 }
 
-/** Staging paths the base image's entrypoint copies from. */
+/**
+ * An allowlist, not the directory. Anything not named here does not enter the sandbox —
+ * notably `projects/` (session transcripts), `history.jsonl`, `plugins/` and the codex
+ * `memories`/`goals` databases.
+ *
+ * Excluding `plugins/` also fixes a correctness problem: a personal plugin's skill was
+ * being invoked in preference to the worker's, so what a nightly run actually did
+ * depended on what you happened to have installed on your laptop.
+ */
 function credentialMounts(runtime: 'claude' | 'codex'): Array<[string, string]> {
   const home = homedir()
   if (runtime === 'claude') {
     return [
-      [join(home, '.claude'), '/host-credentials/claude'],
-      [join(home, '.claude.json'), '/host-credentials/claude.json'],
+      [join(home, '.claude', '.credentials.json'), '/host-credentials/claude/.credentials.json'],
+      [join(home, '.claude', 'settings.json'), '/host-credentials/claude/settings.json'],
     ]
   }
-  return [[join(home, '.codex'), '/host-credentials/codex']]
+  return [
+    [join(home, '.codex', 'auth.json'), '/host-credentials/codex/auth.json'],
+    [join(home, '.codex', 'config.toml'), '/host-credentials/codex/config.toml'],
+  ]
 }
 
 const containerCommand = (runtime: 'claude' | 'codex', argv: string[]): string[] => [

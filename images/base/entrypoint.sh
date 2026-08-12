@@ -28,9 +28,10 @@ seed() {
 # than on a missing directory.
 mkdir -p /home/dev/.claude /home/dev/.codex
 
-seed /host-credentials/claude      /home/dev/.claude
-seed /host-credentials/claude.json /home/dev/.claude.json
-seed /host-credentials/codex       /home/dev/.codex
+# The runner mounts individual credential files, never a whole config directory — see
+# credentialMounts() for why. This copies whatever arrived.
+seed /host-credentials/claude /home/dev/.claude
+seed /host-credentials/codex  /home/dev/.codex
 
 # Git needs an identity to read some repository state even when it never commits.
 git config --global user.email "ogun@localhost" 2>/dev/null || true

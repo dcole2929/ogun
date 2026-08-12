@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, writeFile } from 'node:fs/promises'
 import { execFile } from 'node:child_process'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
@@ -12,10 +12,16 @@ import {
   type RunReport,
 } from '@ogun/core'
 import { ControlPlane, EventFlusher } from './client.ts'
-import { createSandbox, GUEST_WORKSPACE, safeJoin, type Sandbox } from './sandbox/index.ts'
+import {
+  createSandbox,
+  GUEST_WORKSPACE,
+  readContained,
+  type Sandbox,
+} from './sandbox/index.ts'
 import { newParserState, resolveModel, resolveRuntime } from './runtimes/index.ts'
 import { materializeWorkspace, resolveHeadSha, stageAll } from './workspace.ts'
 import { runVerifyGate } from './verify.ts'
+import { ensureSkillAvailable, excludeFromGit, listWorkspaceSkills } from './skills.ts'
 
 const run = promisify(execFile)
 
@@ -76,6 +82,19 @@ export async function executeJob(
     cleanup = workspace.cleanup
 
     await mkdir(join(workspace.path, '.ogun-out'), { recursive: true })
+    // The findings document is harness output, not a change the worker made.
+    await excludeFromGit(workspace.path, ['/.ogun-out/'])
+
+    // Make the worker's skill discoverable where the runtime actually looks (§5.1).
+    const skill = await ensureSkillAvailable(workspace.path, job.skillRef)
+    if (!skill) {
+      const available = await listWorkspaceSkills(workspace.path)
+      return await fail(
+        `the workspace has no skill named "${job.skillRef}"` +
+          (available.length ? ` — it has: ${available.join(', ')}` : ' and no skills at all') +
+          '. A skill only reaches a run once it is on the default branch.',
+      )
+    }
 
     const spec = resolveRuntime(job.runtime)
     const model = resolveModel(job.runtime, job.model)
@@ -100,7 +119,7 @@ export async function executeJob(
 
     const guestRoot = job.sandbox === 'worktree' ? workspace.path : GUEST_WORKSPACE
     const ctx = {
-      prompt: composePrompt(job, guestRoot),
+      prompt: composePrompt(job, guestRoot, skill.path),
       ...(model ? { model } : {}),
       workspace: guestRoot,
       outputFile: `${guestRoot}/.ogun-out/last-message.txt`,
@@ -132,7 +151,14 @@ export async function executeJob(
     // real new file a hallucination (§5.3).
     await stageAll(workspace.path).catch(() => undefined)
 
-    const raw = await sandbox.readFile(OUTPUT_PATH)
+    let raw: string | null
+    try {
+      raw = await sandbox.readFile(OUTPUT_PATH)
+    } catch (err) {
+      // A symlinked or oversized output is an attempt to make the host read something it
+      // should not. That ends the run; it is not a gate failure to be graded.
+      return await fail(err instanceof Error ? err.message : String(err))
+    }
     const output = raw === null ? undefined : safeJsonParse(raw)
     const gates = await runVerifyGate({
       config: job.verify ? verifySchema.parse(job.verify) : undefined,
@@ -144,6 +170,18 @@ export async function executeJob(
     })
 
     const transcriptRef = await writeTranscript(config, job, workspace.path)
+    if (skill.injected) {
+      // Worth recording: it means the repo keeps skills somewhere the runtime does not
+      // search, so an interactive session would not see this skill.
+      flusher.push([
+        {
+          type: 'runner.note',
+          ts: new Date().toISOString(),
+          seq: parser.seq++,
+          payload: { note: `injected skill ${skill.name} into ${skill.path}` },
+        },
+      ])
+    }
     const usage = usageFrom(lastEvent)
 
     const report: RunReport = {
@@ -172,9 +210,16 @@ export async function executeJob(
  * staging-error-reviews skill." (§5.1). All this adds is where to put the answer,
  * because the CLI owns the format and the agent must not free-hand it (§4.10).
  */
-function composePrompt(job: ClaimedJob, guestRoot: string): string {
+function composePrompt(job: ClaimedJob, guestRoot: string, skillPath: string): string {
   return [
     job.prompt,
+    '',
+    // The skill is named by path as well as by name. Claude Code can resolve it from
+    // .claude/skills natively, but codex has no skill concept, so without this the
+    // prompt is a reference to something the runtime cannot look up.
+    `That skill is at ${guestRoot}/${skillPath}/SKILL.md — read it first, along with any`,
+    'files it points to under references/. It defines the mission, the evidence standard,',
+    'and the severity scale for this run.',
     '',
     `Write your findings to ${guestRoot}/${OUTPUT_PATH} by running \`ogun findings write\`.`,
     'Do not hand-write that file and do not invent a format — the CLI owns the schema.',
@@ -204,8 +249,8 @@ async function trackedPaths(workspace: string): Promise<Set<string>> {
  */
 async function countLines(workspace: string, relPath: string): Promise<number | null> {
   try {
-    const abs = await safeJoin(workspace, relPath)
-    const text = await readFile(abs, 'utf8')
+    const text = await readContained(workspace, relPath)
+    if (text === null) return null
     // A trailing newline does not make a final empty line.
     return text.length === 0 ? 0 : text.replace(/\n$/, '').split('\n').length
   } catch {
@@ -223,7 +268,10 @@ async function writeTranscript(
   const dir = join(config.scratch, 'transcripts', job.runId)
   await mkdir(dir, { recursive: true })
   const ref = join(dir, 'output.json')
-  const raw = await readFile(join(workspace, OUTPUT_PATH), 'utf8').catch(() => null)
+  // Through readContained, not a bare readFile. This one bypassed the containment check
+  // entirely, and it is the worst place to do so: whatever it reads is written to a host
+  // artifact and served over the API.
+  const raw = await readContained(workspace, OUTPUT_PATH).catch(() => null)
   if (raw === null) return undefined
   await writeFile(ref, raw, { mode: 0o600 })
   return ref

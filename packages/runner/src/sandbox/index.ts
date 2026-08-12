@@ -24,4 +24,4 @@ export function createSandbox(input: CreateSandboxInput): Sandbox {
 
 export { GUEST_WORKSPACE }
 export * from './types.ts'
-export { safeJoin } from './paths.ts'
+export { readContained, safeJoin, UnsafeReadback } from './paths.ts'

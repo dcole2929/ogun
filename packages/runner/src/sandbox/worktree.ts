@@ -1,6 +1,5 @@
-import { readFile } from 'node:fs/promises'
 import { spawnJsonl } from './exec.ts'
-import { safeJoin } from './paths.ts'
+import { readContained } from './paths.ts'
 import type { Sandbox, SandboxSpec } from './types.ts'
 
 /**
@@ -21,10 +20,7 @@ export function createWorktreeSandbox(spec: SandboxSpec): Sandbox {
         timeoutMs: spec.timeoutMs,
         env: { ...process.env, ...spec.env },
       }),
-    readFile: async (relPath) => {
-      const abs = await safeJoin(spec.hostWorkspace, relPath)
-      return readFile(abs, 'utf8').catch(() => null)
-    },
+    readFile: (relPath) => readContained(spec.hostWorkspace, relPath),
     dispose: async () => {},
   }
 }
