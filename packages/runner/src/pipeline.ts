@@ -85,8 +85,10 @@ export async function executeJob(
     // The findings document is harness output, not a change the worker made.
     await excludeFromGit(workspace.path, ['/.ogun-out/'])
 
-    // Make the worker's skill discoverable where the runtime actually looks (§5.1).
-    const skill = await ensureSkillAvailable(workspace.path, job.skillRef)
+    // Make the worker's skill discoverable where *this* runtime looks — the two do not
+    // agree on a location, so it depends on which one is about to run (§5.1).
+    const spec = resolveRuntime(job.runtime)
+    const skill = await ensureSkillAvailable(workspace.path, job.skillRef, spec.provider)
     if (!skill) {
       const available = await listWorkspaceSkills(workspace.path)
       return await fail(
@@ -96,7 +98,6 @@ export async function executeJob(
       )
     }
 
-    const spec = resolveRuntime(job.runtime)
     const model = resolveModel(job.runtime, job.model)
     await cp.started(job.runId, {
       repoSha: workspace.sha,

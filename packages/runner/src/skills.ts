@@ -5,17 +5,36 @@ import { join } from 'node:path'
  * The `inject` step from §5.1 — "inject only the skills the workspace lacks".
  *
  * A skill in the repo arrives with the workspace, but arriving is not the same as being
- * *discoverable*. Claude Code resolves skills from `.claude/skills/`; Ogun's canonical
- * location is `.agents/skills/` (§4.8). So a prompt of "Use the adversarial-review
- * skill." had nothing to resolve against, and only worked because the agent went looking
- * with `find` and happened to succeed. Codex has no skill discovery at all.
+ * *discoverable*, and the two runtimes do not agree on where to look. Measured against
+ * codex-cli 0.147.0 and Claude Code 2.1.228, with search tools disabled so only native
+ * discovery could answer:
  *
- * This makes the binding real: the worker's skill is placed where the runtime looks, and
- * the caller names its concrete path in the prompt so a runtime with no skill concept
- * can still follow it.
+ * | location          | claude | codex |
+ * |-------------------|--------|-------|
+ * | `.claude/skills/` | yes    | no    |
+ * | `.codex/skills/`  | no     | yes   |
+ * | `.agents/skills/` | no     | yes   |
+ *
+ * So there is no single location that both runtimes find. A skill is materialized into
+ * the *running* runtime's own directory, which is also where a human using that tool
+ * interactively would expect it.
+ *
+ * `.agents/skills/` stays canonical for authoring (§4.8): it is the one Ogun owns, it is
+ * what `ogun skill new` scaffolds, and codex reading it too is a convenience rather than
+ * something to depend on.
  */
 export const AGENTS_SKILLS = '.agents/skills'
 export const CLAUDE_SKILLS = '.claude/skills'
+export const CODEX_SKILLS = '.codex/skills'
+
+export type SkillRuntime = 'claude' | 'codex'
+
+/** Where this runtime natively discovers skills. */
+export const nativeSkillDir = (runtime: SkillRuntime): string =>
+  runtime === 'claude' ? CLAUDE_SKILLS : CODEX_SKILLS
+
+/** Every place a skill might already be, most canonical first. */
+const SOURCES = [AGENTS_SKILLS, CLAUDE_SKILLS, CODEX_SKILLS]
 
 export type ResolvedSkill = {
   name: string
@@ -39,29 +58,36 @@ const exists = async (p: string): Promise<boolean> =>
 export async function ensureSkillAvailable(
   workspace: string,
   skillName: string,
+  runtime: SkillRuntime,
 ): Promise<ResolvedSkill | null> {
-  const canonical = join(AGENTS_SKILLS, skillName)
-  const claudePath = join(CLAUDE_SKILLS, skillName)
+  const target = join(nativeSkillDir(runtime), skillName)
 
-  const inClaude = await exists(join(workspace, claudePath, 'SKILL.md'))
-  const inAgents = await exists(join(workspace, canonical, 'SKILL.md'))
+  // Already where this runtime looks: nothing to do. Common for a repo that keeps its
+  // skills in .claude/skills for interactive sessions too.
+  if (await exists(join(workspace, target, 'SKILL.md'))) {
+    return { name: skillName, path: target, injected: false }
+  }
 
-  // Already where the runtime looks: nothing to do. This is the common case for a repo
-  // that keeps its skills in .claude/skills for interactive sessions too.
-  if (inClaude) return { name: skillName, path: claudePath, injected: false }
-  if (!inAgents) return null
+  let source: string | undefined
+  for (const base of SOURCES) {
+    if (await exists(join(workspace, base, skillName, 'SKILL.md'))) {
+      source = join(base, skillName)
+      break
+    }
+  }
+  if (!source) return null
 
   // Copy rather than symlink: the workspace is bind-mounted into a container, and a
   // symlink resolving through the host's path layout would dangle inside it.
-  await mkdir(join(workspace, CLAUDE_SKILLS), { recursive: true })
-  await cp(join(workspace, canonical), join(workspace, claudePath), { recursive: true })
+  await mkdir(join(workspace, nativeSkillDir(runtime)), { recursive: true })
+  await cp(join(workspace, source), join(workspace, target), { recursive: true })
 
   // Harness-created files must never reach a patch. `stageAll` runs `git add -A` before
   // grading (§5.3), so without this a modifier's diff would carry a copy of its own
   // skill — and the grounding check would accept citations into it.
-  await excludeFromGit(workspace, [`/${claudePath}/`])
+  await excludeFromGit(workspace, [`/${target}/`])
 
-  return { name: skillName, path: claudePath, injected: true }
+  return { name: skillName, path: target, injected: true }
 }
 
 /**
@@ -77,7 +103,7 @@ export async function excludeFromGit(workspace: string, patterns: string[]): Pro
 /** Every skill the workspace carries, for a prompt that wants to name alternatives. */
 export async function listWorkspaceSkills(workspace: string): Promise<string[]> {
   const found = new Set<string>()
-  for (const base of [AGENTS_SKILLS, CLAUDE_SKILLS]) {
+  for (const base of SOURCES) {
     const dir = join(workspace, base)
     if (!(await exists(dir))) continue
     for (const entry of await readdir(dir, { withFileTypes: true })) {

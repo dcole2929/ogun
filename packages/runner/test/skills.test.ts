@@ -5,15 +5,20 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { test } from 'node:test'
-import { ensureSkillAvailable, listWorkspaceSkills } from '../src/skills.ts'
+import { ensureSkillAvailable, listWorkspaceSkills, nativeSkillDir } from '../src/skills.ts'
 
 const run = promisify(execFile)
 
 /**
  * "Use the adversarial-review skill." is only a real instruction if the runtime can
- * resolve that name. Claude Code searches `.claude/skills/`; ogun's canonical location
- * is `.agents/skills/`. Without this step the prompt pointed at nothing and worked only
- * because the agent went hunting with `find`.
+ * resolve that name — and the two runtimes disagree about where to look. Measured with
+ * search tools disabled, so only native discovery could answer:
+ *
+ *   .claude/skills  claude yes, codex no
+ *   .codex/skills   claude no,  codex yes
+ *   .agents/skills  claude no,  codex yes
+ *
+ * There is no shared location, so the destination depends on which runtime is running.
  */
 const workspace = async (layout: Record<string, string>) => {
   const dir = await mkdtemp(join(tmpdir(), 'ogun-skills-'))
@@ -26,13 +31,24 @@ const workspace = async (layout: Record<string, string>) => {
   return dir
 }
 
-test('a skill in .agents/skills is placed where the runtime looks', async () => {
-  const dir = await workspace({ '.agents/skills/review/SKILL.md': '# review' })
-  const resolved = await ensureSkillAvailable(dir, 'review')
+test('a skill goes to the running runtime\'s own directory, not a shared one', async () => {
+  for (const runtime of ['claude', 'codex'] as const) {
+    const dir = await workspace({ '.agents/skills/review/SKILL.md': '# review' })
+    const resolved = await ensureSkillAvailable(dir, 'review', runtime)
 
+    assert.equal(resolved?.injected, true)
+    assert.equal(resolved?.path, `${nativeSkillDir(runtime)}/review`)
+    assert.equal(await readFile(join(dir, resolved!.path, 'SKILL.md'), 'utf8'), '# review')
+  }
+})
+
+test('the other runtime\'s directory is not a source of truth by accident', async () => {
+  // A skill sitting only in .claude/skills is still usable by a codex worker — it just
+  // has to be copied across, because codex cannot see that directory.
+  const dir = await workspace({ '.claude/skills/review/SKILL.md': '# review' })
+  const resolved = await ensureSkillAvailable(dir, 'review', 'codex')
+  assert.equal(resolved?.path, '.codex/skills/review')
   assert.equal(resolved?.injected, true)
-  assert.equal(resolved?.path, '.claude/skills/review')
-  assert.equal(await readFile(join(dir, '.claude/skills/review/SKILL.md'), 'utf8'), '# review')
 })
 
 test('references come along, since the shared procedure lives there', async () => {
@@ -40,7 +56,7 @@ test('references come along, since the shared procedure lives there', async () =
     '.agents/skills/review/SKILL.md': '# review',
     '.agents/skills/review/references/running-a-review.md': '# procedure',
   })
-  await ensureSkillAvailable(dir, 'review')
+  await ensureSkillAvailable(dir, 'review', 'claude')
   assert.equal(
     await readFile(join(dir, '.claude/skills/review/references/running-a-review.md'), 'utf8'),
     '# procedure',
@@ -49,21 +65,21 @@ test('references come along, since the shared procedure lives there', async () =
 
 test('a skill already where the runtime looks is left alone', async () => {
   const dir = await workspace({ '.claude/skills/review/SKILL.md': '# already here' })
-  const resolved = await ensureSkillAvailable(dir, 'review')
+  const resolved = await ensureSkillAvailable(dir, 'review', 'claude')
   assert.equal(resolved?.injected, false)
   assert.equal(resolved?.path, '.claude/skills/review')
 })
 
 test('a missing skill is null, so the run can fail loudly', async () => {
   const dir = await workspace({ '.agents/skills/other/SKILL.md': '# other' })
-  assert.equal(await ensureSkillAvailable(dir, 'review'), null)
+  assert.equal(await ensureSkillAvailable(dir, 'review', 'claude'), null)
   // And the caller can say what *is* available, which is the useful half of the error.
   assert.deepEqual(await listWorkspaceSkills(dir), ['other'])
 })
 
 test('a directory without SKILL.md is not a skill', async () => {
   const dir = await workspace({ '.agents/skills/notaskill/README.md': 'nope' })
-  assert.equal(await ensureSkillAvailable(dir, 'notaskill'), null)
+  assert.equal(await ensureSkillAvailable(dir, 'notaskill', 'claude'), null)
   assert.deepEqual(await listWorkspaceSkills(dir), [])
 })
 
@@ -74,7 +90,7 @@ test('an injected skill never reaches a patch', async () => {
   await run('git', ['-C', dir, 'add', '-A'])
   await run('git', ['-C', dir, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'init'])
 
-  await ensureSkillAvailable(dir, 'review')
+  await ensureSkillAvailable(dir, 'review', 'claude')
   await run('git', ['-C', dir, 'add', '-A'])
 
   const { stdout } = await run('git', ['-C', dir, 'status', '--porcelain'])
