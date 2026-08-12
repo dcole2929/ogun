@@ -3,54 +3,79 @@ import { and, eq } from 'drizzle-orm'
 import { z } from 'zod'
 import { schema } from '@ogun/core/db'
 import {
-  hashContent,
   PERMISSION_PROFILES,
   RUNTIMES,
   SANDBOX_KINDS,
-  singleWorkerCycle,
   workerSchema,
+  type WorkerConfig,
 } from '@ogun/core'
 import type { Env } from '../context.ts'
+import {
+  ConfigConflict,
+  ConfigUnreachable,
+  workerToYamlBlock,
+  workerToYamlNode,
+} from '../config-store.ts'
+import { reindexProject } from '../reindex.ts'
 
-const { cycles, projects, skills, workers } = schema
+const { projects, skills, workers } = schema
 
 /**
- * Workers created and edited here are `origin: 'ui'`, and `ogun project sync` never
- * touches one (see routes/projects.ts). That split is the whole design:
+ * Creating a worker in the UI edits the repo's `.ogun/config.yaml` and re-indexes from
+ * it. There is one definition of a worker and it is in git, reviewable in a diff — the
+ * UI is an editor over that file, not a second place a worker can live.
  *
- *   config — committed to git, reviewed, reproducible on another machine
- *   ui     — a few clicks, live in seconds, and yours alone until you export it
- *
- * The doc says git is the source of truth for definitions, and it still is — for what
- * is committed. Making the UI write YAML back into a repo would mean the control plane
- * needs filesystem access to every project, which §4.5 spent real effort avoiding.
- * Instead `GET /api/workers/:id/yaml` renders the block to paste into config.yaml, so
- * promoting an experiment into git is a copy rather than a rewrite.
+ * The file is written but never committed. That is deliberate: the uncommitted diff *is*
+ * the review step, and auto-committing to someone's working branch is not ours to do.
  */
 export const workersRoutes = new Hono<Env>()
 
-const createSchema = z.object({
-  projectSlug: z.string().min(1),
-  name: z
-    .string()
-    .min(1)
-    .max(64)
-    // The name ends up in a container name and a cycle key, so keep it boring.
-    .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, 'must be a lowercase kebab-case slug'),
+const workerFields = z.object({
   skill: z.string().min(1),
   runtime: z.enum(RUNTIMES).default('claude'),
   model: z.string().default('worker'),
   permissions: z.enum(PERMISSION_PROFILES).default('reviewer'),
   sandbox: z.enum(SANDBOX_KINDS).default('container'),
   prompt: z.string().optional(),
-  timeoutMs: z.number().int().positive().default(30 * 60_000),
+  schedule: z.string().optional(),
+  timeoutMs: z.number().int().positive().optional(),
   enabled: z.boolean().default(true),
 })
 
-const updateSchema = createSchema.partial().omit({ projectSlug: true, name: true })
+const createSchema = workerFields.extend({
+  projectSlug: z.string().min(1),
+  name: z
+    .string()
+    .min(1)
+    .max(64)
+    // Ends up as a yaml key, a container name, and a cycle node key. Keep it boring.
+    .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, 'must be a lowercase kebab-case slug'),
+  /** Compare-and-swap token from a prior read. Absent means "I have not read it". */
+  expectedHash: z.string().optional(),
+})
+
+/**
+ * Spelled out rather than derived from `workerFields.partial()`. `.partial()` makes a
+ * field optional but leaves its `.default()` in place, so a PATCH of `{runtime}` came
+ * back carrying `model: 'worker'` and silently reset a field the client never mentioned.
+ * A patch must say nothing about what it does not send.
+ */
+const updateSchema = z.object({
+  skill: z.string().min(1).optional(),
+  runtime: z.enum(RUNTIMES).optional(),
+  model: z.string().optional(),
+  permissions: z.enum(PERMISSION_PROFILES).optional(),
+  sandbox: z.enum(SANDBOX_KINDS).optional(),
+  /** An empty string clears it — the only way to remove a prompt override. */
+  prompt: z.string().optional(),
+  schedule: z.string().optional(),
+  timeoutMs: z.number().int().positive().optional(),
+  enabled: z.boolean().optional(),
+  expectedHash: z.string().optional(),
+})
 
 workersRoutes.get('/', async (c) => {
-  const { db } = c.var.ctx
+  const { db, config } = c.var.ctx
   const slug = c.req.query('project')
   const project = slug
     ? await db.query.projects.findFirst({ where: eq(projects.slug, slug) })
@@ -63,11 +88,22 @@ workersRoutes.get('/', async (c) => {
     .innerJoin(projects, eq(projects.id, workers.projectId))
     .where(project ? eq(workers.projectId, project.id) : undefined)
     .orderBy(workers.name)
-  return c.json({ workers: rows })
+
+  // Whether this control plane can edit each project's config.yaml. The UI needs it up
+  // front so it can offer a copy-this-yaml fallback rather than a button that 409s.
+  const slugs = [...new Set(rows.map((r) => r.project.slug))]
+  const editable: Record<string, boolean> = {}
+  const hashes: Record<string, string> = {}
+  for (const s of slugs) {
+    editable[s] = await config.writable(s)
+    if (editable[s]) hashes[s] = (await config.read(s)).hash
+  }
+
+  return c.json({ workers: rows, editable, hashes })
 })
 
 workersRoutes.post('/', async (c) => {
-  const { db } = c.var.ctx
+  const { db, config } = c.var.ctx
   const body = createSchema.parse(await c.req.json())
 
   const project = await db.query.projects.findFirst({
@@ -75,186 +111,147 @@ workersRoutes.post('/', async (c) => {
   })
   if (!project) return c.json({ error: `no such project: ${body.projectSlug}` }, 404)
 
+  const invalid = await validate(c.var.ctx.db, project.id, body)
+  if (invalid) return c.json({ error: invalid }, 400)
+
   const existing = await db.query.workers.findFirst({
     where: and(eq(workers.projectId, project.id), eq(workers.name, body.name)),
   })
-  if (existing) {
-    return c.json(
-      {
-        error: `a worker named "${body.name}" already exists${
-          existing.origin === 'config' ? ' and is defined in .ogun/config.yaml' : ''
-        }`,
-      },
-      409,
-    )
-  }
+  if (existing) return c.json({ error: `a worker named "${body.name}" already exists` }, 409)
 
-  const skill = await db.query.skills.findFirst({
-    where: and(eq(skills.projectId, project.id), eq(skills.name, body.skill)),
-  })
-  // A worker pointing at a skill that isn't there produces a run that reads a prompt
-  // referencing nothing and reports something vague. Refuse up front instead.
-  if (!skill) {
-    return c.json(
-      { error: `no skill named "${body.skill}" in ${body.projectSlug} — run \`ogun project sync\`` },
-      400,
-    )
-  }
-  if (body.permissions === 'modifier' && body.sandbox === 'worktree') {
-    return c.json(
-      { error: 'a modifier on the worktree sandbox edits files directly on the host' },
-      400,
-    )
-  }
-
-  const config = configFrom(body)
-  const [row] = await db
-    .insert(workers)
-    .values({
-      projectId: project.id,
-      name: body.name,
-      skillId: skill.id,
-      skillRef: skill.name,
-      runtime: body.runtime,
-      modelRole: body.model,
-      permissions: body.permissions,
-      sandbox: body.sandbox,
-      origin: 'ui',
-      versionHash: hashContent('ui', JSON.stringify(config), skill.versionHash),
-      config,
-      enabled: body.enabled,
+  const fields = toWorkerConfig(body)
+  try {
+    const file = await config.mutate(body.projectSlug, body.expectedHash, (doc) => {
+      // setIn creates `workers:` if the file somehow lacks it, so a minimal config.yaml
+      // still works.
+      doc.setIn(['workers', body.name], workerToYamlNode(fields))
     })
-    .returning()
-  if (!row) return c.json({ error: 'failed to create worker' }, 500)
-
-  // Every worker is a one-node cycle so "run this now" and the eventual nightly path
-  // stay the same code (§5.1).
-  await db
-    .insert(cycles)
-    .values({ projectId: project.id, name: body.name, definition: singleWorkerCycle(body.name) })
-    .onConflictDoUpdate({
-      target: [cycles.projectId, cycles.name],
-      set: { definition: singleWorkerCycle(body.name) },
-    })
-
-  return c.json({ worker: row }, 201)
+    const result = await reindexProject(db, body.projectSlug, file)
+    return c.json({ worker: result.workers[body.name], config: describe(file) }, 201)
+  } catch (err) {
+    const f = handle(err, body.projectSlug, body.name, fields)
+    return c.json(f.body, f.status)
+  }
 })
 
 workersRoutes.patch('/:id', async (c) => {
-  const { db } = c.var.ctx
+  const { db, config } = c.var.ctx
   const body = updateSchema.parse(await c.req.json())
+
   const worker = await db.query.workers.findFirst({ where: eq(workers.id, c.req.param('id')) })
   if (!worker) return c.json({ error: 'no such worker' }, 404)
+  const project = await db.query.projects.findFirst({ where: eq(projects.id, worker.projectId) })
+  if (!project) return c.json({ error: 'no such project' }, 404)
 
-  /**
-   * A config worker is editable only in the repo. Allowing an edit here would produce a
-   * worker whose behaviour silently disagrees with the file it came from, and the next
-   * sync would revert it — the worst of both.
-   */
-  if (worker.origin === 'config') {
-    return c.json(
-      {
-        error:
-          'this worker is defined in .ogun/config.yaml — edit it there and run `ogun project sync`',
-      },
-      409,
-    )
-  }
+  const merged = { ...(worker.config as Record<string, unknown>), ...stripUndefined(body) }
+  const invalid = await validate(db, project.id, merged as z.infer<typeof workerFields>)
+  if (invalid) return c.json({ error: invalid }, 400)
 
-  const merged = { ...(worker.config as Record<string, unknown>), ...body }
-  const skillName = body.skill ?? worker.skillRef
-  const skill = await db.query.skills.findFirst({
-    where: and(eq(skills.projectId, worker.projectId), eq(skills.name, skillName)),
-  })
-  if (!skill) return c.json({ error: `no skill named "${skillName}"` }, 400)
-
-  const permissions = body.permissions ?? worker.permissions
-  const sandbox = body.sandbox ?? worker.sandbox
-  if (permissions === 'modifier' && sandbox === 'worktree') {
-    return c.json(
-      { error: 'a modifier on the worktree sandbox edits files directly on the host' },
-      400,
-    )
-  }
-
-  const [row] = await db
-    .update(workers)
-    .set({
-      skillId: skill.id,
-      skillRef: skill.name,
-      runtime: body.runtime ?? (worker.runtime as 'claude' | 'codex'),
-      modelRole: body.model ?? worker.modelRole,
-      permissions,
-      sandbox,
-      enabled: body.enabled ?? worker.enabled,
-      config: merged,
-      // Bumped on every edit so a later run can answer whether a finding stopped
-      // appearing because the code changed or because the worker did (§6).
-      versionHash: hashContent('ui', JSON.stringify(merged), skill.versionHash),
+  const fields = toWorkerConfig(merged as z.infer<typeof workerFields>)
+  try {
+    const file = await config.mutate(project.slug, body.expectedHash, (doc) => {
+      // Set each key individually rather than replacing the node, so any comment a human
+      // wrote against an untouched field survives the edit.
+      const node = workerToYamlNode(fields)
+      for (const [key, value] of Object.entries(node)) {
+        doc.setIn(['workers', worker.name, key], value)
+      }
+      const stale = Object.keys((worker.config as Record<string, unknown>) ?? {}).filter(
+        (k) => !(k in node),
+      )
+      for (const key of stale) doc.deleteIn(['workers', worker.name, key])
     })
-    .where(eq(workers.id, worker.id))
-    .returning()
-  return c.json({ worker: row })
+    const result = await reindexProject(db, project.slug, file)
+    return c.json({ worker: result.workers[worker.name], config: describe(file) })
+  } catch (err) {
+    const f = handle(err, project.slug, worker.name, fields)
+    return c.json(f.body, f.status)
+  }
 })
 
 workersRoutes.delete('/:id', async (c) => {
-  const { db } = c.var.ctx
+  const { db, config } = c.var.ctx
   const worker = await db.query.workers.findFirst({ where: eq(workers.id, c.req.param('id')) })
   if (!worker) return c.json({ error: 'no such worker' }, 404)
-  if (worker.origin === 'config') {
-    return c.json(
-      { error: 'remove it from .ogun/config.yaml and run `ogun project sync`' },
-      409,
-    )
+  const project = await db.query.projects.findFirst({ where: eq(projects.id, worker.projectId) })
+  if (!project) return c.json({ error: 'no such project' }, 404)
+
+  try {
+    const file = await config.mutate(project.slug, c.req.query('hash'), (doc) => {
+      doc.deleteIn(['workers', worker.name])
+    })
+    // Reindex removes the row, since it is no longer in the file — the same path a
+    // hand-edit followed by `ogun project sync` takes.
+    await reindexProject(db, project.slug, file)
+    return c.json({ deleted: worker.name, config: describe(file) })
+  } catch (err) {
+    const f = handle(err, project.slug, worker.name, worker.config as WorkerConfig)
+    return c.json(f.body, f.status)
   }
-  // Runs and findings cascade from the worker. Disabling keeps the history; deleting
-  // is for a worker that was a mistake.
-  await db.delete(workers).where(eq(workers.id, worker.id))
-  await db
-    .delete(cycles)
-    .where(and(eq(cycles.projectId, worker.projectId), eq(cycles.name, worker.name)))
-  return c.json({ deleted: worker.name })
 })
+
+/** What the file looks like now, so the UI can show the diff it just caused. */
+const describe = (file: { path: string; text: string; hash: string }) => ({
+  path: file.path,
+  hash: file.hash,
+  text: file.text,
+})
+
+const toWorkerConfig = (input: z.infer<typeof workerFields>): WorkerConfig =>
+  workerSchema.parse({
+    skill: input.skill,
+    runtime: input.runtime,
+    model: input.model,
+    permissions: input.permissions,
+    sandbox: input.sandbox,
+    enabled: input.enabled,
+    ...(input.prompt ? { prompt: input.prompt } : {}),
+    ...(input.schedule ? { schedule: input.schedule } : {}),
+    ...(input.timeoutMs ? { timeoutMs: input.timeoutMs } : {}),
+  })
+
+async function validate(
+  db: Env['Variables']['ctx']['db'],
+  projectId: string,
+  input: { skill?: string; permissions?: string; sandbox?: string },
+): Promise<string | null> {
+  if (input.skill) {
+    const skill = await db.query.skills.findFirst({
+      where: and(eq(skills.projectId, projectId), eq(skills.name, input.skill)),
+    })
+    // A worker pointing at a missing skill produces a run whose prompt references
+    // nothing. Refuse up front rather than at 3am.
+    if (!skill) {
+      return `no skill named "${input.skill}" — run \`ogun project sync\` after adding it`
+    }
+  }
+  if (input.permissions === 'modifier' && input.sandbox === 'worktree') {
+    return 'a modifier on the worktree sandbox edits files directly on the host'
+  }
+  return null
+}
+
+const stripUndefined = (o: Record<string, unknown>): Record<string, unknown> =>
+  Object.fromEntries(Object.entries(o).filter(([k, v]) => v !== undefined && k !== 'expectedHash'))
 
 /**
- * The stored config is validated against the same schema config.yaml is, so a UI worker
- * and a file worker are indistinguishable to everything downstream — the runner reads
- * this blob either way.
+ * The unreachable case is not an error so much as a different deployment: a control
+ * plane on a VPS has no local copy of your repo. Hand back the yaml block so the edit is
+ * still possible by hand, rather than failing with nothing to act on.
  */
-const configFrom = (body: z.infer<typeof createSchema>): Record<string, unknown> =>
-  workerSchema.parse({
-    skill: body.skill,
-    runtime: body.runtime,
-    model: body.model,
-    permissions: body.permissions,
-    sandbox: body.sandbox,
-    timeoutMs: body.timeoutMs,
-    enabled: body.enabled,
-    ...(body.prompt ? { prompt: body.prompt } : {}),
-  }) as unknown as Record<string, unknown>
+type Failure = { body: Record<string, unknown>; status: 409 | 500 }
 
-/** The promotion path: render the config.yaml block for a UI worker. */
-workersRoutes.get('/:id/yaml', async (c) => {
-  const { db } = c.var.ctx
-  const worker = await db.query.workers.findFirst({ where: eq(workers.id, c.req.param('id')) })
-  if (!worker) return c.json({ error: 'no such worker' }, 404)
-  const cfg = worker.config as Record<string, unknown>
-
-  const lines = [
-    `  ${worker.name}:`,
-    `    skill: ${worker.skillRef}`,
-    `    runtime: ${worker.runtime}`,
-    `    model: ${worker.modelRole}`,
-    `    permissions: ${worker.permissions}`,
-    `    sandbox: ${worker.sandbox}`,
-  ]
-  if (typeof cfg.prompt === 'string' && cfg.prompt) {
-    lines.push(`    prompt: ${JSON.stringify(cfg.prompt)}`)
+function handle(err: unknown, slug: string, name: string, fields: WorkerConfig): Failure {
+  if (err instanceof ConfigUnreachable) {
+    return {
+      status: 409,
+      body: {
+        error: err.message,
+        yaml: workerToYamlBlock(name, fields),
+        hint: `add this under \`workers:\` in ${slug}/.ogun/config.yaml, then run \`ogun project sync\``,
+      },
+    }
   }
-  if (typeof cfg.timeoutMs === 'number' && cfg.timeoutMs !== 30 * 60_000) {
-    lines.push(`    timeoutMs: ${cfg.timeoutMs}`)
-  }
-  if (worker.enabled === false) lines.push('    enabled: false')
-
-  return c.json({ yaml: lines.join('\n') })
-})
+  if (err instanceof ConfigConflict) return { status: 409, body: { error: err.message } }
+  return { status: 500, body: { error: err instanceof Error ? err.message : String(err) } }
+}

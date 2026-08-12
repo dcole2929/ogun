@@ -42,7 +42,6 @@ skillsRoutes.get('/', async (c) => {
       id: workers.id,
       runtime: workers.runtime,
       enabled: workers.enabled,
-      origin: workers.origin,
     })
     .from(workers)
 
@@ -78,7 +77,6 @@ skillsRoutes.get('/:project/:name', async (c) => {
       permissions: workers.permissions,
       sandbox: workers.sandbox,
       enabled: workers.enabled,
-      origin: workers.origin,
     })
     .from(workers)
     .where(and(eq(workers.projectId, project.id), eq(workers.skillRef, skill.name)))

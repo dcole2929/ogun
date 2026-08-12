@@ -73,16 +73,6 @@ export const workers = pgTable(
     permissions: text('permissions').notNull().default('reviewer'),
     sandbox: text('sandbox').notNull().default('container'),
     /**
-     * `config` — defined in the repo's .ogun/config.yaml. Git owns it; sync rewrites it.
-     * `ui`     — created here. Sync never touches one, or every edit would be undone by
-     *            the next `ogun project sync`.
-     *
-     * Both are real workers. The difference is only who is allowed to overwrite them
-     * (§4.1: git is the source of truth for what is committed — not for what you are
-     * still experimenting with).
-     */
-    origin: text('origin').notNull().default('config'),
-    /**
      * Bumped when the worker's resolved config changes. With skill_version on every
      * run it answers: did this finding stop appearing because we fixed the code, or
      * because I edited the worker?

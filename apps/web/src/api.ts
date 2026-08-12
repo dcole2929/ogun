@@ -101,13 +101,15 @@ export type WorkerRow = {
     modelRole: string
     permissions: string
     sandbox: string
-    origin: string
     enabled: boolean
     versionHash: string
     config: Record<string, unknown>
   }
   project: { slug: string }
 }
+
+/** What the config.yaml looks like after an edit, so the UI can show what it changed. */
+export type ConfigSnapshot = { path: string; hash: string; text: string }
 
 export type WorkerInput = {
   projectSlug: string
@@ -119,6 +121,8 @@ export type WorkerInput = {
   sandbox: string
   prompt?: string
   enabled: boolean
+  /** Compare-and-swap token, so two tabs cannot silently clobber each other. */
+  expectedHash?: string
 }
 
 const json = async <T,>(path: string, init?: RequestInit): Promise<T> => {
@@ -153,22 +157,26 @@ export const api = {
   skill: (project: string, name: string) => json<SkillDetail>(`/api/skills/${project}/${name}`),
 
   allWorkers: (project?: string) =>
-    json<{ workers: WorkerRow[] }>(`/api/workers${project ? `?project=${project}` : ''}`),
+    json<{
+      workers: WorkerRow[]
+      /** Per project: can this control plane reach the repo to edit config.yaml? */
+      editable: Record<string, boolean>
+      hashes: Record<string, string>
+    }>(`/api/workers${project ? `?project=${project}` : ''}`),
   createWorker: (input: WorkerInput) =>
-    json<{ worker: WorkerRow['worker'] }>('/api/workers', {
+    json<{ worker: WorkerRow['worker']; config: ConfigSnapshot }>('/api/workers', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(input),
     }),
   updateWorker: (id: string, input: Partial<WorkerInput>) =>
-    json<{ worker: WorkerRow['worker'] }>(`/api/workers/${id}`, {
+    json<{ worker: WorkerRow['worker']; config: ConfigSnapshot }>(`/api/workers/${id}`, {
       method: 'PATCH',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(input),
     }),
   deleteWorker: (id: string) =>
-    json<{ deleted: string }>(`/api/workers/${id}`, { method: 'DELETE' }),
-  workerYaml: (id: string) => json<{ yaml: string }>(`/api/workers/${id}/yaml`),
+    json<{ deleted: string; config: ConfigSnapshot }>(`/api/workers/${id}`, { method: 'DELETE' }),
 
   trigger: (projectSlug: string, worker: string) =>
     json<{ cycleRunId: string; jobs: Array<{ nodeKey: string; state: string }> }>('/api/trigger', {

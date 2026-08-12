@@ -12,6 +12,7 @@ import {
 } from './commands/findings.ts'
 import { imageBuild } from './commands/image.ts'
 import { skillsList, skillsShow } from './commands/skills.ts'
+import { skillNew } from './commands/skill-new.ts'
 import { workersList } from './commands/workers.ts'
 import { runnerInit } from './commands/runner.ts'
 
@@ -35,9 +36,10 @@ ${bold('projects')}
   ogun project list
 
 ${bold('what can run')}
+  ogun skill new <name>            scaffold .agents/skills/<name>/
   ogun skills                      every skill, and which workers bind it
   ogun skills show <name>          read one, including its SKILL.md
-  ogun workers                     every worker, and where it is defined
+  ogun workers                     every worker
 
 ${bold('running')}
   ogun trigger <project> <worker>  queue a run now
@@ -67,6 +69,12 @@ try {
       if (sub === 'sync') await projectSync(rest, serverUrl)
       else if (sub === 'list' || sub === undefined) await projectList(serverUrl)
       else fail('usage: ogun project sync [dir] | ogun project list')
+      break
+
+    case 'skill':
+      if (sub === 'new') await skillNew(rest)
+      else if (sub === 'show') await skillsShow(rest, serverUrl)
+      else fail('usage: ogun skill new <name> | ogun skill show <name>')
       break
 
     case 'skills':

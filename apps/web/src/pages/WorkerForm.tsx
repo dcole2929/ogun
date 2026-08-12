@@ -20,6 +20,8 @@ const HELP: Record<string, string> = {
 export type WorkerFormProps = {
   projectSlug: string
   existing?: WorkerRow['worker']
+  /** Compare-and-swap token from the list read. Two tabs cannot clobber each other. */
+  configHash?: string
   onDone: () => void
 }
 
@@ -27,7 +29,7 @@ export type WorkerFormProps = {
  * The point of this form is that a worker is a small thing: a skill, plus how to run
  * it. Everything here has a working default except which skill to point at.
  */
-export function WorkerForm({ projectSlug, existing, onDone }: WorkerFormProps) {
+export function WorkerForm({ projectSlug, existing, configHash, onDone }: WorkerFormProps) {
   const qc = useQueryClient()
   const { data: skillData } = useQuery({
     queryKey: ['skills', projectSlug],
@@ -54,6 +56,8 @@ export function WorkerForm({ projectSlug, existing, onDone }: WorkerFormProps) {
     if (!existing && skill && !name) setName(skill)
   }, [skill, existing, name])
 
+  const [written, setWritten] = useState<{ path: string; text: string } | null>(null)
+
   const save = useMutation({
     mutationFn: async () => {
       const input = {
@@ -65,17 +69,22 @@ export function WorkerForm({ projectSlug, existing, onDone }: WorkerFormProps) {
         permissions,
         sandbox,
         enabled,
-        ...(prompt.trim() ? { prompt: prompt.trim() } : {}),
+        // An empty string is how you clear a prompt override; omitting it would keep
+        // the old one on an edit.
+        prompt: prompt.trim(),
+        ...(configHash ? { expectedHash: configHash } : {}),
       }
       return existing ? api.updateWorker(existing.id, input) : api.createWorker(input)
     },
-    onSuccess: async () => {
+    onSuccess: async (result) => {
       await Promise.all([
         qc.invalidateQueries({ queryKey: ['allWorkers'] }),
         qc.invalidateQueries({ queryKey: ['workers'] }),
         qc.invalidateQueries({ queryKey: ['skills'] }),
       ])
-      onDone()
+      // Don't close: the point of writing to config.yaml is that you can see the change
+      // and go commit it. Closing the form hides the only evidence it happened.
+      setWritten({ path: result.config.path, text: result.config.text })
     },
   })
 
@@ -192,24 +201,45 @@ export function WorkerForm({ projectSlug, existing, onDone }: WorkerFormProps) {
 
       {save.error && <p className="error">{errorText(save.error)}</p>}
 
-      <div className="row" style={{ marginTop: 14 }}>
-        <button className="primary" disabled={!canSave} onClick={() => save.mutate()}>
-          {save.isPending ? 'saving…' : existing ? 'Save' : 'Create worker'}
-        </button>
-        <button onClick={onDone}>Cancel</button>
-        {!existing && (
+      {written ? (
+        <div style={{ marginTop: 14 }}>
+          <p style={{ margin: '0 0 6px', fontSize: 13 }}>
+            Wrote <span className="mono">{written.path}</span>. It is not committed — review
+            the diff and commit it like any other change.
+          </p>
+          <pre className="md-code" style={{ maxHeight: 260 }}>
+            {excerpt(written.text, name)}
+          </pre>
+          <button onClick={onDone}>Done</button>
+        </div>
+      ) : (
+        <div className="row" style={{ marginTop: 14 }}>
+          <button className="primary" disabled={!canSave} onClick={() => save.mutate()}>
+            {save.isPending ? 'saving…' : existing ? 'Save' : 'Create worker'}
+          </button>
+          <button onClick={onDone}>Cancel</button>
           <span className="muted" style={{ fontSize: 12, marginLeft: 'auto' }}>
-            Created here, so <span className="mono">ogun project sync</span> will leave it alone.
+            Writes to <span className="mono">.ogun/config.yaml</span>
           </span>
-        )}
-      </div>
+        </div>
+      )}
     </div>
   )
+}
+
+/** The worker's own block out of the whole file — enough to see what landed. */
+function excerpt(text: string, name: string): string {
+  const lines = text.split('\n')
+  const start = lines.findIndex((l) => l.trimEnd() === `  ${name}:`)
+  if (start === -1) return text
+  let end = start + 1
+  while (end < lines.length && /^\s{4,}\S/.test(lines[end] ?? '')) end++
+  return lines.slice(start, end).join('\n')
 }
 
 const errorText = (err: unknown): string => {
   const raw = err instanceof Error ? err.message : String(err)
   // The client throws "<path>: <status> <json body>"; surface just the message.
-  const match = /\{"error":"(.*)"\}/.exec(raw)
-  return match?.[1]?.replace(/\\"/g, '"') ?? raw
+  const match = /"error":"((?:[^"\\]|\\.)*)"/.exec(raw)
+  return match?.[1]?.replace(/\\"/g, '"').replace(/\\n/g, ' ') ?? raw
 }

@@ -1,14 +1,9 @@
 import { Hono } from 'hono'
-import { and, desc, eq, inArray, not } from 'drizzle-orm'
+import { and, desc, eq } from 'drizzle-orm'
 import { z } from 'zod'
 import { schema } from '@ogun/core/db'
-import {
-  cycleDefinitionSchema,
-  hashContent,
-  policiesSchema,
-  singleWorkerCycle,
-  workerSchema,
-} from '@ogun/core'
+import { cycleDefinitionSchema, policiesSchema, workerSchema } from '@ogun/core'
+import { reindexProject } from '../reindex.ts'
 import type { Env } from '../context.ts'
 
 const { coverage, cycleRuns, cycles, projects, skills, workers } = schema
@@ -105,85 +100,11 @@ projectsRoutes.post('/sync', async (c) => {
     if (row) skillIds.set(s.name, row.id)
   }
 
-  const workerIds = new Map<string, string>()
-  const names = Object.keys(body.workers)
-  const shadowed: string[] = []
-  for (const [name, w] of Object.entries(body.workers)) {
-    const skillName = w.skill.replace(/^\.\/skills\//, '').replace(/^ogun:\/\//, '')
-    const skillId = skillIds.get(skillName)
-    const skillVersion = body.skills.find((s) => s.name === skillName)?.versionHash ?? 'unknown'
-    // worker_version folds in the skill so a later run can answer: did this finding stop
-    // appearing because we fixed the code, or because I edited the skill? (§6)
-    const versionHash = hashContent(body.configHash, JSON.stringify(w), skillVersion)
+  const { workers: indexed, removed } = await reindexProject(db, project.slug, {
+    hash: body.configHash,
+    workers: body.workers,
+  })
 
-    const [row] = await db
-      .insert(workers)
-      .values({
-        projectId: project.id,
-        name,
-        ...(skillId ? { skillId } : {}),
-        skillRef: skillName,
-        runtime: w.runtime,
-        modelRole: w.model,
-        permissions: w.permissions,
-        sandbox: w.sandbox,
-        versionHash,
-        origin: 'config',
-        config: w as unknown as Record<string, unknown>,
-        enabled: w.enabled,
-      })
-      // `where` is the load-bearing clause: a worker created in the UI keeps its name
-      // in the same namespace, and without this a sync would silently overwrite it with
-      // whatever the YAML said. Git owns what is committed, not what you are still
-      // experimenting with.
-      .onConflictDoUpdate({
-        target: [workers.projectId, workers.name],
-        set: {
-          skillId: skillId ?? null,
-          skillRef: skillName,
-          runtime: w.runtime,
-          modelRole: w.model,
-          permissions: w.permissions,
-          sandbox: w.sandbox,
-          versionHash,
-          config: w as unknown as Record<string, unknown>,
-          enabled: w.enabled,
-        },
-        setWhere: eq(workers.origin, 'config'),
-      })
-      .returning()
-    // No row back means setWhere excluded it: a UI-origin worker already owns this
-    // name. Say so rather than letting the config entry look applied.
-    if (row) workerIds.set(name, row.id)
-    else shadowed.push(name)
-  }
-
-  /**
-   * A worker deleted from config.yaml is deleted here. Only config-origin ones — a UI
-   * worker was never in the file, so its absence from the file means nothing.
-   */
-  const removed = await db
-    .delete(workers)
-    .where(
-      and(
-        eq(workers.projectId, project.id),
-        eq(workers.origin, 'config'),
-        names.length > 0 ? not(inArray(workers.name, names)) : undefined,
-      ),
-    )
-    .returning({ name: workers.name })
-
-  // Every worker gets a one-node cycle so "run this worker now" and "run the nightly
-  // cycle" are the same code path from the first commit (§5.1).
-  for (const name of Object.keys(body.workers)) {
-    await db
-      .insert(cycles)
-      .values({ projectId: project.id, name, definition: singleWorkerCycle(name) })
-      .onConflictDoUpdate({
-        target: [cycles.projectId, cycles.name],
-        set: { definition: singleWorkerCycle(name) },
-      })
-  }
   for (const [name, definition] of Object.entries(body.cycles)) {
     await db
       .insert(cycles)
@@ -193,10 +114,9 @@ projectsRoutes.post('/sync', async (c) => {
 
   return c.json({
     project: { id: project.id, slug: project.slug },
-    workers: [...workerIds.keys()],
+    workers: Object.keys(indexed),
     skills: [...skillIds.keys()],
-    removed: removed.map((r) => r.name),
-    shadowed,
+    removed,
   })
 })
 

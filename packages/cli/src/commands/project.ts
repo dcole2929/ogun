@@ -1,7 +1,8 @@
 import { execFile } from 'node:child_process'
-import { resolve } from 'node:path'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { dirname, resolve } from 'node:path'
 import { promisify } from 'node:util'
-import { discoverSkills, loadProjectConfig } from '@ogun/core'
+import { discoverSkills, expandHome, loadProjectConfig } from '@ogun/core'
 import { bold, cyan, dim, fail, green, table } from '../output.ts'
 
 const run = promisify(execFile)
@@ -20,6 +21,7 @@ export async function projectSync(args: string[], serverUrl: string): Promise<vo
   })
   const skills = await discoverSkills(root)
   const remoteUrl = await gitRemote(root)
+  await registerLocalPath(loaded.config.project.name, root)
 
   const payload = {
     slug: loaded.config.project.name,
@@ -64,7 +66,7 @@ export async function projectSync(args: string[], serverUrl: string): Promise<vo
     fail(`sync failed: ${res ? await res.text() : `could not reach ${serverUrl}`}`)
   }
 
-  const result = (await res.json()) as { removed?: string[]; shadowed?: string[] }
+  const result = (await res.json()) as { removed?: string[] }
 
   console.log(green(`synced ${payload.slug}`))
   console.log(
@@ -85,12 +87,7 @@ export async function projectSync(args: string[], serverUrl: string): Promise<vo
   if (result.removed?.length) {
     console.log(dim(`removed (gone from config.yaml): ${result.removed.join(', ')}`))
   }
-  if (result.shadowed?.length) {
-    console.log(
-      `\nnot applied: ${result.shadowed.join(', ')} — a worker created in the UI already`,
-    )
-    console.log('owns that name. Delete it there, or rename one of them.')
-  }
+
   // A skill only reaches an automated run once it lands on the default branch, since
   // the workspace is a clone at a pinned SHA (§4.8). Worth saying out loud.
   const dirty = await isDirty(root)
@@ -118,6 +115,25 @@ export async function projectList(serverUrl: string): Promise<void> {
       ...projects.map((p) => [cyan(p.slug), p.defaultBranch, dim(p.remoteUrl ?? '')]),
     ]),
   )
+}
+
+/**
+ * ~/.ogun/projects.json — machine-local, same posture as runner.json. A control plane on
+ * this machine reads it to find the repo when the UI edits a worker.
+ *
+ * Written here rather than sent over the API on purpose: a filesystem path is a fact
+ * about *this* machine, so it must never travel the wire or land in the database (§4.5).
+ * A remote control plane simply will not have this file, and degrades to rendering yaml
+ * for you to paste.
+ */
+async function registerLocalPath(slug: string, root: string): Promise<void> {
+  const path = expandHome(process.env.OGUN_PROJECT_MAP ?? '~/.ogun/projects.json')
+  const existing = await readFile(path, 'utf8')
+    .then((t) => JSON.parse(t) as { projects?: Record<string, string> })
+    .catch(() => ({ projects: {} }))
+  const projects = { ...(existing.projects ?? {}), [slug]: root }
+  await mkdir(dirname(path), { recursive: true })
+  await writeFile(path, `${JSON.stringify({ projects }, null, 2)}\n`, { mode: 0o600 })
 }
 
 const gitRemote = async (root: string): Promise<string | undefined> => {

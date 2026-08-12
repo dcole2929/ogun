@@ -1,0 +1,42 @@
+#!/bin/sh
+# Launcher so `ogun` works from any directory.
+#
+# The CLI runs TypeScript directly via Node's native type stripping, which needs Node 24
+# or newer. Version managers are directory-scoped — asdf reads .tool-versions from the
+# *current* directory — so running `ogun` inside another repo picks up whatever Node that
+# repo pins, which is usually not new enough. Symlink this onto your PATH instead of the
+# entry point itself:
+#
+#   ln -s ~/dev/ogun/bin/ogun ~/.local/bin/ogun
+set -eu
+
+here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+root=$(dirname "$here")
+entry="$root/packages/cli/src/main.ts"
+
+# Prefer whatever this repo pins, since that is the version the code is tested against.
+node_bin=""
+if [ -f "$root/.tool-versions" ]; then
+  version=$(awk '/^nodejs /{print $2}' "$root/.tool-versions")
+  for candidate in \
+    "${ASDF_DATA_DIR:-$HOME/.asdf}/installs/nodejs/$version/bin/node" \
+    "$HOME/.local/share/fnm/node-versions/v$version/installation/bin/node" \
+    "$HOME/.nvm/versions/node/v$version/bin/node"
+  do
+    [ -x "$candidate" ] && node_bin="$candidate" && break
+  done
+fi
+
+# Otherwise fall back to PATH, but only if it is new enough to strip types.
+if [ -z "$node_bin" ] && command -v node >/dev/null 2>&1; then
+  major=$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)
+  [ "$major" -ge 24 ] && node_bin=$(command -v node)
+fi
+
+if [ -z "$node_bin" ]; then
+  echo "ogun: needs Node 24 or newer (it runs TypeScript without a build step)." >&2
+  echo "      Nothing suitable found. Install one, or set OGUN_NODE to a node binary." >&2
+  exit 1
+fi
+
+exec "${OGUN_NODE:-$node_bin}" "$entry" "$@"
