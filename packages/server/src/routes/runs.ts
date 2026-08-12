@@ -1,6 +1,6 @@
 import { Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
-import { and, asc, desc, eq, gt } from 'drizzle-orm'
+import { and, asc, desc, eq, gt, inArray, sql } from 'drizzle-orm'
 import { schema } from '@ogun/core/db'
 import {
   eventBatchSchema,
@@ -12,7 +12,7 @@ import {
 import type { Env } from '../context.ts'
 import { finalizeRun } from '../foreman/finalize.ts'
 
-const { artifacts, jobs, projects, runEvents, runs, workers } = schema
+const { artifacts, jobs, projects, runEvents, runs, runners: runnersTable, workers } = schema
 
 export const runsRoutes = new Hono<Env>()
 
@@ -96,7 +96,43 @@ runsRoutes.get('/', async (c) => {
     .innerJoin(projects, eq(projects.id, jobs.projectId))
     .orderBy(desc(runs.startedAt))
     .limit(Number(c.req.query('limit') ?? 50))
-  return c.json({ runs: rows })
+
+  /**
+   * Jobs waiting to be claimed, which have no run row yet. Without these, triggering a
+   * worker while no runner is online showed *nothing at all* — the queue is where the
+   * work is, and it was invisible.
+   */
+  const pending = await db
+    .select({
+      job: { id: jobs.id, nodeKey: jobs.nodeKey, state: jobs.state, createdAt: jobs.createdAt },
+      requires: jobs.requires,
+      worker: { id: workers.id, name: workers.name },
+      project: { slug: projects.slug },
+    })
+    .from(jobs)
+    .innerJoin(workers, eq(workers.id, jobs.workerId))
+    .innerJoin(projects, eq(projects.id, jobs.projectId))
+    .where(inArray(jobs.state, ['queued', 'blocked']))
+    .orderBy(desc(jobs.createdAt))
+    .limit(50)
+
+  // What could pick them up, so "queued" can say whether it is waiting on a machine or
+  // just waiting its turn.
+  const online = await db
+    .select({ id: runnersTable.id, labels: runnersTable.labels })
+    .from(runnersTable)
+    .where(sql`${runnersTable.lastSeenAt} > now() - interval '60 seconds'`)
+
+  return c.json({
+    runs: rows,
+    pending: pending.map((p) => ({
+      ...p,
+      // A job whose requirements no runner advertises will never be claimed. Saying so
+      // beats leaving it queued forever with no explanation.
+      claimable: online.some((r) => p.requires.every((label) => r.labels.includes(label))),
+    })),
+    onlineRunners: online.length,
+  })
 })
 
 runsRoutes.get('/:id', async (c) => {

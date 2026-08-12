@@ -1,3 +1,36 @@
+export type SystemInfo = {
+  controlPlane: {
+    bind: string
+    port: number
+    tokenRequired: boolean
+    addresses: string[]
+    reachabilityWarning: string | null
+    configPath: string
+  }
+  host: {
+    git: string | null
+    docker: string | null
+    claude: string | null
+    codex: string | null
+    baseImage: boolean
+    claudeCredentials: boolean
+    codexCredentials: boolean
+    isRunner: boolean
+    runnerName: string | null
+  }
+  checkouts: Array<{ slug: string; path: string; present: boolean }>
+  counts: { projects: number; runs: number; openFindings: number; queuedJobs: number }
+}
+
+export type PendingJob = {
+  job: { id: string; nodeKey: string; state: string; createdAt: string }
+  requires: string[]
+  worker: { id: string; name: string }
+  project: { slug: string }
+  /** False when no online runner advertises everything this job needs. */
+  claimable: boolean
+}
+
 export type RunSummary = {
   run: {
     id: string
@@ -157,7 +190,17 @@ export const api = {
       `/api/projects/${slug}/workers`,
     ),
   coverage: (slug: string) => json<{ coverage: CoverageRow[] }>(`/api/projects/${slug}/coverage`),
-  runs: () => json<{ runs: RunSummary[] }>('/api/runs?limit=50'),
+  runs: () =>
+    json<{ runs: RunSummary[]; pending: PendingJob[]; onlineRunners: number }>(
+      '/api/runs?limit=50',
+    ),
+  system: () => json<SystemInfo>('/api/system'),
+  adminToken: () =>
+    json<{ token: string | null; reason?: string; fromEnvironment?: boolean }>('/api/system/token'),
+  rotateToken: () =>
+    json<{ token: string; restartRequired: boolean }>('/api/system/token/rotate', {
+      method: 'POST',
+    }),
   run: (id: string) => json<RunDetail>(`/api/runs/${id}`),
   findings: (params: { project?: string; status?: string }) => {
     const q = new URLSearchParams()
