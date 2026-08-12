@@ -57,7 +57,7 @@ export async function doctor(serverUrl: string): Promise<void> {
       name: 'joined',
       ok: Boolean(local.runner),
       detail: local.runner
-        ? `${local.runner.id} -> ${local.runner.serverUrl}`
+        ? `${local.runner.name} -> ${local.runner.serverUrl}`
         : 'not set up as a runner — `ogun runner init`, or `ogun runner join <url>`',
       fatal: true,
     })

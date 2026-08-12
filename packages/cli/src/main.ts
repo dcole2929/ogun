@@ -30,6 +30,7 @@ const usage = `${bold('ogun')} — a local-first software factory
 
 ${bold('running it')}
   ogun server                      start the control plane and web UI
+  ogun runner init [--name]        make this machine a runner for it
   ogun runner start                start a runner on this machine
   ogun runner doctor               what this machine can actually run
   ogun image build [project-dir]   build ogun/base, or a project image
@@ -40,7 +41,7 @@ ${bold('adding a machine')}
   ogun token show                  admin secret, to unlock the UI from another device
 
 ${bold('projects')}
-  ogun project add [dir]           tell this machine where a repo is checked out
+  ogun project add [dir] [--name]  tell this machine where a repo is checked out
   ogun project sync [dir]          read .ogun/config.yaml and register it
   ogun project list
 

@@ -3,6 +3,11 @@ import { test } from 'node:test'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+const reachable = await fetch('http://localhost:7777/api/health').then(
+  () => true,
+  () => false,
+)
+
 import {
   assertBindIsSafe,
   hashToken,
@@ -60,11 +65,11 @@ test('a wider bind generates and stores a token rather than demanding one', asyn
   const path = join(dir, 'local.json')
   t.after(() => rm(dir, { recursive: true, force: true }))
 
-  const previous = process.env.OGUN_LOCAL_CONFIG
-  process.env.OGUN_LOCAL_CONFIG = path
+  const previous = process.env.OGUN_CONFIG
+  process.env.OGUN_CONFIG = path
   t.after(() => {
-    if (previous === undefined) delete process.env.OGUN_LOCAL_CONFIG
-    else process.env.OGUN_LOCAL_CONFIG = previous
+    if (previous === undefined) delete process.env.OGUN_CONFIG
+    else process.env.OGUN_CONFIG = previous
   })
 
   const first = await resolveAuth({ OGUN_BIND: '0.0.0.0' } as NodeJS.ProcessEnv)
@@ -231,4 +236,45 @@ test('the admin token comes from OGUN_ADMIN_TOKEN, not a shared name', async () 
   } as NodeJS.ProcessEnv)
   assert.equal(explicit.token, 'ogun_explicit')
   assert.equal(explicit.generated, false, 'an explicit token must not be overwritten')
+})
+
+/**
+ * Two machines answering to one name would share a claim identity and a run history,
+ * and neither would be attributable. `runner init` originally never contacted the
+ * control plane at all, so nothing could have noticed.
+ */
+test('a runner name is unique across the control plane', { skip: reachable ? false : 'no control plane' }, async () => {
+  const name = `dup-${Date.now()}`
+  const register = () =>
+    fetch('http://localhost:7777/api/runners/join', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name, labels: ['claude'], maxConcurrency: 1 }),
+    })
+
+  const first = await register()
+  assert.equal(first.status, 201, 'the first machine registers')
+
+  const second = await register()
+  assert.equal(second.status, 409, 'the second must be refused, not silently take over')
+  assert.match((await second.json() as { error: string }).error, /already registered/)
+
+  await fetch(`http://localhost:7777/api/runners/${name}`, { method: 'DELETE' })
+})
+
+test('a revoked name can be reused', { skip: reachable ? false : 'no control plane' }, async () => {
+  // Otherwise re-registering a machine after replacing its disk means picking a new name
+  // forever.
+  const name = `reuse-${Date.now()}`
+  const register = () =>
+    fetch('http://localhost:7777/api/runners/join', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name, labels: [], maxConcurrency: 1 }),
+    })
+
+  assert.equal((await register()).status, 201)
+  await fetch(`http://localhost:7777/api/runners/${name}`, { method: 'DELETE' })
+  assert.equal((await register()).status, 201, 'a revoked name is free again')
+  await fetch(`http://localhost:7777/api/runners/${name}`, { method: 'DELETE' })
 })

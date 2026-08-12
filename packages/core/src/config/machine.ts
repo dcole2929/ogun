@@ -6,7 +6,7 @@ import { z } from 'zod'
 const expandHome = (p: string): string => (p.startsWith('~/') ? join(homedir(), p.slice(2)) : p)
 
 /**
- * `~/.ogun/local.json` — everything this *machine* knows, in one file.
+ * `~/.ogun/config.json` — everything this *machine* knows, in one file.
  *
  * There were two: `projects.json` for the server's path map and `runner.json` for the
  * runner's, both answering "where is project X on this disk" and both able to disagree.
@@ -33,7 +33,23 @@ export const localConfigSchema = z.object({
   /** Present once this machine has joined a control plane as a runner. */
   runner: z
     .object({
-      id: z.string(),
+      /**
+       * What this machine is called. Unique across the control plane — registering
+       * refuses a name another live runner already holds, because two machines sharing
+       * one would share a claim identity and a run history.
+       */
+      name: z.string(),
+      /**
+       * What this machine can do, as a set of capability tags. A worker's requirements
+       * are derived from its config — a `codex` runtime requires `codex`, a `container`
+       * sandbox requires `docker` — and a job is only offered to a runner advertising
+       * every tag it needs. That is how a Mac without Docker never picks up a container
+       * job and leaves it queued for a machine that can run it.
+       *
+       * Detected at registration by checking which binaries are present. Extra tags can
+       * be added by hand for capabilities Ogun cannot detect, and matched by a worker's
+       * `requires:` — "gpu", "vpn", "staging-db".
+       */
       labels: z.array(z.string()).default([]),
       serverUrl: z.string(),
       token: z.string().nullish().transform((v) => v ?? undefined),
@@ -49,7 +65,7 @@ export type LocalConfig = z.infer<typeof localConfigSchema>
 export class LocalConfigError extends Error {}
 
 export const localConfigPath = (): string =>
-  expandHome(process.env.OGUN_LOCAL_CONFIG ?? '~/.ogun/local.json')
+  expandHome(process.env.OGUN_CONFIG ?? '~/.ogun/config.json')
 
 export async function loadLocalConfig(path = localConfigPath()): Promise<LocalConfig> {
   const text = await readFile(path, 'utf8').catch(() => null)

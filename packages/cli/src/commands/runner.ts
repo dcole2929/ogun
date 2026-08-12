@@ -19,20 +19,40 @@ const run = promisify(execFile)
 export async function runnerInit(args: string[]): Promise<void> {
   const name = (argValue(args, '--name') ?? hostname()).toLowerCase().replace(/\..*$/, '')
   const serverUrl = argValue(args, '--url') ?? process.env.OGUN_SERVER_URL ?? 'http://localhost:7777'
-  const labels = await detectLabels()
+  // Detected, plus anything the operator adds for a capability Ogun cannot see.
+  const labels = [...new Set([...(await detectLabels()), ...extraLabels(args)])]
 
   const existing = await loadLocalConfig()
   if (existing.runner && !args.includes('--force')) {
     fail(
-      `this machine is already set up as "${existing.runner.id}" pointing at ` +
+      `this machine is already set up as "${existing.runner.name}" pointing at ` +
         `${existing.runner.serverUrl} — pass --force to replace that`,
     )
+  }
+
+  // Registers through the same endpoint `join` uses, which is the only place name
+  // uniqueness is enforced. Skipping it would let two machines answer to one name and
+  // silently share a claim identity and a run history.
+  const res = await fetch(`${serverUrl}/api/runners/join`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...(await authHeaders()) },
+    body: JSON.stringify({ name, labels, maxConcurrency: 2 }),
+  }).catch(() => null)
+
+  if (!res) {
+    fail(
+      `cannot reach ${serverUrl}. Start it with \`ogun server\`, or pass --url if the` +
+        ' control plane is elsewhere.',
+    )
+  }
+  if (!res.ok) {
+    fail(((await res.json()) as { error?: string }).error ?? 'the control plane refused this name')
   }
 
   await updateLocalConfig((c) => ({
     ...c,
     runner: {
-      id: name,
+      name,
       labels,
       serverUrl,
       // No token: a control plane on localhost needs none, and one across a network is
@@ -153,11 +173,11 @@ export async function runnerJoin(args: string[]): Promise<void> {
     )
   }
 
-  const labels = await detectLabels()
+  const labels = [...new Set([...(await detectLabels()), ...extraLabels(args)])]
   const res = await fetch(`${url}/api/runners/join`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
-    body: JSON.stringify({ id: name, labels, maxConcurrency: 2 }),
+    body: JSON.stringify({ name, labels, maxConcurrency: 2 }),
   }).catch(() => null)
   if (!res?.ok) {
     fail(res ? ((await res.json()) as { error?: string }).error ?? 'join refused' : 'join failed')
@@ -168,7 +188,7 @@ export async function runnerJoin(args: string[]): Promise<void> {
   await updateLocalConfig((c) => ({
     ...c,
     runner: {
-      id: name,
+      name,
       labels,
       serverUrl: url,
       token,
@@ -201,6 +221,17 @@ export async function runnerJoin(args: string[]): Promise<void> {
     ),
   )
 }
+
+/**
+ * Capabilities Ogun cannot detect by looking for a binary — "gpu", "vpn", "staging-db".
+ * A worker asks for one with `requires:` and the job then only goes to a machine that
+ * advertises it.
+ */
+const extraLabels = (args: string[]): string[] =>
+  (argValue(args, '--labels') ?? '')
+    .split(',')
+    .map((l) => l.trim())
+    .filter(Boolean)
 
 const argValue = (args: string[], flag: string): string | undefined => {
   const i = args.indexOf(flag)

@@ -46,7 +46,7 @@ const hashOf = (text: string): string =>
   createHash('sha256').update(text).digest('hex').slice(0, 16)
 
 /**
- * `~/.ogun/local.json` — machine-local, shared with the runner. Written by
+ * `~/.ogun/config.json` — machine-local, shared with the runner. Written by
  * `ogun project add` and `ogun project sync`, the only components that know both a
  * project's slug and where it sits on this disk.
  */

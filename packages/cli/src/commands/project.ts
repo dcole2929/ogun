@@ -126,7 +126,7 @@ export async function projectList(serverUrl: string): Promise<void> {
 }
 
 /**
- * `~/.ogun/local.json` — machine-local. A filesystem path is a fact about *this* machine,
+ * `~/.ogun/config.json` — machine-local. A filesystem path is a fact about *this* machine,
  * so it never travels the wire and never lands in the database (§4.5).
  *
  * Both halves read it: the control plane to find a repo when the UI edits a worker, and

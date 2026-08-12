@@ -106,7 +106,7 @@ runnersRoutes.delete('/invites/:id', async (c) => {
 
 const joinSchema = z.object({
   /** Chosen by the machine, defaulting to its hostname. It is the thing that knows. */
-  id: z
+  name: z
     .string()
     .min(1)
     .max(64)
@@ -124,25 +124,52 @@ const joinSchema = z.object({
  * more is a shared secret wearing an invite's clothes.
  */
 runnersRoutes.post('/join', async (c) => {
-  const { db } = c.var.ctx
+  const { db, adminTokenConfigured } = c.var.ctx
   const presented = (c.req.header('authorization') ?? '').replace(/^Bearer /, '')
   const body = joinSchema.parse(await c.req.json())
 
-  const invite = await db.query.invites.findFirst({
-    where: and(eq(invites.tokenHash, hashToken(presented)), isNull(invites.revokedAt)),
-  })
-  if (!invite) return c.json({ error: 'that join token is not valid' }, 401)
-  if (invite.usedAt) {
-    return c.json(
-      { error: `that join token was already used by "${invite.usedBy}" — mint a new one` },
-      409,
-    )
+  /**
+   * An invite is only required when the control plane is protected. On localhost there
+   * is nothing to protect against and no credential to carry, so `ogun runner init`
+   * registers through this same endpoint with no token.
+   *
+   * One registration path rather than two: it is the only place that can enforce name
+   * uniqueness, and a second path that skipped it would be the hole.
+   */
+  const invite = adminTokenConfigured
+    ? await db.query.invites.findFirst({
+        where: and(eq(invites.tokenHash, hashToken(presented)), isNull(invites.revokedAt)),
+      })
+    : undefined
+
+  if (adminTokenConfigured) {
+    if (!invite) return c.json({ error: 'that join token is not valid' }, 401)
+    if (invite.usedAt) {
+      return c.json(
+        { error: `that join token was already used by "${invite.usedBy}" — mint a new one` },
+        409,
+      )
+    }
   }
 
-  const taken = await db.query.runners.findFirst({ where: eq(runners.id, body.id) })
+  /**
+   * Names are unique. Two machines answering to one name would share a claim identity
+   * and a run history, and neither would be attributable — so the second one is refused
+   * rather than quietly taking over the first one's row.
+   */
+  const taken = await db.query.runners.findFirst({ where: eq(runners.id, body.name) })
   if (taken && !taken.revokedAt) {
+    const age = Date.now() - taken.lastSeenAt.getTime()
+    const seen = taken.pending
+      ? 'has never connected'
+      : `was last seen ${Math.round(age / 60_000)} minutes ago`
     return c.json(
-      { error: `a runner called "${body.id}" is already connected — join with --name <other>` },
+      {
+        error:
+          `a runner called "${body.name}" is already registered and ${seen}. ` +
+          'Choose another name with --name, or revoke that one from the Runners page ' +
+          'if it is the same machine being re-registered.',
+      },
       409,
     )
   }
@@ -151,21 +178,25 @@ runnersRoutes.post('/join', async (c) => {
   // its own — which is the property that makes a lost laptop a revocation rather than a
   // rotation across every machine.
   const values = {
-    id: body.id,
+    id: body.name,
     labels: body.labels,
     maxConcurrency: body.maxConcurrency,
-    tokenHash: invite.tokenHash,
+    // Null on a localhost control plane: there is no credential because none is needed.
+    tokenHash: invite?.tokenHash ?? null,
     enrolledAt: new Date(),
     revokedAt: null,
     pending: true,
   }
   await db.insert(runners).values(values).onConflictDoUpdate({ target: runners.id, set: values })
-  await db
-    .update(invites)
-    .set({ usedAt: new Date(), usedBy: body.id })
-    .where(eq(invites.id, invite.id))
 
-  return c.json({ runner: { id: body.id, labels: body.labels } }, 201)
+  if (invite) {
+    await db
+      .update(invites)
+      .set({ usedAt: new Date(), usedBy: body.name })
+      .where(eq(invites.id, invite.id))
+  }
+
+  return c.json({ runner: { name: body.name, labels: body.labels } }, 201)
 })
 
 /** Revoked, not deleted, so this machine's runs keep a name to point at. */

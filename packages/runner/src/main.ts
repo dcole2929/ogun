@@ -32,7 +32,7 @@ const context = { projects: local.projects, scratch: runner.scratch }
  * Deliberately terse. Labels and capacity are defaults nobody asked about, and printing
  * them on every start trains you to skim past the line that does matter.
  */
-console.log(`ogun-runner "${runner.id}" -> ${serverUrl}`)
+console.log(`ogun-runner "${runner.name}" -> ${serverUrl}`)
 
 const missing = ['claude', 'codex', 'docker'].filter((l) => !runner.labels.includes(l))
 if (missing.length > 0) {
@@ -57,7 +57,7 @@ const tick = async (): Promise<void> => {
   const capacity = runner.maxConcurrentJobs - inFlight.size
   if (capacity <= 0 || stopping) return
 
-  const jobs = await cp.claim(runner.id, runner.labels, capacity)
+  const jobs = await cp.claim(runner.name, runner.labels, capacity)
   for (const job of jobs) {
     inFlight.add(job.runId)
     console.log(`[runner] claimed ${job.workerName} (${job.projectSlug}) run=${job.runId}`)

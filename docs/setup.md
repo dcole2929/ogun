@@ -125,7 +125,7 @@ OGUN_BIND=0.0.0.0 ogun server
 
 ```
 ogun-server listening on http://0.0.0.0:7777
-  generated an admin token — stored in /home/doug/.ogun/local.json
+  generated an admin token — stored in /home/doug/.ogun/config.json
   reachable from the network; the UI will ask for the token once
 ```
 
@@ -173,8 +173,41 @@ cd ~/dev/heirchive-api
 ogun project add .
 ```
 
-Both halves read the same `~/.ogun/local.json` — a machine has one filesystem, so it has
+Both halves read the same `~/.ogun/config.json` — a machine has one filesystem, so it has
 one map of where things are on it.
+
+```sh
+ogun project add ~/dev/heirchive-api           # slug comes from its .ogun/config.yaml
+ogun project add ~/dev/api --name heirchive-api  # or name it explicitly
+```
+
+### What labels are for
+
+A worker's requirements come from its config — a `codex` runtime requires `codex`, a
+`container` sandbox requires `docker`. A runner advertises what it has. **A job is only
+offered to a runner advertising every label it needs**, which is how a Mac without Docker
+leaves a container job queued for a machine that can actually run it, rather than
+claiming it and failing.
+
+They are detected by looking for the binaries. Add your own for anything Ogun cannot see,
+and match it from a worker's `requires:`:
+
+```sh
+ogun runner init --labels gpu,staging-db
+```
+
+### Names are unique
+
+Two machines answering to one name would share a claim identity and a run history, and
+neither would be attributable. Registering refuses a name a live runner already holds:
+
+```
+a runner called "desktop" is already registered and was last seen 3 minutes ago.
+Choose another name with --name, or revoke that one from the Runners page if it is
+the same machine being re-registered.
+```
+
+Revoking frees the name.
 
 ### The two tokens
 
@@ -190,7 +223,7 @@ They are different credentials with different powers, and they never mix.
 | env var | `OGUN_ADMIN_TOKEN` | `OGUN_RUNNER_TOKEN` |
 
 **Neither environment variable is normally needed.** Both are read from
-`~/.ogun/local.json` on the machine that owns them. Set one only to run the CLI against a
+`~/.ogun/config.json` on the machine that owns them. Set one only to run the CLI against a
 control plane on another machine, or to keep a secret in a systemd unit instead of a file.
 
 They deliberately do not share a name. An admin token satisfies a runner-scoped route, so
