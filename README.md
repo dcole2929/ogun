@@ -54,13 +54,13 @@ asdf install                     # node 26
 pnpm install
 pnpm db:up && pnpm db:migrate    # postgres in a container on :5433
 
-ogun runner init            # writes ~/.ogun/runner.json for this machine
 ogun image build            # builds ogun/base
-ogun runner doctor          # what this machine can actually run
 
 ogun server                 # control plane + UI on :7777
+ogun runner init            # this machine becomes a runner for it
 ogun runner start           # claims and executes jobs
 
+ogun project add .          # tell this machine where this repo is (optional)
 ogun project sync           # register a repo with a .ogun/config.yaml
 ogun trigger ogun adversarial-review
 ```

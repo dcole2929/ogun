@@ -38,7 +38,7 @@ export async function doctor(serverUrl: string): Promise<void> {
     fatal: false,
   })
 
-  const reachable = await fetch(`${serverUrl}/api/health`, { headers: authHeaders() }).then(
+  const reachable = await fetch(`${serverUrl}/api/health`, { headers: await authHeaders() }).then(
     (r) => r.ok,
     () => false,
   )

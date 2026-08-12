@@ -29,7 +29,7 @@ export async function skillsList(args: string[], serverUrl: string): Promise<voi
   const url = new URL('/api/skills', serverUrl)
   if (project) url.searchParams.set('project', project)
 
-  const res = await fetch(url, { headers: authHeaders() }).catch(() => null)
+  const res = await fetch(url, { headers: await authHeaders() }).catch(() => null)
   if (!res?.ok) fail(`could not reach the control plane at ${serverUrl}`)
   const { skills } = (await res.json()) as { skills: SkillRow[] }
 
@@ -60,7 +60,7 @@ export async function skillsShow(args: string[], serverUrl: string): Promise<voi
   if (!name) fail('usage: ogun skills show <name> [--project <slug>]')
 
   const project = argValue(args, '--project') ?? (await onlyProject(serverUrl))
-  const res = await fetch(`${serverUrl}/api/skills/${project}/${name}`, { headers: authHeaders() }).catch(() => null)
+  const res = await fetch(`${serverUrl}/api/skills/${project}/${name}`, { headers: await authHeaders() }).catch(() => null)
   if (!res?.ok) fail(`no skill "${name}" in project "${project}"`)
   const body = (await res.json()) as {
     skill: SkillRow['skill'] & { body: string | null }
@@ -108,7 +108,7 @@ export async function skillsShow(args: string[], serverUrl: string): Promise<voi
 }
 
 const onlyProject = async (serverUrl: string): Promise<string> => {
-  const res = await fetch(`${serverUrl}/api/projects`, { headers: authHeaders() }).catch(() => null)
+  const res = await fetch(`${serverUrl}/api/projects`, { headers: await authHeaders() }).catch(() => null)
   if (!res?.ok) fail(`could not reach the control plane at ${serverUrl}`)
   const { projects } = (await res.json()) as { projects: Array<{ slug: string }> }
   if (projects.length === 1) return projects[0]!.slug

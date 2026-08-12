@@ -8,7 +8,6 @@ import {
   type ClaimedJob,
   type GateResult,
   type RunEvent,
-  type RunnerConfig,
   type RunOutcome,
   type RunReport,
 } from '@ogun/core'
@@ -46,7 +45,7 @@ export const OUTPUT_PATH = '.ogun-out/findings.json'
  */
 export async function executeJob(
   cp: ControlPlane,
-  config: RunnerConfig,
+  config: { projects: Record<string, string>; scratch: string },
   job: ClaimedJob,
 ): Promise<RunOutcome> {
   const startedAt = Date.now()
@@ -310,7 +309,7 @@ async function countLines(workspace: string, relPath: string): Promise<number | 
 
 /** Transcripts are large and rarely read: to disk with a pointer, never into postgres. */
 async function writeTranscript(
-  config: RunnerConfig,
+  config: { projects: Record<string, string>; scratch: string },
   job: ClaimedJob,
   workspace: string,
 ): Promise<string | undefined> {

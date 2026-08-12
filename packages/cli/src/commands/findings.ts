@@ -143,7 +143,7 @@ export async function findingsList(args: string[], serverUrl: string): Promise<v
   if (project) url.searchParams.set('project', project)
   url.searchParams.set('status', status)
 
-  const res = await fetch(url, { headers: authHeaders() }).catch(() => null)
+  const res = await fetch(url, { headers: await authHeaders() }).catch(() => null)
   if (!res?.ok) fail(`could not reach the control plane at ${serverUrl}`)
   const { findings } = (await res.json()) as {
     findings: Array<{

@@ -1,39 +1,63 @@
+import { loadLocalConfig, localConfigPath, updateLocalConfig } from '@ogun/core'
 import { randomBytes } from 'node:crypto'
-import { bold, cyan, dim, green } from '../output.ts'
+import { bold, cyan, dim, fail, green } from '../output.ts'
 
 /**
- * `ogun token new` — the admin secret for a control plane bound beyond localhost.
+ * `ogun token show` — print this machine's admin secret.
  *
- * A command rather than a documented `openssl rand -hex 32`, because the shape of the
- * token is ours: the prefix is what makes one recognisable in a shell history or a
- * systemd unit, and it is what tells you whether a leaked string is an admin token or a
- * runner's.
+ * There is deliberately no "create" step in the normal flow. `ogun server` generates one
+ * the first time it binds beyond localhost and stores it, and the CLI on that machine
+ * reads the same file — so the token exists without anyone having to carry it between
+ * two commands. You only need to see it to unlock the web UI from another device, or to
+ * run the CLI from one.
  */
-export function tokenNew(args: string[]): void {
-  const token = `ogun_${randomBytes(32).toString('hex')}`
+export async function tokenShow(args: string[]): Promise<void> {
+  const config = await loadLocalConfig()
+  const token = config.server.token
+
+  if (!token) {
+    console.log(dim('No admin token on this machine.'))
+    console.log(
+      dim(
+        'One is generated the first time `ogun server` binds beyond localhost. A control\n' +
+          'plane on localhost needs none — nothing off this machine can reach it.',
+      ),
+    )
+    return
+  }
 
   if (args.includes('--quiet') || args.includes('-q')) {
-    // For `OGUN_TOKEN=$(ogun token new -q)`.
     process.stdout.write(`${token}\n`)
     return
   }
 
   console.log(`\n  ${cyan(token)}\n`)
-  console.log(bold('Control plane'))
-  console.log(`  OGUN_TOKEN=${token} OGUN_BIND=0.0.0.0 pnpm server`)
-  console.log(bold('\nCLI on another machine'))
-  console.log(`  export OGUN_TOKEN=${token}`)
-  console.log(`  export OGUN_SERVER_URL=http://<this-machine>:7777`)
+  console.log(dim(`  stored in ${localConfigPath()}`))
+  console.log(bold('\nUse it to'))
+  console.log('  · unlock the web UI from another device')
+  console.log(`  · run the CLI from another machine: ${dim('export OGUN_TOKEN=…')}`)
   console.log(
     dim(
-      [
-        '',
-        'This is the admin secret: it can define workers, and defining a worker is',
-        'defining what runs on the host. Runners do not need it and should not have it —',
-        'enroll each machine instead, which gives it a token scoped to claiming work:',
-        '',
-        `  ${green('ogun runner invite <name>')}   or the Runners page`,
-      ].join('\n'),
+      '\nRunners do not need this and should not have it — they get their own token from' +
+        `\n${green('  ogun runner invite')}`,
+    ),
+  )
+}
+
+/** `ogun token rotate` — invalidates every existing session and CLI export. */
+export async function tokenRotate(): Promise<void> {
+  const existing = (await loadLocalConfig()).server.token
+  if (!existing) fail('there is no admin token on this machine to rotate')
+
+  const token = `ogun_${randomBytes(32).toString('hex')}`
+  await updateLocalConfig((c) => ({ ...c, server: { ...c.server, token } }))
+
+  console.log(`\n  ${cyan(token)}\n`)
+  console.log(
+    dim(
+      'Restart `ogun server` for this to take effect. Every browser session and every\n' +
+        'exported OGUN_TOKEN stops working; runner tokens are unaffected, since they are\n' +
+        'separate credentials.',
     ),
   )
 }

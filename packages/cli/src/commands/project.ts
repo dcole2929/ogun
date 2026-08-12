@@ -1,9 +1,15 @@
 import { execFile } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
-import { dirname, resolve } from 'node:path'
+import { join, resolve } from 'node:path'
 import { promisify } from 'node:util'
-import { discoverSkills, expandHome, loadProjectConfig } from '@ogun/core'
+import { existsSync } from 'node:fs'
+import { basename } from 'node:path'
+import {
+  discoverSkills,
+  loadProjectConfig,
+  localConfigPath,
+  updateLocalConfig,
+} from '@ogun/core'
 import { bold, cyan, dim, fail, green, table } from '../output.ts'
 import { authHeaders } from '../auth.ts'
 
@@ -61,7 +67,7 @@ export async function projectSync(args: string[], serverUrl: string): Promise<vo
 
   const res = await fetch(`${serverUrl}/api/projects/sync`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', ...authHeaders() },
+    headers: { 'content-type': 'application/json', ...(await authHeaders()) },
     body: JSON.stringify(payload),
   }).catch(() => null)
   if (!res?.ok) {
@@ -102,7 +108,7 @@ export async function projectSync(args: string[], serverUrl: string): Promise<vo
 }
 
 export async function projectList(serverUrl: string): Promise<void> {
-  const res = await fetch(`${serverUrl}/api/projects`, { headers: authHeaders() }).catch(() => null)
+  const res = await fetch(`${serverUrl}/api/projects`, { headers: await authHeaders() }).catch(() => null)
   if (!res?.ok) fail(`could not reach the control plane at ${serverUrl}`)
   const { projects } = (await res.json()) as {
     projects: Array<{ slug: string; defaultBranch: string; remoteUrl: string | null }>
@@ -120,22 +126,62 @@ export async function projectList(serverUrl: string): Promise<void> {
 }
 
 /**
- * ~/.ogun/projects.json — machine-local, same posture as runner.json. A control plane on
- * this machine reads it to find the repo when the UI edits a worker.
+ * `~/.ogun/local.json` — machine-local. A filesystem path is a fact about *this* machine,
+ * so it never travels the wire and never lands in the database (§4.5).
  *
- * Written here rather than sent over the API on purpose: a filesystem path is a fact
- * about *this* machine, so it must never travel the wire or land in the database (§4.5).
- * A remote control plane simply will not have this file, and degrades to rendering yaml
- * for you to paste.
+ * Both halves read it: the control plane to find a repo when the UI edits a worker, and
+ * the runner to clone from disk instead of the network.
  */
 async function registerLocalPath(slug: string, root: string): Promise<void> {
-  const path = expandHome(process.env.OGUN_PROJECT_MAP ?? '~/.ogun/projects.json')
-  const existing = await readFile(path, 'utf8')
-    .then((t) => JSON.parse(t) as { projects?: Record<string, string> })
-    .catch(() => ({ projects: {} }))
-  const projects = { ...(existing.projects ?? {}), [slug]: root }
-  await mkdir(dirname(path), { recursive: true })
-  await writeFile(path, `${JSON.stringify({ projects }, null, 2)}\n`, { mode: 0o600 })
+  await updateLocalConfig((c) => ({ ...c, projects: { ...c.projects, [slug]: root } }))
+}
+
+/**
+ * `ogun project add [dir]` — tell this machine where a repo is checked out, without the
+ * full sync. Run it in each repo a runner on this machine should be able to work on.
+ *
+ * Optional: a runner with no path clones from the project's remote instead. Registering
+ * one makes it faster, lets it work offline, and lets a co-located control plane edit
+ * that project's config.yaml.
+ */
+export async function projectAdd(args: string[], serverUrl: string): Promise<void> {
+  const root = resolve(args.find((a) => !a.startsWith('--')) ?? process.cwd())
+
+  if (!existsSync(join(root, '.git'))) {
+    fail(`${root} is not a git repository — point this at the repo itself`)
+  }
+
+  // The slug comes from the project's own config where there is one, so this machine's
+  // map agrees with what the control plane calls it. Two names for one project would
+  // mean the path silently never matches.
+  const configured = await loadProjectConfig(root)
+    .then((l) => l.config.project.name)
+    .catch(() => null)
+  const slug = argValue(args, '--name') ?? configured ?? basename(root)
+
+  if (!configured) {
+    console.log(
+      dim(
+        `${root} has no .ogun/config.yaml, so this is registered as "${slug}" from its
+` +
+          'directory name. If the project is known by another name, pass --name.',
+      ),
+    )
+  }
+
+  await registerLocalPath(slug, root)
+  console.log(green(`${slug} → ${root}`))
+  console.log(dim(`  in ${localConfigPath()}`))
+
+  const known = await fetch(`${serverUrl}/api/projects`, { headers: await authHeaders() })
+    .then((r) => r.json() as Promise<{ projects: Array<{ slug: string }> }>)
+    .then((d) => d.projects.some((p) => p.slug === slug))
+    .catch(() => null)
+  if (known === false) {
+    console.log(
+      dim(`\n  The control plane has no project called "${slug}" yet — \`ogun project sync\`.`),
+    )
+  }
 }
 
 /**
@@ -163,4 +209,9 @@ const isDirty = async (root: string): Promise<boolean> => {
     stdout: '',
   }))
   return stdout.trim().length > 0
+}
+
+const argValue = (args: string[], flag: string): string | undefined => {
+  const i = args.indexOf(flag)
+  return i === -1 ? undefined : args[i + 1]
 }

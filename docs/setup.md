@@ -80,13 +80,23 @@ port and no fixed address.
 
 So enrolling is: mint a credential on the control plane, carry it to the other machine.
 
+### One machine
+
+Nothing to configure. The control plane binds to localhost, where nothing off this
+machine can reach it, so there is no token to manage.
+
+```sh
+ogun server         # control plane and UI on :7777
+ogun runner init    # this machine becomes a runner for it
+ogun runner start
+```
+
 ### 0. Make the control plane reachable
 
-Skip only if both machines are the same machine.
+Only needed when the runner is a *different* machine.
 
-The control plane binds to `127.0.0.1` by default and refuses to bind wider without a
-token — an open API can define a worker, and defining a worker is defining what runs on
-the host.
+The control plane binds to `127.0.0.1` by default. Set `OGUN_BIND=0.0.0.0` and it
+generates an admin token on first start and stores it — you never create or paste one.
 
 **On WSL2 there is an extra step.** WSL2's address is private to Windows; nothing else on
 your network can reach it. Pick one:
@@ -107,74 +117,64 @@ curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up
 Option 3 is `netsh interface portproxy`, which works but breaks whenever the WSL address
 changes on reboot.
 
-### 1. On the CONTROL PLANE — create the admin secret, once
+### 1. On the CONTROL PLANE — start it
 
 ```sh
-ogun token new
+OGUN_BIND=0.0.0.0 ogun server
 ```
 
-Prints a token starting `ogun_`. This is the admin secret: it can define workers, and
-defining a worker is defining what runs on the host. It never leaves this machine.
-
-```sh
-OGUN_TOKEN=ogun_… OGUN_BIND=0.0.0.0 ogun server
 ```
+ogun-server listening on http://0.0.0.0:7777
+  generated an admin token — stored in /home/doug/.ogun/local.json
+  reachable from the network; the UI will ask for the token once
+```
+
+The admin token can define workers, which is to say define what runs on this machine. It
+stays here. The CLI on this machine reads the same file, so you never export it — you only
+need to *see* it (`ogun token show`) to unlock the web UI from another device.
 
 ### 2. On the CONTROL PLANE — mint a join token
 
 ```sh
-OGUN_TOKEN=ogun_… ogun runner invite
+ogun runner invite
 ```
 
 **No machine name.** The machine has not joined yet, and it is the thing that knows its
-own hostname — naming it here would be guessing, and would leave a row for a machine that
-may never appear. It prints the command for step 3.
+own hostname. It prints:
 
-The token starts `ogr_`, is single use, and is shown once. Only its hash is stored, which
-is what makes storing it safe.
+```
+  ogun runner join http://192.168.1.20:7777 --token ogr_d1c0e964…
 
-### 3. On the NEW MACHINE — join
-
-Paste exactly what step 2 printed:
-
-```sh
-ogun runner join http://<control-plane>:7777 --token ogr_…
+  It names itself from its hostname. Add --name <label> to choose.
 ```
 
-The machine names itself from its hostname; pass `--name` to override. This checks the
-address is reachable and the token is valid, registers the machine, and writes
-`~/.ogun/runner.json` (mode 0600) with the URL, the detected labels, and the token.
+Single use, shown once. Only its hash is stored, which is what makes storing it safe.
 
-That token is now this machine's permanent credential. It can claim work and report on
-it, and nothing else.
-
-### 4. On the NEW MACHINE — start it
+### 3. On the NEW MACHINE — join and start
 
 ```sh
+ogun runner join http://192.168.1.20:7777 --token ogr_d1c0e964…
 ogun runner start
 ```
 
-Nothing else. No environment variable — `join` stored the token. `OGUN_TOKEN` still
-overrides if you would rather keep it in a systemd unit.
+That token is now this machine's permanent credential. It can claim work and report on
+it, and nothing else. No environment variable — `join` stored it.
 
-### Repositories are cloned, not registered
+### Telling a runner where a repo is
 
-A runner does not need to know about a project in advance. It clones from the project's
-remote, so a machine that joined a minute ago can work on anything.
+Optional. A runner with no local path clones from the project's remote, so a machine that
+joined a minute ago can already work on anything.
 
-Registering a local path is an **optimisation**, not a requirement: it clones from disk
-instead, which is faster, needs no network, and works offline.
+Registering a checkout makes it faster, works offline, and lets a co-located control plane
+edit that project's `config.yaml`:
 
-```jsonc
-// ~/.ogun/runner.json — optional
-"projects": { "ogun": "/Users/doug/dev/ogun" }
+```sh
+cd ~/dev/heirchive-api
+ogun project add .
 ```
 
-### Why paths are per machine
-
-`/home/doug/dev/x` and `/Users/doug/dev/x` are the same project. No absolute path is ever
-stored centrally, so each runner keeps its own map in `runner.json` — and a runner with no
-entry falls back to cloning from the remote.
+Both halves read the same `~/.ogun/local.json` — a machine has one filesystem, so it has
+one map of where things are on it.
 
 ### The two tokens
 

@@ -1,5 +1,6 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
 import { and, eq, isNull } from 'drizzle-orm'
+import { loadLocalConfig, updateLocalConfig } from '@ogun/core'
 import { schema } from '@ogun/core/db'
 import type { MiddlewareHandler } from 'hono'
 import type { Env } from './context.ts'
@@ -23,36 +24,51 @@ export const LOCAL_BINDS = new Set(['127.0.0.1', 'localhost', '::1'])
 
 export type Scope = 'admin' | 'runner'
 
-export type AuthConfig = { bind: string; token: string | undefined }
+export type AuthConfig = {
+  bind: string
+  token: string | undefined
+  /** True when this run created it, so the caller can say where it went. */
+  generated: boolean
+}
 
-export function resolveAuth(env = process.env): AuthConfig {
-  return {
-    // Localhost by default. Reaching this from another machine should be a decision you
-    // made, not something that happened because a framework defaults to all interfaces.
-    bind: env.OGUN_BIND ?? '127.0.0.1',
-    token: env.OGUN_TOKEN?.trim() || undefined,
-  }
+/**
+ * Localhost by default. Reaching this from another machine should be a decision you
+ * made, not something that happened because a framework defaults to all interfaces.
+ *
+ * The admin token is *generated and stored*, not typed. Requiring `ogun token new` and
+ * then pasting the result into an environment variable made the operator responsible for
+ * moving a secret around by hand, for no benefit: the CLI on this machine can read the
+ * same file the server writes, so neither of them needs it in the environment.
+ */
+export async function resolveAuth(env = process.env): Promise<AuthConfig> {
+  const bind = env.OGUN_BIND ?? '127.0.0.1'
+  const fromEnv = env.OGUN_TOKEN?.trim() || undefined
+  if (fromEnv) return { bind, token: fromEnv, generated: false }
+
+  // A localhost control plane needs no token: nothing off this machine can reach it.
+  if (LOCAL_BINDS.has(bind)) return { bind, token: undefined, generated: false }
+
+  const local = await loadLocalConfig()
+  if (local.server.token) return { bind, token: local.server.token, generated: false }
+
+  const token = mintToken('ogun')
+  await updateLocalConfig((c) => ({ ...c, server: { ...c.server, token } }))
+  return { bind, token, generated: true }
 }
 
 export class InsecureBind extends Error {}
 
-/** Called at boot. Refuses rather than warns: a warning in a systemd log is not read. */
+/**
+ * Called at boot. With `resolveAuth` generating a token for any non-local bind this is
+ * now unreachable in practice — it stays as the invariant it always was, so a future
+ * caller constructing an AuthConfig by hand cannot produce an open one by accident.
+ */
 export function assertBindIsSafe(config: AuthConfig): void {
   if (LOCAL_BINDS.has(config.bind) || config.token) return
   throw new InsecureBind(
-    [
-      `refusing to listen on ${config.bind} without OGUN_TOKEN.`,
-      '',
-      'This API can create workers and trigger runs, so an open one on a shared network',
-      'is remote code execution on this machine.',
-      '',
-      'Either bind to localhost (unset OGUN_BIND), or set a shared secret:',
-      '',
-      '  ogun token new            # prints a token and the export line',
-      '',
-      'Runners are enrolled separately and get their own tokens — see `ogun runner invite`',
-      'or the Runners page.',
-    ].join('\n'),
+    `refusing to listen on ${config.bind} with no admin token. This API can define ` +
+      'workers and trigger runs, so an open one on a shared network is remote code ' +
+      'execution on this machine.',
   )
 }
 
@@ -71,8 +87,25 @@ const constantTimeEqual = (a: string, b: string): boolean => {
   return timingSafeEqual(left, right)
 }
 
-const presentedToken = (header: string | undefined, fallback: string | undefined): string | undefined =>
-  header?.startsWith('Bearer ') ? header.slice(7) : fallback
+export const SESSION_COOKIE = 'ogun_session'
+
+/**
+ * The browser cannot set an Authorization header on its own first request, and the UI is
+ * served from this same origin — so a token-protected control plane needs a cookie or the
+ * whole web interface 401s. It holds the admin token itself rather than a session id:
+ * httpOnly so scripts cannot read it, and there is no session table to expire, which for
+ * a single-operator tool is the right amount of machinery.
+ */
+const presentedToken = (
+  header: string | undefined,
+  fallback: string | undefined,
+  cookie: string | undefined,
+): string | undefined => {
+  if (header?.startsWith('Bearer ')) return header.slice(7)
+  if (fallback) return fallback
+  const match = cookie?.match(new RegExp(`(?:^|; )${SESSION_COOKIE}=([^;]+)`))
+  return match?.[1] ? decodeURIComponent(match[1]) : undefined
+}
 
 /**
  * Routes a runner token may reach. Everything else is admin.
@@ -92,7 +125,7 @@ const RUNNER_ROUTES = [
  * a runner credential, so requiring a runner credential to reach it would be circular.
  * It validates the invite itself, and refuses a used or revoked one.
  */
-const ENROLLMENT_ROUTES = [/^\/api\/runners\/join$/]
+const ENROLLMENT_ROUTES = [/^\/api\/runners\/join$/, /^\/api\/session$/]
 
 export const scopeForPath = (path: string): Scope | 'enrollment' =>
   ENROLLMENT_ROUTES.some((r) => r.test(path))
@@ -117,7 +150,11 @@ export function requireScope(
     // The route checks the invite itself; it cannot require a credential it issues.
     if (scope === 'enrollment') return next()
 
-    const presented = presentedToken(c.req.header('authorization'), c.req.header('x-ogun-token'))
+    const presented = presentedToken(
+      c.req.header('authorization'),
+      c.req.header('x-ogun-token'),
+      c.req.header('cookie'),
+    )
     if (!presented) return c.json({ error: 'unauthorized' }, 401)
 
     if (constantTimeEqual(presented, adminToken)) return next()

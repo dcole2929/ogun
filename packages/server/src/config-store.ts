@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import { readFile, rename, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { Document, parseDocument } from 'yaml'
-import { expandHome, projectConfigSchema, workerSchema, type WorkerConfig } from '@ogun/core'
+import { loadLocalConfig, projectConfigSchema, workerSchema, type WorkerConfig } from '@ogun/core'
 
 /**
  * Worker definitions live in the repo's `.ogun/config.yaml`, and the control plane edits
@@ -46,26 +46,15 @@ const hashOf = (text: string): string =>
   createHash('sha256').update(text).digest('hex').slice(0, 16)
 
 /**
- * ~/.ogun/projects.json — machine-local, same posture as runner.json. Written by
- * `ogun project sync`, which is the only component that knows both a project's slug and
- * where it sits on this disk.
+ * `~/.ogun/local.json` — machine-local, shared with the runner. Written by
+ * `ogun project add` and `ogun project sync`, the only components that know both a
+ * project's slug and where it sits on this disk.
  */
-export const PROJECT_MAP_PATH = '~/.ogun/projects.json'
-
-export async function readProjectMap(path = PROJECT_MAP_PATH): Promise<Record<string, string>> {
-  const raw = await readFile(expandHome(path), 'utf8').catch(() => null)
-  if (raw === null) return {}
-  try {
-    const parsed = JSON.parse(raw) as { projects?: Record<string, string> }
-    return parsed.projects ?? {}
-  } catch {
-    return {}
-  }
+export async function readProjectMap(path?: string): Promise<Record<string, string>> {
+  return (await loadLocalConfig(path).catch(() => null))?.projects ?? {}
 }
 
-export function createLocalConfigStore(
-  projectMapPath = process.env.OGUN_PROJECT_MAP ?? PROJECT_MAP_PATH,
-): ConfigStore {
+export function createLocalConfigStore(projectMapPath?: string): ConfigStore {
   // Re-read on every call rather than caching: `ogun project sync` rewrites this file,
   // and a server that cached it at boot would need a restart to see a new project.
   const configPathFor = async (slug: string): Promise<string> => {

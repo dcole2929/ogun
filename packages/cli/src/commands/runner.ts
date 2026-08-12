@@ -1,49 +1,61 @@
 import { execFile } from 'node:child_process'
-import { mkdir, writeFile } from 'node:fs/promises'
-import { existsSync } from 'node:fs'
+import { mkdir } from 'node:fs/promises'
 import { hostname } from 'node:os'
-import { dirname, resolve } from 'node:path'
+import { resolve } from 'node:path'
 import { promisify } from 'node:util'
-import { readFile } from 'node:fs/promises'
-import { expandHome } from '@ogun/core'
+import { expandHome, loadLocalConfig, localConfigPath, updateLocalConfig } from '@ogun/core'
 import { bold, cyan, dim, fail, green } from '../output.ts'
 import { authHeaders } from '../auth.ts'
 
 const run = promisify(execFile)
 
 /**
- * `ogun runner init` — write ~/.ogun/runner.json. Machine-local and never synced: the
- * repo registry is per-runner precisely because /home/doug/dev/x on WSL2 and
- * /Users/doug/dev/x on macOS are the same project at different paths (§4.5).
+ * `ogun runner init` — set this machine up as a runner for a control plane on this same
+ * machine. The one-box case, and the common one.
+ *
+ * `ogun runner join` is the other machine's version of this: same result, but it has to
+ * present a token because it is talking to a control plane across a network.
  */
 export async function runnerInit(args: string[]): Promise<void> {
-  const path = expandHome(process.env.OGUN_RUNNER_CONFIG ?? '~/.ogun/runner.json')
-  if (existsSync(path) && !args.includes('--force')) {
-    fail(`${path} already exists. Edit it, or pass --force to overwrite.`)
-  }
-
+  const name = (argValue(args, '--name') ?? hostname()).toLowerCase().replace(/\..*$/, '')
+  const serverUrl = argValue(args, '--url') ?? process.env.OGUN_SERVER_URL ?? 'http://localhost:7777'
   const labels = await detectLabels()
-  const config = {
-    runnerId: args[0] ?? hostname(),
-    labels,
-    projects: {} as Record<string, string>,
-    scratch: '~/.ogun/work',
-    // WSL2 caps at ~50% of Windows RAM and a container running an agent plus a test
-    // suite is not small. Raise memory= in .wslconfig before raising this (§8).
-    maxConcurrentJobs: 2,
-    serverUrl: process.env.OGUN_SERVER_URL ?? 'http://localhost:7777',
-    pollIntervalMs: 3000,
+
+  const existing = await loadLocalConfig()
+  if (existing.runner && !args.includes('--force')) {
+    fail(
+      `this machine is already set up as "${existing.runner.id}" pointing at ` +
+        `${existing.runner.serverUrl} — pass --force to replace that`,
+    )
   }
 
-  await mkdir(dirname(path), { recursive: true })
+  await updateLocalConfig((c) => ({
+    ...c,
+    runner: {
+      id: name,
+      labels,
+      serverUrl,
+      // No token: a control plane on localhost needs none, and one across a network is
+      // reached with `ogun runner join` instead, which carries an invite.
+      token: undefined,
+      maxConcurrentJobs: c.runner?.maxConcurrentJobs ?? 2,
+      pollIntervalMs: c.runner?.pollIntervalMs ?? 3000,
+      scratch: c.runner?.scratch ?? '~/.ogun/work',
+    },
+  }))
   await mkdir(resolve(expandHome('~/.ogun/work')), { recursive: true })
-  await writeFile(path, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 })
 
-  console.log(green(`wrote ${path}`))
-  console.log(dim(`  runnerId: ${config.runnerId}`))
-  console.log(dim(`  labels:   ${labels.join(', ') || '(none detected)'}`))
-  console.log(`\nAdd your repositories under ${bold('projects')}, keyed by project slug:`)
-  console.log(dim(`  "projects": { "ogun": "${process.cwd()}" }`))
+  console.log(green(`this machine is runner "${name}" for ${serverUrl}`))
+  console.log(dim(`  ${localConfigPath()}`))
+
+  const missing = ['claude', 'codex', 'docker'].filter((l) => !labels.includes(l))
+  if (missing.length > 0) {
+    console.log(
+      `\n  ${bold('not found:')} ${missing.join(', ')}` +
+        '\n  Jobs needing those will never be claimed here — see `ogun runner doctor`.',
+    )
+  }
+  console.log(`\n  ${cyan('ogun runner start')}   to start it`)
 }
 
 async function detectLabels(): Promise<string[]> {
@@ -74,7 +86,7 @@ export async function runnerInvite(args: string[], serverUrl: string): Promise<v
   const note = argValue(args, '--note')
   const res = await fetch(`${serverUrl}/api/runners/invites`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', ...authHeaders() },
+    headers: { 'content-type': 'application/json', ...(await authHeaders()) },
     body: JSON.stringify({
       ...(note ? { note } : {}),
       ...(argValue(args, '--url') ? { serverUrl: argValue(args, '--url') } : {}),
@@ -90,7 +102,7 @@ export async function runnerInvite(args: string[], serverUrl: string): Promise<v
   }
   const body = (await res!.json()) as { token: string; command: string }
 
-  const warning = await fetch(`${serverUrl}/api/runners`, { headers: authHeaders() })
+  const warning = await fetch(`${serverUrl}/api/runners`, { headers: await authHeaders() })
     .then((r) => r.json() as Promise<{ reachabilityWarning: string | null }>)
     .then((d) => d.reachabilityWarning)
     .catch(() => null)
@@ -98,6 +110,9 @@ export async function runnerInvite(args: string[], serverUrl: string): Promise<v
   if (warning) console.log(`${dim(warning)}\n`)
   console.log(bold('Run this on the machine you want to add:\n'))
   console.log(`  ${cyan(body.command)}\n`)
+  console.log(
+    dim(`  It names itself from its hostname. Add ${bold('--name <label>')} to choose.\n`),
+  )
   console.log(
     dim(
       [
@@ -148,41 +163,40 @@ export async function runnerJoin(args: string[]): Promise<void> {
     fail(res ? ((await res.json()) as { error?: string }).error ?? 'join refused' : 'join failed')
   }
 
-  const path = expandHome(process.env.OGUN_RUNNER_CONFIG ?? '~/.ogun/runner.json')
-  // Preserved rather than overwritten: joining must not discard repository paths already
+  // Merged, not overwritten: joining must not discard repository paths already
   // registered on this machine.
-  const existing: Record<string, unknown> = await readFile(path, 'utf8')
-    .then((t) => JSON.parse(t) as Record<string, unknown>)
-    .catch(() => ({}))
-
-  const config = {
-    ...existing,
-    runnerId: name,
-    labels,
-    projects: (existing.projects as Record<string, string>) ?? {},
-    scratch: (existing.scratch as string) ?? '~/.ogun/work',
-    maxConcurrentJobs: (existing.maxConcurrentJobs as number) ?? 2,
-    serverUrl: url,
-    pollIntervalMs: (existing.pollIntervalMs as number) ?? 3000,
-    // Persisted so starting the runner needs nothing else. The file is 0600.
-    token,
-  }
-  await mkdir(dirname(path), { recursive: true })
+  await updateLocalConfig((c) => ({
+    ...c,
+    runner: {
+      id: name,
+      labels,
+      serverUrl: url,
+      token,
+      maxConcurrentJobs: c.runner?.maxConcurrentJobs ?? 2,
+      pollIntervalMs: c.runner?.pollIntervalMs ?? 3000,
+      scratch: c.runner?.scratch ?? '~/.ogun/work',
+    },
+  }))
   await mkdir(resolve(expandHome('~/.ogun/work')), { recursive: true })
-  await writeFile(path, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 })
 
   console.log(green(`joined ${url} as ${bold(name)}`))
-  console.log(dim(`  ${path}  —  url, labels, and token (mode 0600)`))
-  console.log(dim(`  labels: ${labels.join(', ') || '(none detected — see `ogun runner doctor`)'}`))
-  console.log(`\nStart it:\n`)
-  console.log(`  ${cyan('ogun runner start')}`)
+  console.log(dim(`  ${localConfigPath()}`))
+
+  const missing = ['claude', 'codex', 'docker'].filter((l) => !labels.includes(l))
+  if (missing.length > 0) {
+    console.log(
+      `\n  ${bold('not found on this machine:')} ${missing.join(', ')}` +
+        '\n  Jobs needing those will never be claimed here — see `ogun runner doctor`.',
+    )
+  }
+
+  console.log(`\n  ${cyan('ogun runner start')}   to start it`)
   console.log(
     dim(
       [
         '',
-        'Repositories are cloned from their remote automatically. If a repo is already',
-        'checked out here, add its path under "projects" in that file and the runner',
-        'will use the local copy instead — faster, and works offline.',
+        'Repositories are cloned from their remote as needed. To use a local checkout',
+        'instead — faster, and works offline — run `ogun project add` inside it.',
       ].join('\n'),
     ),
   )

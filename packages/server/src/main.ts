@@ -1,12 +1,13 @@
 import { serve } from '@hono/node-server'
 import { createApp } from './app.ts'
 import { createContext } from './context.ts'
+import { localConfigPath } from '@ogun/core'
 import { assertBindIsSafe, InsecureBind, LOCAL_BINDS, resolveAuth } from './auth.ts'
 import { sweepStaleClaims } from './foreman/sweep.ts'
 
 const port = Number(process.env.OGUN_PORT ?? 7777)
 const staleAfterMs = Number(process.env.OGUN_STALE_CLAIM_MS ?? 45 * 60_000)
-const auth = resolveAuth()
+const auth = await resolveAuth()
 
 try {
   assertBindIsSafe(auth)
@@ -23,8 +24,11 @@ const server = serve(
   { fetch: createApp(ctx, auth.token).fetch, port, hostname: auth.bind },
   (info) => {
     console.log(`ogun-server listening on http://${auth.bind}:${info.port}`)
+    if (auth.generated) {
+      console.log(`  generated an admin token — stored in ${localConfigPath()}`)
+    }
     if (!LOCAL_BINDS.has(auth.bind)) {
-      console.log('  reachable from the network, token required')
+      console.log('  reachable from the network; the UI will ask for the token once')
     }
   },
 )

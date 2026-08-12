@@ -1,5 +1,8 @@
 import { strict as assert } from 'node:assert'
 import { test } from 'node:test'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import {
   assertBindIsSafe,
   hashToken,
@@ -17,29 +20,64 @@ import type { Scope } from '../src/auth.ts'
  * The default has to be safe, and the unsafe combination has to be impossible to reach
  * by accident.
  */
-test('the default bind is localhost, not every interface', () => {
-  assert.equal(resolveAuth({} as NodeJS.ProcessEnv).bind, '127.0.0.1')
+test('the default bind is localhost, not every interface', async () => {
+  assert.equal((await resolveAuth({} as NodeJS.ProcessEnv)).bind, '127.0.0.1')
+})
+
+test('localhost generates no token — nothing off this machine can reach it', async () => {
+  const auth = await resolveAuth({} as NodeJS.ProcessEnv)
+  assert.equal(auth.token, undefined)
+  assert.equal(auth.generated, false)
 })
 
 test('localhost needs no token', () => {
-  assert.doesNotThrow(() => assertBindIsSafe({ bind: '127.0.0.1', token: undefined }))
-  assert.doesNotThrow(() => assertBindIsSafe({ bind: '::1', token: undefined }))
+  assert.doesNotThrow(() => assertBindIsSafe({ bind: '127.0.0.1', token: undefined, generated: false }))
+  assert.doesNotThrow(() => assertBindIsSafe({ bind: '::1', token: undefined, generated: false }))
 })
 
 test('a wider bind without a token is refused at boot', () => {
   for (const bind of ['0.0.0.0', '192.168.1.10', '::']) {
-    assert.throws(() => assertBindIsSafe({ bind, token: undefined }), InsecureBind, bind)
+    assert.throws(() => assertBindIsSafe({ bind, token: undefined, generated: false }), InsecureBind, bind)
   }
 })
 
 test('a wider bind with a token is allowed', () => {
-  assert.doesNotThrow(() => assertBindIsSafe({ bind: '0.0.0.0', token: 'secret' }))
+  assert.doesNotThrow(() => assertBindIsSafe({ bind: '0.0.0.0', token: 'secret', generated: false }))
 })
 
-test('an empty token counts as no token', () => {
+test('an empty env token falls through to the stored one', async () => {
   // Otherwise `OGUN_TOKEN=` in a .env silently disables the check it looks like it sets.
-  assert.equal(resolveAuth({ OGUN_TOKEN: '   ' } as NodeJS.ProcessEnv).token, undefined)
-  assert.throws(() => assertBindIsSafe({ bind: '0.0.0.0', token: undefined }), InsecureBind)
+  const auth = await resolveAuth({ OGUN_TOKEN: '   ' } as NodeJS.ProcessEnv)
+  assert.equal(auth.token, undefined, 'localhost still needs none')
+  assert.throws(
+    () => assertBindIsSafe({ bind: '0.0.0.0', token: undefined, generated: false }),
+    InsecureBind,
+  )
+})
+
+test('a wider bind generates and stores a token rather than demanding one', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'ogun-auth-'))
+  const path = join(dir, 'local.json')
+  t.after(() => rm(dir, { recursive: true, force: true }))
+
+  const previous = process.env.OGUN_LOCAL_CONFIG
+  process.env.OGUN_LOCAL_CONFIG = path
+  t.after(() => {
+    if (previous === undefined) delete process.env.OGUN_LOCAL_CONFIG
+    else process.env.OGUN_LOCAL_CONFIG = previous
+  })
+
+  const first = await resolveAuth({ OGUN_BIND: '0.0.0.0' } as NodeJS.ProcessEnv)
+  assert.equal(first.generated, true)
+  assert.match(first.token ?? '', /^ogun_[0-9a-f]{64}$/)
+
+  // Stable across restarts, or every restart would invalidate every operator's session.
+  const second = await resolveAuth({ OGUN_BIND: '0.0.0.0' } as NodeJS.ProcessEnv)
+  assert.equal(second.token, first.token)
+  assert.equal(second.generated, false)
+
+  const stored = JSON.parse(await readFile(path, 'utf8')) as { server: { token: string } }
+  assert.equal(stored.server.token, first.token)
 })
 
 /**

@@ -130,11 +130,25 @@ export type WorkerInput = {
   expectedHash?: string
 }
 
+/** Thrown when the control plane needs a token this browser has not presented yet. */
+export class Unauthorized extends Error {}
+
 const json = async <T,>(path: string, init?: RequestInit): Promise<T> => {
-  const res = await fetch(path, init)
+  // credentials: same-origin so the session cookie rides along. Without it a
+  // token-protected control plane serves a page that cannot talk to itself.
+  const res = await fetch(path, { credentials: 'same-origin', ...init })
+  if (res.status === 401) throw new Unauthorized('this control plane requires a token')
   if (!res.ok) throw new Error(`${path}: ${res.status} ${await res.text().catch(() => '')}`)
   return res.json() as Promise<T>
 }
+
+/** Exchange the admin token for an httpOnly session cookie. */
+export const startSession = (token: string) =>
+  json<{ ok: boolean; required: boolean }>('/api/session', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ token }),
+  })
 
 export const api = {
   projects: () => json<{ projects: Array<{ id: string; slug: string; defaultBranch: string }> }>('/api/projects'),

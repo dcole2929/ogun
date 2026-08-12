@@ -11,7 +11,7 @@ export async function workersList(args: string[], serverUrl: string): Promise<vo
   const url = new URL('/api/workers', serverUrl)
   if (project) url.searchParams.set('project', project)
 
-  const res = await fetch(url, { headers: authHeaders() }).catch(() => null)
+  const res = await fetch(url, { headers: await authHeaders() }).catch(() => null)
   if (!res?.ok) fail(`could not reach the control plane at ${serverUrl}`)
   const { workers } = (await res.json()) as {
     workers: Array<{

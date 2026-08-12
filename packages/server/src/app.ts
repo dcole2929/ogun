@@ -4,7 +4,8 @@ import { logger } from 'hono/logger'
 import { serveStatic } from '@hono/node-server/serve-static'
 import { existsSync } from 'node:fs'
 import type { AppContext, Env } from './context.ts'
-import { requireScope, scopeForPath } from './auth.ts'
+import { deleteCookie, setCookie } from 'hono/cookie'
+import { requireScope, scopeForPath, SESSION_COOKIE } from './auth.ts'
 import { jobsRoutes } from './routes/jobs.ts'
 import { runsRoutes } from './routes/runs.ts'
 import { projectsRoutes } from './routes/projects.ts'
@@ -34,6 +35,31 @@ export function createApp(ctx: AppContext, token?: string) {
   app.use('/api/*', requireScope(token, scopeForPath))
 
   app.get('/api/health', (c) => c.json({ ok: true }))
+
+  /**
+   * Exchange the admin token for a session cookie. The UI calls this once, when it gets
+   * a 401 — a browser cannot attach an Authorization header to its own navigation, so
+   * without this a token-protected control plane serves a page that cannot talk to it.
+   */
+  app.post('/api/session', async (c) => {
+    if (!token) return c.json({ ok: true, required: false })
+    const body = (await c.req.json().catch(() => ({}))) as { token?: string }
+    if (!body.token || body.token !== token) return c.json({ error: 'wrong token' }, 401)
+    setCookie(c, SESSION_COOKIE, token, {
+      httpOnly: true,
+      sameSite: 'Strict',
+      path: '/',
+      maxAge: 60 * 60 * 24 * 30,
+      // Not `secure`: this is plain HTTP on a LAN or a VPN address. Marking it secure
+      // would stop the cookie being sent at all, which is worse than not marking it.
+    })
+    return c.json({ ok: true, required: true })
+  })
+
+  app.delete('/api/session', (c) => {
+    deleteCookie(c, SESSION_COOKIE, { path: '/' })
+    return c.json({ ok: true })
+  })
   app.route('/api/jobs', jobsRoutes)
   app.route('/api/runs', runsRoutes)
   app.route('/api/projects', projectsRoutes)

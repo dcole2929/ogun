@@ -10,6 +10,7 @@ import { WorkersPage } from './pages/Workers.tsx'
 import { CoveragePage } from './pages/Coverage.tsx'
 import { SkillDetailPage, SkillsPage } from './pages/Skills.tsx'
 import { RunnersPage } from './pages/Runners.tsx'
+import { TokenGate } from './TokenGate.tsx'
 
 const client = new QueryClient({
   defaultOptions: {
@@ -63,7 +64,9 @@ createRoot(document.getElementById('root')!).render(
   <StrictMode>
     <QueryClientProvider client={client}>
       <BrowserRouter>
-        <Shell />
+        <TokenGate>
+          <Shell />
+        </TokenGate>
       </BrowserRouter>
     </QueryClientProvider>
   </StrictMode>,

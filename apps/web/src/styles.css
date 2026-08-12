@@ -239,3 +239,11 @@ button.danger:hover:not(:disabled) { border-color: var(--red); }
 
 /* a bare .live is just the pulsing dot */
 .live:empty::before { margin: 0; }
+
+.gate {
+  display: grid;
+  place-items: center;
+  min-height: 100vh;
+  padding: 20px;
+}
+.gate input { margin-top: 4px; }

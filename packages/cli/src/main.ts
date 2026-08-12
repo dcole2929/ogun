@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { bold, cyan, dim, fail } from './output.ts'
 import { doctor } from './commands/doctor.ts'
-import { projectList, projectSync } from './commands/project.ts'
+import { projectAdd, projectList, projectSync } from './commands/project.ts'
 import { coverage, runsList, trigger } from './commands/runs.ts'
 import {
   checkCitations,
@@ -15,7 +15,7 @@ import { skillsList, skillsShow } from './commands/skills.ts'
 import { skillNew } from './commands/skill-new.ts'
 import { workersList } from './commands/workers.ts'
 import { runnerInit, runnerInvite, runnerJoin } from './commands/runner.ts'
-import { tokenNew } from './commands/token.ts'
+import { tokenRotate, tokenShow } from './commands/token.ts'
 import { runnerStart, serverStart } from './commands/serve.ts'
 
 const serverUrl = process.env.OGUN_SERVER_URL ?? 'http://localhost:7777'
@@ -35,11 +35,12 @@ ${bold('running it')}
   ogun image build [project-dir]   build ogun/base, or a project image
 
 ${bold('adding a machine')}
-  ogun token new                   admin secret, once, on the control plane
   ogun runner invite               on the CONTROL PLANE — mints a join token
   ogun runner join <url> --token   on the NEW MACHINE — paste what invite printed
+  ogun token show                  admin secret, to unlock the UI from another device
 
 ${bold('projects')}
+  ogun project add [dir]           tell this machine where a repo is checked out
   ogun project sync [dir]          read .ogun/config.yaml and register it
   ogun project list
 
@@ -77,9 +78,10 @@ try {
       break
 
     case 'project':
-      if (sub === 'sync') await projectSync(rest, serverUrl)
+      if (sub === 'add') await projectAdd(rest, serverUrl)
+      else if (sub === 'sync') await projectSync(rest, serverUrl)
       else if (sub === 'list' || sub === undefined) await projectList(serverUrl)
-      else fail('usage: ogun project sync [dir] | ogun project list')
+      else fail('usage: ogun project add [dir] | sync [dir] | list')
       break
 
     case 'server':
@@ -88,8 +90,9 @@ try {
       break
 
     case 'token':
-      if (sub === 'new' || sub === undefined) tokenNew(rest)
-      else fail('usage: ogun token new [--quiet]')
+      if (sub === 'show' || sub === undefined) await tokenShow(rest)
+      else if (sub === 'rotate') await tokenRotate()
+      else fail('usage: ogun token show [--quiet] | ogun token rotate')
       break
 
     case 'skill':
