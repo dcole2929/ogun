@@ -139,12 +139,16 @@ async function registerLocalPath(slug: string, root: string): Promise<void> {
 }
 
 /**
- * Ogun's own `.agents/skills/` is the built-in library — universal disciplines available
- * in every repo without copying them around. A project defining a skill of the same name
+ * Ogun's `skills/` directory is the built-in library — universal disciplines available in
+ * every repo without copying them around. A project defining a skill of the same name
  * overrides it.
+ *
+ * Deliberately not `.agents/skills/`: that is Ogun's own skills for reviewing Ogun,
+ * exactly as any other project has its own, and shipping those to other repositories
+ * would be nonsense.
  */
 export function builtinSkillsRoot(): string {
-  return resolve(fileURLToPath(new URL('../../../..', import.meta.url)), '.agents', 'skills')
+  return resolve(fileURLToPath(new URL('../../../..', import.meta.url)), 'skills')
 }
 
 const gitRemote = async (root: string): Promise<string | undefined> => {

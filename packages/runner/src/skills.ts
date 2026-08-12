@@ -159,6 +159,9 @@ export async function listAvailableSkills(
 export function defaultSearchPaths(): SkillSearchPath[] {
   return [
     { root: expandHome('~/.ogun/skills'), origin: 'machine' },
-    { root: fileURLToPath(new URL('../../../.agents/skills', import.meta.url)), origin: 'builtin' },
+    // `skills/`, not `.agents/skills/`. The latter is Ogun reviewing itself, which is
+    // the same relationship any project has to its own skills — it would make no sense
+    // to ship those to other repositories.
+    { root: fileURLToPath(new URL('../../../skills', import.meta.url)), origin: 'builtin' },
   ]
 }

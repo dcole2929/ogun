@@ -45,8 +45,9 @@ test('every page renders with no data', () => {
 })
 
 test('SKILL.md renders every block type it uses', () => {
-  // cwd is apps/web — the bundle's own location is not a stable base after esbuild.
-  const source = readFileSync('../../.agents/skills/adversarial-review/SKILL.md', 'utf8')
+  // cwd is apps/web. skills/ is the library ogun ships; .agents/skills is ogun
+  // reviewing itself, which is a different thing.
+  const source = readFileSync('../../skills/adversarial-review/SKILL.md', 'utf8')
   const html = renderToString(<Markdown source={source} />)
   for (const cls of ['md-frontmatter', 'md-h1', 'md-h2', 'md-table', 'md-code', 'md-list']) {
     assert.match(html, new RegExp(cls), `missing ${cls}`)
