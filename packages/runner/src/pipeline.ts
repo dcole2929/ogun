@@ -87,7 +87,8 @@ export async function executeJob(
     if (!localPath && !job.remoteUrl) {
       return await fail(
         `no way to obtain "${job.projectSlug}": this runner has no local path for it, and ` +
-          'the project has no remote url. Add one, or register a path in ~/.ogun/runner.json.',
+          'the project has no remote url. Add one, or run `ogun project add` inside a\n' +
+          'local checkout on this machine.',
       )
     }
 

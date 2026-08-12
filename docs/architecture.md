@@ -103,8 +103,8 @@ the server's.
 What this costs: the control plane needs a local path for a project to edit it. That is
 recoverable rather than fundamental — the rule §4.5 actually protects is *no absolute
 path in the database*, since `/home/doug/dev/x` and `/Users/doug/dev/x` are the same
-project. So the path map is machine-local (`~/.ogun/projects.json`, written by
-`ogun project sync`, same posture as `runner.json`) and never crosses the API. A control
+project. So the path map is machine-local (`~/.ogun/local.json`, written by
+`ogun project add` and `ogun project sync`) and never crosses the API. A control
 plane with no local copy reports that it cannot edit and returns the YAML block to paste
 by hand — which is the hosted case, and the seam where `ConfigStore` grows a second
 implementation that writes through the GitHub API.
@@ -234,14 +234,35 @@ same when a home server appears.
 **The repo registry is per-runner, never global.** `/home/doug/dev/x` on WSL2 vs
 `/Users/doug/dev/x` on macOS. No absolute path is ever stored in the database.
 
+**A local checkout is an optimisation, not a requirement.** [settled] A runner with no
+path for a project clones from its remote, so a machine that joined a minute ago can work
+on anything. Registering one — `ogun project add` inside the repo — makes it faster, works
+offline, and lets a co-located control plane edit that project's `config.yaml`.
+
+**One machine-local file, not one per component.** [settled] `~/.ogun/local.json` holds
+everything this box knows. There were briefly two — one for the server's path map, one
+for the runner's — both answering "where is project X on this disk" and able to disagree.
+A machine has one filesystem, so it has one map.
+
 ```jsonc
-// ~/.ogun/runner.json — machine-local, never synced
+// ~/.ogun/local.json — machine-local, never synced, mode 0600
 {
-  "runnerId": "wsl-desktop",
-  "labels": ["claude", "codex", "docker"],
+  // Optional. Absent, a runner clones from the project's remote instead.
   "projects": { "ogun": "/home/doug/dev/ogun" },
-  "scratch": "/home/doug/.ogun/work",
-  "maxConcurrentJobs": 2
+
+  // Present once this machine runs a control plane bound beyond localhost.
+  // Generated on first start; never typed in.
+  "server": { "token": "ogun_…" },
+
+  // Present once this machine is a runner.
+  "runner": {
+    "id": "wsl-desktop",
+    "labels": ["claude", "codex", "docker"],
+    "serverUrl": "http://localhost:7777",
+    "token": "ogr_…",
+    "maxConcurrentJobs": 2,
+    "scratch": "~/.ogun/work"
+  }
 }
 ```
 
@@ -995,7 +1016,7 @@ ogun/
   .ogun/          ogun's own project config — it reviews itself
   .agents/skills/ the skills ogun runs
 
-~/.ogun/          machine-local: runner.json, global skills, cache volumes
+~/.ogun/          machine-local: local.json, skills, workspaces, cache volumes
 ```
 
 Stack: Node 26 (via asdf), Hono, Vite + React (no Next), Postgres + Drizzle, croner,
