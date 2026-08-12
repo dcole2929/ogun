@@ -32,7 +32,7 @@ export function tokenNew(args: string[]): void {
         'defining what runs on the host. Runners do not need it and should not have it —',
         'enroll each machine instead, which gives it a token scoped to claiming work:',
         '',
-        `  ${green('ogun runner add <name>')}   or the Runners page`,
+        `  ${green('ogun runner invite <name>')}   or the Runners page`,
       ].join('\n'),
     ),
   )

@@ -37,6 +37,7 @@ export function RunnersPage() {
         <EnrollForm
           addresses={data?.addresses ?? []}
           tokenRequired={data?.tokenRequired ?? false}
+          warning={data?.reachabilityWarning ?? null}
           onDone={() => setAdding(false)}
         />
       )}
@@ -140,10 +141,12 @@ function RunnerTable({ runners }: { runners: NonNullable<Awaited<ReturnType<type
 function EnrollForm({
   addresses,
   tokenRequired,
+  warning,
   onDone,
 }: {
   addresses: string[]
   tokenRequired: boolean
+  warning: string | null
   onDone: () => void
 }) {
   const qc = useQueryClient()
@@ -182,6 +185,20 @@ function EnrollForm({
   return (
     <div className="card" style={{ marginBottom: 22 }}>
       <h2 style={{ marginTop: 0 }}>Add a runner</h2>
+
+      {/* Shown before the form, not after a failed connection: an address that looks
+          plausible and cannot work is the most expensive thing to debug here. */}
+      {warning && (
+        <>
+          <p className="error" style={{ fontSize: 13, marginTop: 0 }}>
+            The detected address will not reach this machine from another one.
+          </p>
+          <pre className="md-code" style={{ fontSize: 11 }}>
+            {warning}
+          </pre>
+        </>
+      )}
+
       <div className="form">
         <label>
           <span>Name</span>

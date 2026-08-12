@@ -172,6 +172,7 @@ export const api = {
       }>
       /** Addresses this control plane believes it is reachable at. */
       addresses: string[]
+      reachabilityWarning: string | null
       tokenRequired: boolean
     }>('/api/runners'),
   enrollRunner: (input: { id: string; labels: string[]; serverUrl?: string }) =>

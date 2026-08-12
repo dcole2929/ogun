@@ -50,7 +50,7 @@ export function assertBindIsSafe(config: AuthConfig): void {
       '',
       '  ogun token new            # prints a token and the export line',
       '',
-      'Runners are enrolled separately and get their own tokens — see `ogun runner add`',
+      'Runners are enrolled separately and get their own tokens — see `ogun runner invite`',
       'or the Runners page.',
     ].join('\n'),
   )

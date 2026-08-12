@@ -64,15 +64,15 @@ async function detectLabels(): Promise<string[]> {
 
 
 /**
- * `ogun runner add <name>` — enroll a machine from the CLI, the same operation the
- * Runners page performs. Prints the command to run *on that machine*.
+ * `ogun runner invite <name>` — run this **on the control plane**. Mints a credential
+ * for a machine that does not have one yet, and prints the command to run over there.
  *
- * Note the direction: this mints a credential here and you carry it there. The control
- * plane never dials a runner, which is what lets a laptop be one.
+ * Named invite/join rather than add/join because `add` reads as something you do on the
+ * machine being added, which is the opposite of where it runs.
  */
-export async function runnerAdd(args: string[], serverUrl: string): Promise<void> {
+export async function runnerInvite(args: string[], serverUrl: string): Promise<void> {
   const name = args.find((a) => !a.startsWith('--'))
-  if (!name) fail('usage: ogun runner add <name> [--labels claude,codex,docker] [--url <server>]')
+  if (!name) fail('usage: ogun runner invite <name> [--labels claude,codex,docker] [--url <server>]')
 
   const labels = (argValue(args, '--labels') ?? '').split(',').filter(Boolean)
   const res = await fetch(`${serverUrl}/api/runners`, {
@@ -90,7 +90,15 @@ export async function runnerAdd(args: string[], serverUrl: string): Promise<void
   }
   const body = (await res!.json()) as { token: string; command: string }
 
-  console.log(green(`enrolled ${name}`))
+  const warning = await fetch(`${serverUrl}/api/runners`, { headers: authHeaders() })
+    .then((r) => r.json() as Promise<{ reachabilityWarning: string | null }>)
+    .then((d) => d.reachabilityWarning)
+    .catch(() => null)
+
+  console.log(green(`invited ${name}`))
+  if (warning) {
+    console.log(`\n${dim(warning)}\n`)
+  }
   console.log(bold('\nRun this on that machine:\n'))
   console.log(`  ${body.command.split('\n').join('\n  ')}`)
   console.log(
@@ -106,8 +114,9 @@ export async function runnerAdd(args: string[], serverUrl: string): Promise<void
 }
 
 /**
- * `ogun runner join <url> --token <t> --name <n>` — run on the *new* machine. Writes
- * runner.json so `pnpm runner` needs no further arguments.
+ * `ogun runner join <url> --token <t>` — run this **on the new machine**, with the
+ * command `ogun runner invite` printed. Writes runner.json so `pnpm runner` needs no
+ * further arguments.
  */
 export async function runnerJoin(args: string[]): Promise<void> {
   const url = args.find((a) => a.startsWith('http'))
@@ -160,7 +169,7 @@ export async function runnerJoin(args: string[]): Promise<void> {
     (r) => r.status !== 401 && r.status !== 403,
     () => false,
   )
-  if (!authorized) fail('the control plane rejected that token — re-issue it with `ogun runner add`')
+  if (!authorized) fail('the control plane rejected that token — re-issue it with `ogun runner invite`')
 
   console.log(green(`joined ${url} as ${name}`))
   console.log(dim(`  wrote ${path}`))

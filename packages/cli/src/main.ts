@@ -14,7 +14,7 @@ import { imageBuild } from './commands/image.ts'
 import { skillsList, skillsShow } from './commands/skills.ts'
 import { skillNew } from './commands/skill-new.ts'
 import { workersList } from './commands/workers.ts'
-import { runnerAdd, runnerInit, runnerJoin } from './commands/runner.ts'
+import { runnerInit, runnerInvite, runnerJoin } from './commands/runner.ts'
 import { tokenNew } from './commands/token.ts'
 
 const serverUrl = process.env.OGUN_SERVER_URL ?? 'http://localhost:7777'
@@ -32,10 +32,10 @@ ${bold('setup')}
   ogun runner doctor               what this machine can actually run
   ogun image build [project-dir]   build ogun/base, or a project image
 
-${bold('more machines')}
+${bold('more machines')}   (invite runs HERE, join runs on the OTHER machine)
   ogun token new                   admin secret, for a control plane on a network
-  ogun runner add <name>           enroll a machine; prints the command to run there
-  ogun runner join <url> --token   run on the new machine to connect it back
+  ogun runner invite <name>        mint a token, print the command to run over there
+  ogun runner join <url> --token   paste that command on the new machine
 
 ${bold('projects')}
   ogun project sync [dir]          read .ogun/config.yaml and register it
@@ -68,9 +68,9 @@ try {
     case 'runner':
       if (sub === 'doctor') await doctor(serverUrl)
       else if (sub === 'init') await runnerInit(rest)
-      else if (sub === 'add') await runnerAdd(rest, serverUrl)
+      else if (sub === 'invite') await runnerInvite(rest, serverUrl)
       else if (sub === 'join') await runnerJoin(rest)
-      else fail('usage: ogun runner init | doctor | add <name> | join <url> --token <t>')
+      else fail('usage: ogun runner init | doctor | invite <name> | join <url> --token <t>')
       break
 
     case 'project':

@@ -1,4 +1,5 @@
 import { Hono } from 'hono'
+import { readFileSync } from 'node:fs'
 import { networkInterfaces } from 'node:os'
 import { desc, eq } from 'drizzle-orm'
 import { z } from 'zod'
@@ -45,6 +46,8 @@ runnersRoutes.get('/', async (c) => {
     })),
     /** Addresses this control plane believes it is reachable at, for the paste command. */
     addresses: reachableAddresses(),
+    /** Why an address may not work from another machine, when we can tell in advance. */
+    reachabilityWarning: reachabilityWarning(),
     tokenRequired: Boolean(process.env.OGUN_TOKEN?.trim()),
   })
 })
@@ -113,6 +116,47 @@ runnersRoutes.delete('/:id', async (c) => {
   if (!row) return c.json({ error: 'no such runner' }, 404)
   return c.json({ revoked: row.id })
 })
+
+/**
+ * WSL2 sits behind a NAT'd virtual switch. Windows can reach the distro, but nothing
+ * else on the LAN can, so the eth0 address is exactly the wrong thing to paste into
+ * another machine's config — and it looks plausible, which is worse than looking wrong.
+ *
+ * Detected rather than assumed, because the answer differs per Windows version and per
+ * .wslconfig.
+ */
+export function reachabilityWarning(): string | null {
+  if (!isWsl()) return null
+  const addrs = reachableAddresses()
+  const hasOverlay = addrs.some((a) => a.includes('://100.'))
+  if (hasOverlay) return null
+  return [
+    'This control plane is on WSL2, whose address is private to Windows — another',
+    'machine on your network cannot reach it as-is. Three ways out, cheapest first:',
+    '',
+    '  1. Mirrored networking (Windows 11 22H2+): add to %USERPROFILE%\\.wslconfig',
+    '       [wsl2]',
+    '       networkingMode=mirrored',
+    '     then `wsl --shutdown`. WSL then shares the Windows LAN address.',
+    '',
+    '  2. A mesh VPN such as Tailscale, installed inside WSL2. Gives a stable 100.x',
+    '     address that works from any network, not just this one — the right answer if',
+    '     a runner is ever off your LAN.',
+    '',
+    '  3. Port forwarding, from an elevated PowerShell:',
+    '       netsh interface portproxy add v4tov4 listenport=7777 \\',
+    '         connectaddress=<wsl-ip> connectport=7777',
+    '     Brittle: the WSL address changes on reboot.',
+  ].join('\n')
+}
+
+const isWsl = (): boolean => {
+  try {
+    return readFileSync('/proc/version', 'utf8').toLowerCase().includes('microsoft')
+  } catch {
+    return false
+  }
+}
 
 const enrollCommand = (id: string, url: string, token: string): string =>
   [
