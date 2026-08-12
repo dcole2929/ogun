@@ -155,11 +155,22 @@ function WorkerCard({
             skill <Link to={`/skills/${row.project.slug}/${w.skillRef}`}>{w.skillRef}</Link> ·
             model {w.modelRole}
           </div>
-          {typeof w.config?.prompt === 'string' && (
-            <div className="mono muted" style={{ marginTop: 6, fontSize: 12 }}>
-              {String(w.config.prompt)}
-            </div>
-          )}
+          <div className="mono muted" style={{ marginTop: 6, fontSize: 12 }}>
+            {row.effectivePrompt.text}
+            {row.effectivePrompt.source !== 'worker' && (
+              <span
+                className="pill"
+                style={{ marginLeft: 8 }}
+                title={
+                  row.effectivePrompt.source === 'skill'
+                    ? "no override on this worker — it uses the skill's default_prompt"
+                    : 'the skill declares no default_prompt, so this is synthesised'
+                }
+              >
+                from {row.effectivePrompt.source}
+              </span>
+            )}
+          </div>
         </div>
 
         <div className="row" style={{ whiteSpace: 'nowrap' }}>

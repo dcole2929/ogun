@@ -256,3 +256,117 @@ describe('re-sighting a finding', { skip: reachable ? false : 'no control plane 
     assert.equal((await current()).status, 'open')
   })
 })
+
+/**
+ * The prompt layers, most specific first (§5.1): a trigger override, then a cycle node,
+ * then the worker, then the skill's own `default_prompt`, then a synthesised fallback.
+ *
+ * The skill layer was missing — sync stored `default_prompt` and nothing ever read it.
+ * It went unnoticed because the fallback produced the same string for a skill whose
+ * declared prompt was the obvious one-liner.
+ */
+describe('prompt resolution', { skip: reachable ? false : 'no control plane running' }, () => {
+  const { db, close } = createDb(url)
+  const slug = `prompt-${Date.now()}`
+  let projectId = ''
+
+  before(async () => {
+    const [p] = await db.insert(schema.projects).values({ slug }).returning()
+    projectId = p!.id
+    await db.insert(schema.skills).values({
+      projectId,
+      name: 'review',
+      sourcePath: '.agents/skills/review',
+      versionHash: 'sv1',
+      // Deliberately not "Use the review skill." — the fallback would mask the bug.
+      defaultPrompt: 'Use the review skill and start from the last deploy.',
+    })
+  })
+
+  after(async () => {
+    await db.delete(schema.projects).where(eq(schema.projects.id, projectId))
+    await close()
+  })
+
+  const promptFor = async (
+    name: string,
+    config: Record<string, unknown>,
+    overrides?: Record<string, string>,
+  ) => {
+    const [w] = await db
+      .insert(schema.workers)
+      .values({
+        projectId,
+        name,
+        skillRef: 'review',
+        runtime: 'claude',
+        versionHash: `v-${name}`,
+        config,
+      })
+      .returning()
+    const [c] = await db
+      .insert(schema.cycles)
+      .values({ projectId, name, definition: singleWorkerCycle(name) })
+      .returning()
+    const { cycleRunId } = await startCycleRun(db, {
+      cycleId: c!.id,
+      trigger: 'test',
+      ...(overrides ? { promptOverrides: overrides } : {}),
+    })
+    const [job] = await db
+      .select()
+      .from(schema.jobs)
+      .where(eq(schema.jobs.cycleRunId, cycleRunId))
+    void w
+    return job!.prompt
+  }
+
+  test("a worker with no prompt inherits the skill's default_prompt", async () => {
+    assert.equal(
+      await promptFor('inherits', {}),
+      'Use the review skill and start from the last deploy.',
+    )
+  })
+
+  test('a worker prompt overrides the skill default', async () => {
+    assert.equal(await promptFor('overrides', { prompt: 'Only look at auth.' }), 'Only look at auth.')
+  })
+
+  test('a trigger override beats both', async () => {
+    assert.equal(
+      await promptFor('triggered', { prompt: 'Only look at auth.' }, { triggered: 'Just this once.' }),
+      'Just this once.',
+    )
+  })
+
+  test('a skill with no declared prompt falls back to a synthesised one', async () => {
+    await db.insert(schema.skills).values({
+      projectId,
+      name: 'bare',
+      sourcePath: '.agents/skills/bare',
+      versionHash: 'sv2',
+    })
+    const [w] = await db
+      .insert(schema.workers)
+      .values({
+        projectId,
+        name: 'bare-worker',
+        skillRef: 'bare',
+        runtime: 'claude',
+        versionHash: 'v-bare',
+        config: {},
+      })
+      .returning()
+    const [c] = await db
+      .insert(schema.cycles)
+      .values({ projectId, name: 'bare-worker', definition: singleWorkerCycle('bare-worker') })
+      .returning()
+    const { cycleRunId } = await startCycleRun(db, { cycleId: c!.id, trigger: 'test' })
+    const [job] = await db
+      .select()
+      .from(schema.jobs)
+      .where(eq(schema.jobs.cycleRunId, cycleRunId))
+    void w
+    assert.equal(job!.prompt, 'Use the bare skill.')
+  })
+})

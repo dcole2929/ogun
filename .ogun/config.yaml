@@ -12,6 +12,12 @@ workers:
     # Phase 1 has no cron; the schedule is recorded so phase 2 has something to read.
     schedule: "0 3 * * *"
     onMissed: skip
+  security-review:
+    skill: adversarial-review
+    runtime: codex
+    model: reviewer
+    prompt: Use the adversarial-review skill. Focus on authorization boundaries,
+      trust boundaries, and anything that handles credentials.
 
 policies:
   directPush: false

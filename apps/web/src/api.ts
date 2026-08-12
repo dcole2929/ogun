@@ -106,6 +106,11 @@ export type WorkerRow = {
     config: Record<string, unknown>
   }
   project: { slug: string }
+  /**
+   * What a run would actually use. `skill` means the worker inherits its skill's
+   * default_prompt rather than having none of its own.
+   */
+  effectivePrompt: { text: string; source: 'worker' | 'skill' | 'fallback' }
 }
 
 /** What the config.yaml looks like after an edit, so the UI can show what it changed. */

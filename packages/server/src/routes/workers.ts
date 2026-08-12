@@ -83,9 +83,17 @@ workersRoutes.get('/', async (c) => {
   if (slug && !project) return c.json({ error: 'no such project' }, 404)
 
   const rows = await db
-    .select({ worker: workers, project: { slug: projects.slug } })
+    .select({
+      worker: workers,
+      project: { slug: projects.slug },
+      // The prompt a run would actually use, and where it came from. A worker with no
+      // prompt of its own is not a worker with no prompt — it inherits the skill's, and
+      // showing a blank field invites exactly the question "why has this one got none?"
+      skillPrompt: skills.defaultPrompt,
+    })
     .from(workers)
     .innerJoin(projects, eq(projects.id, workers.projectId))
+    .leftJoin(skills, eq(skills.id, workers.skillId))
     .where(project ? eq(workers.projectId, project.id) : undefined)
     .orderBy(workers.name)
 
@@ -99,7 +107,14 @@ workersRoutes.get('/', async (c) => {
     if (editable[s]) hashes[s] = (await config.read(s)).hash
   }
 
-  return c.json({ workers: rows, editable, hashes })
+  return c.json({
+    workers: rows.map((r) => ({
+      ...r,
+      effectivePrompt: effectivePrompt(r.worker, r.skillPrompt),
+    })),
+    editable,
+    hashes,
+  })
 })
 
 workersRoutes.post('/', async (c) => {
@@ -189,6 +204,17 @@ workersRoutes.delete('/:id', async (c) => {
     return c.json(f.body, f.status)
   }
 })
+
+/** Mirrors the layering in startCycleRun (§5.1), minus the per-run overrides. */
+function effectivePrompt(
+  worker: { skillRef: string; config: unknown },
+  skillPrompt: string | null,
+): { text: string; source: 'worker' | 'skill' | 'fallback' } {
+  const own = (worker.config as { prompt?: string } | null)?.prompt
+  if (own) return { text: own, source: 'worker' }
+  if (skillPrompt) return { text: skillPrompt, source: 'skill' }
+  return { text: `Use the ${worker.skillRef} skill.`, source: 'fallback' }
+}
 
 /** What the file looks like now, so the UI can show the diff it just caused. */
 const describe = (file: { path: string; text: string; hash: string }) => ({

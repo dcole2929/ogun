@@ -4,7 +4,7 @@ import type { Db } from '@ogun/core/db'
 import { cycleDefinitionSchema, isTerminal, type CycleDefinition, type JobState } from '@ogun/core'
 import { admit, DEFAULT_LIMITS, type AdmissionLimits } from './admission.ts'
 
-const { coverage, cycleRuns, cycles, jobs, workers } = schema
+const { coverage, cycleRuns, cycles, jobs, skills, workers } = schema
 
 export type StartCycleRunInput = {
   cycleId: string
@@ -33,6 +33,7 @@ export async function startCycleRun(
 
   const definition = cycleDefinitionSchema.parse(cycle.definition)
   const byName = await resolveWorkers(db, cycle.projectId, definition)
+  const skillPrompts = await resolveSkillPrompts(db, cycle.projectId)
 
   return db.transaction(async (tx) => {
     const [cycleRun] = await tx
@@ -52,10 +53,17 @@ export async function startCycleRun(
         : ({ allowed: false, reason: 'worker disabled' } as const)
 
       const state: JobState = !verdict.allowed ? 'skipped' : dependsOn.length ? 'blocked' : 'queued'
+      /**
+       * The prompt layers, most specific first (§5.1). The skill's own `default_prompt`
+       * from its agents/*.yaml is the base — it was being stored by sync and then never
+       * read, so a skill that declared anything other than the obvious one-liner had it
+       * silently ignored.
+       */
       const prompt =
         input.promptOverrides?.[node.key] ??
         node.prompt ??
         (worker.config as { prompt?: string }).prompt ??
+        skillPrompts.get(worker.skillRef) ??
         `Use the ${worker.skillRef} skill.`
 
       const [job] = await tx
@@ -174,6 +182,17 @@ export async function markCoverage(
         findingCount: fields.findingCount ?? 0,
       },
     })
+}
+
+/** A skill with no agents/*.yaml has no declared prompt; the caller falls back. */
+async function resolveSkillPrompts(db: Db, projectId: string): Promise<Map<string, string>> {
+  const rows = await db
+    .select({ name: skills.name, defaultPrompt: skills.defaultPrompt })
+    .from(skills)
+    .where(eq(skills.projectId, projectId))
+  return new Map(
+    rows.flatMap((r) => (r.defaultPrompt ? [[r.name, r.defaultPrompt] as const] : [])),
+  )
 }
 
 async function resolveWorkers(db: Db, projectId: string, definition: CycleDefinition) {

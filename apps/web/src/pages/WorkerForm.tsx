@@ -188,8 +188,14 @@ export function WorkerForm({ projectSlug, existing, configHash, onDone }: Worker
             placeholder={defaultPrompt}
           />
           <small className="muted">
-            The literal text handed to the agent. Leave blank to use the skill's default:{' '}
-            <span className="mono">{defaultPrompt}</span>
+            The literal text handed to the agent. Leave blank and the skill's own
+            <span className="mono"> default_prompt</span> is used — most workers want that.
+            {chosen && (
+              <>
+                {' '}
+                Here that is <span className="mono">{defaultPrompt}</span>
+              </>
+            )}
           </small>
         </label>
 
