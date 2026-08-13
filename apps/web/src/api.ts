@@ -167,6 +167,15 @@ export type WorkerRow = {
   project: { slug: string }
   /** Null when this worker has never failed. */
   breaker: { consecutiveFailures: number; openedAt: string | null } | null
+  /** Null when the worker has no `schedule:` — it only runs when triggered. */
+  schedule: {
+    cron: string | null
+    tz: string | null
+    onMissed: string | null
+    lastRunAt: string | null
+    enabled: boolean | null
+  } | null
+  nextRun: string | null
   /**
    * What a run would actually use. `skill` means the worker inherits its skill's
    * default_prompt rather than having none of its own.

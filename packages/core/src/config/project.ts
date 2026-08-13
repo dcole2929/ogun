@@ -43,6 +43,9 @@ export const workerSchema = z.object({
   /** Overrides the skill's own default_prompt. Usually absent. */
   prompt: z.string().optional(),
   schedule: z.string().optional(),
+  /** IANA name. Defaults to the control plane's own timezone, since "3am" in a config
+   *  file means three in the morning where you are. */
+  timezone: z.string().optional(),
   onMissed: z.enum(['skip', 'runOnce']).default('skip'),
   enabled: z.boolean().default(true),
   /** Capability labels a runner must advertise. Derived when omitted. */
