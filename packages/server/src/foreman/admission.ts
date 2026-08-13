@@ -41,17 +41,26 @@ export async function admit(
   return { allowed: true }
 }
 
-/** Re-checked at claim time because conditions change while a job sits in the queue —
- *  defence in depth, not the primary gate. */
-export async function hasCapacity(
+/**
+ * How many jobs may start right now, machine-wide. Re-checked at claim time because
+ * conditions change while a job sits in the queue — defence in depth, not the primary
+ * gate.
+ *
+ * A count rather than a boolean. "Is a slot free?" is the wrong question to ask on
+ * behalf of a caller that then takes as many jobs as *it* wants: with one job running
+ * and a cap of two, a runner reporting capacity 2 was handed two more. The cap exists
+ * because WSL2 will OOM (§8), so overshooting it is the failure it was written to
+ * prevent.
+ */
+export async function remainingCapacity(
   db: Db,
   limits: AdmissionLimits = DEFAULT_LIMITS,
-): Promise<boolean> {
+): Promise<number> {
   const [row] = await db
     .select({ n: count() })
     .from(jobs)
     .where(inArray(jobs.state, ['claimed', 'running']))
-  return (row?.n ?? 0) < limits.maxConcurrentJobs
+  return Math.max(0, limits.maxConcurrentJobs - (row?.n ?? 0))
 }
 
 export async function recordWorkerFailure(

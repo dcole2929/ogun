@@ -3,7 +3,7 @@ import { and, arrayContained, eq, isNull, sql } from 'drizzle-orm'
 import { schema } from '@ogun/core/db'
 import { claimRequestSchema, claimedJobSchema, type ClaimedJob } from '@ogun/core'
 import type { Env } from '../context.ts'
-import { DEFAULT_LIMITS, hasCapacity } from '../foreman/admission.ts'
+import { DEFAULT_LIMITS, remainingCapacity } from '../foreman/admission.ts'
 
 const { jobs, projects, runners, runs, workers } = schema
 
@@ -42,7 +42,13 @@ jobsRoutes.post('/claim', async (c) => {
     })
     .where(eq(runners.id, runner.id))
 
-  if (!(await hasCapacity(db, globalLimits))) return c.json({ jobs: [] })
+  /**
+   * The runner's `capacity` is what *it* has free; this is what the *machine* has free.
+   * The claim takes the smaller, or a runner that just started could take the whole
+   * queue regardless of what else is already running.
+   */
+  const slots = Math.min(body.capacity, await remainingCapacity(db, globalLimits))
+  if (slots <= 0) return c.json({ jobs: [] })
 
   /**
    * FOR UPDATE SKIP LOCKED is the whole reason postgres is here (§4.4). Two runners
@@ -63,7 +69,7 @@ jobsRoutes.post('/claim', async (c) => {
         and ${jobs.availableAt} <= now()
         and ${arrayContained(jobs.requires, body.labels)}
       order by ${jobs.priority} desc, ${jobs.createdAt} asc
-      limit ${body.capacity}
+      limit ${slots}
       for update skip locked
     )
     returning ${jobs.id} as id
