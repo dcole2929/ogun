@@ -39,6 +39,8 @@ const workerFields = z.object({
   sandbox: z.enum(SANDBOX_KINDS).default('container'),
   prompt: z.string().optional(),
   schedule: z.string().optional(),
+  /** What happens when the machine was asleep at the scheduled time (§4.2). */
+  onMissed: z.enum(['skip', 'runOnce']).default('skip'),
   timeoutMs: z.number().int().positive().optional(),
   enabled: z.boolean().default(true),
 })
@@ -69,7 +71,9 @@ const updateSchema = z.object({
   sandbox: z.enum(SANDBOX_KINDS).optional(),
   /** An empty string clears it — the only way to remove a prompt override. */
   prompt: z.string().optional(),
+  /** An empty string removes the schedule, leaving a trigger-only worker. */
   schedule: z.string().optional(),
+  onMissed: z.enum(['skip', 'runOnce']).optional(),
   timeoutMs: z.number().int().positive().optional(),
   enabled: z.boolean().optional(),
   expectedHash: z.string().optional(),
@@ -140,6 +144,38 @@ workersRoutes.get('/', async (c) => {
     editable,
     hashes,
   })
+})
+
+/**
+ * What a cron expression will actually do, answered by the same parser the foreman uses.
+ *
+ * The alternative is a cron library in the browser, which would be a second
+ * implementation to disagree with the first — and the question you are really asking
+ * when you type an expression is "will *this system* fire when I think", not "is this
+ * valid in the abstract".
+ */
+workersRoutes.post('/schedule/preview', async (c) => {
+  const body = z
+    .object({ cron: z.string().min(1), tz: z.string().optional() })
+    .parse(await c.req.json())
+  const tz = body.tz ?? Intl.DateTimeFormat().resolvedOptions().timeZone ?? 'UTC'
+
+  try {
+    const parsed = parseSchedule(body.cron, tz)
+    const runs: string[] = []
+    let cursor = new Date()
+    // Three, because one tells you nothing about the interval and a list tells you
+    // whether "every 5 minutes" means what you hoped.
+    for (let i = 0; i < 3; i++) {
+      const next = parsed.nextRun(cursor)
+      if (!next) break
+      runs.push(next.toISOString())
+      cursor = next
+    }
+    return c.json({ valid: true, tz, nextRuns: runs })
+  } catch (err) {
+    return c.json({ valid: false, tz, nextRuns: [], error: (err as Error).message })
+  }
 })
 
 workersRoutes.post('/', async (c) => {
@@ -285,6 +321,9 @@ const toWorkerConfig = (input: z.infer<typeof workerFields>): WorkerConfig =>
     enabled: input.enabled,
     ...(input.prompt ? { prompt: input.prompt } : {}),
     ...(input.schedule ? { schedule: input.schedule } : {}),
+    // Carried explicitly. It was silently dropped here, so a worker asked to catch up
+    // after a missed night was written to config.yaml as `skip` and quietly did not.
+    ...(input.onMissed ? { onMissed: input.onMissed } : {}),
     ...(input.timeoutMs ? { timeoutMs: input.timeoutMs } : {}),
   })
 

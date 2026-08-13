@@ -2,7 +2,8 @@ import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link, useNavigate } from 'react-router'
 import { api, type WorkerRow } from '../api.ts'
-import { Empty, Page, Pill, when } from '../ui.tsx'
+import { Empty, exact, Page, Pill, when } from '../ui.tsx'
+import { describeSchedule } from '../ScheduleField.tsx'
 import { WorkerForm } from './WorkerForm.tsx'
 
 /** Mirrors policies.failureBreakerThreshold, whose default is 3 (§4.3). */
@@ -176,18 +177,21 @@ function WorkerCard({
           <div className="muted" style={{ fontSize: 12, marginTop: 3 }}>
             {row.schedule?.cron ? (
               <>
-                <span className="mono">{row.schedule.cron}</span>{' '}
-                <span title={row.schedule.tz ?? ''}>
-                  · next {row.nextRun ? when(row.nextRun) : 'never — expression is invalid'}
+                {/* Words first, expression on hover. "Every day at 3:00 AM" is what you
+                    are checking; the cron is what you edit. */}
+                <span title={`${row.schedule.cron}  (${row.schedule.tz ?? ''})`}>
+                  {describeSchedule(row.schedule.cron)}
+                </span>
+                {' · next '}
+                <span title={row.nextRun ? exact(row.nextRun) : ''}>
+                  {row.nextRun ? when(row.nextRun) : 'never — expression is invalid'}
                 </span>
                 {/* Only worth saying when it is not the default: this is what happens if
                     the machine is asleep at 3am, which on WSL2 it often is. */}
-                {row.schedule.onMissed === 'runOnce' && (
-                  <span> · catches up once if missed</span>
-                )}
+                {row.schedule.onMissed === 'runOnce' && <span> · catches up if missed</span>}
               </>
             ) : (
-              'no schedule — runs when triggered'
+              'runs only when triggered'
             )}
           </div>
           <div className="mono muted" style={{ marginTop: 6, fontSize: 12 }}>

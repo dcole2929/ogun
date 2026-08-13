@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, type WorkerRow } from '../api.ts'
+import { ScheduleField, type ScheduleValue } from '../ScheduleField.tsx'
 
 const RUNTIMES = ['claude', 'codex']
 const MODEL_ROLES = ['worker', 'reviewer']
@@ -45,6 +46,10 @@ export function WorkerForm({ projectSlug, existing, configHash, onDone }: Worker
   const [sandbox, setSandbox] = useState(existing?.sandbox ?? 'container')
   const [prompt, setPrompt] = useState(String(existing?.config?.prompt ?? ''))
   const [enabled, setEnabled] = useState(existing?.enabled ?? true)
+  const [schedule, setSchedule] = useState<ScheduleValue>({
+    cron: String(existing?.config?.schedule ?? ''),
+    onMissed: (existing?.config?.onMissed as 'skip' | 'runOnce') ?? 'skip',
+  })
 
   const chosen = skills.find((s) => s.skill.name === skill)
   const defaultPrompt = chosen?.skill.defaultPrompt ?? `Use the ${skill || '<skill>'} skill.`
@@ -70,8 +75,10 @@ export function WorkerForm({ projectSlug, existing, configHash, onDone }: Worker
         sandbox,
         enabled,
         // An empty string is how you clear a prompt override; omitting it would keep
-        // the old one on an edit.
+        // the old one on an edit. Same for the schedule.
         prompt: prompt.trim(),
+        schedule: schedule.cron.trim(),
+        onMissed: schedule.onMissed,
         ...(configHash ? { expectedHash: configHash } : {}),
       }
       return existing ? api.updateWorker(existing.id, input) : api.createWorker(input)
@@ -198,6 +205,8 @@ export function WorkerForm({ projectSlug, existing, configHash, onDone }: Worker
             )}
           </small>
         </label>
+
+        <ScheduleField value={schedule} onChange={setSchedule} />
 
         <label className="inline">
           <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} />

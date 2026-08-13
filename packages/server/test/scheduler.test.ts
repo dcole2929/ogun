@@ -177,3 +177,51 @@ describe('scheduler', () => {
     assert.ok(rows.every((r) => r.nextRun === null || r.nextRun > new Date()))
   })
 })
+
+/**
+ * A schedule set through the UI has to reach the foreman, not just `config.yaml`. The
+ * two are written by different code and it is possible for one to succeed silently
+ * without the other — `onMissed` did exactly that, arriving as `skip` no matter what was
+ * asked for, so a worker told to catch up quietly did not.
+ */
+describe('editing a schedule', () => {
+  let h: Awaited<ReturnType<typeof startHarness>>
+
+  before(async () => {
+    h = await startHarness()
+  })
+  after(async () => {
+    await h.stop()
+  })
+
+  const preview = async (cron: string) =>
+    (await (
+      await h.fetch('/api/workers/schedule/preview', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cron }),
+      })
+    ).json()) as { valid: boolean; nextRuns: string[]; error?: string }
+
+  test('a valid expression previews its next firings', async () => {
+    const r = await preview('0 3 * * *')
+    assert.equal(r.valid, true)
+    assert.equal(r.nextRuns.length, 3, 'one time tells you nothing about the interval')
+    assert.ok(new Date(r.nextRuns[0]!) > new Date())
+  })
+
+  test('an invalid one says so rather than silently never firing', async () => {
+    const r = await preview('every other tuesday')
+    assert.equal(r.valid, false)
+    assert.match(r.error ?? '', /not a valid cron/)
+    assert.deepEqual(r.nextRuns, [])
+  })
+
+  test('the preview uses the same parser the foreman does', async () => {
+    // A cron library in the browser would be a second implementation to disagree with
+    // the first, and the question being asked is "will *this system* fire when I think".
+    const r = await preview('*/15 * * * *')
+    const gaps = r.nextRuns.slice(1).map((t, i) => +new Date(t) - +new Date(r.nextRuns[i]!))
+    assert.deepEqual(gaps, [15 * 60_000, 15 * 60_000])
+  })
+})

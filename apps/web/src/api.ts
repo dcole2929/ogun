@@ -195,6 +195,9 @@ export type WorkerInput = {
   permissions: string
   sandbox: string
   prompt?: string
+  /** Cron expression. Empty string removes the schedule. */
+  schedule?: string
+  onMissed?: string
   enabled: boolean
   /** Compare-and-swap token, so two tabs cannot silently clobber each other. */
   expectedHash?: string
@@ -305,6 +308,15 @@ export const api = {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(input),
     }),
+  previewSchedule: (cron: string, tz?: string) =>
+    json<{ valid: boolean; tz: string; nextRuns: string[]; error?: string }>(
+      '/api/workers/schedule/preview',
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cron, tz }),
+      },
+    ),
   clearBreaker: (id: string) =>
     json<{ cleared: string }>(`/api/workers/${id}/breaker/clear`, { method: 'POST' }),
   deleteWorker: (id: string) =>
