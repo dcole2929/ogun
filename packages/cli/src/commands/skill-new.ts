@@ -169,13 +169,19 @@ const argValue = (args: string[], flag: string): string | undefined => {
  * Returns what it linked. A filesystem without symlink support loses nothing at run time
  * — the runner copies the skill into place regardless — only interactive discovery.
  */
-export async function linkForRuntimes(root: string, name: string): Promise<string[]> {
+export async function linkForRuntimes(
+  root: string,
+  name: string,
+  /** Repo-relative directory holding the skill. Must be inside the repo, or the link
+   *  would point outside a workspace clone and dangle in the container. */
+  source = '.agents/skills',
+): Promise<string[]> {
   const linked: string[] = []
   for (const runtimeDir of RUNTIME_SKILL_DIRS) {
     const target = join(root, runtimeDir, name)
     if (existsSync(target)) continue
     await mkdir(join(root, runtimeDir), { recursive: true })
-    await symlink(join('../..', '.agents', 'skills', name), target).then(
+    await symlink(join('../..', source, name), target).then(
       () => linked.push(`${runtimeDir}/${name}`),
       () => undefined,
     )
@@ -184,33 +190,47 @@ export async function linkForRuntimes(root: string, name: string): Promise<strin
 }
 
 /**
+ * Directories in this repo that hold authored skills, in the order a name is resolved.
+ *
+ * `skills/` is Ogun's own shipped library. Other projects will not have one, and for them
+ * a builtin is *copied* into the workspace by the runner rather than linked — a link out
+ * to wherever Ogun happens to be installed would dangle in a container and break on
+ * another machine. Inside this repo it is in-tree, so a relative link is safe.
+ */
+const LINKABLE_SOURCES = ['.agents/skills', 'skills'] as const
+
+/**
  * `ogun skill link` — do the same for skills authored before this existed, or checked
  * out on a filesystem that dropped the links.
  */
 export async function skillLink(args: string[]): Promise<void> {
   const root = resolve(argValue(args, '--dir') ?? process.cwd())
-  const authored = join(root, '.agents', 'skills')
-  if (!existsSync(authored)) {
-    fail(`${relative(root, authored) || '.agents/skills'} does not exist — nothing to link`)
+  const { readdir } = await import('node:fs/promises')
+
+  // First source wins, so a repo's own skill shadows a shipped one of the same name —
+  // the same precedence the runner applies when resolving a worker's skill.
+  const found = new Map<string, string>()
+  for (const source of LINKABLE_SOURCES) {
+    const dir = join(root, source)
+    if (!existsSync(dir)) continue
+    for (const entry of await readdir(dir, { withFileTypes: true })) {
+      if (!entry.isDirectory() || found.has(entry.name)) continue
+      if (existsSync(join(dir, entry.name, 'SKILL.md'))) found.set(entry.name, source)
+    }
   }
 
-  const { readdir } = await import('node:fs/promises')
-  const names = (await readdir(authored, { withFileTypes: true }))
-    .filter((e) => e.isDirectory() && existsSync(join(authored, e.name, 'SKILL.md')))
-    .map((e) => e.name)
-
-  if (names.length === 0) {
-    console.log(dim('no skills in .agents/skills/'))
+  if (found.size === 0) {
+    console.log(dim(`no skills in ${LINKABLE_SOURCES.join(' or ')}`))
     return
   }
 
   let total = 0
-  for (const name of names) {
-    const linked = await linkForRuntimes(root, name)
+  for (const [name, source] of found) {
+    const linked = await linkForRuntimes(root, name, source)
     total += linked.length
     console.log(
       linked.length > 0
-        ? green(`${name} → ${linked.join(', ')}`)
+        ? `${green(name)} ${dim(`(${source})`)} → ${linked.join(', ')}`
         : dim(`${name} — already linked`),
     )
   }
