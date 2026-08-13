@@ -12,7 +12,7 @@ import {
 } from './commands/findings.ts'
 import { imageBuild } from './commands/image.ts'
 import { skillsList, skillsShow } from './commands/skills.ts'
-import { skillNew } from './commands/skill-new.ts'
+import { skillLink, skillNew } from './commands/skill-new.ts'
 import { workersList } from './commands/workers.ts'
 import { runnerInit, runnerInvite, runnerJoin } from './commands/runner.ts'
 import { tokenRotate, tokenShow } from './commands/token.ts'
@@ -47,6 +47,7 @@ ${bold('projects')}
 
 ${bold('what can run')}
   ogun skill new <name>            scaffold .agents/skills/<name>/
+  ogun skill link                  link existing skills into .claude/ and .codex/
   ogun skills                      every skill, and which workers bind it
   ogun skills show <name>          read one, including its SKILL.md
   ogun workers                     every worker
@@ -98,8 +99,9 @@ try {
 
     case 'skill':
       if (sub === 'new') await skillNew(rest)
+      else if (sub === 'link') await skillLink(rest)
       else if (sub === 'show') await skillsShow(rest, serverUrl)
-      else fail('usage: ogun skill new <name> | ogun skill show <name>')
+      else fail('usage: ogun skill new <name> | link | show <name>')
       break
 
     case 'skills':

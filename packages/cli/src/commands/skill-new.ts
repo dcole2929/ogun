@@ -1,7 +1,25 @@
 import { existsSync } from 'node:fs'
-import { mkdir, writeFile } from 'node:fs/promises'
+import { mkdir, symlink, writeFile } from 'node:fs/promises'
 import { join, relative, resolve } from 'node:path'
 import { bold, cyan, dim, fail, green } from '../output.ts'
+
+/**
+ * Where each runtime natively discovers skills. Measured with the agents' own search
+ * tools disabled, so only native discovery could answer:
+ *
+ *   .claude/skills/   claude yes, codex no
+ *   .codex/skills/    claude no,  codex yes
+ *   .agents/skills/   claude no,  codex yes
+ *
+ * **There is no directory both read.** `.agents/skills/` looks neutral and is not — it
+ * is a location codex happens to also read, so authoring there alone means Claude Code
+ * cannot see the skill when you open the repo yourself.
+ *
+ * Ogun's runner papers over this for automated runs by copying into whichever directory
+ * the running runtime reads. Interactive use gets no such help, which is why the files
+ * live in one place and each runtime's directory links to it.
+ */
+const RUNTIME_SKILL_DIRS = ['.claude/skills', '.codex/skills'] as const
 
 /**
  * `ogun skill new <name>` — scaffold a skill in the repo.
@@ -40,10 +58,18 @@ review skill delegates to. Do not copy it here; reference it.\n`
 SKILL.md rather than inlining it.\n`
   await writeFile(join(dir, 'references', 'README.md'), sharedNote)
 
+  const linked = await linkForRuntimes(root, name)
+
   console.log(green(`created ${relative(root, dir)}`))
   console.log(dim('  SKILL.md            the mission — edit this first'))
   console.log(dim('  agents/ogun.yaml    display name, default prompt, invocation policy'))
   console.log(dim('  references/         shared procedure and background'))
+  if (linked.length > 0) {
+    console.log(dim(`\n  linked into ${linked.join(' and ')}`))
+    console.log(
+      dim('  — no runtime reads all three locations, so each gets a link to the one copy'),
+    )
+  }
   console.log(`\n${bold('Next')}`)
   console.log(`  1. write the mission in ${cyan(`${relative(root, dir)}/SKILL.md`)}`)
   console.log(`  2. ${cyan('ogun project sync')} to index it`)
@@ -130,4 +156,63 @@ policy:
 const argValue = (args: string[], flag: string): string | undefined => {
   const i = args.indexOf(flag)
   return i === -1 ? undefined : args[i + 1]
+}
+
+
+/**
+ * Link one authored skill into each runtime's own directory.
+ *
+ * Relative links, so they resolve identically in the repo, in a workspace clone made
+ * with `git clone --local --no-hardlinks`, and inside a container bind-mount — all three
+ * verified, since a link that dangles in the sandbox would be worse than none.
+ *
+ * Returns what it linked. A filesystem without symlink support loses nothing at run time
+ * — the runner copies the skill into place regardless — only interactive discovery.
+ */
+export async function linkForRuntimes(root: string, name: string): Promise<string[]> {
+  const linked: string[] = []
+  for (const runtimeDir of RUNTIME_SKILL_DIRS) {
+    const target = join(root, runtimeDir, name)
+    if (existsSync(target)) continue
+    await mkdir(join(root, runtimeDir), { recursive: true })
+    await symlink(join('../..', '.agents', 'skills', name), target).then(
+      () => linked.push(`${runtimeDir}/${name}`),
+      () => undefined,
+    )
+  }
+  return linked
+}
+
+/**
+ * `ogun skill link` — do the same for skills authored before this existed, or checked
+ * out on a filesystem that dropped the links.
+ */
+export async function skillLink(args: string[]): Promise<void> {
+  const root = resolve(argValue(args, '--dir') ?? process.cwd())
+  const authored = join(root, '.agents', 'skills')
+  if (!existsSync(authored)) {
+    fail(`${relative(root, authored) || '.agents/skills'} does not exist — nothing to link`)
+  }
+
+  const { readdir } = await import('node:fs/promises')
+  const names = (await readdir(authored, { withFileTypes: true }))
+    .filter((e) => e.isDirectory() && existsSync(join(authored, e.name, 'SKILL.md')))
+    .map((e) => e.name)
+
+  if (names.length === 0) {
+    console.log(dim('no skills in .agents/skills/'))
+    return
+  }
+
+  let total = 0
+  for (const name of names) {
+    const linked = await linkForRuntimes(root, name)
+    total += linked.length
+    console.log(
+      linked.length > 0
+        ? green(`${name} → ${linked.join(', ')}`)
+        : dim(`${name} — already linked`),
+    )
+  }
+  if (total === 0) console.log(dim('\nnothing to do'))
 }
