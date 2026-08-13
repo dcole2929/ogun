@@ -1,5 +1,6 @@
 import { bold, cyan, dim, fail, green, table, yellow } from '../output.ts'
 import { authHeaders } from '../auth.ts'
+import { parse } from '../args.ts'
 
 /**
  * `ogun workers` — what is defined, and when each one next runs.
@@ -39,7 +40,7 @@ const relative = (iso: string): string => {
 }
 
 export async function workersList(args: string[], serverUrl: string): Promise<void> {
-  const project = args.find((a) => !a.startsWith('--'))
+  const { first: project } = parse(args, {}, 'ogun workers [project]')
   const url = new URL('/api/workers', serverUrl)
   if (project) url.searchParams.set('project', project)
 

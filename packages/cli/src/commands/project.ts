@@ -12,6 +12,7 @@ import {
   updateLocalConfig,
 } from '@ogun/core'
 import { bold, cyan, dim, fail, green, table, yellow } from '../output.ts'
+import { parse } from '../args.ts'
 import { authHeaders } from '../auth.ts'
 
 const run = promisify(execFile)
@@ -23,7 +24,8 @@ const run = promisify(execFile)
  * the database (§4.5).
  */
 export async function projectSync(args: string[], serverUrl: string): Promise<void> {
-  const root = resolve(args[0] ?? process.cwd())
+  const { first } = parse(args, {}, 'ogun project sync [dir]')
+  const root = resolve(first ?? process.cwd())
   const loaded = await loadProjectConfig(root).catch((err) => {
     fail(`could not read ${root}/.ogun/config.yaml: ${(err as Error).message}`)
     throw err
@@ -185,7 +187,12 @@ async function registerLocalPath(slug: string, root: string): Promise<void> {
  * that project's config.yaml.
  */
 export async function projectAdd(args: string[], serverUrl: string): Promise<void> {
-  const root = resolve(args.find((a) => !a.startsWith('--')) ?? process.cwd())
+  const { flags, first } = parse(
+    args,
+    { '--name': 'string' },
+    'ogun project add [dir] [--name <slug>]',
+  )
+  const root = resolve(first ?? process.cwd())
 
   if (!existsSync(join(root, '.git'))) {
     fail(`${root} is not a git repository — point this at the repo itself`)
@@ -197,7 +204,7 @@ export async function projectAdd(args: string[], serverUrl: string): Promise<voi
   const configured = await loadProjectConfig(root)
     .then((l) => l.config.project.name)
     .catch(() => null)
-  const slug = argValue(args, '--name') ?? configured ?? basename(root)
+  const slug = flags.name ?? configured ?? basename(root)
 
   if (!configured) {
     console.log(

@@ -6,6 +6,7 @@ import {
   type FindingsDocument,
 } from '@ogun/core'
 import { bold, cyan, dim, fail, green, red, severityColor, table } from '../output.ts'
+import { parse } from '../args.ts'
 import { authHeaders } from '../auth.ts'
 
 /**
@@ -19,7 +20,8 @@ const OUTPUT_PATH = process.env.OGUN_OUTPUT_PATH ?? '.ogun-out/findings.json'
 
 /** `ogun findings write` — reads a findings document on stdin, validates, writes it. */
 export async function findingsWrite(args: string[]): Promise<void> {
-  const target = resolve(argValue(args, '--out') ?? OUTPUT_PATH)
+  const { flags } = parse(args, { '--out': 'string' }, 'ogun findings write [--out <file>]')
+  const target = resolve(flags.out ?? OUTPUT_PATH)
   const raw = await readStdin()
   if (raw.trim() === '') {
     fail('nothing on stdin. Pipe a JSON document: {"findings": [...]}')
@@ -63,7 +65,8 @@ export async function findingsWrite(args: string[]): Promise<void> {
 
 /** `ogun validate-findings <file>` — the schema tool check, runnable as a verify lens. */
 export async function validateFindings(args: string[]): Promise<void> {
-  const file = resolve(args[0] ?? OUTPUT_PATH)
+  const { first } = parse(args, {}, 'ogun validate-findings [file]')
+  const file = resolve(first ?? OUTPUT_PATH)
   const doc = await loadDocument(file)
   for (const f of doc.findings) {
     const fp = parseFingerprint(f.fingerprint)
@@ -78,7 +81,8 @@ export async function validateFindings(args: string[]): Promise<void> {
  * expensive step (§4.11).
  */
 export async function checkCitations(args: string[]): Promise<void> {
-  const file = resolve(args[0] ?? OUTPUT_PATH)
+  const { first } = parse(args, {}, 'ogun check-citations [file]')
+  const file = resolve(first ?? OUTPUT_PATH)
   const doc = await loadDocument(file)
   const { execFile } = await import('node:child_process')
   const { promisify } = await import('node:util')
@@ -137,8 +141,13 @@ export function findingsSchema(): void {
 
 /** `ogun findings list` — read the inbox from the control plane. */
 export async function findingsList(args: string[], serverUrl: string): Promise<void> {
-  const project = argValue(args, '--project')
-  const status = argValue(args, '--status') ?? 'open,triaged'
+  const { flags } = parse(
+    args,
+    { '--project': 'string', '--status': 'string' },
+    'ogun findings list [--project <slug>] [--status <a,b>]',
+  )
+  const project = flags.project
+  const status = flags.status ?? 'open,triaged'
   const url = new URL('/api/findings', serverUrl)
   if (project) url.searchParams.set('project', project)
   url.searchParams.set('status', status)
@@ -194,10 +203,6 @@ const readStdin = async (): Promise<string> => {
   return Buffer.concat(chunks).toString('utf8')
 }
 
-const argValue = (args: string[], flag: string): string | undefined => {
-  const i = args.indexOf(flag)
-  return i === -1 ? undefined : args[i + 1]
-}
 
 const EXAMPLE = `{
   "findings": [
