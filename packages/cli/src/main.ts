@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-import { bold, cyan, dim, fail } from './output.ts'
+import { cyan, fail, red } from './output.ts'
+import { helpFor, isHelpFlag, usage } from './help.ts'
 import { doctor } from './commands/doctor.ts'
 import { projectAdd, projectList, projectSync } from './commands/project.ts'
 import { coverage, runsList, trigger } from './commands/runs.ts'
@@ -21,59 +22,46 @@ import { dbDown, dbMigrate, dbStatus, dbUp } from './commands/db.ts'
 import { init } from './commands/init.ts'
 
 const serverUrl = process.env.OGUN_SERVER_URL ?? 'http://localhost:7777'
-const [command, sub, ...rest] = process.argv.slice(2)
+const argv = process.argv.slice(2)
+const [command, sub, ...rest] = argv
+
+/**
+ * Help is answered before dispatch, not inside each command. `ogun findings write` reads
+ * stdin and several others open a socket, so a `--help` handled after the switch would
+ * block or fail on an unreachable control plane rather than print anything.
+ */
+if (command === undefined || argv.some(isHelpFlag)) {
+  const path = argv.filter((a) => !isHelpFlag(a))
+  const topic = path.length > 0 ? helpFor(path) : undefined
+  if (topic) {
+    console.log(topic)
+  } else if (path.length > 0) {
+    console.error(red(`no help for: ${path.join(' ')}`) + '\n')
+    console.log(usage(serverUrl))
+    process.exit(1)
+  } else {
+    console.log(usage(serverUrl))
+  }
+  process.exit(0)
+}
+
+/**
+ * There is one usage text per command and it lives in help.ts, so an unknown subcommand
+ * prints that command's page rather than a second, drifting summary of it.
+ */
+const unknownSub = (command: string, sub: string | undefined): never => {
+  console.error(
+    `${red(sub ? `unknown: ogun ${command} ${sub}` : `ogun ${command} needs a subcommand`)}\n`,
+  )
+  console.error(helpFor([command]) ?? usage(serverUrl))
+  process.exit(1)
+}
 
 /**
  * The CLI is a peer to the UI, not an afterthought (§7) — and it is also the interface
  * the *agents* use. `findings write`, `validate-findings`, and `check-citations` run
  * inside the sandbox, which is what keeps output format out of the prompt (§4.10).
  */
-const usage = `${bold('ogun')} — a local-first software factory
-
-${bold('setup')}
-  ogun init                        database, schema, sandbox image — run this first
-  ogun db up | down | migrate | status
-  ogun image build [project-dir]   build ogun/base, or a project image
-
-${bold('running it')}
-  ogun server                      start the control plane and web UI
-  ogun runner init [--name]        make this machine a runner for it
-  ogun runner start                start a runner on this machine
-  ogun runner doctor               what this machine can actually run
-
-${bold('adding a machine')}
-  ogun runner invite               on the CONTROL PLANE — mints a join token
-  ogun runner join <url> --token   on the NEW MACHINE — paste what invite printed
-  ogun token show                  admin secret, to unlock the UI from another device
-
-${bold('projects')}
-  ogun project add [dir] [--name]  tell this machine where a repo is checked out
-  ogun project sync [dir]          read .ogun/config.yaml and register it
-  ogun project list
-
-${bold('what can run')}
-  ogun skill new <name>            scaffold .agents/skills/<name>/
-  ogun skill link                  link existing skills into .claude/ and .codex/
-  ogun skills                      every skill, and which workers bind it
-  ogun skills show <name>          read one, including its SKILL.md
-  ogun workers                     every worker
-
-${bold('running')}
-  ogun trigger <project> <worker>  queue a run now
-  ogun runs                        recent runs
-  ogun coverage <project>          what ran, what didn't, and why
-
-${bold('findings')}
-  ogun findings list [--project x] [--status open]
-  ogun findings schema             print the document shape
-
-${bold('used by skills, inside the sandbox')}
-  ogun findings write [--out f]    validate a findings document on stdin and write it
-  ogun validate-findings [file]    schema check          (verify lens)
-  ogun check-citations [file]      grounding check       (verify lens)
-
-${dim(`control plane: ${serverUrl}`)}`
-
 try {
   switch (command) {
     case 'runner':
@@ -82,14 +70,14 @@ try {
       else if (sub === 'init') await runnerInit(rest)
       else if (sub === 'invite') await runnerInvite(rest, serverUrl)
       else if (sub === 'join') await runnerJoin(rest)
-      else fail('usage: ogun runner start | doctor | init | invite | join <url> --token <t>')
+      else unknownSub('runner', sub)
       break
 
     case 'project':
       if (sub === 'add') await projectAdd(rest, serverUrl)
       else if (sub === 'sync') await projectSync(rest, serverUrl)
       else if (sub === 'list' || sub === undefined) await projectList(serverUrl)
-      else fail('usage: ogun project add [dir] | sync [dir] | list')
+      else unknownSub('project', sub)
       break
 
     case 'init':
@@ -101,25 +89,25 @@ try {
       else if (sub === 'down') await dbDown(rest)
       else if (sub === 'migrate') await dbMigrate()
       else if (sub === 'status' || sub === undefined) await dbStatus()
-      else fail('usage: ogun db up | down [--volumes] | migrate | status')
+      else unknownSub('db', sub)
       break
 
     case 'server':
       if (sub === undefined || sub === 'start') serverStart(rest)
-      else fail('usage: ogun server')
+      else unknownSub('server', sub)
       break
 
     case 'token':
       if (sub === 'show' || sub === undefined) await tokenShow(rest)
       else if (sub === 'rotate') await tokenRotate()
-      else fail('usage: ogun token show [--quiet] | ogun token rotate')
+      else unknownSub('token', sub)
       break
 
     case 'skill':
       if (sub === 'new') await skillNew(rest)
       else if (sub === 'link') await skillLink(rest)
       else if (sub === 'show') await skillsShow(rest, serverUrl)
-      else fail('usage: ogun skill new <name> | link | show <name>')
+      else unknownSub('skill', sub)
       break
 
     case 'skills':
@@ -150,7 +138,7 @@ try {
       if (sub === 'write') await findingsWrite(rest)
       else if (sub === 'schema') findingsSchema()
       else if (sub === 'list' || sub === undefined) await findingsList(rest, serverUrl)
-      else fail('usage: ogun findings list | write | schema')
+      else unknownSub('findings', sub)
       break
 
     case 'validate-findings':
@@ -163,19 +151,12 @@ try {
 
     case 'image':
       if (sub === 'build') await imageBuild(rest)
-      else fail('usage: ogun image build [project-dir]')
-      break
-
-    case 'help':
-    case '--help':
-    case '-h':
-    case undefined:
-      console.log(usage)
+      else unknownSub('image', sub)
       break
 
     default:
       console.error(`unknown command: ${cyan(command)}\n`)
-      console.log(usage)
+      console.log(usage(serverUrl))
       process.exit(1)
   }
 } catch (err) {
