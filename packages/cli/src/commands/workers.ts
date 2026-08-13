@@ -2,10 +2,42 @@ import { bold, cyan, dim, fail, green, table, yellow } from '../output.ts'
 import { authHeaders } from '../auth.ts'
 
 /**
- * `ogun workers` — the `WHERE` column is the one that matters. A `config` worker is
- * owned by the repo and edited there; a `ui` worker was created in the browser and
- * sync leaves it alone. Both run identically.
+ * `ogun workers` — what is defined, and when each one next runs.
+ *
+ * There used to be a `WHERE` column separating repo-defined workers from UI-created
+ * ones. It read `worker.origin`, which has never existed on a worker — the field is on
+ * `skills` — so the command crashed off a TTY. The column went rather than the field
+ * arriving: under the single-definition model there is nowhere else for a worker to
+ * live. The UI edits `.ogun/config.yaml`, so every worker is a repo worker.
  */
+/**
+ * When this worker next runs, and what decides that.
+ *
+ * A worker inside a cycle has no schedule of its own — the cycle owns it — so listing it
+ * as trigger-only would be wrong about the thing you are checking the table for.
+ */
+const runsWhen = (r: {
+  schedule: { cron: string } | null
+  nextRun: string | null
+  drivenBy: { cycle: string; nextRun: string | null } | null
+}): string => {
+  if (r.drivenBy) {
+    const via = `via ${r.drivenBy.cycle}`
+    return r.drivenBy.nextRun ? `${via} · ${relative(r.drivenBy.nextRun)}` : dim(via)
+  }
+  if (!r.schedule) return dim('on trigger')
+  return r.nextRun ? relative(r.nextRun) : yellow('never — bad expression')
+}
+
+/** Coarse on purpose: the question is "tonight or next week", not the minute. */
+const relative = (iso: string): string => {
+  const mins = Math.round((new Date(iso).getTime() - Date.now()) / 60_000)
+  if (mins < 1) return 'now'
+  if (mins < 60) return `in ${mins}m`
+  if (mins < 60 * 24) return `in ${Math.round(mins / 60)}h`
+  return `in ${Math.round(mins / (60 * 24))}d`
+}
+
 export async function workersList(args: string[], serverUrl: string): Promise<void> {
   const project = args.find((a) => !a.startsWith('--'))
   const url = new URL('/api/workers', serverUrl)
@@ -22,10 +54,12 @@ export async function workersList(args: string[], serverUrl: string): Promise<vo
         modelRole: string
         permissions: string
         sandbox: string
-        origin: string
         enabled: boolean
       }
       project: { slug: string }
+      schedule: { cron: string } | null
+      nextRun: string | null
+      drivenBy: { cycle: string; schedule: string | null; nextRun: string | null } | null
     }>
   }
 
@@ -44,7 +78,7 @@ export async function workersList(args: string[], serverUrl: string): Promise<vo
         bold('RUNTIME'),
         bold('PERMISSIONS'),
         bold('SANDBOX'),
-        bold('WHERE'),
+        bold('RUNS'),
       ],
       ...workers.map((r) => [
         r.worker.enabled ? green('●') : dim('○'),
@@ -56,7 +90,7 @@ export async function workersList(args: string[], serverUrl: string): Promise<vo
           ? yellow(r.worker.permissions)
           : r.worker.permissions,
         r.worker.sandbox,
-        dim(r.worker.origin),
+        runsWhen(r),
       ]),
     ]),
   )

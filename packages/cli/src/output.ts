@@ -1,6 +1,12 @@
 const ESC = String.fromCharCode(27)
 const isTTY = process.stdout.isTTY === true
-const paint = (code: string, s: string): string => (isTTY ? `${ESC}[${code}m${s}${ESC}[0m` : s)
+/**
+ * Total in `s`, because a colour helper is where a missing API field surfaces. Off a
+ * TTY an absent cell used to reach `table()` as `undefined` and crash on `.replace` —
+ * a listing command dying rather than printing a blank.
+ */
+const paint = (code: string, s: string): string =>
+  isTTY ? `${ESC}[${code}m${s ?? ''}${ESC}[0m` : (s ?? '')
 
 export const dim = (s: string) => paint('2', s)
 export const bold = (s: string) => paint('1', s)
@@ -25,7 +31,10 @@ export function table(rows: string[][]): string {
   return rows
     .map((r) =>
       r
-        .map((cell, i) => cell + ' '.repeat(Math.max(0, widths[i]! - stripAnsi(cell).length)))
+        .map((c, i) => {
+          const cell = c ?? ''
+          return cell + ' '.repeat(Math.max(0, widths[i]! - stripAnsi(cell).length))
+        })
         .join('  ')
         .trimEnd(),
     )
