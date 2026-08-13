@@ -1,10 +1,13 @@
 /**
- * The anvil from the favicon, inline.
+ * The anvil, inline.
  *
- * The same drawing rather than an <img src="/favicon.svg">: inline it inherits the page's
- * colours, so the mark shifts with the theme instead of carrying its own dark plate into
- * a light sidebar. The plate is dropped here — at 22px next to a word there is nothing to
- * separate it from.
+ * Identical to the favicon, plate and all. The first version dropped the plate here and
+ * let the anvil take the theme's accent colour, on the reasoning that a mark sitting on a
+ * known panel needs no ground of its own. That produced two different-looking marks —
+ * orange-on-white in a light sidebar, orange-on-dark in the tab — and "why do these not
+ * match" is the correct response to it.
+ *
+ * One drawing, carrying its own ground, legible on any background.
  */
 export function Mark({ size = 22 }: { size?: number }) {
   return (
@@ -16,13 +19,14 @@ export function Mark({ size = 22 }: { size?: number }) {
       aria-label="Ogun"
       style={{ flexShrink: 0 }}
     >
-      <g fill="var(--accent)" opacity="0.85">
+      <rect width="32" height="32" rx="7" fill="#d98b3a" />
+      <g fill="#17120b" opacity="0.55">
         <circle cx="7.5" cy="6.5" r="1.15" />
         <circle cx="11.5" cy="4.6" r="0.85" />
         <circle cx="4.6" cy="9.4" r="0.7" />
       </g>
       <path
-        fill="var(--accent)"
+        fill="#17120b"
         d="M3.2 13.6
            C5.4 12.2 7.6 11.6 9.6 11.5
            L26.4 11.5

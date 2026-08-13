@@ -2,33 +2,32 @@
   <!--
     An anvil, struck.
 
-    Ogun is the orisha of iron, metalwork, and tools — the patron of blacksmiths — so an
-    anvil is the obvious mark, and it is also one of the few shapes that survives being
-    16 pixels wide. Everything here is built for that size: one silhouette, no interior
-    detail, and a background plate so it holds up against both a light and a dark
-    browser tab.
+    Ogun is the orisha of iron and metalwork, patron of blacksmiths, so an anvil is the
+    obvious mark — and it is one of the few shapes that survives being 16 pixels wide.
+    Drawn for that size: one silhouette, no interior detail, and sparks off the horn
+    placed above the face so they read as motion rather than as noise on the outline.
 
-    Drawn rather than generated, because a favicon is mostly a test of whether the
-    silhouette still reads once it is smaller than the text beside it.
+    The mark carries its own ground rather than adapting to the page. A plate that
+    followed the theme would be dark in a dark tab and light in a light one, which means
+    the icon is a different thing depending on where you look at it — and the sidebar,
+    sitting on a known panel, would need a different treatment again. An orange field
+    with a dark anvil is one drawing, legible on any background, and identical in the tab
+    and in the menu.
   -->
-  <rect width="32" height="32" rx="7" fill="#16181d" />
+  <rect width="32" height="32" rx="7" fill="#d98b3a" />
 
-  <!--
-    The strike: three sparks off the horn. Placed above the face so they read as motion
-    at small sizes rather than as noise on the outline.
-  -->
-  <g fill="#d98b3a" opacity="0.9">
+  <g fill="#17120b" opacity="0.55">
     <circle cx="7.5" cy="6.5" r="1.15" />
     <circle cx="11.5" cy="4.6" r="0.85" />
     <circle cx="4.6" cy="9.4" r="0.7" />
   </g>
 
   <!--
-    The anvil. One path: horn tapering left, the face, the waist, and a base that flares
-    wider than the face so it sits rather than floats.
+    Horn tapering left, the face, the waist, and a base that flares wider than the face
+    so it sits rather than floats.
   -->
   <path
-    fill="#e8a24f"
+    fill="#17120b"
     d="M3.2 13.6
        C5.4 12.2 7.6 11.6 9.6 11.5
        L26.4 11.5
