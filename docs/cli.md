@@ -55,8 +55,11 @@ Idempotent, and it reports what it skipped: re-running it is how you pick up a n
 migration. The image is built now rather than at first use because a nightly run that has
 to build an image first is a nightly run that fails on a bad network.
 
-It checks whether this machine is registered as a runner but does not register it —
-that needs the control plane running, so it is `ogun runner init`, after `ogun server`.
+Registering this machine as a runner is the last step, and the only one that needs the
+control plane: name uniqueness is enforced there and nowhere else. So `ogun init` does it
+if the control plane is already up, and otherwise tells you to run `ogun runner init`
+after `ogun server`. Everything before that point needs nothing running, which is why
+`init` comes first.
 
 - `--no-image` — skip the image build. Quicker, but the first container job then has
   nothing to run inside.
@@ -108,13 +111,17 @@ sweeps stale claims, and reconciles coverage. One machine, and it stays running.
 connect outward to it and it never dials a runner, which is what lets a laptop behind NAT
 be one.
 
-No flags — it is configured by environment, because these are properties of the machine
-rather than of one invocation, and a systemd unit should not have to carry an argument
-list.
+`--port <n>` is the one flag, because running a second control plane on one machine is a
+real thing to want; it wins over `OGUN_PORT`. Everything else is environment, because
+these are properties of the machine rather than of one invocation, and a systemd unit
+should not have to carry an argument list.
+
+Unknown flags are refused rather than ignored. `ogun server --prot 8080` used to start on
+7777 and say so in a line nobody reads twice.
 
 | | |
 |---|---|
-| `OGUN_PORT` | listen port (7777) |
+| `OGUN_PORT` | listen port (7777) — `--port` wins over it |
 | `OGUN_BIND` | interface (127.0.0.1) |
 | `OGUN_ADMIN_TOKEN` | use this instead of the stored one |
 | `OGUN_STALE_CLAIM_MS` | how long a claim may go unreported before it is swept (45 minutes) |
@@ -145,7 +152,12 @@ invite token.
 - `--labels a,b` — extra capability labels for things Ogun cannot detect by looking for a
   binary: `gpu`, `staging-db`. A worker asks for one with `requires:`, and the job then
   only goes to a machine advertising it. `claude`, `codex` and `docker` are detected.
-- `--force` — replace an existing registration on this machine. Refused without it.
+- `--force` — take a *different* identity: another name, or another control plane.
+  Refused without it, since that abandons the runner identity the control plane still has
+  rows for.
+
+Re-running it with the same name and url is a **refresh**, not an error: it re-detects
+capabilities and updates the labels this machine advertises, and prints what it gained.
 
 Touches: `~/.ogun/config.json` (the runner block), creates `~/.ogun/work/`, and a runner
 row on the control plane.
@@ -186,8 +198,9 @@ per-machine, so this is the only honest place to ask. It exits non-zero when som
 blocking is wrong, so it works as a check in a script.
 
 Labels are detected at join time, so a runtime installed since then shows up here as
-something this machine *could* advertise but does not; re-run `ogun runner init --force`
-to pick it up.
+something this machine *could* advertise but does not; re-run `ogun runner init` to pick
+it up. No `--force` — that flag is for changing identity, and this is the same machine
+saying the same name.
 
 ### `ogun trigger <project> <worker>`
 
@@ -412,7 +425,7 @@ Touches: the database (an invite row, holding only the hash).
 ### `ogun runner join`
 
 ```
-ogun runner join <url> --token <token> [--name <name>] [--labels a,b]
+ogun runner join <url> --token <token> [--name <name>] [--labels a,b] [--force]
 ```
 
 **On the machine being added**, with the command `ogun runner invite` printed.
@@ -428,6 +441,12 @@ compromised runner must not be able to hand itself a new prompt.
 `--name` and `--labels` mean what they do for
 [`runner init`](#ogun-runner-init). The local config is merged rather than replaced, so
 joining does not discard repository paths already registered here.
+
+`--force` is required to join a *different* control plane, or to join under a different
+name. Joining rewrites the runner block wholesale — name, url and token — so without the
+guard it silently abandoned the identity this machine already answered to, along with the
+run history filed under it. Re-joining the same control plane under the same name is a
+refresh and needs nothing.
 
 Touches: `~/.ogun/config.json` (the runner block, including the token), creates
 `~/.ogun/work/`, and a runner row on the control plane.
