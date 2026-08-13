@@ -2,11 +2,21 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { loadLocalConfig } from '@ogun/core'
 import { bold, cyan, dim, fail, green, yellow } from '../output.ts'
+import { parse } from '../args.ts'
 import { dbMigrate, dbUp, isReady } from './db.ts'
 import { imageBuild } from './image.ts'
 import { runnerInit } from './runner.ts'
 
 const run = promisify(execFile)
+
+const DEFAULT_SERVER_URL = process.env.OGUN_SERVER_URL ?? 'http://localhost:7777'
+
+/** Short timeout: this is "is it already up", not "wait for it". */
+const controlPlaneIsUp = (serverUrl: string): Promise<boolean> =>
+  fetch(`${serverUrl}/api/health`, { signal: AbortSignal.timeout(2000) }).then(
+    (r) => r.ok,
+    () => false,
+  )
 
 /**
  * `ogun init` — everything a machine needs before it can run anything, in the order the
@@ -20,8 +30,9 @@ const run = promisify(execFile)
  * Idempotent, and says what it skipped. Re-running after adding Docker, or after a
  * migration lands, should be the obvious move rather than a risk.
  */
-export async function init(args: string[]): Promise<void> {
-  const skipImage = args.includes('--no-image')
+export async function init(args: string[], serverUrl = DEFAULT_SERVER_URL): Promise<void> {
+  const { flags } = parse(args, { '--no-image': 'boolean' }, 'ogun init [--no-image]')
+  const skipImage = Boolean(flags['no-image'])
   const steps: string[] = []
   const skipped: string[] = []
 
@@ -78,24 +89,40 @@ export async function init(args: string[]): Promise<void> {
     }
   }
 
+  /**
+   * Registering as a runner is the one step that needs the control plane, because name
+   * uniqueness is enforced there and nowhere else — two machines answering to one name
+   * would silently share a claim identity and a run history.
+   *
+   * Everything above this point is prerequisites and needs nothing running, so `init`
+   * before `server` is the right order. This step just cannot complete in that order on
+   * a first run, which is fine: it registers if the control plane happens to be up, and
+   * otherwise says plainly what to run after starting it. It used to print
+   * "registering — the control plane must be running for this" and then not register,
+   * which reads as a step that succeeded.
+   */
   console.log(bold('\nThis machine as a runner\n'))
   const local = await loadLocalConfig().catch(() => null)
   if (local?.runner) {
     console.log(`  ${green('ok  ')}  already registered as ${bold(local.runner.name)}`)
     skipped.push('runner')
+  } else if (await controlPlaneIsUp(serverUrl)) {
+    await runnerInit([])
+    steps.push('registered this machine as a runner')
   } else {
-    console.log(dim('  registering — the control plane must be running for this'))
-    console.log(dim(`  if it is not, run ${cyan('ogun runner init')} after starting it`))
+    console.log(`  ${yellow('none')}  not registered yet`)
+    console.log(dim(`  the control plane is not running at ${serverUrl}, and registering`))
+    console.log(dim(`  needs it — start ${cyan('ogun server')}, then ${cyan('ogun runner init')}`))
   }
 
   console.log(bold('\nReady\n'))
   for (const s of steps) console.log(`  ${green('·')} ${s}`)
   for (const s of skipped) console.log(`  ${dim('·')} ${dim(`${s} — already done`)}`)
 
+  const registered = Boolean((await loadLocalConfig().catch(() => null))?.runner)
   console.log(`\n  ${cyan('ogun server')}        the control plane and web UI`)
-  console.log(`  ${cyan('ogun runner init')}   once the server is up, if this machine should run jobs`)
+  if (!registered) {
+    console.log(`  ${cyan('ogun runner init')}   once it is up, if this machine should run jobs`)
+  }
   console.log(`  ${cyan('ogun runner start')}  start claiming work\n`)
 }
-
-/** Kept separate so `ogun runner init` still works on its own. */
-export { runnerInit }
