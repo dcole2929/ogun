@@ -1,26 +1,27 @@
 import { strict as assert } from 'node:assert'
 import { after, before, describe, test } from 'node:test'
 import { eq } from 'drizzle-orm'
-import { createDb, schema } from '@ogun/core/db'
+import { schema } from '@ogun/core/db'
+import { startHarness } from './harness.ts'
 import { singleWorkerCycle } from '@ogun/core'
 import { startCycleRun } from '../src/foreman/cycles.ts'
 import { finalizeRun } from '../src/foreman/finalize.ts'
 import { admit } from '../src/foreman/admission.ts'
 
-const url = process.env.DATABASE_URL ?? 'postgres://ogun:ogun@localhost:5433/ogun'
-const reachable = await fetch('http://localhost:7777/api/health').then(
-  () => true,
-  () => false,
-)
 
-describe('run lifecycle', { skip: reachable ? false : 'no control plane running' }, () => {
-  const { db, close } = createDb(url)
+
+
+describe('run lifecycle', () => {
+  let h: Awaited<ReturnType<typeof startHarness>>
+  let db: Awaited<ReturnType<typeof startHarness>>['db']
   const slug = `test-${Date.now()}`
   let projectId = ''
   let workerId = ''
   let cycleId = ''
 
   before(async () => {
+    h = await startHarness()
+    db = h.db
     const [p] = await db.insert(schema.projects).values({ slug }).returning()
     projectId = p!.id
     const [w] = await db
@@ -44,7 +45,7 @@ describe('run lifecycle', { skip: reachable ? false : 'no control plane running'
 
   after(async () => {
     await db.delete(schema.projects).where(eq(schema.projects.id, projectId))
-    await close()
+    await h.stop()
   })
 
   const runOnce = async (report: Parameters<typeof finalizeRun>[1] extends infer R ? Omit<R & object, 'runId'> : never) => {
@@ -160,13 +161,16 @@ describe('run lifecycle', { skip: reachable ? false : 'no control plane running'
  * against ogun: the upsert bumped seenCount but never touched status, so a `fixed`
  * finding that came back stayed invisible to `--status open,triaged` forever.
  */
-describe('re-sighting a finding', { skip: reachable ? false : 'no control plane running' }, () => {
-  const { db, close } = createDb(url)
+describe('re-sighting a finding', () => {
+  let h: Awaited<ReturnType<typeof startHarness>>
+  let db: Awaited<ReturnType<typeof startHarness>>['db']
   const slug = `resight-${Date.now()}`
   let projectId = ''
   let cycleId = ''
 
   before(async () => {
+    h = await startHarness()
+    db = h.db
     const [p] = await db.insert(schema.projects).values({ slug }).returning()
     projectId = p!.id
     await db.insert(schema.workers).values({
@@ -186,7 +190,7 @@ describe('re-sighting a finding', { skip: reachable ? false : 'no control plane 
 
   after(async () => {
     await db.delete(schema.projects).where(eq(schema.projects.id, projectId))
-    await close()
+    await h.stop()
   })
 
   const report = async (extra: Partial<{ revisitOf: string; revisitReason: string }> = {}) => {
@@ -266,12 +270,15 @@ describe('re-sighting a finding', { skip: reachable ? false : 'no control plane 
  * It went unnoticed because the fallback produced the same string for a skill whose
  * declared prompt was the obvious one-liner.
  */
-describe('prompt resolution', { skip: reachable ? false : 'no control plane running' }, () => {
-  const { db, close } = createDb(url)
+describe('prompt resolution', () => {
+  let h: Awaited<ReturnType<typeof startHarness>>
+  let db: Awaited<ReturnType<typeof startHarness>>['db']
   const slug = `prompt-${Date.now()}`
   let projectId = ''
 
   before(async () => {
+    h = await startHarness()
+    db = h.db
     const [p] = await db.insert(schema.projects).values({ slug }).returning()
     projectId = p!.id
     await db.insert(schema.skills).values({
@@ -286,7 +293,7 @@ describe('prompt resolution', { skip: reachable ? false : 'no control plane runn
 
   after(async () => {
     await db.delete(schema.projects).where(eq(schema.projects.id, projectId))
-    await close()
+    await h.stop()
   })
 
   const promptFor = async (

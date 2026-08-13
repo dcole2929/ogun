@@ -16,7 +16,7 @@
     "runner": "node packages/cli/src/main.ts runner start",
     "ogun": "node --env-file-if-exists=.env packages/cli/src/main.ts",
     "web": "pnpm --filter @ogun/web dev",
-    "test": "node --test packages/*/test/*.test.ts && pnpm --filter @ogun/web test"
+    "test": "node --test --test-concurrency=1 packages/*/test/*.test.ts && pnpm --filter @ogun/web test"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

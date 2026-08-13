@@ -1,13 +1,9 @@
 import { strict as assert } from 'node:assert'
-import { describe, test } from 'node:test'
+import { after, before, describe, test } from 'node:test'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { startHarness, truncate } from './harness.ts'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-const reachable = await fetch('http://localhost:7777/api/health').then(
-  () => true,
-  () => false,
-)
-
 import {
   assertBindIsSafe,
   hashToken,
@@ -248,55 +244,65 @@ test('the admin token comes from OGUN_ADMIN_TOKEN, not a shared name', async () 
  * machine, so a collision there cannot mean "another machine" and always means "me
  * again" — re-running init, or reconnecting after the local config was lost.
  */
-describe('runner names', { skip: reachable ? false : 'no control plane' }, () => {
+describe('runner names', () => {
+  let h: Awaited<ReturnType<typeof startHarness>>
+  before(async () => {
+    h = await startHarness()
+  })
+  after(async () => {
+    await truncate(h.db)
+    await h.stop()
+  })
+
   const register = (name: string) =>
-    fetch('http://localhost:7777/api/runners/join', {
+    h.fetch('/api/runners/join', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ name, labels: ['claude'], maxConcurrency: 1 }),
     })
 
-  /**
-   * Hard-delete, not revoke. These run against whatever control plane is up — usually
-   * the real one — so a fixture that only revokes leaves a row behind forever, and the
-   * Runners page slowly fills with `dup-…` from test runs. Cleaning up after yourself
-   * means removing the row, not marking it.
-   */
-  const cleanup = async (name: string) => {
-    await fetch(`http://localhost:7777/api/runners/${name}`, { method: 'DELETE' })
-    await fetch(`http://localhost:7777/api/runners/${name}/forget`, { method: 'DELETE' })
+  /** By uuid, as every real caller does — the route stopped taking a name when runners
+   *  got a real identity, and a test still passing one silently 404s and cleans nothing. */
+  const idOf = async (name: string): Promise<string | undefined> => {
+    const body = (await (await h.fetch('/api/runners')).json()) as {
+      runners: Array<{ id: string; name: string }>
+    }
+    return body.runners.find((r) => r.name === name)?.id
   }
 
-  const isProtected = async () =>
-    (await fetch('http://localhost:7777/api/runners')).status === 401
+  const revoke = async (name: string) => {
+    const id = await idOf(name)
+    if (id) await h.fetch(`/api/runners/${id}`, { method: 'DELETE' })
+  }
 
   test('a name is claimed on first registration', async () => {
-    const name = `first-${Date.now()}`
-    assert.equal((await register(name)).status, 201)
-    await cleanup(name)
+    assert.equal((await register('first')).status, 201)
+    assert.ok(await idOf('first'))
   })
 
-  test('re-registering follows whether this control plane is protected', async () => {
-    if (await isProtected()) {
-      assert.ok(true, 'protected: covered by the enrollment tests, which hold a token')
-      return
-    }
-    const name = `dup-${Date.now()}`
-    assert.equal((await register(name)).status, 201)
-    assert.equal(
-      (await register(name)).status,
-      201,
-      'unprotected: only this machine can reach it, so a collision is this machine again',
-    )
-    await cleanup(name)
+  test('an unprotected control plane treats a collision as the same machine', async () => {
+    // It is only reachable from its own machine, so a collision cannot mean a second one.
+    assert.equal((await register('again')).status, 201)
+    assert.equal((await register('again')).status, 201)
   })
 
   test('a revoked name is free again', async () => {
     // Otherwise re-registering a rebuilt machine means picking a new name forever.
-    const name = `reuse-${Date.now()}`
-    assert.equal((await register(name)).status, 201)
-    await cleanup(name)
-    assert.equal((await register(name)).status, 201)
-    await cleanup(name)
+    assert.equal((await register('rebuilt')).status, 201)
+    await revoke('rebuilt')
+    assert.equal((await register('rebuilt')).status, 201)
+  })
+
+  test('revoke and forget address a runner by id, not by name', async () => {
+    // The regression that leaked a row on every test run: the route takes a uuid, the
+    // caller passed a name, the delete matched nothing and said so to no one.
+    assert.equal((await register('addressed')).status, 201)
+    const id = await idOf('addressed')
+
+    assert.equal((await h.fetch(`/api/runners/addressed`, { method: 'DELETE' })).status, 404)
+    assert.equal((await h.fetch(`/api/runners/${id}`, { method: 'DELETE' })).status, 200)
+    assert.equal((await h.fetch(`/api/runners/${id}/forget`, { method: 'DELETE' })).status, 200)
+
+    assert.equal(await idOf('addressed'), undefined, 'forget must actually remove the row')
   })
 })
