@@ -4,16 +4,12 @@ import { mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { eq } from 'drizzle-orm'
-import { createDb, schema } from '@ogun/core/db'
+import { schema } from '@ogun/core/db'
+import { startHarness } from './harness.ts'
 import { ConfigConflict, createLocalConfigStore, workerToYamlBlock } from '../src/config-store.ts'
 import { reindexProject } from '../src/reindex.ts'
-import { loadLocalConfig, updateLocalConfig, type WorkerConfig } from '@ogun/core'
+import type { WorkerConfig } from '@ogun/core'
 
-const url = process.env.DATABASE_URL ?? 'postgres://ogun:ogun@localhost:5433/ogun'
-const reachable = await fetch('http://localhost:7777/api/health').then(
-  () => true,
-  () => false,
-)
 
 const CONFIG = `project:
   name: SLUG
@@ -109,49 +105,36 @@ describe('config store', () => {
   })
 })
 
-describe('worker api', { skip: reachable ? false : 'no control plane running' }, () => {
-  const base = 'http://localhost:7777'
-  const { db, close } = createDb(url)
+describe('worker api', () => {
+  let h: Awaited<ReturnType<typeof startHarness>>
+  let db: Awaited<ReturnType<typeof startHarness>>['db']
   const slug = `wtest-${Date.now()}`
-
   let root = ''
   let configPath = ''
 
-  // Resolved exactly as the CLI does: env, then the machine-local config the server
-  // writes. A test that only read the env would fail against a control plane whose
-  // token was generated rather than exported.
-  let auth: Record<string, string> = {}
-
   const send = (path: string, body: unknown, method = 'POST') =>
-    fetch(`${base}${path}`, {
+    h.fetch(path, {
       method,
-      headers: { 'content-type': 'application/json', ...auth },
+      headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body),
     })
 
   const errorOf = async (res: Response): Promise<string> =>
     ((await res.json()) as { error?: string }).error ?? ''
 
-  const editMap = (fn: (projects: Record<string, string>) => void) =>
-    updateLocalConfig((c) => {
-      const projects = { ...c.projects }
-      fn(projects)
-      return { ...c, projects }
-    })
 
   before(async () => {
-    const token = process.env.OGUN_TOKEN?.trim() || (await loadLocalConfig()).server.token
-    if (token) auth = { authorization: `Bearer ${token}` }
-
     root = await mkdtemp(join(tmpdir(), 'ogun-api-'))
     configPath = join(root, '.ogun', 'config.yaml')
     await mkdir(join(root, '.ogun'), { recursive: true })
     await writeFile(configPath, CONFIG.replace('SLUG', slug))
-    // The server re-reads the map on every call, so a project added here is visible with
-    // no restart — which is itself behaviour worth relying on.
-    await editMap((p) => {
-      p[slug] = root
-    })
+
+    // A project map scoped to this test, so editing config.yaml on behalf of the UI
+    // cannot reach a repository you actually work in.
+    const mapPath = join(root, 'projects.json')
+    await writeFile(mapPath, JSON.stringify({ projects: { [slug]: root } }))
+    h = await startHarness(createLocalConfigStore(mapPath))
+    db = h.db
 
     await send('/api/projects/sync', {
       slug,
@@ -169,15 +152,11 @@ describe('worker api', { skip: reachable ? false : 'no control plane running' },
   })
 
   after(async () => {
-    await db.delete(schema.projects).where(eq(schema.projects.slug, slug))
-    await editMap((p) => {
-      delete p[slug]
-    })
-    await close()
+    await h.stop()
   })
 
   const state = async (name: string) => {
-    const res = await fetch(`${base}/api/workers?project=${slug}`, { headers: auth })
+    const res = await h.fetch(`/api/workers?project=${slug}`)
     const body = (await res.json()) as {
       workers: Array<{ worker: { id: string; name: string; runtime: string; modelRole: string } }>
       editable: Record<string, boolean>
@@ -236,10 +215,7 @@ describe('worker api', { skip: reachable ? false : 'no control plane running' },
 
   test('deleting removes it from the file and from the index', async () => {
     const { worker } = await state('from-ui')
-    const res = await fetch(`${base}/api/workers/${worker!.id}`, {
-      method: 'DELETE',
-      headers: auth,
-    })
+    const res = await h.fetch(`/api/workers/${worker!.id}`, { method: 'DELETE' })
     assert.equal(res.status, 200)
     assert.ok(!(await readFile(configPath, 'utf8')).includes('from-ui'))
     assert.equal((await state('from-ui')).worker, undefined)

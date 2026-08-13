@@ -1,12 +1,13 @@
 import { strict as assert } from 'node:assert'
 import { after, before, describe, test } from 'node:test'
 import { and, eq } from 'drizzle-orm'
-import { createDb, schema } from '@ogun/core/db'
+import { schema } from '@ogun/core/db'
+import { startHarness } from './harness.ts'
 import { singleWorkerCycle } from '@ogun/core'
 import { startCycleRun } from '../src/foreman/cycles.ts'
 import { reconcileCoverage } from '../src/foreman/sweep.ts'
 
-const url = process.env.DATABASE_URL ?? 'postgres://ogun:ogun@localhost:5433/ogun'
+
 
 /**
  * The coverage ledger is the one table whose entire purpose is to be true about what ran
@@ -15,12 +16,15 @@ const url = process.env.DATABASE_URL ?? 'postgres://ogun:ogun@localhost:5433/ogu
  * carries it is stating something false.
  */
 describe('coverage reconciliation', () => {
-  const { db, close } = createDb(url)
+  let h: Awaited<ReturnType<typeof startHarness>>
+  let db: Awaited<ReturnType<typeof startHarness>>['db']
   const slug = `cov-${Date.now()}`
   let projectId = ''
   let cycleId = ''
 
   before(async () => {
+    h = await startHarness()
+    db = h.db
     const [p] = await db.insert(schema.projects).values({ slug }).returning()
     projectId = p!.id
     await db.insert(schema.workers).values({
@@ -40,7 +44,7 @@ describe('coverage reconciliation', () => {
 
   after(async () => {
     await db.delete(schema.projects).where(eq(schema.projects.id, projectId))
-    await close()
+    await h.stop()
   })
 
   const coverageFor = async (cycleRunId: string) => {
@@ -106,10 +110,8 @@ describe('coverage reconciliation', () => {
       .from(schema.jobs)
       .where(eq(schema.jobs.cycleRunId, cycleRunId))
 
-    const res = await fetch(`http://localhost:7777/api/jobs/${job!.id}/cancel`, {
-      method: 'POST',
-    }).catch(() => null)
-    if (!res?.ok) return // no control plane running; the sweep test covers the same rule
+    const res = await h.fetch(`/api/jobs/${job!.id}/cancel`, { method: 'POST' })
+    assert.equal(res.status, 200)
 
     const row = await coverageFor(cycleRunId)
     assert.equal(row.outcome, 'cancelled', 'nothing blocked it — you stopped it')

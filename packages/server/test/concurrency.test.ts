@@ -1,12 +1,13 @@
 import { strict as assert } from 'node:assert'
 import { after, before, describe, test } from 'node:test'
 import { eq, inArray } from 'drizzle-orm'
-import { createDb, schema } from '@ogun/core/db'
+import { schema } from '@ogun/core/db'
+import { startHarness } from './harness.ts'
 import { singleWorkerCycle } from '@ogun/core'
 import { remainingCapacity } from '../src/foreman/admission.ts'
 import { startCycleRun } from '../src/foreman/cycles.ts'
 
-const url = process.env.DATABASE_URL ?? 'postgres://ogun:ogun@localhost:5433/ogun'
+
 
 /**
  * The global concurrency cap is a hard limit, not a hint: it exists because a container
@@ -18,13 +19,16 @@ const url = process.env.DATABASE_URL ?? 'postgres://ogun:ogun@localhost:5433/ogu
  * runner reporting capacity 2 produced three concurrent jobs against a cap of two.
  */
 describe('global concurrency cap', () => {
-  const { db, close } = createDb(url)
+  let h: Awaited<ReturnType<typeof startHarness>>
+  let db: Awaited<ReturnType<typeof startHarness>>['db']
   const slug = `cap-${Date.now()}`
   let projectId = ''
   let cycleId = ''
   const created: string[] = []
 
   before(async () => {
+    h = await startHarness()
+    db = h.db
     const [p] = await db.insert(schema.projects).values({ slug }).returning()
     projectId = p!.id
     await db.insert(schema.workers).values({
@@ -44,7 +48,7 @@ describe('global concurrency cap', () => {
 
   after(async () => {
     await db.delete(schema.projects).where(eq(schema.projects.id, projectId))
-    await close()
+    await h.stop()
   })
 
   /** Queue a job and force it into a given state, standing in for a real runner. */

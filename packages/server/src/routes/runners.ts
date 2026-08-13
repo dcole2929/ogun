@@ -218,16 +218,27 @@ runnersRoutes.post('/join', async (c) => {
 })
 
 /**
+ * A runner is addressed by its id, which is a uuid. Anything else — most likely a name,
+ * from a caller written before runners had a real identity — would reach postgres as a
+ * failed cast and surface as a 500 with a driver error in it. It is a 404: there is no
+ * runner with that id, and saying so is both true and actionable.
+ */
+const runnerIdOf = (raw: string): string | null =>
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(raw) ? raw : null
+
+/**
  * Revoke: the token stops working and the machine can no longer claim, but the row
  * stays. That is the right default for a machine you are decommissioning — you may want
  * to see it in the list, and it stops the name being silently reused by something else.
  */
 runnersRoutes.delete('/:id', async (c) => {
   const { db } = c.var.ctx
+  const id = runnerIdOf(c.req.param('id'))
+  if (!id) return c.json({ error: 'no such runner' }, 404)
   const [row] = await db
     .update(runners)
     .set({ revokedAt: new Date(), pending: false })
-    .where(eq(runners.id, c.req.param('id')))
+    .where(eq(runners.id, id))
     .returning()
   if (!row) return c.json({ error: 'no such runner' }, 404)
   return c.json({ revoked: row.name })
@@ -243,7 +254,9 @@ runnersRoutes.delete('/:id', async (c) => {
  */
 runnersRoutes.delete('/:id/forget', async (c) => {
   const { db } = c.var.ctx
-  const existing = await db.query.runners.findFirst({ where: eq(runners.id, c.req.param('id')) })
+  const id = runnerIdOf(c.req.param('id'))
+  if (!id) return c.json({ error: 'no such runner' }, 404)
+  const existing = await db.query.runners.findFirst({ where: eq(runners.id, id) })
   if (!existing) return c.json({ error: 'no such runner' }, 404)
   if (!existing.revokedAt) {
     return c.json({ error: 'revoke it first — a live runner would just re-register' }, 409)
