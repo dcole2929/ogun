@@ -21,8 +21,9 @@ import { Empty, exact, Page, Pill, when } from '../ui.tsx'
  */
 /** What to do about it. A warning with no remedy is one you learn to scroll past. */
 const REMEDY: Record<string, string> = {
-  refused:
-    'Admission refused it. Clear the breaker on the Runners page, or re-enable the worker.',
+  // A breaker guards a worker, not a machine, so it lives on Workers — where the thing
+  // it is stopping is shown.
+  refused: 'Clear its breaker on the Workers page, or re-enable the worker there.',
   blocked: 'Fix whatever its dependency was waiting on, then run the cycle again.',
   cancelled: 'Trigger it again from Workers when you want it.',
   errored: 'Open the run for the failure, fix it, and trigger again.',

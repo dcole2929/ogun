@@ -18,7 +18,7 @@ import {
 } from '../config-store.ts'
 import { reindexProject } from '../reindex.ts'
 
-const { projects, skills, workers } = schema
+const { breakers, projects, skills, workers } = schema
 
 /**
  * Creating a worker in the UI edits the repo's `.ogun/config.yaml` and re-indexes from
@@ -86,6 +86,15 @@ workersRoutes.get('/', async (c) => {
     .select({
       worker: workers,
       project: { slug: projects.slug },
+      /**
+       * The failure breaker for this worker. It stops a 2am failure loop from eating the
+       * whole rate limit by morning (§4.3), and it latches — deliberately, so a restart
+       * does not clear it — which means there has to be a way to clear it on purpose.
+       */
+      breaker: {
+        consecutiveFailures: breakers.consecutiveFailures,
+        openedAt: breakers.openedAt,
+      },
       // The prompt a run would actually use, and where it came from. A worker with no
       // prompt of its own is not a worker with no prompt — it inherits the skill's, and
       // showing a blank field invites exactly the question "why has this one got none?"
@@ -94,6 +103,7 @@ workersRoutes.get('/', async (c) => {
     .from(workers)
     .innerJoin(projects, eq(projects.id, workers.projectId))
     .leftJoin(skills, eq(skills.id, workers.skillId))
+    .leftJoin(breakers, eq(breakers.workerId, workers.id))
     .where(project ? eq(workers.projectId, project.id) : undefined)
     .orderBy(workers.name)
 
@@ -215,6 +225,24 @@ function effectivePrompt(
   if (skillPrompt) return { text: skillPrompt, source: 'skill' }
   return { text: `Use the ${worker.skillRef} skill.`, source: 'fallback' }
 }
+
+/**
+ * Clearing a breaker is a deliberate human act — it is the one guard that survives a
+ * restart precisely so it cannot clear itself. Scoped to the worker it guards rather
+ * than living under /api/trigger, where it was unreachable from anything that displays
+ * a worker.
+ */
+workersRoutes.post('/:id/breaker/clear', async (c) => {
+  const { db } = c.var.ctx
+  const worker = await db.query.workers.findFirst({ where: eq(workers.id, c.req.param('id')) })
+  if (!worker) return c.json({ error: 'no such worker' }, 404)
+
+  await db
+    .update(breakers)
+    .set({ consecutiveFailures: 0, openedAt: null, updatedAt: new Date() })
+    .where(eq(breakers.workerId, worker.id))
+  return c.json({ cleared: worker.name })
+})
 
 /** What the file looks like now, so the UI can show the diff it just caused. */
 const describe = (file: { path: string; text: string; hash: string }) => ({

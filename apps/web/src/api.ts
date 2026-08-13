@@ -165,6 +165,8 @@ export type WorkerRow = {
     config: Record<string, unknown>
   }
   project: { slug: string }
+  /** Null when this worker has never failed. */
+  breaker: { consecutiveFailures: number; openedAt: string | null } | null
   /**
    * What a run would actually use. `skill` means the worker inherits its skill's
    * default_prompt rather than having none of its own.
@@ -294,6 +296,8 @@ export const api = {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(input),
     }),
+  clearBreaker: (id: string) =>
+    json<{ cleared: string }>(`/api/workers/${id}/breaker/clear`, { method: 'POST' }),
   deleteWorker: (id: string) =>
     json<{ deleted: string; config: ConfigSnapshot }>(`/api/workers/${id}`, { method: 'DELETE' }),
 

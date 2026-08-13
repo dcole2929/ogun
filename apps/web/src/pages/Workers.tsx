@@ -108,8 +108,9 @@ function ProjectWorkers({ slug }: { slug: string }) {
 
       {run.data?.jobs.some((j) => j.state === 'skipped') && (
         <p className="error" style={{ fontSize: 13 }}>
-          Admission refused that job — most likely the failure breaker is open.{' '}
-          <Link to="/coverage">Coverage</Link> records the reason.
+          Admission refused that job. If the worker shows{' '}
+          <span className="pill red">breaker open</span> above, clear it here;{' '}
+          <Link to="/coverage">Coverage</Link> records the reason either way.
         </p>
       )}
     </>
@@ -135,6 +136,10 @@ function WorkerCard({
 
   const invalidate = () => qc.invalidateQueries({ queryKey: ['allWorkers'] })
   const remove = useMutation({ mutationFn: () => api.deleteWorker(w.id), onSuccess: invalidate })
+  const clearBreaker = useMutation({
+    mutationFn: () => api.clearBreaker(w.id),
+    onSuccess: invalidate,
+  })
   const toggle = useMutation({
     mutationFn: () => api.updateWorker(w.id, { enabled: !w.enabled }),
     onSuccess: invalidate,
@@ -150,6 +155,7 @@ function WorkerCard({
             <span className="pill">{w.runtime}</span>
             <span className="pill">{w.sandbox}</span>
             {!w.enabled && <span className="pill yellow">disabled</span>}
+            {row.breaker?.openedAt && <span className="pill red">breaker open</span>}
           </div>
           <div className="muted" style={{ fontSize: 13 }}>
             skill <Link to={`/skills/${row.project.slug}/${w.skillRef}`}>{w.skillRef}</Link> ·
@@ -182,6 +188,24 @@ function WorkerCard({
           </button>
         </div>
       </div>
+
+      {/* The breaker latches on purpose — it survives a restart, which is exactly when
+          you would want it to hold — so clearing it has to be something you can do. */}
+      {row.breaker?.openedAt && (
+        <div
+          className="row"
+          style={{ marginTop: 12, fontSize: 13, alignItems: 'flex-start', flexWrap: 'wrap' }}
+        >
+          <span className="error" style={{ flex: '1 1 300px' }}>
+            Not being dispatched: {row.breaker.consecutiveFailures} runs failed in a row, so
+            admission stopped sending it work. That guard exists to keep a failure loop from
+            spending the night burning rate limit. Fix what was failing, then clear it.
+          </span>
+          <button onClick={() => clearBreaker.mutate()} disabled={clearBreaker.isPending}>
+            Clear breaker
+          </button>
+        </div>
+      )}
 
       {editable && (
         <div className="row" style={{ marginTop: 12, fontSize: 12 }}>
