@@ -65,6 +65,18 @@ $EDITOR .agents/skills/staging-error-review/SKILL.md
 ogun project sync                      # index it
 ```
 
+Then give a worker that skill, and a schedule, from the Workers page — or in
+`.ogun/config.yaml` directly:
+
+```yaml
+workers:
+  staging-errors:
+    skill: staging-error-review
+    runtime: claude
+    schedule: "0 3 * * *"    # every day at 3am, in the control plane's timezone
+    onMissed: skip           # asleep at 3am? wait for tomorrow rather than run at 11
+```
+
 Then point a worker at it, in the UI or in `.ogun/config.yaml`. Note that a skill only
 reaches an automated run **once it is on the default branch** — the workspace is a clone
 at a pinned SHA, not your working copy.
@@ -86,6 +98,7 @@ Nothing to configure. The control plane binds to localhost, where nothing off th
 machine can reach it, so there is no token to manage.
 
 ```sh
+ogun init           # database, schema, sandbox image
 ogun server         # control plane and UI on :7777
 ogun runner init    # this machine becomes a runner for it
 ogun runner start
@@ -98,24 +111,22 @@ Only needed when the runner is a *different* machine.
 The control plane binds to `127.0.0.1` by default. Set `OGUN_BIND=0.0.0.0` and it
 generates an admin token on first start and stores it — you never create or paste one.
 
-**On WSL2 there is an extra step.** WSL2's address is private to Windows; nothing else on
-your network can reach it. Pick one:
+Ogun detects the addresses it believes it is reachable at and offers them when you enrol
+a runner. If one of them works from the other machine, there is nothing else to do.
 
-```powershell
-# 1. Mirrored networking — Windows 11 22H2+, simplest. In %USERPROFILE%\.wslconfig:
-#      [wsl2]
-#      networkingMode=mirrored
-#    then:  wsl --shutdown
-```
+**If the control plane runs inside a VM or a container-based Linux environment**, its
+address may be private to the host — reachable from the host itself and from nowhere
+else. Ogun detects the common case of this and says so before you enrol, rather than
+handing you an address that cannot work. Two general answers:
 
-```sh
-# 2. A mesh VPN inside WSL2 — the right answer if a runner is ever off your LAN,
-#    because a 100.x address works from any network.
-curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up
-```
+- **Bridge the network** so the environment shares the host's LAN address. On WSL2 that
+  is `networkingMode=mirrored` in `.wslconfig`; on other hypervisors it is usually a
+  "bridged" rather than "NAT" adapter.
+- **A mesh VPN** such as Tailscale, installed where the control plane runs. It gives a
+  stable address that works from any network, not just this one — the right answer if a
+  runner is ever somewhere else entirely.
 
-Option 3 is `netsh interface portproxy`, which works but breaks whenever the WSL address
-changes on reboot.
+Port forwarding also works and tends to break whenever the private address changes.
 
 ### 1. On the CONTROL PLANE — start it
 
