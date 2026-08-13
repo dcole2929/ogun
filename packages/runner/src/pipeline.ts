@@ -34,6 +34,13 @@ const run = promisify(execFile)
 export const OUTPUT_PATH = '.ogun-out/findings.json'
 
 /**
+ * Where a node reads what its upstream nodes produced. Only written when there are any,
+ * so a reviewer never finds an empty file and wonders whether that means "nothing found"
+ * or "nothing ran".
+ */
+export const INPUT_PATH = '.ogun-in/upstream.json'
+
+/**
  * The runner's loop, once per job (§5.2):
  *
  *   prepare   -> materialize workspace, check the image
@@ -114,8 +121,20 @@ export async function executeJob(
     cleanup = workspace.cleanup
 
     await mkdir(join(workspace.path, '.ogun-out'), { recursive: true })
-    // The findings document is harness output, not a change the worker made.
-    await excludeFromGit(workspace.path, ['/.ogun-out/'])
+    // Harness input and output, not changes the worker made.
+    await excludeFromGit(workspace.path, ['/.ogun-out/', '/.ogun-in/'])
+
+    // Deliberately not caught: a node that cannot read its input must fail loudly
+    // rather than run against an empty one. The outer catch turns it into a failed run.
+    const upstream = await cp.inputs(job.jobId)
+    if (upstream) {
+      await mkdir(join(workspace.path, '.ogun-in'), { recursive: true })
+      await writeFile(
+        join(workspace.path, INPUT_PATH),
+        `${JSON.stringify(upstream, null, 2)}\n`,
+        { mode: 0o600 },
+      )
+    }
 
     // Make the worker's skill discoverable where *this* runtime looks — the two do not
     // agree on a location, so it depends on which one is about to run (§5.1).
@@ -158,7 +177,7 @@ export async function executeJob(
 
     const guestRoot = job.sandbox === 'worktree' ? workspace.path : GUEST_WORKSPACE
     const ctx = {
-      prompt: composePrompt(job, guestRoot, skill.path),
+      prompt: composePrompt(job, guestRoot, skill.path, Boolean(upstream)),
       ...(model ? { model } : {}),
       workspace: guestRoot,
       outputFile: `${guestRoot}/.ogun-out/last-message.txt`,
@@ -259,10 +278,23 @@ export async function executeJob(
  * staging-error-reviews skill." (§5.1). All this adds is where to put the answer,
  * because the CLI owns the format and the agent must not free-hand it (§4.10).
  */
-function composePrompt(job: ClaimedJob, guestRoot: string, skillPath: string): string {
+function composePrompt(
+  job: ClaimedJob,
+  guestRoot: string,
+  skillPath: string,
+  hasUpstream: boolean,
+): string {
   return [
     job.prompt,
     '',
+    ...(hasUpstream
+      ? [
+          `What the workers before you produced is at ${guestRoot}/${INPUT_PATH}, including`,
+          'the ones that found nothing and the ones that failed. Read it first — it is your',
+          'input, not the repository.',
+          '',
+        ]
+      : []),
     // The skill is named by path as well as by name. Claude Code can resolve it from
     // .claude/skills natively, but codex has no skill concept, so without this the
     // prompt is a reference to something the runtime cannot look up.

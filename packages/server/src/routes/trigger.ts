@@ -46,6 +46,16 @@ triggerRoutes.post('/', async (c) => {
   }
   if (!cycle) return c.json({ error: 'failed to resolve cycle' }, 500)
 
+  // A prompt override is keyed by node, so one addressed to a multi-node cycle matches
+  // nothing. Silently running the cycle with its configured prompts would look like the
+  // override took effect.
+  if (body.prompt && !worker) {
+    return c.json(
+      { error: `"${body.worker}" is a cycle — a prompt override has to name one worker` },
+      400,
+    )
+  }
+
   const result = await startCycleRun(db, {
     cycleId: cycle.id,
     trigger: 'manual',
