@@ -6,6 +6,7 @@ import { promisify } from 'node:util'
 import { expandHome, loadLocalConfig, localConfigPath, updateLocalConfig } from '@ogun/core'
 import { bold, cyan, dim, fail, green } from '../output.ts'
 import { authHeaders } from '../auth.ts'
+import { listFlag, parse } from '../args.ts'
 
 const run = promisify(execFile)
 
@@ -17,18 +18,37 @@ const run = promisify(execFile)
  * present a token because it is talking to a control plane across a network.
  */
 export async function runnerInit(args: string[]): Promise<void> {
-  const name = (argValue(args, '--name') ?? hostname()).toLowerCase().replace(/\..*$/, '')
-  const serverUrl = argValue(args, '--url') ?? process.env.OGUN_SERVER_URL ?? 'http://localhost:7777'
+  const { flags } = parse(
+    args,
+    { '--name': 'string', '--url': 'string', '--labels': 'string', '--force': 'boolean' },
+    'ogun runner init [--name <name>] [--url <url>] [--labels <a,b>] [--force]',
+  )
+  const name = (flags.name ?? hostname()).toLowerCase().replace(/\..*$/, '')
+  const serverUrl = flags.url ?? process.env.OGUN_SERVER_URL ?? 'http://localhost:7777'
   // Detected, plus anything the operator adds for a capability Ogun cannot see.
-  const labels = [...new Set([...(await detectLabels()), ...extraLabels(args)])]
+  const labels = [...new Set([...(await detectLabels()), ...listFlag(flags.labels)])]
 
   const existing = await loadLocalConfig()
-  if (existing.runner && !args.includes('--force')) {
+  /**
+   * Re-running against the same identity re-detects capabilities and updates them, which
+   * is what you want after installing docker or logging into a runtime — and is exactly
+   * what `ogun runner doctor` tells you to do.
+   *
+   * It used to refuse that, so the advice could not be followed without `--force`, and
+   * `--force` means something much bigger: abandon this runner identity and take another.
+   * Refusing is right for *that*, and only that.
+   */
+  const sameIdentity =
+    existing.runner?.name === name && existing.runner?.serverUrl === serverUrl
+  if (existing.runner && !sameIdentity && !flags.force) {
     fail(
       `this machine is already set up as "${existing.runner.name}" pointing at ` +
-        `${existing.runner.serverUrl} — pass --force to replace that`,
+        `${existing.runner.serverUrl}.\n` +
+        `  Re-running with the same name and url refreshes its labels; changing either ` +
+        `needs --force,\n  which abandons that runner identity and its run history.`,
     )
   }
+  const refreshing = Boolean(existing.runner) && sameIdentity
 
   // Registers through the same endpoint `join` uses, which is the only place name
   // uniqueness is enforced. Skipping it would let two machines answer to one name and
@@ -65,8 +85,19 @@ export async function runnerInit(args: string[]): Promise<void> {
   }))
   await mkdir(resolve(expandHome('~/.ogun/work')), { recursive: true })
 
-  console.log(green(`this machine is runner "${name}" for ${serverUrl}`))
+  const gained = labels.filter((l) => !(existing.runner?.labels ?? []).includes(l))
+  console.log(
+    green(
+      refreshing
+        ? `refreshed runner "${name}" for ${serverUrl}`
+        : `this machine is runner "${name}" for ${serverUrl}`,
+    ),
+  )
   console.log(dim(`  ${localConfigPath()}`))
+  // The point of re-running is usually that something was installed since last time.
+  if (refreshing) {
+    console.log(dim(gained.length > 0 ? `  now advertising: ${gained.join(', ')}` : '  no change'))
+  }
 
   const missing = ['claude', 'codex', 'docker'].filter((l) => !labels.includes(l))
   if (missing.length > 0) {
@@ -103,13 +134,18 @@ async function detectLabels(): Promise<string[]> {
  * that may never appear.
  */
 export async function runnerInvite(args: string[], serverUrl: string): Promise<void> {
-  const note = argValue(args, '--note')
+  const { flags } = parse(
+    args,
+    { '--note': 'string', '--url': 'string' },
+    'ogun runner invite [--note <text>] [--url <url>]',
+  )
+  const note = flags.note
   const res = await fetch(`${serverUrl}/api/runners/invites`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', ...(await authHeaders()) },
     body: JSON.stringify({
       ...(note ? { note } : {}),
-      ...(argValue(args, '--url') ? { serverUrl: argValue(args, '--url') } : {}),
+      ...(flags.url ? { serverUrl: flags.url } : {}),
     }),
   }).catch(() => null)
 
@@ -152,11 +188,38 @@ export async function runnerInvite(args: string[], serverUrl: string): Promise<v
  * The name defaults to this machine's hostname, because this is the machine.
  */
 export async function runnerJoin(args: string[]): Promise<void> {
-  const url = args.find((a) => a.startsWith('http'))?.replace(/\/$/, '')
-  const token = argValue(args, '--token')
-  const name = (argValue(args, '--name') ?? hostname()).toLowerCase().replace(/\..*$/, '')
-  if (!url || !token) {
-    fail('usage: ogun runner join <control-plane-url> --token <token> [--name <name>]')
+  const usage =
+    'ogun runner join <control-plane-url> --token <token> [--name <name>] ' +
+    '[--labels <a,b>] [--force]'
+  const { flags, first } = parse(
+    args,
+    {
+      '--token': 'string',
+      '--name': 'string',
+      '--labels': 'string',
+      '--force': 'boolean',
+    },
+    usage,
+  )
+  const url = first?.replace(/\/$/, '')
+  const token = flags.token
+  const name = (flags.name ?? hostname()).toLowerCase().replace(/\..*$/, '')
+  if (!url || !token) fail(`usage: ${usage}`)
+
+  /**
+   * The same guard `runner init` has, for the same reason: join rewrites the runner
+   * block wholesale — name, url and token — so joining a second control plane silently
+   * abandoned the first, along with whatever run history was filed under that identity.
+   * Re-joining the same control plane under the same name is a refresh and is allowed.
+   */
+  const existing = await loadLocalConfig()
+  const sameIdentity = existing.runner?.name === name && existing.runner?.serverUrl === url
+  if (existing.runner && !sameIdentity && !flags.force) {
+    fail(
+      `this machine is already joined to ${existing.runner.serverUrl} as ` +
+        `"${existing.runner.name}".\n` +
+        '  Joining elsewhere abandons that identity and its run history — pass --force.',
+    )
   }
 
   const reachable = await fetch(`${url}/api/health`).then(
@@ -173,7 +236,7 @@ export async function runnerJoin(args: string[]): Promise<void> {
     )
   }
 
-  const labels = [...new Set([...(await detectLabels()), ...extraLabels(args)])]
+  const labels = [...new Set([...(await detectLabels()), ...listFlag(flags.labels)])]
   const res = await fetch(`${url}/api/runners/join`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
@@ -227,13 +290,3 @@ export async function runnerJoin(args: string[]): Promise<void> {
  * A worker asks for one with `requires:` and the job then only goes to a machine that
  * advertises it.
  */
-const extraLabels = (args: string[]): string[] =>
-  (argValue(args, '--labels') ?? '')
-    .split(',')
-    .map((l) => l.trim())
-    .filter(Boolean)
-
-const argValue = (args: string[], flag: string): string | undefined => {
-  const i = args.indexOf(flag)
-  return i === -1 ? undefined : args[i + 1]
-}
