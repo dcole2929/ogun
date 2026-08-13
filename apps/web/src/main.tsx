@@ -3,6 +3,7 @@ import { createRoot } from 'react-dom/client'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { BrowserRouter, NavLink, Navigate, Route, Routes } from 'react-router'
 import './styles.css'
+import { Mark } from './Mark.tsx'
 import { RunsPage } from './pages/Runs.tsx'
 import { RunDetailPage } from './pages/RunDetail.tsx'
 import { FindingsPage } from './pages/Findings.tsx'
@@ -30,8 +31,11 @@ function Shell() {
     <div className="app">
       <aside className="sidebar">
         <div className="brand">
-          Ogun
-          <small>software factory</small>
+          <Mark />
+          <div>
+            Ogun
+            <small>software factory</small>
+          </div>
         </div>
         <nav className="nav">
           <NavLink to="/findings">Findings</NavLink>
