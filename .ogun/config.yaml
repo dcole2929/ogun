@@ -9,15 +9,34 @@ workers:
     model: worker
     permissions: reviewer
     sandbox: container
-    # Phase 1 has no cron; the schedule is recorded so phase 2 has something to read.
-    schedule: "0 3 * * *"
-    onMissed: skip
   security-review:
     skill: adversarial-review
     runtime: codex
     model: reviewer
     prompt: Use the adversarial-review skill. Focus on authorization boundaries,
       trust boundaries, and anything that handles credentials.
+  triage:
+    skill: triage
+    runtime: claude
+    model: reviewer
+    permissions: reviewer
+    sandbox: container
+
+cycles:
+  # The reviewers run in parallel and stage what they find; triage is the only thing
+  # that writes to the inbox. Listing a worker under `then:` is what makes its inputs
+  # stage-only — no flag on the worker itself, so the same reviewer can run standalone
+  # in another cycle and publish directly.
+  nightly:
+    workers: [adversarial-review, security-review]
+    then: triage
+    # The schedule belongs to the cycle, not to the reviewers. A reviewer that kept its
+    # own would run a second time outside the cycle and publish its findings raw.
+    schedule: "0 3 * * *"
+    onMissed: skip
+    # `degrade` — if a reviewer errors, triage still runs and reports the night as
+    # incomplete. `block` would mean one crashed reviewer buries the other's findings.
+    onDepFailure: degrade
 
 policies:
   directPush: false
