@@ -81,7 +81,7 @@ try {
       break
 
     case 'init':
-      await init([sub, ...rest].filter(Boolean) as string[])
+      await init([sub, ...rest].filter(Boolean) as string[], serverUrl)
       break
 
     case 'db':
@@ -93,7 +93,11 @@ try {
       break
 
     case 'server':
+      // `server` and `server start` are the same command, so a leading flag is an
+      // argument to it and not a mistyped subcommand: `ogun server --port 8080` must
+      // reach the server rather than being reported as an unknown subcommand.
       if (sub === undefined || sub === 'start') serverStart(rest)
+      else if (sub.startsWith('-')) serverStart([sub, ...rest])
       else unknownSub('server', sub)
       break
 

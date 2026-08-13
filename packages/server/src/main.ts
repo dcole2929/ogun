@@ -1,3 +1,4 @@
+import { parseArgs } from 'node:util'
 import { serve } from '@hono/node-server'
 import { createApp } from './app.ts'
 import { createContext } from './context.ts'
@@ -6,7 +7,35 @@ import { assertBindIsSafe, InsecureBind, LOCAL_BINDS, resolveAuth } from './auth
 import { reconcileCoverage, sweepStaleClaims } from './foreman/sweep.ts'
 import { tick } from './foreman/scheduler.ts'
 
-const port = Number(process.env.OGUN_PORT ?? 7777)
+/**
+ * `--port` beats `OGUN_PORT` beats 7777.
+ *
+ * `ogun server` forwards its arguments here, and this used to parse none of them — so
+ * `ogun server --port 8080` started on 7777 and said so in a line nobody reads twice.
+ * Unknown arguments are refused for the same reason: an accepted-and-ignored flag is
+ * worse than a rejected one.
+ */
+const cli = (() => {
+  try {
+    return parseArgs({
+      args: process.argv.slice(2),
+      options: { port: { type: 'string' } },
+      allowPositionals: false,
+    }).values
+  } catch (err) {
+    console.error(
+      `\nogun-server: ${(err as Error).message}\n` +
+        '  usage: ogun server [--port <n>]\n' +
+        '  Everything else is configured by environment — see `ogun server --help`.\n',
+    )
+    process.exit(1)
+  }
+})()
+if (cli.port !== undefined && !/^\d+$/.test(cli.port)) {
+  console.error(`\nogun-server: --port must be a number, got "${cli.port}"\n`)
+  process.exit(1)
+}
+const port = Number(cli.port ?? process.env.OGUN_PORT ?? 7777)
 const staleAfterMs = Number(process.env.OGUN_STALE_CLAIM_MS ?? 45 * 60_000)
 const auth = await resolveAuth()
 
