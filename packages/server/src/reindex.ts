@@ -3,7 +3,7 @@ import { schema } from '@ogun/core/db'
 import type { Db } from '@ogun/core/db'
 import { hashContent, singleWorkerCycle, type WorkerConfig } from '@ogun/core'
 
-const { cycles, projects, skills, workers } = schema
+const { cycles, projects, schedules, skills, workers } = schema
 
 export type ReindexResult = {
   workers: Record<string, typeof workers.$inferSelect>
@@ -73,13 +73,21 @@ export async function reindexProject(
 
     // Every worker is a one-node cycle, so "run this now" and the eventual nightly path
     // are the same code (§5.1).
-    await db
+    const [cycle] = await db
       .insert(cycles)
       .values({ projectId: project.id, name, definition: singleWorkerCycle(name) })
       .onConflictDoUpdate({
         target: [cycles.projectId, cycles.name],
         set: { definition: singleWorkerCycle(name) },
       })
+      .returning()
+
+    /**
+     * A worker's `schedule:` becomes a row the foreman evaluates. `lastRunAt` is left
+     * alone on update — rewriting it would either replay history or skip a due run every
+     * time you touched an unrelated field in config.yaml.
+     */
+    if (cycle) await syncSchedule(db, cycle.id, w)
   }
 
   const removed = await db
@@ -97,4 +105,42 @@ export async function reindexProject(
   }
 
   return { workers: out, removed: removed.map((r) => r.name) }
+}
+
+
+/**
+ * Timezone defaults to this machine's, because "3am" in a config file means three in the
+ * morning where you are, not in UTC. A project that wants otherwise says so explicitly.
+ */
+const localTimezone = (): string => {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
+  } catch {
+    return 'UTC'
+  }
+}
+
+async function syncSchedule(db: Db, cycleId: string, worker: WorkerConfig): Promise<void> {
+  const existing = await db.query.schedules.findFirst({ where: eq(schedules.cycleId, cycleId) })
+
+  if (!worker.schedule) {
+    // Removing `schedule:` from config.yaml stops the schedule, rather than leaving an
+    // orphan that keeps firing for a worker whose definition no longer asks for it.
+    if (existing) await db.delete(schedules).where(eq(schedules.id, existing.id))
+    return
+  }
+
+  const values = {
+    cycleId,
+    cron: worker.schedule,
+    tz: worker.timezone ?? localTimezone(),
+    onMissed: worker.onMissed,
+    enabled: worker.enabled,
+  }
+
+  if (existing) {
+    await db.update(schedules).set(values).where(eq(schedules.id, existing.id))
+  } else {
+    await db.insert(schedules).values(values)
+  }
 }

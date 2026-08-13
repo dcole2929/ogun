@@ -4,6 +4,7 @@ import { createContext } from './context.ts'
 import { localConfigPath } from '@ogun/core'
 import { assertBindIsSafe, InsecureBind, LOCAL_BINDS, resolveAuth } from './auth.ts'
 import { reconcileCoverage, sweepStaleClaims } from './foreman/sweep.ts'
+import { tick } from './foreman/scheduler.ts'
 
 const port = Number(process.env.OGUN_PORT ?? 7777)
 const staleAfterMs = Number(process.env.OGUN_STALE_CLAIM_MS ?? 45 * 60_000)
@@ -33,6 +34,24 @@ const server = serve(
   },
 )
 
+/**
+ * Every 30 seconds. Fine-grained enough that a minute-level schedule fires within its
+ * own minute, and coarse enough that the query is nothing — and since due-ness is
+ * derived from the last run rather than from a timer, a tick that is late or missed
+ * entirely changes nothing except when the work starts.
+ */
+const scheduler = setInterval(() => {
+  tick(ctx.db)
+    .then((r) => {
+      for (const name of r.started) console.log(`[foreman] cron started ${name}`)
+      for (const name of r.skipped) {
+        console.log(`[foreman] cron skipped ${name} — missed while this machine was down`)
+      }
+    })
+    .catch((err) => console.error('[foreman] scheduler failed', err))
+}, 30_000)
+scheduler.unref()
+
 const sweep = setInterval(() => {
   sweepStaleClaims(ctx.db, staleAfterMs)
     .then((n) => n > 0 && console.log(`[foreman] swept ${n} stale claim(s)`))
@@ -44,6 +63,7 @@ const sweep = setInterval(() => {
 sweep.unref()
 
 const shutdown = async () => {
+  clearInterval(scheduler)
   clearInterval(sweep)
   server.close()
   await ctx.close()

@@ -17,8 +17,9 @@ import {
   workerToYamlNode,
 } from '../config-store.ts'
 import { reindexProject } from '../reindex.ts'
+import { parseSchedule } from '../foreman/scheduler.ts'
 
-const { breakers, projects, skills, workers } = schema
+const { breakers, cycles, projects, schedules, skills, workers } = schema
 
 /**
  * Creating a worker in the UI edits the repo's `.ogun/config.yaml` and re-indexes from
@@ -95,6 +96,14 @@ workersRoutes.get('/', async (c) => {
         consecutiveFailures: breakers.consecutiveFailures,
         openedAt: breakers.openedAt,
       },
+      /** Null when this worker has no `schedule:` — it only runs when triggered. */
+      schedule: {
+        cron: schedules.cron,
+        tz: schedules.tz,
+        onMissed: schedules.onMissed,
+        lastRunAt: schedules.lastRunAt,
+        enabled: schedules.enabled,
+      },
       // The prompt a run would actually use, and where it came from. A worker with no
       // prompt of its own is not a worker with no prompt — it inherits the skill's, and
       // showing a blank field invites exactly the question "why has this one got none?"
@@ -104,6 +113,9 @@ workersRoutes.get('/', async (c) => {
     .innerJoin(projects, eq(projects.id, workers.projectId))
     .leftJoin(skills, eq(skills.id, workers.skillId))
     .leftJoin(breakers, eq(breakers.workerId, workers.id))
+    // Schedules hang off the cycle, and a worker's own cycle carries its name.
+    .leftJoin(cycles, and(eq(cycles.projectId, workers.projectId), eq(cycles.name, workers.name)))
+    .leftJoin(schedules, eq(schedules.cycleId, cycles.id))
     .where(project ? eq(workers.projectId, project.id) : undefined)
     .orderBy(workers.name)
 
@@ -121,6 +133,9 @@ workersRoutes.get('/', async (c) => {
     workers: rows.map((r) => ({
       ...r,
       effectivePrompt: effectivePrompt(r.worker, r.skillPrompt),
+      // Computed here rather than stored: a next-run time written to the database is
+      // wrong the moment the process restarts or the expression changes.
+      nextRun: r.schedule?.cron ? nextRunOf(r.schedule.cron, r.schedule.tz ?? 'UTC') : null,
     })),
     editable,
     hashes,
@@ -214,6 +229,15 @@ workersRoutes.delete('/:id', async (c) => {
     return c.json(f.body, f.status)
   }
 })
+
+const nextRunOf = (expression: string, tz: string): string | null => {
+  try {
+    return parseSchedule(expression, tz).nextRun()?.toISOString() ?? null
+  } catch {
+    // An invalid expression shows as "never" rather than breaking the whole list.
+    return null
+  }
+}
 
 /** Mirrors the layering in startCycleRun (§5.1), minus the per-run overrides. */
 function effectivePrompt(

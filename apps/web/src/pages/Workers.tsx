@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link, useNavigate } from 'react-router'
 import { api, type WorkerRow } from '../api.ts'
-import { Empty, Page, Pill } from '../ui.tsx'
+import { Empty, Page, Pill, when } from '../ui.tsx'
 import { WorkerForm } from './WorkerForm.tsx'
 
 /** Mirrors policies.failureBreakerThreshold, whose default is 3 (§4.3). */
@@ -172,6 +172,23 @@ function WorkerCard({
           <div className="muted" style={{ fontSize: 13 }}>
             skill <Link to={`/skills/${row.project.slug}/${w.skillRef}`}>{w.skillRef}</Link> ·
             model {w.modelRole}
+          </div>
+          <div className="muted" style={{ fontSize: 12, marginTop: 3 }}>
+            {row.schedule?.cron ? (
+              <>
+                <span className="mono">{row.schedule.cron}</span>{' '}
+                <span title={row.schedule.tz ?? ''}>
+                  · next {row.nextRun ? when(row.nextRun) : 'never — expression is invalid'}
+                </span>
+                {/* Only worth saying when it is not the default: this is what happens if
+                    the machine is asleep at 3am, which on WSL2 it often is. */}
+                {row.schedule.onMissed === 'runOnce' && (
+                  <span> · catches up once if missed</span>
+                )}
+              </>
+            ) : (
+              'no schedule — runs when triggered'
+            )}
           </div>
           <div className="mono muted" style={{ marginTop: 6, fontSize: 12 }}>
             {row.effectivePrompt.text}
