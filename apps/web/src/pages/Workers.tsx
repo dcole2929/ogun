@@ -95,6 +95,7 @@ function ProjectWorkers({ slug }: { slug: string }) {
             key={row.worker.id}
             projectSlug={slug}
             existing={row.worker}
+            {...(row.drivenBy ? { drivenBy: row.drivenBy.cycle } : {})}
             {...(hash ? { configHash: hash } : {})}
             onDone={() => setEditing(null)}
           />
@@ -189,6 +190,28 @@ function WorkerCard({
                 {/* Only worth saying when it is not the default: this is what happens if
                     the machine is asleep at 3am, which on WSL2 it often is. */}
                 {row.schedule.onMissed === 'runOnce' && <span> · catches up if missed</span>}
+              </>
+            ) : row.drivenBy ? (
+              <>
+                {/* A worker in a cycle has no schedule of its own — saying "runs only
+                    when triggered" here would be wrong in the direction that matters. */}
+                {'part of the '}
+                <span className="mono">{row.drivenBy.cycle}</span>
+                {' cycle'}
+                {row.drivenBy.schedule ? (
+                  <>
+                    {' · '}
+                    <span title={row.drivenBy.schedule}>
+                      {describeSchedule(row.drivenBy.schedule)}
+                    </span>
+                    {' · next '}
+                    <span title={row.drivenBy.nextRun ? exact(row.drivenBy.nextRun) : ''}>
+                      {row.drivenBy.nextRun ? when(row.drivenBy.nextRun) : 'never'}
+                    </span>
+                  </>
+                ) : (
+                  ' · runs only when the cycle is triggered'
+                )}
               </>
             ) : (
               'runs only when triggered'

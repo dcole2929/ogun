@@ -21,6 +21,12 @@ const HELP: Record<string, string> = {
 export type WorkerFormProps = {
   projectSlug: string
   existing?: WorkerRow['worker']
+  /**
+   * Name of the cycle that runs this worker, when one does. The schedule field is still
+   * editable — the field is in config.yaml either way — but it would not fire, and a
+   * schedule that silently does nothing is the worst version of this.
+   */
+  drivenBy?: string
   /** Compare-and-swap token from the list read. Two tabs cannot clobber each other. */
   configHash?: string
   onDone: () => void
@@ -30,7 +36,13 @@ export type WorkerFormProps = {
  * The point of this form is that a worker is a small thing: a skill, plus how to run
  * it. Everything here has a working default except which skill to point at.
  */
-export function WorkerForm({ projectSlug, existing, configHash, onDone }: WorkerFormProps) {
+export function WorkerForm({
+  projectSlug,
+  existing,
+  drivenBy,
+  configHash,
+  onDone,
+}: WorkerFormProps) {
   const qc = useQueryClient()
   const { data: skillData } = useQuery({
     queryKey: ['skills', projectSlug],
@@ -207,6 +219,13 @@ export function WorkerForm({ projectSlug, existing, configHash, onDone }: Worker
         </label>
 
         <ScheduleField value={schedule} onChange={setSchedule} />
+        {drivenBy && (
+          <p className="muted" style={{ fontSize: 13, marginTop: -4 }}>
+            The <span className="mono">{drivenBy}</span> cycle runs this worker, and its
+            schedule is what fires. A schedule set here will be ignored — set it on the
+            cycle instead.
+          </p>
+        )}
 
         <label className="inline">
           <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} />

@@ -177,6 +177,11 @@ export type WorkerRow = {
   } | null
   nextRun: string | null
   /**
+   * The named cycle that runs this worker, when one does. Its schedule replaces the
+   * worker's own — a worker cannot be scheduled twice.
+   */
+  drivenBy: { cycle: string; schedule: string | null; nextRun: string | null } | null
+  /**
    * What a run would actually use. `skill` means the worker inherits its skill's
    * default_prompt rather than having none of its own.
    */

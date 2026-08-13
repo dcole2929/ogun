@@ -716,6 +716,43 @@ set it is a two-stage sequential pipeline — run N jobs, await all, run one mor
 roughly 30 lines. A general DAG engine is only needed for user-defined graphs. Hence
 triage in phase 2, cycles in phase 3.
 
+**How it is written.** [settled] Fan-in gets sugar, because spelling out three edges
+that all say the same thing is a place to make a silent mistake — a missed edge means
+that reviewer's findings never reach triage and nothing complains:
+
+```yaml
+cycles:
+  nightly:
+    workers: [adversarial-review, security-review]
+    then: triage
+    schedule: "0 3 * * *"
+    onDepFailure: degrade    # triage still runs if a reviewer dies
+```
+
+The general `nodes`/`edges` form stays available underneath, and the sugar expands into
+it in the CLI before anything else sees it, so the control plane and UI only ever handle
+one shape.
+
+**Staging is derived from the graph, not declared on the worker.** [settled] A run
+stages instead of publishing when something downstream depends on it. The alternative —
+a `stageOnly: true` flag on the worker — makes the same reviewer unusable standalone,
+and gets out of step with the graph the moment you edit one and not the other. The
+coverage ledger still records what the reviewer *reported*, so "found three things" does
+not become "clean" merely because triage has not run yet.
+
+**A worker in a cycle loses its own schedule.** [settled] Every worker also has a
+one-node cycle so it can be triggered alone, and that cycle carries the worker's
+`schedule:`. Once a named cycle drives the worker, two schedules would fire at the same
+hour and the standalone one would publish raw findings — precisely what triage exists to
+prevent. Membership therefore suppresses it, `ogun project sync` says so, and the UI
+shows the cycle in place of the schedule. Manual triggering by worker name is unaffected.
+
+**Triage's input is a file, not a query.** [settled] The sandbox cannot reach the
+database, so the runner fetches the upstream nodes' staged findings and writes them to
+`.ogun-in/upstream.json` in the workspace. It carries every dependency, including the
+ones that found nothing and the ones that failed — triage assembles the coverage
+picture, and "three of four reviewers ran" is not derivable from findings alone.
+
 ### 4.13 Integrations
 
 - **GitHub** — clone, branch, push, draft PR. Host-side only.
@@ -1091,9 +1128,12 @@ evaluated in-process, re-scanned rather than registered once so adding a worker 
 restart, with `skip` and `runOnce` deciding what happens to an occurrence the machine
 slept through. Schedules are editable from the UI. The findings inbox is the home screen.
 
-Remaining: **triage fan-in** — the first genuinely multi-node cycle, and the first use of
-`on_dep_failure: degrade`. Then re-adjudication, which is what stops a reviewer
-re-flagging what you already dismissed.
+Also done: **triage fan-in** (§4.12) — the first genuinely multi-node cycle and the first
+use of `on_dep_failure: degrade`. Reviewers stage, triage publishes, and which of those a
+run does is read off the graph rather than declared on the worker.
+
+Remaining: re-adjudication, which is what stops a reviewer re-flagging what you already
+dismissed.
 
 **Phase 3 — the write path.** Modifier workers, retry loop on the existing verify
 gate, modifier-profile lenses, patch → branch → draft PR pipeline, tests-must-pass

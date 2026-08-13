@@ -142,7 +142,7 @@ ogun db status              is the database up, and is the schema current
 ogun runner doctor          what this machine can actually run
 ogun skill new <name>       scaffold .agents/skills/<name>/
 ogun skills                 every skill, and which workers bind it
-ogun workers                every worker, its schedule, and when it next runs
+ogun workers                every worker, and when it next runs
 ogun runs                   recent runs
 ogun findings list          the inbox
 ogun coverage <project>     what ran, what didn't, and why
@@ -152,6 +152,22 @@ Every command, its flags, which machine it runs on, and what it writes:
 [`docs/cli.md`](docs/cli.md).
 
 ## Skills and workers
+
+**Reviewers fan into triage.** Several reviewers run in parallel, each staging what it
+found; one triage node runs after them and is the only thing that writes to the inbox.
+That is what stops two reviewers reporting the same problem in different words:
+
+```yaml
+cycles:
+  nightly:
+    workers: [adversarial-review, security-review]
+    then: triage
+    schedule: "0 3 * * *"
+```
+
+A worker listed in a cycle stages rather than publishes — read off the graph, so the same
+reviewer still publishes directly when run on its own. The cycle owns the schedule;
+`ogun trigger <project> nightly` runs the whole thing now.
 
 **Skills live in the repo being reviewed**, with a small built-in library for universal
 ones. A repo defining a skill by the same name overrides the built-in — what "security
