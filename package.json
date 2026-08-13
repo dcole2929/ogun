@@ -8,15 +8,16 @@
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json && pnpm --filter @ogun/web typecheck",
-    "db:up": "docker compose up -d",
-    "db:down": "docker compose down",
+    "db:up": "node packages/cli/src/main.ts db up",
+    "db:down": "node packages/cli/src/main.ts db down",
     "db:generate": "pnpm --filter @ogun/core db:generate",
-    "db:migrate": "pnpm --filter @ogun/core db:migrate",
+    "db:migrate": "node packages/cli/src/main.ts db migrate",
     "server": "node packages/cli/src/main.ts server",
     "runner": "node packages/cli/src/main.ts runner start",
     "ogun": "node --env-file-if-exists=.env packages/cli/src/main.ts",
     "web": "pnpm --filter @ogun/web dev",
-    "test": "node --test --test-concurrency=1 packages/*/test/*.test.ts && pnpm --filter @ogun/web test"
+    "test": "node --test --test-concurrency=1 packages/*/test/*.test.ts && pnpm --filter @ogun/web test",
+    "init": "node packages/cli/src/main.ts init"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

@@ -1019,10 +1019,10 @@ ogun/
 ~/.ogun/          machine-local: config.json, skills, workspaces, cache volumes
 ```
 
-Stack: Node 26 (via asdf), Hono, Vite + React (no Next), Postgres + Drizzle, croner,
-Zod for all config and structured-output validation, Docker.
+Stack: Node 24+, Hono, Vite + React (no Next), Postgres + Drizzle, croner, Zod for all
+config and structured-output validation, Docker.
 
-**No build step for the server, runner, or CLI.** [settled] Node 26 strips types
+**No build step for the server, runner, or CLI.** [settled] Node strips types
 natively, so `node packages/server/src/main.ts` runs TypeScript directly and `tsc` is
 typecheck-only. The cost is a dialect restriction — `erasableSyntaxOnly`, so no enums
 and no parameter properties — which is a fair trade for deleting a compile step from
@@ -1036,18 +1036,34 @@ and tools are present on this machine), `ogun run <worker>`, `ogun runs`,
 
 ---
 
-## 8. Cross-platform
+## 8. Host assumptions
 
-Only WSL2 matters today, but the constraints are real:
+Ogun requires Docker, git, Node 24 or newer, and at least one logged-in agent CLI.
+Nothing else about the host is assumed, and nothing machine-specific is stored outside
+`~/.ogun/config.json`.
 
-- **"Always on" isn't.** WSL2 stops with Windows sleep/hibernate/update reboots.
-  Hence the missed-run policy.
-- **systemd.** Set `systemd=true` in `/etc/wsl.conf`; run server and runner as units
-  so they survive restarts.
-- **Memory.** WSL2 caps at ~50% of Windows RAM. A container running an agent plus a
-  test suite is not small. `maxConcurrentJobs: 2`; raise `memory=` in `.wslconfig`
-  before raising concurrency.
-- **Filesystem.** Everything on ext4. Never `/mnt/c` — roughly 10× slower.
+Four constraints hold on any host and shape real decisions:
+
+- **"Always on" isn't.** A workstation sleeps, and a VM or WSL environment stops with its
+  host. Missed occurrences are therefore ordinary rather than exceptional, which is why
+  scheduling derives from the last run rather than from a live timer, and why
+  `onMissed` exists at all (§4.2).
+- **Restarts happen.** Run the server and runner under whatever supervises services on
+  that host — systemd, launchd, a Windows service — so they come back on their own.
+  Nothing in Ogun depends on which.
+- **Memory is the binding constraint on concurrency.** A container running an agent plus
+  a project's test suite is not small, and a virtualised host often has far less RAM than
+  the machine it runs on. `maxConcurrentJobs` defaults to 2; raise the host's memory
+  before raising it.
+- **Filesystem crossings are expensive.** Keep workspaces on the host's native
+  filesystem. Working across a virtualisation boundary — a Windows drive mounted into
+  Linux, a bind-mounted network share — is roughly an order of magnitude slower, and a
+  workspace is cloned for every run.
+
+**Reaching a control plane from another machine** is the one place virtualisation leaks:
+an environment behind NAT has an address its own host can reach and nothing else can.
+Ogun detects that case and says so before you enrol a runner (§4.5) rather than handing
+over an address that cannot work.
 
 ---
 
@@ -1068,10 +1084,16 @@ The first real run found a genuine `high` in Ogun's own finalize path — a find
 `fixed` that regressed stayed `fixed` and never reappeared in the inbox. That is the
 loop doing the thing it exists to do, on day one.
 
-**Phase 2 — the factory runs itself.** Foreman: cron, missed-run catchup, schedule
-re-scan, the job queue, concurrency cap, failure breaker. Second and third workers.
-**Triage fan-in** — the first multi-node cycle, and the first use of
-`on_dep_failure: degrade`. Findings inbox as the home screen. Re-adjudication.
+**Phase 2 — the factory runs itself.** In progress.
+
+Done: the job queue, the global concurrency cap, the failure breaker, and cron —
+evaluated in-process, re-scanned rather than registered once so adding a worker needs no
+restart, with `skip` and `runOnce` deciding what happens to an occurrence the machine
+slept through. Schedules are editable from the UI. The findings inbox is the home screen.
+
+Remaining: **triage fan-in** — the first genuinely multi-node cycle, and the first use of
+`on_dep_failure: degrade`. Then re-adjudication, which is what stops a reviewer
+re-flagging what you already dismissed.
 
 **Phase 3 — the write path.** Modifier workers, retry loop on the existing verify
 gate, modifier-profile lenses, patch → branch → draft PR pipeline, tests-must-pass

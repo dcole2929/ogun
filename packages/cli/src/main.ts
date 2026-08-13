@@ -17,6 +17,8 @@ import { workersList } from './commands/workers.ts'
 import { runnerInit, runnerInvite, runnerJoin } from './commands/runner.ts'
 import { tokenRotate, tokenShow } from './commands/token.ts'
 import { runnerStart, serverStart } from './commands/serve.ts'
+import { dbDown, dbMigrate, dbStatus, dbUp } from './commands/db.ts'
+import { init } from './commands/init.ts'
 
 const serverUrl = process.env.OGUN_SERVER_URL ?? 'http://localhost:7777'
 const [command, sub, ...rest] = process.argv.slice(2)
@@ -28,12 +30,16 @@ const [command, sub, ...rest] = process.argv.slice(2)
  */
 const usage = `${bold('ogun')} — a local-first software factory
 
+${bold('setup')}
+  ogun init                        database, schema, sandbox image — run this first
+  ogun db up | down | migrate | status
+  ogun image build [project-dir]   build ogun/base, or a project image
+
 ${bold('running it')}
   ogun server                      start the control plane and web UI
   ogun runner init [--name]        make this machine a runner for it
   ogun runner start                start a runner on this machine
   ogun runner doctor               what this machine can actually run
-  ogun image build [project-dir]   build ogun/base, or a project image
 
 ${bold('adding a machine')}
   ogun runner invite               on the CONTROL PLANE — mints a join token
@@ -84,6 +90,18 @@ try {
       else if (sub === 'sync') await projectSync(rest, serverUrl)
       else if (sub === 'list' || sub === undefined) await projectList(serverUrl)
       else fail('usage: ogun project add [dir] | sync [dir] | list')
+      break
+
+    case 'init':
+      await init([sub, ...rest].filter(Boolean) as string[])
+      break
+
+    case 'db':
+      if (sub === 'up') await dbUp()
+      else if (sub === 'down') await dbDown(rest)
+      else if (sub === 'migrate') await dbMigrate()
+      else if (sub === 'status' || sub === undefined) await dbStatus()
+      else fail('usage: ogun db up | down [--volumes] | migrate | status')
       break
 
     case 'server':
