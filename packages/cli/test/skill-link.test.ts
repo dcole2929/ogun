@@ -84,3 +84,29 @@ test('linking twice is a no-op', async () => {
   await linkForRuntimes(dir, 'review')
   assert.deepEqual(await linkForRuntimes(dir, 'review'), [])
 })
+
+/**
+ * Ogun's own shipped library lives in `skills/`, and is useful against Ogun itself. It is
+ * in-tree here, so a relative link is safe; in *another* project a builtin is copied into
+ * the workspace by the runner instead, because a link out to wherever Ogun is installed
+ * would dangle in a container and break on another machine.
+ */
+test('a shipped skill is linked from its own directory', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'ogun-shipped-'))
+  await mkdir(join(dir, 'skills/adversarial-review'), { recursive: true })
+  await writeFile(join(dir, 'skills/adversarial-review/SKILL.md'), '# shipped')
+
+  const linked = await linkForRuntimes(dir, 'adversarial-review', 'skills')
+  assert.deepEqual(linked, [
+    '.claude/skills/adversarial-review',
+    '.codex/skills/adversarial-review',
+  ])
+  assert.equal(
+    await readlink(join(dir, '.claude/skills/adversarial-review')),
+    '../../skills/adversarial-review',
+  )
+  assert.equal(
+    await readFile(join(dir, '.claude/skills/adversarial-review/SKILL.md'), 'utf8'),
+    '# shipped',
+  )
+})
