@@ -19,6 +19,16 @@ import { Empty, exact, Page, Pill, when } from '../ui.tsx'
  * which left the ledger saying a job was blocked and nothing about by what — the exact
  * conflation this table exists to prevent.
  */
+/** What to do about it. A warning with no remedy is one you learn to scroll past. */
+const REMEDY: Record<string, string> = {
+  refused:
+    'Admission refused it. Clear the breaker on the Runners page, or re-enable the worker.',
+  blocked: 'Fix whatever its dependency was waiting on, then run the cycle again.',
+  cancelled: 'Trigger it again from Workers when you want it.',
+  errored: 'Open the run for the failure, fix it, and trigger again.',
+  'gate-failed': "Open the run — its output was rejected, and the gate says why.",
+}
+
 const MEANING: Record<string, string> = {
   pending: 'selected and queued — no runner has picked it up yet',
   found: 'ran, and reported findings',
@@ -42,7 +52,23 @@ export function CoveragePage() {
   })
   const rows = data?.coverage ?? []
 
-  const neverRan = rows.filter((r) => !r.coverage.ran && r.coverage.outcome !== 'pending')
+  /**
+   * Only the most recent batch, and only what you can act on.
+   *
+   * Counting every never-ran row in history produced a permanent banner about work that
+   * failed weeks ago, which you could neither dismiss nor fix — and a warning you cannot
+   * act on is one you learn to scroll past, taking the ones that matter with it.
+   * `abandoned` is excluded for the same reason: it is the sweep's inference about a job
+   * that vanished, not a surface anyone decided to skip.
+   */
+  const latestBatch = rows[0]?.cycleRun.id
+  const actionable = rows.filter(
+    (r) =>
+      r.cycleRun.id === latestBatch &&
+      !r.coverage.ran &&
+      r.coverage.outcome !== 'pending' &&
+      r.coverage.outcome !== 'abandoned',
+  )
 
   return (
     <Page
@@ -71,11 +97,26 @@ export function CoveragePage() {
         </Empty>
       )}
 
-      {neverRan.length > 0 && (
-        <p className="error" style={{ fontSize: 13 }}>
-          {neverRan.length} selected {neverRan.length === 1 ? 'worker' : 'workers'} did not
-          run. That surface is uncovered — whatever it would have looked at, nobody has.
-        </p>
+      {actionable.length > 0 && (
+        <div className="card" style={{ borderColor: 'var(--red)', marginBottom: 16 }}>
+          <p className="error" style={{ margin: '0 0 6px', fontSize: 13 }}>
+            In the most recent batch, {actionable.length}{' '}
+            {actionable.length === 1 ? 'worker' : 'workers'} did not run.
+          </p>
+          {/* Named, with the reason and what to do — a count alone tells you something is
+              wrong and nothing about what. */}
+          {actionable.map((r, i) => (
+            <div key={i} style={{ fontSize: 13, marginBottom: 4 }}>
+              <strong>{r.worker.name}</strong>{' '}
+              <span className="muted">
+                — {r.coverage.reason ?? MEANING[r.coverage.outcome] ?? r.coverage.outcome}
+              </span>
+              <div className="muted" style={{ fontSize: 12 }}>
+                {REMEDY[r.coverage.outcome] ?? 'Trigger it again from Workers.'}
+              </div>
+            </div>
+          ))}
+        </div>
       )}
 
       {rows.length > 0 && (
