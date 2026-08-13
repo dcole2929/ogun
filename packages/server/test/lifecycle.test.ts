@@ -149,7 +149,8 @@ describe('run lifecycle', { skip: reachable ? false : 'no control plane running'
       .select()
       .from(schema.coverage)
       .where(eq(schema.coverage.cycleRunId, r.cycleRunId))
-    assert.equal(cov?.outcome, 'blocked')
+    // `refused`, not `blocked`: admission said no. Nothing was blocking it.
+    assert.equal(cov?.outcome, 'refused')
     assert.match(cov?.reason ?? '', /breaker open/)
   })
 })

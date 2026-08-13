@@ -93,6 +93,7 @@ export function RunsPage() {
               <th>Project</th>
               <th>Worker</th>
               <th>Outcome</th>
+              <th>Produced</th>
               <th>Took</th>
               <th>Tokens</th>
               <th>Commit</th>
@@ -108,6 +109,19 @@ export function RunsPage() {
                 <td>{r.worker.name}</td>
                 <td>
                   <Pill value={r.run.outcome ?? r.job.state} />
+                </td>
+                <td className="muted">
+                  {/* The result, not just the status. What a run produced is what you
+                      are scanning the list for. */}
+                  {r.run.outcome === 'approved'
+                    ? (r.produced?.findings ?? 0) > 0
+                      ? `${r.produced?.findings} finding${r.produced?.findings === 1 ? '' : 's'}`
+                      : 'nothing found'
+                    : r.run.outcome === 'changes-requested'
+                      ? 'rejected by the gate'
+                      : r.run.outcome === 'error'
+                        ? 'failed'
+                        : '—'}
                 </td>
                 <td className="muted">{duration(r.run.durationMs)}</td>
                 <td className="muted mono">

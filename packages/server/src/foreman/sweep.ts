@@ -72,10 +72,10 @@ export async function reconcileCoverage(db: Db): Promise<number> {
     await db
       .update(coverage)
       .set({
-        // Never ran, whatever the reason. `blocked` is the honest outcome; the reason
-        // says it was reconciled rather than observed, so a stale row is not mistaken
-        // for a decision something actually made.
-        outcome: 'blocked',
+        // `abandoned`, not `blocked`: nothing blocked it. The job simply ended without
+        // the ledger being told, and this row is the sweep's inference from job state
+        // rather than something anyone observed.
+        outcome: 'abandoned',
         ran: false,
         reason: `job ended as ${row.jobState} without reporting a run`,
       })

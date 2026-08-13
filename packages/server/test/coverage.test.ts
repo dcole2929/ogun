@@ -56,7 +56,7 @@ describe('coverage reconciliation', () => {
     assert.equal((await coverageFor(cycleRunId)).outcome, 'pending')
   })
 
-  test('a job that ended without running is reconciled to blocked', async () => {
+  test('a job that ended without running is reconciled to abandoned', async () => {
     const { cycleRunId } = await startCycleRun(db, { cycleId, trigger: 'test' })
     await db
       .update(schema.jobs)
@@ -67,7 +67,7 @@ describe('coverage reconciliation', () => {
     await reconcileCoverage(db)
 
     const row = await coverageFor(cycleRunId)
-    assert.equal(row.outcome, 'blocked')
+    assert.equal(row.outcome, 'abandoned')
     assert.equal(row.ran, false)
     // The reason has to say it was inferred, so a reconciled row is not mistaken for a
     // decision something actually made.
@@ -112,7 +112,7 @@ describe('coverage reconciliation', () => {
     if (!res?.ok) return // no control plane running; the sweep test covers the same rule
 
     const row = await coverageFor(cycleRunId)
-    assert.equal(row.outcome, 'blocked')
+    assert.equal(row.outcome, 'cancelled', 'nothing blocked it — you stopped it')
     assert.match(row.reason ?? '', /cancelled/)
     void and
   })

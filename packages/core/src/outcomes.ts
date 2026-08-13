@@ -36,14 +36,40 @@ export const isTerminal = (s: JobState): boolean => TERMINAL_JOB_STATES.includes
 export const CYCLE_STATES = ['running', 'complete', 'degraded', 'failed'] as const
 export type CycleState = (typeof CYCLE_STATES)[number]
 
+/**
+ * Why a selected worker did or did not produce a result.
+ *
+ * The three "never ran" cases are deliberately separate. `blocked` previously meant all
+ * of them at once — admission refusing a job, a dependency failing, and a job being
+ * cancelled — which left the ledger saying "blocked" and nothing about by what. That is
+ * the conflation principle 6 exists to prevent, applied to the table written to enforce
+ * it.
+ */
 export const COVERAGE_OUTCOMES = [
-  /** Selected and admitted, but no run has reported yet. Not the same as clean. */
+  /** Selected and admitted, waiting for a runner. Not the same as clean. */
   'pending',
+
+  // Ran.
+  /** Reported findings. */
   'found',
+  /** Looked and reported nothing — a result, not an absence. */
   'clean',
+  /** Produced output the verify gate rejected, so nothing was persisted. */
   'gate-failed',
-  'blocked',
+  /** Started and failed. */
   'errored',
+
+  // Never ran, and which of these it was matters.
+  /** Admission refused it: the breaker is open, or the worker is disabled. */
+  'refused',
+  /** A dependency in its cycle did not succeed. */
+  'blocked',
+  /** Stopped deliberately before it started. */
+  'cancelled',
+  /** Ended without reporting, and the ledger had to infer that from job state. */
+  'abandoned',
+
+  /** Not part of this batch. */
   'not-selected',
 ] as const
 export type CoverageOutcome = (typeof COVERAGE_OUTCOMES)[number]

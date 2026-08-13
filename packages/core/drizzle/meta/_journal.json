@@ -50,6 +50,13 @@
       "when": 1786574581008,
       "tag": "0006_runner_identity_and_timestamps",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1786574581009,
+      "tag": "0007_split_blocked_coverage",
+      "breakpoints": true
     }
   ]
 }

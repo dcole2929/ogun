@@ -32,6 +32,8 @@ export type PendingJob = {
 }
 
 export type RunSummary = {
+  /** Only on the list; the detail route returns the full `produced` breakdown. */
+  produced?: { findings: number }
   run: {
     id: string
     outcome: string | null
@@ -61,6 +63,30 @@ export type RunEventRow = {
 export type RunDetail = RunSummary & {
   events: RunEventRow[]
   artifacts: Array<{ id: string; kind: string; ref: string; bytes: number | null }>
+  /**
+   * What the run produced. Findings are one kind of output, not the point — a modifier
+   * produces a patch and a branch, an architecture reviewer a proposed ADR, and plenty
+   * of runs produce nothing at all.
+   */
+  produced: {
+    findings: Array<Record<string, unknown>>
+    promoted: Array<{
+      id: string
+      fingerprint: string
+      title: string
+      severity: string
+      status: string
+      seenCount: number
+      firstSeenHere: boolean
+    }>
+    changes: Array<{
+      id: string
+      branch: string | null
+      filesChanged: number | null
+      testsPassed: boolean | null
+      prUrl: string | null
+    }>
+  }
 }
 
 export type FindingRow = {

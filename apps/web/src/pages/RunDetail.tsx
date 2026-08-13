@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Link, useParams } from 'react-router'
-import { api, type RunEventRow } from '../api.ts'
-import { duration, Empty, Page, Pill, when } from '../ui.tsx'
+import { api, type RunDetail, type RunEventRow } from '../api.ts'
+import { duration, Empty, Page, Pill, Severity, when } from '../ui.tsx'
 
 export function RunDetailPage() {
   const { id = '' } = useParams()
@@ -72,7 +72,12 @@ export function RunDetailPage() {
         </dl>
       </div>
 
+      <Produced detail={data} />
+
       <h2>Timeline</h2>
+      <p className="muted" style={{ fontSize: 12, marginTop: -4 }}>
+        Every tool call and message, as it happened. The result is above.
+      </p>
       {events.length === 0 && <Empty>no events yet</Empty>}
       <div className="timeline">
         {events.map((e) => (
@@ -80,6 +85,117 @@ export function RunDetailPage() {
         ))}
       </div>
     </Page>
+  )
+}
+
+/**
+ * What the run produced, above the timeline.
+ *
+ * A run is the primary object and its result is the thing you came for. Before this, the
+ * page showed an event stream and metadata, so "what did this run actually do?" was
+ * answerable only by reading fifty tool calls to the end.
+ */
+function Produced({ detail }: { detail: RunDetail }) {
+  const { promoted, changes, findings } = detail.produced
+  const running = !detail.run.endedAt
+  const outcome = detail.run.outcome
+
+  if (running) return null
+
+  return (
+    <>
+      <h2>Result</h2>
+      <div className="card" style={{ marginBottom: 20 }}>
+        {/* The failure reasons first, since that is what you opened this page for when
+            something went wrong. */}
+        {outcome === 'error' && (
+          <p className="error" style={{ marginTop: 0, fontSize: 13 }}>
+            This run failed before producing anything.
+            {detail.run.detail && (
+              <>
+                {' '}
+                <span className="mono">{detail.run.detail}</span>
+              </>
+            )}
+          </p>
+        )}
+        {outcome === 'changes-requested' && (
+          <p className="error" style={{ marginTop: 0, fontSize: 13 }}>
+            The verify gate rejected this run's output, so nothing was persisted —
+            deliberately, because a finding that fails its own schema or cites a file that
+            does not exist is worse than none.
+            {detail.run.detail && (
+              <>
+                {' '}
+                <span className="mono">{detail.run.detail}</span>
+              </>
+            )}
+          </p>
+        )}
+
+        {promoted.length > 0 ? (
+          <>
+            <p className="muted" style={{ marginTop: 0, fontSize: 12 }}>
+              {promoted.length} finding{promoted.length === 1 ? '' : 's'} from this run.
+            </p>
+            {promoted.map((f) => (
+              <div key={f.id} className="finding" style={{ paddingTop: 8 }}>
+                <div className="row" style={{ marginBottom: 3 }}>
+                  <Severity value={f.severity} />
+                  {f.status !== 'open' && <Pill value={f.status} />}
+                  {!f.firstSeenHere && (
+                    // Worth distinguishing: this run confirmed something already known
+                    // rather than discovering it.
+                    <span className="pill" title={`reported ${f.seenCount} times`}>
+                      seen before
+                    </span>
+                  )}
+                </div>
+                <Link to="/findings" style={{ fontWeight: 550 }}>
+                  {f.title}
+                </Link>
+                <div className="fp">{f.fingerprint}</div>
+              </div>
+            ))}
+          </>
+        ) : outcome === 'approved' ? (
+          <p style={{ margin: 0, fontSize: 13 }}>
+            Nothing found.{' '}
+            <span className="muted">
+              The worker looked and reported no issues — a result, not an absence.
+            </span>
+          </p>
+        ) : null}
+
+        {findings.length > promoted.length && (
+          <p className="muted" style={{ fontSize: 12 }}>
+            {findings.length} reported, {promoted.length} persisted — the rest were
+            duplicates of findings already open.
+          </p>
+        )}
+
+        {changes.map((ch) => (
+          <dl className="kv" key={ch.id}>
+            <dt>Branch</dt>
+            <dd className="mono">{ch.branch ?? '—'}</dd>
+            <dt>Files changed</dt>
+            <dd className="muted">{ch.filesChanged ?? '—'}</dd>
+            <dt>Tests</dt>
+            <dd>{ch.testsPassed === null ? '—' : ch.testsPassed ? 'passed' : 'failed'}</dd>
+            {ch.prUrl && (
+              <>
+                <dt>Pull request</dt>
+                <dd>
+                  <a href={ch.prUrl} target="_blank" rel="noreferrer noopener">
+                    {ch.prUrl}
+                  </a>
+                </dd>
+              </>
+            )}
+          </dl>
+        ))}
+      </div>
+    </>
   )
 }
 
