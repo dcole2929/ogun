@@ -3,7 +3,7 @@ import { createApp } from './app.ts'
 import { createContext } from './context.ts'
 import { localConfigPath } from '@ogun/core'
 import { assertBindIsSafe, InsecureBind, LOCAL_BINDS, resolveAuth } from './auth.ts'
-import { sweepStaleClaims } from './foreman/sweep.ts'
+import { reconcileCoverage, sweepStaleClaims } from './foreman/sweep.ts'
 
 const port = Number(process.env.OGUN_PORT ?? 7777)
 const staleAfterMs = Number(process.env.OGUN_STALE_CLAIM_MS ?? 45 * 60_000)
@@ -37,6 +37,9 @@ const sweep = setInterval(() => {
   sweepStaleClaims(ctx.db, staleAfterMs)
     .then((n) => n > 0 && console.log(`[foreman] swept ${n} stale claim(s)`))
     .catch((err) => console.error('[foreman] sweep failed', err))
+  reconcileCoverage(ctx.db)
+    .then((n) => n > 0 && console.log(`[foreman] reconciled ${n} stale coverage row(s)`))
+    .catch((err) => console.error('[foreman] coverage reconcile failed', err))
 }, 60_000)
 sweep.unref()
 

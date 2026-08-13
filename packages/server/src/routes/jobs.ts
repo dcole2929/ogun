@@ -4,6 +4,7 @@ import { schema } from '@ogun/core/db'
 import { claimRequestSchema, claimedJobSchema, type ClaimedJob } from '@ogun/core'
 import type { Env } from '../context.ts'
 import { DEFAULT_LIMITS, remainingCapacity } from '../foreman/admission.ts'
+import { markCoverage } from '../foreman/cycles.ts'
 
 const { jobs, projects, runners, runs, workers } = schema
 
@@ -154,10 +155,19 @@ jobsRoutes.get('/', async (c) => {
 /** Only a queued job can be cancelled; one already claimed belongs to a runner. */
 jobsRoutes.post('/:id/cancel', async (c) => {
   const { db } = c.var.ctx
-  const cancelled = await db
+  const [cancelled] = await db
     .update(jobs)
     .set({ state: 'skipped' })
     .where(and(eq(jobs.id, c.req.param('id')), eq(jobs.state, 'queued')))
-    .returning({ id: jobs.id })
-  return c.json({ cancelled: cancelled.length > 0 })
+    .returning()
+  if (!cancelled) return c.json({ cancelled: false })
+
+  // The ledger has to say so. A cancelled job left at `pending` claims it is still
+  // waiting for a runner, in the one table whose entire purpose is to be true about what
+  // ran (principle 6).
+  await markCoverage(db, cancelled.cycleRunId, cancelled.workerId, {
+    outcome: 'blocked',
+    reason: 'cancelled before it ran',
+  })
+  return c.json({ cancelled: true })
 })
