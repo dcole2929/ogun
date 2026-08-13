@@ -53,6 +53,8 @@ async function ensureTestDatabase(): Promise<string> {
  * `.ogun/config.yaml` is the same class of mistake as one that writes to the real
  * database. Pass a fake when the test is about config editing.
  */
+let cleaned = false
+
 export async function startHarness(config?: ConfigStore): Promise<Harness> {
   const url = await ensureTestDatabase()
   const previous = process.env.DATABASE_URL
@@ -61,12 +63,25 @@ export async function startHarness(config?: ConfigStore): Promise<Harness> {
   const ctx = createContext(config ?? unreachableConfigStore(), false)
 
   /**
-   * Start from empty. Several checks count rows globally — remaining capacity is the
-   * whole machine's, not one project's — so data left by another file makes a passing
-   * test fail for reasons that have nothing to do with it. Cleaning on start rather than
-   * on stop means a crashed run cannot poison the next one.
+   * Start from empty — but only once per process.
+   *
+   * Several checks count rows globally (remaining capacity is the whole machine's, not
+   * one project's), so data left by a previous *file* makes a passing test fail for
+   * reasons of its own. Cleaning on start rather than on stop means a crashed run cannot
+   * poison the next one.
+   *
+   * Truncating on *every* start was wrong: a file with more than one suite starts more
+   * than one harness, and the second one's cleanup deleted the first suite's project
+   * while its tests were still running. The next `startCycleRun` then inserted a
+   * `cycle_runs` row pointing at a cycle that had just been cascade-deleted — an FK
+   * violation that surfaced as a rare, unreproducible failure in whichever test happened
+   * to be mid-flight. Files already run one at a time, and each is its own process, so
+   * once per process is exactly the isolation that was intended.
    */
-  await truncate(ctx.db)
+  if (!cleaned) {
+    await truncate(ctx.db)
+    cleaned = true
+  }
   // Port 0: the OS picks a free one, so parallel test files never collide and none of
   // them can accidentally be the real control plane. Awaited, because binding is
   // asynchronous — reading `address()` immediately gives a port nothing is listening on.
