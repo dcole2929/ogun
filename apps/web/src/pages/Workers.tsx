@@ -5,6 +5,9 @@ import { api, type WorkerRow } from '../api.ts'
 import { Empty, Page, Pill } from '../ui.tsx'
 import { WorkerForm } from './WorkerForm.tsx'
 
+/** Mirrors policies.failureBreakerThreshold, whose default is 3 (§4.3). */
+const BREAKER_THRESHOLD = 3
+
 export function WorkersPage() {
   const { data: projects } = useQuery({ queryKey: ['projects'], queryFn: api.projects })
   const list = projects?.projects ?? []
@@ -155,7 +158,16 @@ function WorkerCard({
             <span className="pill">{w.runtime}</span>
             <span className="pill">{w.sandbox}</span>
             {!w.enabled && <span className="pill yellow">disabled</span>}
-            {row.breaker?.openedAt && <span className="pill red">breaker open</span>}
+            {row.breaker?.openedAt ? (
+              <span className="pill red">breaker open</span>
+            ) : (row.breaker?.consecutiveFailures ?? 0) > 0 ? (
+              // Visible while it is building, not only once it has stopped you. A guard
+              // you first learn about by being blocked is one you experience as a
+              // mystery rather than as a warning.
+              <span className="pill yellow" title="consecutive failures">
+                {row.breaker?.consecutiveFailures} failed in a row
+              </span>
+            ) : null}
           </div>
           <div className="muted" style={{ fontSize: 13 }}>
             skill <Link to={`/skills/${row.project.slug}/${w.skillRef}`}>{w.skillRef}</Link> ·
@@ -191,18 +203,28 @@ function WorkerCard({
 
       {/* The breaker latches on purpose — it survives a restart, which is exactly when
           you would want it to hold — so clearing it has to be something you can do. */}
-      {row.breaker?.openedAt && (
+      {(row.breaker?.consecutiveFailures ?? 0) > 0 && (
         <div
           className="row"
           style={{ marginTop: 12, fontSize: 13, alignItems: 'flex-start', flexWrap: 'wrap' }}
         >
-          <span className="error" style={{ flex: '1 1 300px' }}>
-            Not being dispatched: {row.breaker.consecutiveFailures} runs failed in a row, so
-            admission stopped sending it work. That guard exists to keep a failure loop from
-            spending the night burning rate limit. Fix what was failing, then clear it.
-          </span>
+          {row.breaker?.openedAt ? (
+            <span className="error" style={{ flex: '1 1 320px' }}>
+              <strong>Not being dispatched.</strong> {row.breaker.consecutiveFailures} runs
+              failed in a row, so admission stopped sending it work — the guard that keeps a
+              failure loop from spending the night burning rate limit. Fix what was failing,
+              then clear it.
+            </span>
+          ) : (
+            <span className="muted" style={{ flex: '1 1 320px' }}>
+              {row.breaker?.consecutiveFailures} run
+              {row.breaker?.consecutiveFailures === 1 ? '' : 's'} failed in a row.{' '}
+              {BREAKER_THRESHOLD - (row.breaker?.consecutiveFailures ?? 0)} more and admission
+              stops dispatching this worker. A success resets the count.
+            </span>
+          )}
           <button onClick={() => clearBreaker.mutate()} disabled={clearBreaker.isPending}>
-            Clear breaker
+            {row.breaker?.openedAt ? 'Clear breaker' : 'Reset count'}
           </button>
         </div>
       )}
