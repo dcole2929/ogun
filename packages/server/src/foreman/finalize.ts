@@ -54,7 +54,7 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
     : outcome === 'error'
       ? 'errored'
       : outcome === 'skipped'
-        ? 'blocked'
+        ? 'refused'
         : raw.length > 0
           ? 'found'
           : 'clean'

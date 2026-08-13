@@ -14,13 +14,21 @@ import { Empty, exact, Page, Pill, when } from '../ui.tsx'
  * So every worker in every batch gets a row here, including the ones that never
  * executed, with the reason.
  */
+/**
+ * The three "never ran" cases are separate on purpose. They used to share `blocked`,
+ * which left the ledger saying a job was blocked and nothing about by what — the exact
+ * conflation this table exists to prevent.
+ */
 const MEANING: Record<string, string> = {
+  pending: 'selected and queued — no runner has picked it up yet',
   found: 'ran, and reported findings',
-  clean: 'ran, looked, and found nothing — a real result, not an absence',
-  pending: 'selected and queued, but no runner has picked it up yet',
-  'gate-failed': 'ran, but its output failed the verify gate — nothing was persisted',
-  blocked: 'never ran: admission refused it, or a dependency did not succeed',
-  errored: 'started and failed — the reason is on the right',
+  clean: 'ran, looked, and reported nothing — a result, not an absence',
+  'gate-failed': 'ran, but the verify gate rejected its output, so nothing was persisted',
+  errored: 'started and failed',
+  refused: 'never ran: admission refused it — the breaker is open, or it is disabled',
+  blocked: 'never ran: a dependency in its cycle did not succeed',
+  cancelled: 'never ran: stopped deliberately',
+  abandoned: 'never ran: ended without reporting, inferred from the job',
   'not-selected': 'not part of this batch',
 }
 
@@ -42,11 +50,16 @@ export function CoveragePage() {
       subtitle="Whether the factory actually looked — not what it found."
     >
       <div className="card" style={{ marginBottom: 20 }}>
-        <p style={{ margin: 0, fontSize: 13 }}>
-          An empty <Link to="/findings">findings</Link> list means one of two things: the
-          code is clean, or nothing ran. Those look identical from the inbox, so every
-          worker in every batch is recorded here — including the ones that never executed,
-          and why.
+        <p style={{ marginTop: 0, fontSize: 13 }}>
+          <Link to="/runs">Runs</Link> shows what happened, one row per attempt. This shows
+          what was <em>supposed</em> to happen: every worker selected for a batch, including
+          the ones that produced no run at all — so an empty{' '}
+          <Link to="/findings">findings</Link> list can be read as "clean" rather than
+          "nothing ran".
+        </p>
+        <p className="muted" style={{ marginBottom: 0, fontSize: 12 }}>
+          With one worker and manual triggers it says little that Runs does not. It earns
+          its place when a nightly cycle runs several workers and three of four succeed.
         </p>
       </div>
 
@@ -93,7 +106,9 @@ export function CoveragePage() {
                       and a worker that did not execute has not made one. */}
                   {r.coverage.ran ? r.coverage.findingCount : '—'}
                 </td>
-                <td className="muted" style={{ maxWidth: 380, fontSize: 12 }}>
+                <td className="muted" style={{ maxWidth: 420, fontSize: 12 }}>
+                  {/* The reason it recorded, then what the outcome means. Previously an
+                      outcome with no reason showed an empty cell. */}
                   {r.coverage.reason ?? MEANING[r.coverage.outcome] ?? ''}
                 </td>
               </tr>

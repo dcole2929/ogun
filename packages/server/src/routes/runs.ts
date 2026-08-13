@@ -1,6 +1,6 @@
 import { Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
-import { and, asc, desc, eq, gt, inArray, sql } from 'drizzle-orm'
+import { and, asc, count, desc, eq, gt, inArray, or, sql } from 'drizzle-orm'
 import { schema } from '@ogun/core/db'
 import {
   eventBatchSchema,
@@ -12,7 +12,18 @@ import {
 import type { Env } from '../context.ts'
 import { finalizeRun } from '../foreman/finalize.ts'
 
-const { artifacts, jobs, projects, runEvents, runs, runners: runnersTable, workers } = schema
+const {
+  artifacts,
+  changes,
+  findings,
+  jobs,
+  projects,
+  runEvents,
+  runs,
+  runners: runnersTable,
+  stagedFindings,
+  workers,
+} = schema
 
 export const runsRoutes = new Hono<Env>()
 
@@ -123,8 +134,19 @@ runsRoutes.get('/', async (c) => {
     .from(runnersTable)
     .where(sql`${runnersTable.lastSeenAt} > now() - interval '60 seconds'`)
 
+  /**
+   * What each run produced, for the list. A run's result is what you are scanning for —
+   * "3 findings" or "nothing found" or "failed" — and having to open each one to learn
+   * that makes the list a table of timestamps.
+   */
+  const counts = await db
+    .select({ runId: stagedFindings.runId, n: count() })
+    .from(stagedFindings)
+    .groupBy(stagedFindings.runId)
+  const byRun = new Map(counts.map((c) => [c.runId, c.n]))
+
   return c.json({
-    runs: rows,
+    runs: rows.map((r) => ({ ...r, produced: { findings: byRun.get(r.run.id) ?? 0 } })),
     pending: pending.map((p) => ({
       ...p,
       // A job whose requirements no runner advertises will never be claimed. Saying so
@@ -158,7 +180,50 @@ runsRoutes.get('/:id', async (c) => {
     .where(eq(runEvents.runId, id))
     .orderBy(asc(runEvents.seq))
   const files = await db.select().from(artifacts).where(eq(artifacts.runId, id))
-  return c.json({ ...row, events, artifacts: files })
+
+  /**
+   * What this run actually produced.
+   *
+   * A run is the primary object; findings are one kind of output it can have, not the
+   * point of the system. A modifier produces a patch and a branch; an architecture
+   * reviewer produces a proposed ADR; plenty produce nothing at all. The detail page was
+   * showing an event timeline and nothing about the result, which made the question
+   * "what did this run do?" answerable only by reading fifty tool calls.
+   */
+  const reported = await db
+    .select()
+    .from(stagedFindings)
+    .where(eq(stagedFindings.runId, id))
+
+  // Which of them were promoted, and whether this run was the first to say so.
+  const promoted = await db
+    .select()
+    .from(findings)
+    .where(or(eq(findings.firstSeenRun, id), eq(findings.lastSeenRun, id)))
+
+  const change = await db.select().from(changes).where(eq(changes.runId, id))
+
+  return c.json({
+    ...row,
+    events,
+    artifacts: files,
+    produced: {
+      /** Exactly what the agent reported, before triage. */
+      findings: reported.map((f) => f.raw),
+      /** Those the control plane accepted, with their status now. */
+      promoted: promoted.map((f) => ({
+        id: f.id,
+        fingerprint: f.fingerprint,
+        title: f.title,
+        severity: f.severity,
+        status: f.status,
+        seenCount: f.seenCount,
+        firstSeenHere: f.firstSeenRun === id,
+      })),
+      /** Phase 3: branch, patch, PR. Empty until modifier workers exist. */
+      changes: change,
+    },
+  })
 })
 
 /**

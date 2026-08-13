@@ -166,7 +166,7 @@ jobsRoutes.post('/:id/cancel', async (c) => {
   // waiting for a runner, in the one table whose entire purpose is to be true about what
   // ran (principle 6).
   await markCoverage(db, cancelled.cycleRunId, cancelled.workerId, {
-    outcome: 'blocked',
+    outcome: 'cancelled',
     reason: 'cancelled before it ran',
   })
   return c.json({ cancelled: true })

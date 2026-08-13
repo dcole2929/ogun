@@ -91,7 +91,7 @@ export async function startCycleRun(
         // from the moment the batch does so a crashed run leaves evidence it was
         // supposed to happen, but calling it not-selected would be a false entry in
         // the one table whose entire job is to be true (principle 6).
-        outcome: verdict.allowed ? 'pending' : 'blocked',
+        outcome: verdict.allowed ? 'pending' : 'refused',
         ...(verdict.allowed ? {} : { reason: verdict.reason }),
       })
     }
@@ -129,6 +129,7 @@ export async function releaseDependents(db: Db, cycleRunId: string): Promise<str
         .set({ state: 'skipped' })
         .where(eq(jobs.id, job.id))
       await markCoverage(db, cycleRunId, job.workerId, {
+        // `blocked` in its narrow sense: a dependency in this cycle did not succeed.
         outcome: 'blocked',
         reason: `dependency ${blockedBy.map((b) => b.edge.from).join(', ')} did not succeed`,
       })
