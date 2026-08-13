@@ -79,8 +79,17 @@ export function createApp(ctx: AppContext, token?: string) {
 
   const webDist = new URL('../../../apps/web/dist/', import.meta.url).pathname
   if (existsSync(webDist)) {
-    app.use('/assets/*', serveStatic({ root: relativeToCwd(webDist) }))
-    app.get('*', serveStatic({ path: `${relativeToCwd(webDist)}/index.html` }))
+    const root = relativeToCwd(webDist)
+    /**
+     * Anything that exists on disk, then index.html for everything else.
+     *
+     * Serving only `/assets/*` meant a root-level file — favicon.svg, and anything else
+     * that lives beside index.html — fell through to the SPA fallback and was returned
+     * as HTML with a 200. A browser asking for an icon and getting a document does not
+     * report an error; it just shows no icon.
+     */
+    app.use('*', serveStatic({ root }))
+    app.get('*', serveStatic({ path: `${root}/index.html` }))
   }
 
   return app
