@@ -2,6 +2,7 @@ import { existsSync } from 'node:fs'
 import { mkdir, symlink, writeFile } from 'node:fs/promises'
 import { join, relative, resolve } from 'node:path'
 import { bold, cyan, dim, fail, green } from '../output.ts'
+import { parse } from '../args.ts'
 
 /**
  * Where each runtime natively discovers skills. Measured with the agents' own search
@@ -30,13 +31,14 @@ const RUNTIME_SKILL_DIRS = ['.claude/skills', '.codex/skills'] as const
  * with plausible defaults you would forget to replace.
  */
 export async function skillNew(args: string[]): Promise<void> {
-  const name = args.find((a) => !a.startsWith('--'))
-  if (!name) fail('usage: ogun skill new <name> [--dir <repo>]')
+  const usage = 'ogun skill new <name> [--dir <repo>]'
+  const { flags, first: name } = parse(args, { '--dir': 'string' }, usage)
+  if (!name) fail(`usage: ${usage}`)
   if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(name)) {
     fail(`"${name}" must be a lowercase kebab-case slug — it becomes a directory and a config key`)
   }
 
-  const root = resolve(argValue(args, '--dir') ?? process.cwd())
+  const root = resolve(flags.dir ?? process.cwd())
   const dir = join(root, '.agents', 'skills', name)
   if (existsSync(dir)) fail(`${relative(root, dir)} already exists`)
 
@@ -153,10 +155,6 @@ policy:
   allow_implicit_invocation: false
 `
 
-const argValue = (args: string[], flag: string): string | undefined => {
-  const i = args.indexOf(flag)
-  return i === -1 ? undefined : args[i + 1]
-}
 
 
 /**
@@ -204,7 +202,8 @@ const LINKABLE_SOURCES = ['.agents/skills', 'skills'] as const
  * out on a filesystem that dropped the links.
  */
 export async function skillLink(args: string[]): Promise<void> {
-  const root = resolve(argValue(args, '--dir') ?? process.cwd())
+  const { flags } = parse(args, { '--dir': 'string' }, 'ogun skill link [--dir <repo>]')
+  const root = resolve(flags.dir ?? process.cwd())
   const { readdir } = await import('node:fs/promises')
 
   // First source wins, so a repo's own skill shadows a shipped one of the same name —

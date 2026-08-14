@@ -1,14 +1,17 @@
 import { eq, sql } from 'drizzle-orm'
 import { schema } from '@ogun/core/db'
 import type { Db } from '@ogun/core/db'
+import { cycleDefinitionSchema, nodesWithDependents } from '@ogun/core'
 import type { CoverageOutcome, JobState, RunOutcome, RunReport } from '@ogun/core'
 import { DEFAULT_LIMITS } from './admission.ts'
 import { finalizeCycleIfDone, markCoverage, releaseDependents } from './cycles.ts'
 
-const { artifacts, breakers, findings, jobs, runs, stagedFindings } = schema
+const { artifacts, breakers, cycleRuns, cycles, findings, jobs, runs, stagedFindings } = schema
 
 export type FinalizeResult = {
   ok: true
+  /** Findings reported but withheld from the inbox because triage will consolidate them. */
+  staged: number
   /** The outcome as derived, which may differ from what the runner reported. */
   outcome: RunOutcome
   jobState: JobState
@@ -40,7 +43,20 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
   const outcome: RunOutcome =
     gateFailed && report.outcome === 'approved' ? 'changes-requested' : report.outcome
 
-  const raw = outcome === 'approved' ? (report.findings?.findings ?? []) : []
+  /**
+   * Whether this run's findings reach the inbox, or only the staging area.
+   *
+   * Triage is the only thing that writes to the findings table (§4.12). A reviewer that
+   * feeds one must stage only — otherwise the inbox shows the raw findings *and* the
+   * consolidated ones, which is worse than having no triage at all.
+   *
+   * Decided from the graph rather than from a flag on the worker: the same reviewer can
+   * be a standalone one-node cycle on Monday and feed triage on Tuesday, and it should
+   * publish in the first case without being reconfigured.
+   */
+  const consumed = await hasDependents(db, job.cycleRunId, job.nodeKey)
+  const reported = outcome === 'approved' ? (report.findings?.findings ?? []) : []
+  const raw = consumed ? [] : reported
 
   const jobState: JobState =
     outcome === 'approved' || outcome === 'dispatched'
@@ -55,7 +71,10 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
       ? 'errored'
       : outcome === 'skipped'
         ? 'refused'
-        : raw.length > 0
+        : // What the run reported, not what reached the inbox. A reviewer feeding triage
+          // still found what it found; the ledger recording `clean` would be a lie that
+          // makes the coverage picture depend on whether triage has run yet.
+          reported.length > 0
           ? 'found'
           : 'clean'
 
@@ -94,9 +113,11 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
      * through staging first regardless, so wiring triage in phase 2 changes who reads
      * staging rather than who writes it.
      */
-    if (raw.length > 0) {
+    // Staged regardless of whether they are promoted — this is what triage reads, and
+    // what makes a discarded finding recoverable rather than gone.
+    if (reported.length > 0) {
       await tx.insert(stagedFindings).values(
-        raw.map((f) => ({
+        reported.map((f) => ({
           runId: report.runId,
           workerId: job.workerId,
           raw: f as unknown as Record<string, unknown>,
@@ -149,7 +170,10 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
       outcome: coverageOutcome,
       ran: outcome !== 'skipped',
       runId: report.runId,
-      findingCount: raw.length,
+      // What it reported, not what was promoted. A reviewer feeding triage found what it
+      // found; the ledger should say so rather than showing zero because triage has not
+      // run yet.
+      findingCount: reported.length,
       ...(coverageReason(report, gateFailed) ? { reason: coverageReason(report, gateFailed)! } : {}),
     })
 
@@ -181,7 +205,15 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
   await releaseDependents(db, job.cycleRunId)
   await finalizeCycleIfDone(db, job.cycleRunId)
 
-  return { ok: true, outcome, jobState, findingsWritten: raw.length, coverage: coverageOutcome }
+  return {
+    ok: true,
+    outcome,
+    jobState,
+    findingsWritten: raw.length,
+    /** Reported but held for triage rather than published. */
+    staged: consumed ? reported.length : 0,
+    coverage: coverageOutcome,
+  }
 }
 
 /**
@@ -211,6 +243,22 @@ const reopenReasonClause = sql`case
     then 'reopened: reported again after being set aside by triage'
   else ${findings.statusReason}
 end`
+
+/**
+ * Does anything downstream in this cycle run depend on this node? Read from the cycle's
+ * own definition rather than from the jobs, so it is true even before the dependent has
+ * been released.
+ */
+async function hasDependents(db: Db, cycleRunId: string, nodeKey: string): Promise<boolean> {
+  const cycleRun = await db.query.cycleRuns.findFirst({ where: eq(cycleRuns.id, cycleRunId) })
+  if (!cycleRun) return false
+  const cycle = await db.query.cycles.findFirst({ where: eq(cycles.id, cycleRun.cycleId) })
+  if (!cycle) return false
+
+  const definition = cycleDefinitionSchema.safeParse(cycle.definition)
+  if (!definition.success) return false
+  return nodesWithDependents(definition.data).has(nodeKey)
+}
 
 const gateSummary = (report: RunReport): string | undefined => {
   const failed = report.gates.filter((g) => !g.passed)

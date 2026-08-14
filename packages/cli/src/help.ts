@@ -53,9 +53,11 @@ const topics: Record<string, Topic> = {
         'migration.',
       'The sandbox image is built now rather than on first use, because a nightly run ' +
         'that has to build an image first is a nightly run that fails on a bad network.',
-      'It reports whether this machine is registered as a runner but does not register ' +
-        'it — that needs the control plane running, so it is `ogun runner init`, after ' +
-        '`ogun server`.',
+      'Registering this machine as a runner is the last step and the only one that ' +
+        'needs the control plane, since name uniqueness is enforced there. It does that ' +
+        'if the control plane is already up, and otherwise tells you to run `ogun ' +
+        'runner init` after `ogun server`. Everything before it needs nothing running, ' +
+        'which is why `init` comes first.',
     ],
     flags: [
       [
@@ -67,6 +69,7 @@ const topics: Record<string, Topic> = {
       ['docker', 'starts the postgres container from docker-compose.yml'],
       ['the database', 'applies any pending migrations'],
       ['ogun/base:latest', 'builds the sandbox image, unless --no-image'],
+      [LOCAL_CONFIG, 'the runner block, if the control plane was up to register with'],
     ],
     see: ['ogun server', 'ogun runner init', 'ogun db status'],
   },
@@ -138,12 +141,13 @@ const topics: Record<string, Topic> = {
 
   server: {
     summary: 'start the control plane: API, web UI, and the foreman',
-    usage: ['ogun server'],
+    usage: ['ogun server [--port <n>]'],
     where:
       'One machine, and it stays running. Runners connect outward to it; it never ' +
       'dials a runner, which is what lets a laptop behind NAT be one.',
     notes: [
-      'No flags. It is configured by environment because these are properties of the ' +
+      '--port is the one flag, because a second control plane on one machine is a real ' +
+        'thing to want. Everything else is environment: those are properties of the ' +
         'machine rather than of one invocation, and a systemd unit should not have to ' +
         'carry an argument list.',
       'Binds to localhost, where nothing off this machine can reach it and no token is ' +
@@ -152,7 +156,7 @@ const topics: Record<string, Topic> = {
         'is remote code execution on this machine, and it refuses to start that way.',
     ],
     env: [
-      ['OGUN_PORT', 'listen port (7777)'],
+      ['OGUN_PORT', 'listen port (7777) — --port wins over it'],
       ['OGUN_BIND', 'interface (127.0.0.1)'],
       ['OGUN_ADMIN_TOKEN', 'use this instead of the stored one'],
       ['OGUN_STALE_CLAIM_MS', 'how long a claim may go unreported before it is swept (45m)'],
@@ -194,9 +198,16 @@ const topics: Record<string, Topic> = {
       ['--labels a,b', LABELS],
       [
         '--force',
-        'replace an existing registration on this machine. Refused without it, since ' +
-          'that would silently abandon the runner identity the control plane still has rows for',
+        'take a *different* identity — another name, or another control plane. Refused ' +
+          'without it, since that abandons the runner identity the control plane still ' +
+          'has rows for',
       ],
+    ],
+    notes: [
+      'Re-running it with the same name and url is a refresh, not an error: it ' +
+        're-detects capabilities and updates the labels this machine advertises. That ' +
+        'is what `ogun runner doctor` tells you to do after installing docker or ' +
+        'logging into a runtime.',
     ],
     touches: [
       [LOCAL_CONFIG, 'the runner block: name, labels, control-plane URL'],
@@ -280,7 +291,9 @@ const topics: Record<string, Topic> = {
 
   'runner join': {
     summary: 'join a control plane, from the machine being added',
-    usage: ['ogun runner join <url> --token <token> [--name <name>] [--labels a,b]'],
+    usage: [
+      'ogun runner join <url> --token <token> [--name <name>] [--labels a,b] [--force]',
+    ],
     where:
       'On the NEW MACHINE, with the command `ogun runner invite` printed on the ' +
       'control plane.',
@@ -295,6 +308,13 @@ const topics: Record<string, Topic> = {
       ['--token <token>', 'the single-use token `ogun runner invite` printed. Required'],
       ['--name <name>', NAME],
       ['--labels a,b', LABELS],
+      [
+        '--force',
+        'join a different control plane, or under a different name. Refused without ' +
+          'it: joining rewrites the runner block wholesale, so it would silently ' +
+          'abandon the identity this machine already answers to. Re-joining the same ' +
+          'control plane under the same name is a refresh and needs nothing',
+      ],
     ],
     touches: [
       [LOCAL_CONFIG, 'the runner block, including the token — this is where it lives'],

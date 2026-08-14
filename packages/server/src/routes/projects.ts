@@ -100,23 +100,18 @@ projectsRoutes.post('/sync', async (c) => {
     if (row) skillIds.set(s.name, row.id)
   }
 
-  const { workers: indexed, removed } = await reindexProject(db, project.slug, {
-    hash: body.configHash,
-    workers: body.workers,
-  })
-
-  for (const [name, definition] of Object.entries(body.cycles)) {
-    await db
-      .insert(cycles)
-      .values({ projectId: project.id, name, definition })
-      .onConflictDoUpdate({ target: [cycles.projectId, cycles.name], set: { definition } })
-  }
+  const { workers: indexed, removed, overriddenSchedules } = await reindexProject(
+    db,
+    project.slug,
+    { hash: body.configHash, workers: body.workers, cycles: body.cycles },
+  )
 
   return c.json({
     project: { id: project.id, slug: project.slug },
     workers: Object.keys(indexed),
     skills: [...skillIds.keys()],
     removed,
+    overriddenSchedules,
   })
 })
 

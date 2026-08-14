@@ -120,6 +120,9 @@ const presentedToken = (
  */
 const RUNNER_ROUTES = [
   /^\/api\/jobs\/claim$/,
+  // A triage node's input is the upstream nodes' staged findings (§4.12). The runner
+  // has to fetch it to write it into the workspace, holding only a runner token.
+  /^\/api\/jobs\/[^/]+\/inputs$/,
   /^\/api\/runs\/[^/]+\/(started|events|report)$/,
 ]
 

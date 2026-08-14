@@ -194,6 +194,10 @@ test('only the runner endpoints are runner-scoped', () => {
     '/api/runs/abc-123/started',
     '/api/runs/abc-123/events',
     '/api/runs/abc-123/report',
+    // A triage node reads its upstream's staged findings through this, holding only a
+    // runner token. A 401 here does not look like a failure from inside the sandbox —
+    // it looks like a night on which nobody found anything.
+    '/api/jobs/abc-123/inputs',
   ]) {
     assert.equal(scopeForPath(path), 'runner', path)
   }
@@ -209,8 +213,10 @@ test('everything that changes what runs is admin-scoped', () => {
     '/api/findings',
     '/api/runs',
     '/api/runs/abc-123',
-    // Not a runner route despite the prefix — a runner has no business listing jobs.
+    // Not runner routes despite the prefix — a runner has no business listing jobs, or
+    // reading a job it did not claim.
     '/api/jobs',
+    '/api/jobs/abc-123',
   ]) {
     assert.equal(scopeForPath(path), 'admin', path)
   }

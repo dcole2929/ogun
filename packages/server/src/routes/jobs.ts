@@ -1,12 +1,12 @@
 import { Hono } from 'hono'
-import { and, arrayContained, eq, isNull, sql } from 'drizzle-orm'
+import { and, arrayContained, eq, inArray, isNull, sql } from 'drizzle-orm'
 import { schema } from '@ogun/core/db'
 import { claimRequestSchema, claimedJobSchema, type ClaimedJob } from '@ogun/core'
 import type { Env } from '../context.ts'
 import { DEFAULT_LIMITS, remainingCapacity } from '../foreman/admission.ts'
 import { markCoverage } from '../foreman/cycles.ts'
 
-const { jobs, projects, runners, runs, workers } = schema
+const { jobs, projects, runners, runs, stagedFindings, workers } = schema
 
 const globalLimits = {
   ...DEFAULT_LIMITS,
@@ -137,6 +137,63 @@ jobsRoutes.post('/claim', async (c) => {
   }
 
   return c.json({ jobs: out })
+})
+
+/**
+ * What a job's upstream nodes produced.
+ *
+ * A triage node reads findings rather than a repository (§4.12), and those findings come
+ * from jobs that have already finished in the same cycle run. The runner fetches this and
+ * writes it into the workspace, so the skill's input is a file rather than a database
+ * query it has no way to make from inside a sandbox.
+ *
+ * Includes the reviewers that produced nothing and the ones that failed, because triage
+ * assembles the coverage picture and cannot do that from findings alone — four reviewers
+ * where one crashed is a different night from three reviewers that all ran.
+ *
+ * Runner-scoped, and not bound to the runner that claimed the job — the same as the run
+ * reporting endpoints. Runners are your own machines and are trusted peers; if that ever
+ * stops being true, this and `/api/runs/:id/*` need the same ownership check, not
+ * different ones.
+ */
+jobsRoutes.get('/:id/inputs', async (c) => {
+  const { db } = c.var.ctx
+  const job = await db.query.jobs.findFirst({ where: eq(jobs.id, c.req.param('id')) })
+  if (!job) return c.json({ error: 'no such job' }, 404)
+
+  const upstream = await db
+    .select({
+      job: { nodeKey: jobs.nodeKey, state: jobs.state },
+      worker: { name: workers.name },
+      run: { id: runs.id, outcome: runs.outcome, detail: runs.detail },
+    })
+    .from(jobs)
+    .innerJoin(workers, eq(workers.id, jobs.workerId))
+    .leftJoin(runs, eq(runs.jobId, jobs.id))
+    .where(and(eq(jobs.cycleRunId, job.cycleRunId), inArray(jobs.nodeKey, job.dependsOn)))
+
+  const sources = []
+  for (const row of upstream) {
+    const staged = row.run?.id
+      ? await db.select().from(stagedFindings).where(eq(stagedFindings.runId, row.run.id))
+      : []
+    sources.push({
+      worker: row.worker.name,
+      node: row.job.nodeKey,
+      outcome: row.run?.outcome ?? row.job.state,
+      // Named so triage can say "three of four reviewers ran" rather than inferring it.
+      ran: Boolean(row.run?.outcome),
+      detail: row.run?.detail ?? null,
+      findings: staged.map((f) => f.raw),
+    })
+  }
+
+  return c.json({
+    cycleRunId: job.cycleRunId,
+    /** True when a dependency did not succeed, so triage marks the batch incomplete. */
+    degraded: sources.some((s) => s.outcome !== 'approved'),
+    sources,
+  })
 })
 
 jobsRoutes.get('/', async (c) => {

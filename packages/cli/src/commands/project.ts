@@ -6,11 +6,13 @@ import { existsSync } from 'node:fs'
 import { basename } from 'node:path'
 import {
   discoverSkills,
+  expandCycle,
   loadProjectConfig,
   localConfigPath,
   updateLocalConfig,
 } from '@ogun/core'
-import { bold, cyan, dim, fail, green, table } from '../output.ts'
+import { bold, cyan, dim, fail, green, table, yellow } from '../output.ts'
+import { parse } from '../args.ts'
 import { authHeaders } from '../auth.ts'
 
 const run = promisify(execFile)
@@ -22,13 +24,29 @@ const run = promisify(execFile)
  * the database (§4.5).
  */
 export async function projectSync(args: string[], serverUrl: string): Promise<void> {
-  const root = resolve(args[0] ?? process.cwd())
+  const { first } = parse(args, {}, 'ogun project sync [dir]')
+  const root = resolve(first ?? process.cwd())
   const loaded = await loadProjectConfig(root).catch((err) => {
     fail(`could not read ${root}/.ogun/config.yaml: ${(err as Error).message}`)
     throw err
   })
   const skills = await discoverSkills(root, [builtinSkillsRoot()])
   const remoteUrl = await gitRemote(root)
+
+  // Sugar expands here rather than server-side, so the control plane only ever sees one
+  // shape and the UI does not have to render two.
+  const cycles = Object.fromEntries(
+    Object.entries(loaded.config.cycles).map(([name, cycle]) => [name, expandCycle(cycle)]),
+  )
+  // A typo in `then:` is otherwise a cycle that runs its reviewers and then blocks
+  // forever waiting on a node that has no worker behind it.
+  for (const [name, definition] of Object.entries(cycles)) {
+    for (const node of definition.nodes) {
+      if (!loaded.config.workers[node.worker]) {
+        fail(`cycle "${name}" refers to worker "${node.worker}", which is not defined`)
+      }
+    }
+  }
   await registerLocalPath(loaded.config.project.name, root)
 
   const payload = {
@@ -40,6 +58,7 @@ export async function projectSync(args: string[], serverUrl: string): Promise<vo
     configHash: loaded.configHash,
     workers: loaded.config.workers,
     policies: loaded.config.policies,
+    cycles,
     skills: skills.map((s) => ({
       name: s.name,
       sourcePath: s.sourcePath,
@@ -74,7 +93,7 @@ export async function projectSync(args: string[], serverUrl: string): Promise<vo
     fail(`sync failed: ${res ? await res.text() : `could not reach ${serverUrl}`}`)
   }
 
-  const result = (await res.json()) as { removed?: string[] }
+  const result = (await res.json()) as { removed?: string[]; overriddenSchedules?: string[] }
 
   console.log(green(`synced ${payload.slug}`))
   console.log(
@@ -92,8 +111,31 @@ export async function projectSync(args: string[], serverUrl: string): Promise<vo
   if (skills.length > 0) {
     console.log(dim(`\nskills: ${skills.map((s) => s.name).join(', ')}`))
   }
+  for (const [name, definition] of Object.entries(cycles)) {
+    // Printed as the dependency shape rather than a node list, because the thing worth
+    // checking after a sync is what feeds what.
+    const feeders = new Map<string, string[]>()
+    for (const e of definition.edges) feeders.set(e.to, [...(feeders.get(e.to) ?? []), e.from])
+    const shape = [...feeders].map(([to, from]) => `${from.join(' + ')} → ${to}`)
+    const standalone = definition.nodes
+      .map((n) => n.key)
+      .filter((k) => !definition.edges.some((e) => e.from === k || e.to === k))
+    console.log(
+      dim(`cycle ${cyan(name)}: ${[...shape, ...standalone].join(', ') || 'no nodes'}`),
+    )
+  }
   if (result.removed?.length) {
     console.log(dim(`removed (gone from config.yaml): ${result.removed.join(', ')}`))
+  }
+  if (result.overriddenSchedules?.length) {
+    // The config file still says `schedule:` on these workers, so the reason it no longer
+    // fires belongs here rather than only in the docs.
+    console.log(
+      yellow(
+        `\n  ${result.overriddenSchedules.join(', ')}: own schedule ignored — a cycle runs them.` +
+          `\n  Put the schedule on the cycle instead; triggering the worker by name still works.`,
+      ),
+    )
   }
 
   // A skill only reaches an automated run once it lands on the default branch, since
@@ -145,7 +187,12 @@ async function registerLocalPath(slug: string, root: string): Promise<void> {
  * that project's config.yaml.
  */
 export async function projectAdd(args: string[], serverUrl: string): Promise<void> {
-  const root = resolve(args.find((a) => !a.startsWith('--')) ?? process.cwd())
+  const { flags, first } = parse(
+    args,
+    { '--name': 'string' },
+    'ogun project add [dir] [--name <slug>]',
+  )
+  const root = resolve(first ?? process.cwd())
 
   if (!existsSync(join(root, '.git'))) {
     fail(`${root} is not a git repository — point this at the repo itself`)
@@ -157,13 +204,14 @@ export async function projectAdd(args: string[], serverUrl: string): Promise<voi
   const configured = await loadProjectConfig(root)
     .then((l) => l.config.project.name)
     .catch(() => null)
-  const slug = argValue(args, '--name') ?? configured ?? basename(root)
+  const slug = flags.name ?? configured ?? basename(root)
 
-  if (!configured) {
+  // Only when the name was *guessed*. Telling someone to pass --name when they just
+  // passed --name reads as though it was ignored.
+  if (!configured && !flags.name) {
     console.log(
       dim(
-        `${root} has no .ogun/config.yaml, so this is registered as "${slug}" from its
-` +
+        `${root} has no .ogun/config.yaml, so this is registered as "${slug}" from its\n` +
           'directory name. If the project is known by another name, pass --name.',
       ),
     )

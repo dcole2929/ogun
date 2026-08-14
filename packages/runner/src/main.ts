@@ -1,6 +1,19 @@
+import { parseArgs } from 'node:util'
 import { loadLocalConfig, LocalConfigError } from '@ogun/core'
 import { ControlPlane } from './client.ts'
 import { executeJob } from './pipeline.ts'
+
+// The runner takes no flags — it reads ~/.ogun/config.json. Parsed anyway so that a
+// flag someone reasonably expects to work is refused rather than silently dropped.
+try {
+  parseArgs({ args: process.argv.slice(2), options: {}, allowPositionals: false })
+} catch (err) {
+  console.error(
+    `\nogun-runner: ${(err as Error).message}\n` +
+      `  This command takes no arguments — it is configured by \`ogun runner init\`.\n`,
+  )
+  process.exit(1)
+}
 
 const local = await loadLocalConfig().catch((err) => {
   if (err instanceof LocalConfigError) {

@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { cycleConfigSchema } from './cycle.ts'
 
 export const RUNTIMES = ['claude', 'codex'] as const
 export type Runtime = (typeof RUNTIMES)[number]
@@ -73,6 +74,8 @@ export const projectConfigSchema = z.object({
   }),
   extends: z.array(z.string()).default([]),
   workers: z.record(z.string(), workerSchema).default({}),
+  /** Multi-worker graphs. A single worker needs none — it is already a one-node cycle. */
+  cycles: z.record(z.string(), cycleConfigSchema).default({}),
   policies: policiesSchema.prefault({}),
 })
 export type ProjectConfig = z.infer<typeof projectConfigSchema>

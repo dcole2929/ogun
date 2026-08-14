@@ -5,6 +5,8 @@ import { schema } from '@ogun/core/db'
 import {
   PERMISSION_PROFILES,
   RUNTIMES,
+  cycleDefinitionSchema,
+  cycleMembers,
   SANDBOX_KINDS,
   workerSchema,
   type WorkerConfig,
@@ -123,6 +125,35 @@ workersRoutes.get('/', async (c) => {
     .where(project ? eq(workers.projectId, project.id) : undefined)
     .orderBy(workers.name)
 
+  /**
+   * The named cycle that drives each worker, if any.
+   *
+   * A worker in a cycle has no schedule row of its own — the cycle carries it — so
+   * without this the UI would show "runs only when triggered" for a worker that runs
+   * every night. Read from the definitions rather than stored on the worker, because
+   * membership is a property of the graph.
+   */
+  const named = await db
+    .select()
+    .from(cycles)
+    .where(project ? eq(cycles.projectId, project.id) : undefined)
+  const workerNames = new Set(rows.map((r) => r.worker.name))
+  const drivenBy = new Map<string, { cycle: string; schedule: string | null; nextRun: string | null }>()
+  for (const cycle of named) {
+    // Skip the one-node cycle that shadows each worker's own name — it is the worker.
+    if (workerNames.has(cycle.name)) continue
+    const definition = cycleDefinitionSchema.safeParse(cycle.definition)
+    if (!definition.success) continue
+    const row = await db.query.schedules.findFirst({ where: eq(schedules.cycleId, cycle.id) })
+    for (const worker of cycleMembers(definition.data)) {
+      drivenBy.set(`${cycle.projectId}:${worker}`, {
+        cycle: cycle.name,
+        schedule: row?.cron ?? null,
+        nextRun: row?.cron ? nextRunOf(row.cron, row.tz ?? 'UTC') : null,
+      })
+    }
+  }
+
   // Whether this control plane can edit each project's config.yaml. The UI needs it up
   // front so it can offer a copy-this-yaml fallback rather than a button that 409s.
   const slugs = [...new Set(rows.map((r) => r.project.slug))]
@@ -140,6 +171,8 @@ workersRoutes.get('/', async (c) => {
       // Computed here rather than stored: a next-run time written to the database is
       // wrong the moment the process restarts or the expression changes.
       nextRun: r.schedule?.cron ? nextRunOf(r.schedule.cron, r.schedule.tz ?? 'UTC') : null,
+      /** Null unless a named cycle runs this worker, in which case it owns the schedule. */
+      drivenBy: drivenBy.get(`${r.worker.projectId}:${r.worker.name}`) ?? null,
     })),
     editable,
     hashes,

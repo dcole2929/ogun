@@ -27,6 +27,26 @@ export class ControlPlane {
     return claimResponseSchema.parse(res).jobs
   }
 
+  /**
+   * What this job's upstream nodes produced. Null when there are none, which is every
+   * one-node cycle.
+   *
+   * Throws rather than returning null on a transport or auth failure. Those two cases
+   * look identical from here and must not: a triage node that silently receives no
+   * input reads the repository, finds nothing to consolidate, and reports a clean
+   * night — the exact failure the coverage ledger exists to make impossible.
+   */
+  async inputs(jobId: string): Promise<unknown | null> {
+    const res = await fetch(`${this.#baseUrl}/api/jobs/${jobId}/inputs`, {
+      headers: this.#headers,
+    })
+    if (!res.ok) {
+      throw new Error(`could not read job inputs (${res.status}): ${await res.text()}`)
+    }
+    const body = (await res.json()) as { sources?: unknown[] }
+    return body.sources && body.sources.length > 0 ? body : null
+  }
+
   async started(runId: string, fields: Record<string, unknown>): Promise<void> {
     await this.post(`/api/runs/${runId}/started`, fields)
   }

@@ -1,0 +1,7 @@
+interface:
+  display_name: "Triage"
+  short_description: "Consolidate a night's reviewers into one ranked inbox"
+  default_prompt: "Use the triage skill."
+policy:
+  # Never auto-triggered. Triage is meaningless outside a cycle — it has no input.
+  allow_implicit_invocation: false
