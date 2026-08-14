@@ -244,6 +244,19 @@ everything this box knows. There were briefly two — one for the server's path 
 for the runner's — both answering "where is project X on this disk" and able to disagree.
 A machine has one filesystem, so it has one map.
 
+**JSON here, YAML in the repo.** [settled] The two config files are different things, and
+the format follows who writes each one. `~/.ogun/config.json` is written by commands
+(`runner init`, `project add`) and never hand-edited, so there are no comments or key
+order to preserve and JSON's lack of ambiguity is worth more than its unfriendliness.
+`.ogun/config.yaml` is authored by a person, reviewed in a pull request, and edited in
+place by the UI — which needs comments and ordering to survive a round-trip (§4.9), and
+which is why prompts are readable block scalars rather than strings full of `\n`.
+
+The cost is remembering which file is which shape, and it is a real cost. The alternative
+— one format everywhere — means either giving the repo file up to JSON, which loses the
+comments in the file people actually read, or giving the machine file to YAML, which buys
+nothing for a file no one opens.
+
 ```jsonc
 // ~/.ogun/config.json — machine-local, never synced, mode 0600
 {

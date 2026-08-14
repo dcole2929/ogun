@@ -35,6 +35,9 @@ reach it. Four groups cannot:
 | the database | projects, workers, skills, runs, findings, coverage. An index of what git already says, not a second source of truth |
 | Docker | the postgres container, and the image each job runs inside |
 
+The first is JSON because commands write it and nobody opens it; the second is YAML
+because you write it, comment it, and review it in a pull request.
+
 `OGUN_CONFIG` moves the local config file; `OGUN_SERVER_URL` points the CLI at a control
 plane elsewhere (default `http://localhost:7777`).
 
