@@ -137,6 +137,7 @@ is itself.
 
 ```sh
 ogun                        list every command
+ogun <command> --help       one command in full — flags, and which machine it runs on
 ogun db status              is the database up, and is the schema current
 ogun runner doctor          what this machine can actually run
 ogun skill new <name>       scaffold .agents/skills/<name>/
@@ -146,6 +147,9 @@ ogun runs                   recent runs
 ogun findings list          the inbox
 ogun coverage <project>     what ran, what didn't, and why
 ```
+
+Every command, its flags, which machine it runs on, and what it writes:
+[`docs/cli.md`](docs/cli.md).
 
 ## Skills and workers
 
