@@ -206,11 +206,12 @@ export async function projectAdd(args: string[], serverUrl: string): Promise<voi
     .catch(() => null)
   const slug = flags.name ?? configured ?? basename(root)
 
-  if (!configured) {
+  // Only when the name was *guessed*. Telling someone to pass --name when they just
+  // passed --name reads as though it was ignored.
+  if (!configured && !flags.name) {
     console.log(
       dim(
-        `${root} has no .ogun/config.yaml, so this is registered as "${slug}" from its
-` +
+        `${root} has no .ogun/config.yaml, so this is registered as "${slug}" from its\n` +
           'directory name. If the project is known by another name, pass --name.',
       ),
     )
