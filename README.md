@@ -62,29 +62,60 @@ Any operating system that runs those. Ogun keeps nothing machine-specific outsid
 
 ## Running it
 
-```sh
-pnpm install          # the only package-manager step; everything after is `ogun`
-./bin/ogun init       # database, schema, sandbox image
-```
-
-`init` reports what it did and what was already done, so re-running it is the normal way
-to pick up a new migration or a rebuilt image.
-
-Then, in two terminals:
+### 1. Install, and put `ogun` on your PATH
 
 ```sh
-ogun server           # control plane and UI on http://localhost:7777
-ogun runner start     # claims and executes jobs
-```
-
-`ogun runner init` once, before the first `runner start`, to register this machine.
-
-To use `ogun` from anywhere, symlink the launcher — it finds a new enough Node whatever
-the directory you're in pins:
-
-```sh
+pnpm install
 ln -s "$PWD/bin/ogun" ~/.local/bin/ogun
 ```
+
+`pnpm install` is the only package-manager step — it fetches dependencies. Everything
+after it is `ogun`.
+
+The symlink points at a launcher rather than at the code. Ogun runs TypeScript directly,
+which needs Node 24 or newer, and the launcher finds a suitable Node regardless of what
+version the directory you happen to be standing in pins. Without the symlink every
+command below is `./bin/ogun` from this directory instead.
+
+### 2. Set up this machine, once
+
+```sh
+ogun init
+```
+
+Three things, in this order:
+
+1. **starts postgres** in a container — the control plane's database
+2. **applies migrations** — creates or updates the schema
+3. **builds `ogun/base`** — the container image a job's agent runs inside
+
+Re-running it is safe and is how you pick up a new migration; it reports what it did and
+what was already done. The image is built here rather than on first use because a nightly
+run that has to build an image first is a nightly run that fails on a bad network.
+
+### 3. Start the control plane
+
+```sh
+ogun server
+```
+
+The API and web UI on <http://localhost:7777>. Leave it running.
+
+### 4. Make this machine a runner
+
+In a second terminal:
+
+```sh
+ogun runner init      # once — registers this machine with the control plane
+ogun runner start     # every time — claims jobs and executes them
+```
+
+`runner init` needs the control plane already running, because registering means claiming
+a name on it: two machines answering to one name would share a claim identity and make
+every run unattributable. It writes `~/.ogun/config.json` and does not need repeating.
+
+`runner start` is the long-running process that actually does the work. Nothing runs
+without it — jobs simply queue.
 
 ### Pointing it at a repository
 
