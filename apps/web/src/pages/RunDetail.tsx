@@ -133,6 +133,19 @@ function Produced({ detail }: { detail: RunDetail }) {
           </p>
         )}
 
+        {/* What the node wanted said, before the list of what it filed. A triage run
+            that names the reviewer which crashed is telling you the inbox below is
+            short by one surface, and that is not derivable from the findings. */}
+        {detail.run.notes && (
+          <div style={{ marginBottom: 14 }}>
+            <p className="note">{detail.run.notes}</p>
+            <p className="muted" style={{ margin: '4px 0 0', fontSize: 11 }}>
+              {detail.worker.name}'s own account of this pass. Also shown against its row
+              on <Link to="/coverage">Coverage</Link>.
+            </p>
+          </div>
+        )}
+
         {promoted.length > 0 ? (
           <>
             <p className="muted" style={{ marginTop: 0, fontSize: 12 }}>

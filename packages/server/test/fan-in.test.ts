@@ -58,7 +58,12 @@ describe('triage fan-in', () => {
     await h.stop()
   })
 
-  const finish = async (cycleRunId: string, nodeKey: string, findings: unknown[]) => {
+  const finish = async (
+    cycleRunId: string,
+    nodeKey: string,
+    findings: unknown[],
+    notes?: string,
+  ) => {
     const [job] = await db
       .select()
       .from(schema.jobs)
@@ -71,7 +76,7 @@ describe('triage fan-in', () => {
       runId: run!.id,
       outcome: 'approved',
       gates: [],
-      findings: { findings: findings as never },
+      findings: { findings: findings as never, ...(notes ? { notes } : {}) },
       coverage: { outcome: findings.length > 0 ? 'found' : 'clean' },
       artifacts: [],
     })
@@ -278,6 +283,60 @@ describe('triage fan-in', () => {
       )
     assert.equal(row?.outcome, 'blocked', '"blocked" is narrower than "errored" — say which')
     assert.match(row?.reason ?? '', /reviewer-a/, 'name the dependency that stopped it')
+  })
+
+  /**
+   * The other half of a degraded night: what triage *said* about it.
+   *
+   * The ledger records that reviewer-b errored. Only triage can say what that cost —
+   * which surface therefore went unexamined tonight — and the skill requires it to,
+   * because an inbox with three findings from four reviewers looks identical to one with
+   * three from three. The document schema accepted `notes` from the beginning and
+   * finalize wrote it nowhere: a real triage run explained a missing security review and
+   * the account went straight in the bin, which is principle 6 inverted in the one node
+   * whose job is assembling the coverage picture.
+   */
+  test("a node's account of its own pass is kept, and readable per batch", async () => {
+    const { cycleRunId } = await startCycleRun(db, { cycleId, trigger: 'test' })
+    const a = await finish(
+      cycleRunId,
+      'reviewer-a',
+      [finding('auth/session/fixation/reuse', 'src/auth.ts')],
+      'I could not build the worker package, so this pass read it without types.',
+    )
+    await crash(cycleRunId, 'reviewer-b', 'codex exited 1: model not supported')
+
+    const account =
+      'reviewer-b errored and produced nothing. Its empty findings array is a crash, not a' +
+      ' clean result — and since its brief is authorization boundaries, nothing looked at' +
+      ' that surface tonight.'
+    const t = await finish(cycleRunId, 'triage', [], account)
+
+    const [triageRun] = await db.select().from(schema.runs).where(eq(schema.runs.id, t.run.id))
+    assert.equal(triageRun?.notes, account, "triage's account of a degraded night is durable")
+    assert.equal(
+      triageRun?.detail,
+      null,
+      'a note is not a failure reason; sharing `detail` would make a successful run read as a broken one',
+    )
+
+    // Staging withholds findings from the inbox. A note is output of the run, and is read
+    // with the run whether or not anything downstream consumed it.
+    const [staged] = await db.select().from(schema.runs).where(eq(schema.runs.id, a.run.id))
+    assert.match(staged?.notes ?? '', /without types/, 'a staged reviewer still gets to speak')
+
+    const res = await h.fetch(`/api/runs/notes?project=${slug}`)
+    assert.equal(res.status, 200)
+    const body = (await res.json()) as {
+      notes: Array<{ runId: string; cycleRunId: string; notes: string; worker: { name: string } }>
+    }
+    const batch = body.notes.filter((n) => n.cycleRunId === cycleRunId)
+    assert.deepEqual(
+      batch.map((n) => n.worker.name).sort(),
+      ['reviewer-a', 'triage'],
+      'the coverage ledger reads notes by batch, and the crashed reviewer wrote none',
+    )
+    assert.equal(batch.find((n) => n.worker.name === 'triage')?.notes, account)
   })
 })
 

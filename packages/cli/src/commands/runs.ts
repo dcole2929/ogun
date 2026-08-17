@@ -81,8 +81,14 @@ export async function coverage(args: string[], serverUrl: string): Promise<void>
   if (!res?.ok) fail(`could not read coverage for ${project}`)
   const { coverage: rows } = (await res.json()) as {
     coverage: Array<{
-      coverage: { outcome: string; ran: boolean; findingCount: number; reason: string | null }
-      cycleRun: { startedAt: string; state: string }
+      coverage: {
+        outcome: string
+        ran: boolean
+        findingCount: number
+        reason: string | null
+        runId: string | null
+      }
+      cycleRun: { id: string; startedAt: string; state: string }
       worker: { name: string }
     }>
   }
@@ -102,4 +108,36 @@ export async function coverage(args: string[], serverUrl: string): Promise<void>
       ]),
     ]),
   )
+
+  /**
+   * What the workers said about the most recent batch, in full.
+   *
+   * The table above is derived facts; this is the one place a node gets to speak, and
+   * triage is required to use it when a reviewer did not run — so a terminal that showed
+   * the ledger and swallowed the note would leave the reader knowing something failed and
+   * nothing about what went unexamined. Only the latest batch: this command is read to
+   * ask about last night, and the Coverage page carries every note against its own row.
+   */
+  const latest = rows[0]?.cycleRun.id
+  const inBatch = new Set(
+    rows.filter((r) => r.cycleRun.id === latest && r.coverage.runId).map((r) => r.coverage.runId!),
+  )
+  for (const note of await runNotes(project, serverUrl)) {
+    if (!inBatch.has(note.runId)) continue
+    console.log(`\n${cyan(note.worker.name)} ${dim('·')} ${note.notes}`)
+  }
+}
+
+type RunNote = { runId: string; notes: string; worker: { name: string } }
+
+/** Notes are written per run and read per batch, so the ledger matches them on `runId`. */
+async function runNotes(project: string, serverUrl: string): Promise<RunNote[]> {
+  const res = await fetch(`${serverUrl}/api/runs/notes?project=${project}`, {
+    headers: await authHeaders(),
+  }).catch(() => null)
+  // The ledger is the point of the command; a note it could not fetch is not worth
+  // failing over having already printed it.
+  if (!res?.ok) return []
+  const { notes } = (await res.json()) as { notes: RunNote[] }
+  return notes
 }

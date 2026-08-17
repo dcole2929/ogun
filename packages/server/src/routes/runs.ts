@@ -1,6 +1,6 @@
 import { Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
-import { and, asc, count, desc, eq, gt, inArray, or, sql } from 'drizzle-orm'
+import { and, asc, count, desc, eq, gt, inArray, isNotNull, or, sql } from 'drizzle-orm'
 import { schema } from '@ogun/core/db'
 import {
   eventBatchSchema,
@@ -168,6 +168,41 @@ runsRoutes.get('/', async (c) => {
     })),
     onlineRunners: online.length,
   })
+})
+
+/**
+ * What the nodes had to say, most recent first, optionally scoped to one project.
+ *
+ * A note is written per run but read per batch: "which surface did nobody look at last
+ * night" is asked on the coverage ledger, and that ledger is keyed on the cycle run
+ * rather than the run. So the batch-shaped views read this and match on `runId`, instead
+ * of each of them growing its own join back to `runs`.
+ *
+ * Registered above `GET /:id`, which would otherwise take `notes` for a run id and hand
+ * postgres a string that is not a uuid.
+ */
+runsRoutes.get('/notes', async (c) => {
+  const { db } = c.var.ctx
+  const slug = c.req.query('project')
+  const rows = await db
+    .select({
+      runId: runs.id,
+      startedAt: runs.startedAt,
+      outcome: runs.outcome,
+      notes: runs.notes,
+      cycleRunId: jobs.cycleRunId,
+      worker: { name: jobs.workerName },
+      project: { slug: projects.slug },
+    })
+    .from(runs)
+    .innerJoin(jobs, eq(jobs.id, runs.jobId))
+    .innerJoin(projects, eq(projects.id, jobs.projectId))
+    .where(slug ? and(isNotNull(runs.notes), eq(projects.slug, slug)) : isNotNull(runs.notes))
+    .orderBy(desc(runs.startedAt))
+    // Wide enough to cover the batches the coverage page shows, so a row there is never
+    // shown without a note that exists.
+    .limit(Number(c.req.query('limit') ?? 200))
+  return c.json({ notes: rows })
 })
 
 runsRoutes.get('/:id', async (c) => {

@@ -124,6 +124,16 @@ export const findingsDocumentSchema = z.object({
    * is read off the graph rather than declared (§4.12).
    */
   adjudications: z.array(adjudicationSchema).optional(),
+  /**
+   * Anything about this pass that is not a finding: which reviewers did not run and what
+   * therefore went unexamined, why a pass was inconclusive, what the node noticed but
+   * could not substantiate.
+   *
+   * Kept on the run rather than attached to a finding, because its subject is the pass —
+   * a degraded night is exactly the case where there is no finding to hang it on. Triage
+   * is required to write one when the batch is degraded, and for a long time the schema
+   * accepted it and nothing persisted it.
+   */
   notes: z.string().optional(),
 })
 export type FindingsDocument = z.infer<typeof findingsDocumentSchema>

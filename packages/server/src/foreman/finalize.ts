@@ -78,6 +78,19 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
   const reported = outcome === 'approved' ? (report.findings?.findings ?? []) : []
   const raw = consumed ? [] : reported
 
+  /**
+   * The node's own account of the pass, kept whatever else this run did.
+   *
+   * Not gated on `outcome` the way findings are, and not withheld from a staged run.
+   * Staging decides what reaches the *inbox*; a note is output of the run and is read
+   * with it. And the run that most needs to explain itself is the one that ended badly —
+   * discarding the note there would repeat the loss this column exists to stop.
+   *
+   * Blank is treated as absent, so an agent emitting `""` does not put an empty block in
+   * front of a reader.
+   */
+  const notes = report.findings?.notes?.trim()
+
   const jobState: JobState =
     outcome === 'approved' || outcome === 'dispatched'
       ? 'succeeded'
@@ -117,6 +130,7 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
         outcome,
         detail: report.detail ?? gateSummary(report),
         endedAt: new Date(),
+        ...(notes ? { notes } : {}),
         ...(report.durationMs !== undefined ? { durationMs: report.durationMs } : {}),
         ...(report.usage?.inputTokens !== undefined ? { inputTokens: report.usage.inputTokens } : {}),
         ...(report.usage?.outputTokens !== undefined

@@ -1,3 +1,4 @@
+import { Fragment } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Link } from 'react-router'
 import { api } from '../api.ts'
@@ -52,6 +53,22 @@ export function CoveragePage() {
     enabled: Boolean(slug),
   })
   const rows = data?.coverage ?? []
+
+  /**
+   * What the workers wrote about their own pass, keyed by the run that wrote it.
+   *
+   * This is the page a degraded night is read on, and triage is required to describe one
+   * in `notes` — naming the reviewers that did not run, so that "three findings from four
+   * reviewers" cannot be read as "three findings from three". Kept beside the ledger row
+   * it is about rather than only on the run, since nobody opens four run pages to find
+   * out whether the night was whole.
+   */
+  const { data: notes } = useQuery({
+    queryKey: ['run-notes', slug],
+    queryFn: () => api.runNotes(slug!),
+    enabled: Boolean(slug),
+  })
+  const noteFor = new Map((notes?.notes ?? []).map((n) => [n.runId, n]))
 
   /**
    * Only the most recent batch, and only what you can act on.
@@ -133,28 +150,46 @@ export function CoveragePage() {
             </tr>
           </thead>
           <tbody>
-            {rows.map((r, i) => (
-              <tr key={`${r.cycleRun.id}-${r.worker.name}-${i}`}>
-                <td className="muted" title={exact(r.cycleRun.startedAt)}>
-                  {when(r.cycleRun.startedAt)}
-                </td>
-                <td className="muted">{r.cycle.name}</td>
-                <td>{r.worker.name}</td>
-                <td title={MEANING[r.coverage.outcome] ?? ''}>
-                  <Pill value={r.coverage.outcome} />
-                </td>
-                <td className="muted">
-                  {/* A dash rather than 0 when it never ran: zero findings is a claim,
-                      and a worker that did not execute has not made one. */}
-                  {r.coverage.ran ? r.coverage.findingCount : '—'}
-                </td>
-                <td className="muted" style={{ maxWidth: 420, fontSize: 12 }}>
-                  {/* The reason it recorded, then what the outcome means. Previously an
-                      outcome with no reason showed an empty cell. */}
-                  {r.coverage.reason ?? MEANING[r.coverage.outcome] ?? ''}
-                </td>
-              </tr>
-            ))}
+            {rows.map((r, i) => {
+              const note = r.coverage.runId ? noteFor.get(r.coverage.runId) : undefined
+              return (
+                <Fragment key={`${r.cycleRun.id}-${r.worker.name}-${i}`}>
+                  <tr>
+                    <td className="muted" title={exact(r.cycleRun.startedAt)}>
+                      {when(r.cycleRun.startedAt)}
+                    </td>
+                    <td className="muted">{r.cycle.name}</td>
+                    <td>{r.worker.name}</td>
+                    <td title={MEANING[r.coverage.outcome] ?? ''}>
+                      <Pill value={r.coverage.outcome} />
+                    </td>
+                    <td className="muted">
+                      {/* A dash rather than 0 when it never ran: zero findings is a claim,
+                          and a worker that did not execute has not made one. */}
+                      {r.coverage.ran ? r.coverage.findingCount : '—'}
+                    </td>
+                    <td className="muted" style={{ maxWidth: 420, fontSize: 12 }}>
+                      {/* The reason it recorded, then what the outcome means. Previously an
+                          outcome with no reason showed an empty cell. */}
+                      {r.coverage.reason ?? MEANING[r.coverage.outcome] ?? ''}
+                    </td>
+                  </tr>
+                  {/* Its own row rather than a cell, because a note is a paragraph and
+                      the columns beside it are words wide. Under the worker that wrote
+                      it, in the batch it describes. */}
+                  {note && (
+                    <tr>
+                      <td colSpan={6} style={{ paddingTop: 0 }}>
+                        <p className="note">{note.notes}</p>
+                        <Link className="muted" style={{ fontSize: 11 }} to={`/runs/${note.runId}`}>
+                          the run that wrote this →
+                        </Link>
+                      </td>
+                    </tr>
+                  )}
+                </Fragment>
+              )
+            })}
           </tbody>
         </table>
       )}

@@ -231,6 +231,19 @@ export const runs = pgTable(
     outcome: text('outcome'),
     /** Why, when the outcome alone doesn't say — gate failure reason, error message. */
     detail: text('detail'),
+    /**
+     * What the node wanted a person to know, in its own words: triage naming the
+     * reviewers that did not run, a reviewer saying its pass was inconclusive.
+     *
+     * Not folded into `detail`, which is the control plane's account of why a run ended
+     * badly. One column for both would make "the agent has something to tell you"
+     * indistinguishable from "the run broke" — and the case this exists for is a run
+     * that succeeded while describing a night that did not. Triage wrote
+     * "security-review errored and produced nothing … nothing looked at that surface
+     * tonight" and it was thrown away, which is principle 6 inverted in the one node
+     * whose job is assembling the coverage picture.
+     */
+    notes: text('notes'),
     repoSha: text('repo_sha'),
     workerVersion: text('worker_version'),
     skillVersion: text('skill_version'),

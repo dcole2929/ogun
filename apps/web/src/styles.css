@@ -197,6 +197,18 @@ button.primary { background: var(--accent); color: #16110a; border-color: var(--
 .finding .fp { font-family: var(--mono); font-size: 11px; color: var(--muted); }
 .finding .body { margin: 8px 0 0; color: var(--muted); font-size: 13px; white-space: pre-wrap; }
 .finding .actions { margin-top: 10px; display: flex; gap: 6px; }
+
+/* A note is prose a worker wrote for a person, not a field — set as a quotation so it
+   reads as somebody talking rather than as one more cell of metadata. */
+.note {
+  margin: 0;
+  padding-left: 12px;
+  border-left: 2px solid var(--yellow);
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  max-width: 78ch;
+}
 .row { display: flex; gap: 10px; align-items: center; }
 .spread { display: flex; justify-content: space-between; align-items: flex-start; gap: 20px; }
 
