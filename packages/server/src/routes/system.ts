@@ -10,9 +10,10 @@ import type { Env } from '../context.ts'
 import { mintToken } from '../auth.ts'
 import { updateLocalConfig } from '@ogun/core'
 import { reachableAddresses, reachabilityWarning } from './runners.ts'
+import { driftAcross } from '../drift.ts'
 
 const run = promisify(execFile)
-const { findings, jobs, projects, runs } = schema
+const { breakers, findings, jobs, projects, runners, runs, workers } = schema
 
 /**
  * What `ogun runner doctor` answers, for the machine running the control plane.
@@ -29,6 +30,49 @@ const version = async (bin: string, args: string[]): Promise<string | null> =>
     ({ stdout }) => stdout.split('\n')[0]?.trim() ?? '',
     () => null,
   )
+
+/**
+ * The three things that silently stop work, cheap enough for the UI to ask constantly.
+ *
+ * Deliberately not part of `GET /api/system`, which shells out to `git`, `docker`,
+ * `claude` and `codex` with ten-second timeouts — fine for a page you open, ruinous for
+ * something the chrome polls every few seconds. This is four queries and one file hash.
+ *
+ * All three fail the same way: everything reports success and nothing runs. No runner
+ * online and jobs queue forever; a drifted config runs last week's definition; an open
+ * breaker refuses a worker at admission. Each is visible today only on the page that owns
+ * it, which is no use when you are looking at something else.
+ */
+systemRoutes.get('/status', async (c) => {
+  const { db, config } = c.var.ctx
+
+  const [online] = await db
+    .select({ n: count() })
+    .from(runners)
+    .where(
+      sql`${runners.revokedAt} is null and ${runners.pending} = false
+          and ${runners.lastSeenAt} > now() - interval '60 seconds'`,
+    )
+
+  const tripped = await db
+    .select({ worker: workers.name, project: projects.slug, failures: breakers.consecutiveFailures })
+    .from(breakers)
+    .innerJoin(workers, eq(workers.id, breakers.workerId))
+    .innerJoin(projects, eq(projects.id, workers.projectId))
+    .where(sql`${breakers.openedAt} is not null`)
+
+  const drift = await driftAcross(db, config)
+
+  return c.json({
+    runnersOnline: online?.n ?? 0,
+    // Only `drifted` is actionable. `unreachable` is a hosted control plane working as
+    // designed, and `unknown` is a project indexed before the hash was recorded.
+    drifted: Object.entries(drift)
+      .filter(([, d]) => d.state === 'drifted')
+      .map(([slug]) => slug),
+    breakers: tripped,
+  })
+})
 
 systemRoutes.get('/', async (c) => {
   const { db, adminTokenConfigured } = c.var.ctx

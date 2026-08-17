@@ -4,6 +4,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { BrowserRouter, NavLink, Navigate, Route, Routes } from 'react-router'
 import './styles.css'
 import { Mark } from './Mark.tsx'
+import { StatusRail } from './StatusRail.tsx'
 import { RunsPage } from './pages/Runs.tsx'
 import { RunDetailPage } from './pages/RunDetail.tsx'
 import { FindingsPage } from './pages/Findings.tsx'
@@ -46,6 +47,7 @@ function Shell() {
           <NavLink to="/runners">Runners</NavLink>
           <NavLink to="/settings">Settings</NavLink>
         </nav>
+        <StatusRail />
       </aside>
       <main className="main">
         <Routes>

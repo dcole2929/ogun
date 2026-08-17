@@ -46,6 +46,18 @@ function ProjectWorkers({ slug }: { slug: string }) {
   const editable = data?.editable[slug] ?? false
   const hash = data?.hashes[slug]
 
+  const { data: projects } = useQuery({ queryKey: ['projects'], queryFn: api.projects })
+  const drift = projects?.projects.find((p) => p.slug === slug)?.drift
+
+  const sync = useMutation({
+    mutationFn: () => api.syncLocal(slug),
+    onSuccess: async () => {
+      // Everything the index feeds is now potentially different — workers, cycles,
+      // skills, and the drift banner itself.
+      await qc.invalidateQueries()
+    },
+  })
+
   const run = useMutation({
     mutationFn: (worker: string) => api.trigger(slug, worker),
     onSuccess: async () => {
@@ -71,6 +83,32 @@ function ProjectWorkers({ slug }: { slug: string }) {
           This control plane has no local copy of <span className="mono">{slug}</span>, so it
           cannot edit <span className="mono">.ogun/config.yaml</span>. Run{' '}
           <span className="mono">ogun project sync</span> on the machine holding the repo.
+        </p>
+      )}
+
+      {/*
+        The gap between the file and what actually runs. `config.yaml` is the definition,
+        but the foreman reads the database (§5.1), and only the UI publishes on its own —
+        a hand-edit or a `git pull` leaves the factory on the previous definition with
+        nothing saying so. Shown here because this is the page about what runs.
+      */}
+      {drift?.state === 'drifted' && (
+        <div className="drift-banner">
+          <div>
+            <strong>config.yaml has changed since it was last published.</strong>
+            <p>
+              The factory is still running the previous definition — a worker you added or
+              a schedule you edited is not live yet.
+            </p>
+          </div>
+          <button className="primary" onClick={() => sync.mutate()} disabled={sync.isPending}>
+            {sync.isPending ? 'Publishing…' : 'Publish now'}
+          </button>
+        </div>
+      )}
+      {sync.isError && (
+        <p className="muted" style={{ fontSize: 12, color: 'var(--red)' }}>
+          {(sync.error as Error).message}
         </p>
       )}
 

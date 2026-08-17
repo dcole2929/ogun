@@ -121,6 +121,15 @@ export async function reindexProject(
     if (cycle) await syncSchedule(db, cycle.id, driven.has(name) ? { ...w, schedule: undefined } : w)
   }
 
+  /**
+   * Record which file this index came from, here rather than in the sync route, because
+   * both write paths pass through this function — `ogun project sync` and the control
+   * plane writing on behalf of the UI. Recorded in only one of them, a UI edit would
+   * land on disk, land in the database, and then read as drifted against a hash from
+   * before it.
+   */
+  await db.update(projects).set({ configHash: file.hash }).where(eq(projects.id, project.id))
+
   await syncNamedCycles(db, project.id, file.cycles ?? {}, names)
 
   const doomed = await db

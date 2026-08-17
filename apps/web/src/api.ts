@@ -228,8 +228,25 @@ export const startSession = (token: string) =>
     body: JSON.stringify({ token }),
   })
 
+export type Drift = { state: 'current' | 'drifted' | 'unreachable' | 'unknown'; path?: string }
+
+/** The three things that stop work while every page still reports success. */
+export type Status = {
+  runnersOnline: number
+  drifted: string[]
+  breakers: Array<{ worker: string; project: string; failures: number }>
+}
+
 export const api = {
-  projects: () => json<{ projects: Array<{ id: string; slug: string; defaultBranch: string }> }>('/api/projects'),
+  projects: () =>
+    json<{ projects: Array<{ id: string; slug: string; defaultBranch: string; drift: Drift }> }>(
+      '/api/projects',
+    ),
+  status: () => json<Status>('/api/system/status'),
+  syncLocal: (slug: string) =>
+    json<{ workers: string[]; skills: string[] }>(`/api/projects/${slug}/sync-local`, {
+      method: 'POST',
+    }),
   workers: (slug: string) =>
     json<{ workers: Array<{ id: string; name: string; runtime: string; sandbox: string; permissions: string; enabled: boolean }> }>(
       `/api/projects/${slug}/workers`,

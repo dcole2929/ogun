@@ -2,7 +2,12 @@ import { Hono } from 'hono'
 import { and, desc, eq, inArray } from 'drizzle-orm'
 import { z } from 'zod'
 import { schema } from '@ogun/core/db'
+import type { Db } from '@ogun/core/db'
 import { cycleDefinitionSchema, policiesSchema, workerSchema } from '@ogun/core'
+import { resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { discoverSkills, expandCycle, loadProjectConfig } from '@ogun/core'
+import { driftAcross } from '../drift.ts'
 import { reindexProject } from '../reindex.ts'
 import type { Env } from '../context.ts'
 
@@ -41,10 +46,18 @@ const syncSchema = z.object({
 
 export const projectsRoutes = new Hono<Env>()
 
-projectsRoutes.post('/sync', async (c) => {
-  const { db } = c.var.ctx
-  const body = syncSchema.parse(await c.req.json())
+export type SyncPayload = z.infer<typeof syncSchema>
 
+/**
+ * Publish a config to the database. The one implementation, called by both routes below.
+ *
+ * `POST /sync` is the CLI posting a payload it assembled from a repo on *its* machine;
+ * `POST /:slug/sync-local` is the control plane assembling the same payload from a repo
+ * on its own. Two code paths writing the same rows is how the file and the index drift
+ * apart, which is the whole failure this endpoint pair exists to make visible — so there
+ * is one, and the difference is only where the payload came from.
+ */
+async function applySync(db: Db, body: SyncPayload) {
   const [project] = await db
     .insert(projects)
     .values({
@@ -60,7 +73,7 @@ projectsRoutes.post('/sync', async (c) => {
       },
     })
     .returning()
-  if (!project) return c.json({ error: 'failed to upsert project' }, 500)
+  if (!project) throw new Error('failed to upsert project')
 
   const skillIds = new Map<string, string>()
   for (const s of body.skills) {
@@ -106,19 +119,118 @@ projectsRoutes.post('/sync', async (c) => {
     { hash: body.configHash, workers: body.workers, cycles: body.cycles },
   )
 
-  return c.json({
+  return {
     project: { id: project.id, slug: project.slug },
     workers: Object.keys(indexed),
     skills: [...skillIds.keys()],
     removed,
     overriddenSchedules,
-  })
+  }
+}
+
+projectsRoutes.post('/sync', async (c) => {
+  return c.json(await applySync(c.var.ctx.db, syncSchema.parse(await c.req.json())))
 })
 
+/**
+ * Publish this project's config without a terminal.
+ *
+ * Only possible where the control plane can reach the repo — the co-located case §4.1
+ * describes, which is also the only case where the UI can edit `config.yaml` at all. A
+ * hosted control plane has no checkout and says so rather than failing obscurely; there
+ * the remedy is `ogun project sync` on the machine that has the repo.
+ *
+ * Reads exactly what the CLI reads: the config file, the skills discoverable from the
+ * repo root, and the git remote. Anything less would make a UI sync and a CLI sync mean
+ * different things, and you would not find out which you had until a run behaved oddly.
+ */
+projectsRoutes.post('/:slug/sync-local', async (c) => {
+  const { db, config } = c.var.ctx
+  const slug = c.req.param('slug')
+
+  const root = await config.root(slug)
+  if (!root) {
+    return c.json(
+      {
+        error:
+          `this control plane has no local checkout of "${slug}", so it cannot read its ` +
+          'config. Run `ogun project sync` on the machine that has the repo.',
+      },
+      409,
+    )
+  }
+
+  const loaded = await loadProjectConfig(root).catch((err: Error) => err)
+  if (loaded instanceof Error) {
+    return c.json({ error: `could not read ${root}/.ogun/config.yaml: ${loaded.message}` }, 400)
+  }
+
+  const cycles = Object.fromEntries(
+    Object.entries(loaded.config.cycles).map(([name, cycle]) => [name, expandCycle(cycle)]),
+  )
+  // The same guard the CLI applies: a typo in `then:` is otherwise a cycle that runs its
+  // reviewers and then waits forever on a node no worker sits behind.
+  for (const [name, definition] of Object.entries(cycles)) {
+    for (const node of definition.nodes) {
+      if (!loaded.config.workers[node.worker]) {
+        return c.json(
+          { error: `cycle "${name}" refers to worker "${node.worker}", which is not defined` },
+          400,
+        )
+      }
+    }
+  }
+
+  const discovered = await discoverSkills(root, [builtinSkillsRoot()])
+  const result = await applySync(db, {
+    slug: loaded.config.project.name,
+    defaultBranch: loaded.config.project.defaultBranch,
+    ...(loaded.config.project.remoteUrl ? { remoteUrl: loaded.config.project.remoteUrl } : {}),
+    configHash: loaded.configHash,
+    workers: loaded.config.workers,
+    policies: loaded.config.policies,
+    cycles,
+    skills: discovered.map((s) => ({
+      name: s.name,
+      sourcePath: s.sourcePath,
+      versionHash: s.versionHash,
+      origin: s.origin,
+      ...(s.body ? { body: s.body } : {}),
+      referencePaths: s.referencePaths,
+      allowImplicitInvocation: s.agentConfig.policy.allow_implicit_invocation,
+      ...(s.agentConfig.interface.display_name
+        ? { displayName: s.agentConfig.interface.display_name }
+        : {}),
+      ...(s.agentConfig.interface.short_description
+        ? { shortDescription: s.agentConfig.interface.short_description }
+        : {}),
+      ...(s.agentConfig.interface.default_prompt
+        ? { defaultPrompt: s.agentConfig.interface.default_prompt }
+        : {}),
+    })),
+  })
+  return c.json(result)
+})
+
+/**
+ * Where Ogun's own shipped skills live, resolved from this file rather than from the
+ * process's working directory — the server is started from wherever systemd happens to
+ * put it. Deliberately not `.agents/skills/`: that is Ogun reviewing Ogun, exactly as any
+ * project has its own, and shipping those to other repositories would be nonsense.
+ */
+function builtinSkillsRoot(): string {
+  return resolve(fileURLToPath(new URL('../../../..', import.meta.url)), 'skills')
+}
+
 projectsRoutes.get('/', async (c) => {
-  const { db } = c.var.ctx
+  const { db, config } = c.var.ctx
   const rows = await db.select().from(projects).orderBy(projects.slug)
-  return c.json({ projects: rows })
+  // Carried on the row rather than behind a second call: every caller that lists projects
+  // is the sort of caller that needs to know one of them is not what it says it is.
+  const drift = await driftAcross(db, config)
+  return c.json({
+    projects: rows.map((p) => ({ ...p, drift: drift[p.slug] ?? { state: 'unknown' } })),
+  })
 })
 
 projectsRoutes.get('/:slug/workers', async (c) => {

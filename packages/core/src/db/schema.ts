@@ -25,6 +25,20 @@ export const projects = pgTable('projects', {
   slug: text('slug').notNull().unique(),
   remoteUrl: text('remote_url'),
   defaultBranch: text('default_branch').notNull().default('main'),
+  /**
+   * The hash of the `.ogun/config.yaml` this project was last indexed from.
+   *
+   * `config.yaml` is the definition, but the database is what the foreman actually reads
+   * (§5.1) — and the two only meet when something publishes the file. The UI does that
+   * itself; a hand-edit or a `git pull` does not, and nothing noticed. The triage fan-in
+   * merged and sat inert for fourteen hours exactly this way, with every command
+   * reporting success against a definition nobody was running.
+   *
+   * Storing the hash makes the difference computable: the file on disk hashes to
+   * something else, or it does not. Null for a project registered before this existed,
+   * which reads as "unknown" rather than as drift.
+   */
+  configHash: text('config_hash'),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 })
 

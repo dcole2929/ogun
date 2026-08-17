@@ -153,7 +153,12 @@ export async function projectList(serverUrl: string): Promise<void> {
   const res = await fetch(`${serverUrl}/api/projects`, { headers: await authHeaders() }).catch(() => null)
   if (!res?.ok) fail(`could not reach the control plane at ${serverUrl}`)
   const { projects } = (await res.json()) as {
-    projects: Array<{ slug: string; defaultBranch: string; remoteUrl: string | null }>
+    projects: Array<{
+      slug: string
+      defaultBranch: string
+      remoteUrl: string | null
+      drift: { state: 'current' | 'drifted' | 'unreachable' | 'unknown' }
+    }>
   }
   if (projects.length === 0) {
     console.log(dim('no projects — run `ogun project sync` inside a repo with .ogun/config.yaml'))
@@ -161,11 +166,44 @@ export async function projectList(serverUrl: string): Promise<void> {
   }
   console.log(
     table([
-      [bold('PROJECT'), bold('BRANCH'), bold('REMOTE')],
-      ...projects.map((p) => [cyan(p.slug), p.defaultBranch, dim(p.remoteUrl ?? '')]),
+      [bold('PROJECT'), bold('BRANCH'), bold('CONFIG'), bold('REMOTE')],
+      ...projects.map((p) => [
+        cyan(p.slug),
+        p.defaultBranch,
+        configState(p.drift.state),
+        dim(p.remoteUrl ?? ''),
+      ]),
     ]),
   )
+
+  /**
+   * Said once, under the table, rather than repeated per row: the remedy is the same
+   * command whether one project has drifted or four have.
+   */
+  const drifted = projects.filter((p) => p.drift.state === 'drifted').map((p) => p.slug)
+  if (drifted.length > 0) {
+    console.log()
+    console.log(
+      yellow(
+        `${drifted.join(', ')}: config.yaml has changed since it was last published, so the ` +
+          'factory is still running the previous definition.',
+      ),
+    )
+    console.log(dim('run `ogun project sync` in the repo to publish it'))
+  }
 }
+
+/**
+ * `unreachable` is not a problem — it is a control plane with no copy of the repo, which
+ * is the hosted case and the normal one there. Only drift is coloured, because only drift
+ * is something to do.
+ */
+const configState = (state: string): string =>
+  state === 'drifted'
+    ? yellow('drifted')
+    : state === 'current'
+      ? green('synced')
+      : dim(state === 'unreachable' ? 'not local' : 'unknown')
 
 /**
  * `~/.ogun/config.json` — machine-local. A filesystem path is a fact about *this* machine,

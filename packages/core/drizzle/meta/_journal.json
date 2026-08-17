@@ -71,6 +71,13 @@
       "when": 1786997250971,
       "tag": "0009_readjudication",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1787006008770,
+      "tag": "0010_indexed_config_hash",
+      "breakpoints": true
     }
   ]
 }
