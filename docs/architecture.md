@@ -77,7 +77,7 @@ WSL2 host — always-on-ish, systemd
 **Why HTTP on one host.** The runner speaks HTTP to the server even though they're
 the same machine. Cost: nothing. Benefit: moving the control plane to a VPS later is
 a URL change, and the boundary is exercised from day one. The runner never opens a
-database connection. **[settled]**
+database connection. **[settled — ADR-0001]**
 
 ---
 
@@ -89,9 +89,9 @@ Hono API + React UI + Postgres, one Node process serving both. Owns: project/wor
 skill/cycle definitions, the job queue, run history, findings, the runner registry.
 
 **Git is the source of truth for worker definitions, and the control plane edits the
-file.** [settled] A worker lives in exactly one place: `.ogun/config.yaml`, in the repo.
-Creating one in the UI writes that file and re-indexes from it. There is no second
-place a worker can exist, and no "which copy wins" question.
+file.** [settled — ADR-0002] A worker lives in exactly one place: `.ogun/config.yaml`,
+in the repo. Creating one in the UI writes that file and re-indexes from it. There is
+no second place a worker can exist, and no "which copy wins" question.
 
 Two designs were tried before this one. Keeping UI workers in the database alongside
 file workers meant an `origin` column, a shadowing rule, and a promotion step — three
@@ -205,7 +205,7 @@ token budget before knowing what one review run costs.
 
 ### 4.4 Durable state
 
-**Postgres**, in a container next to the server. [settled — reversible]
+**Postgres**, in a container next to the server. [settled — reversible; ADR-0003]
 
 Rationale: Docker is already a hard dependency for sandboxing, so the container costs
 nothing new; `FOR UPDATE SKIP LOCKED` is the correct claim primitive; JSONB suits
@@ -215,11 +215,11 @@ well. This is a ~2-hour migration later, not a one-way door.
 
 Drizzle for schema and queries.
 
-**What the database is for.** [settled] Postgres owns exactly what GitHub and Linear
-cannot represent: runs, events, cost, and findings identity. PR state and ticket state
-stay in GitHub and Linear, read live, **never mirrored**. A review producing thirty
-observations with severity, status, and cross-run identity does not fit in a PR label;
-"this PR is awaiting review" does not need a row in our database.
+**What the database is for.** [settled — ADR-0004] Postgres owns exactly what GitHub
+and Linear cannot represent: runs, events, cost, and findings identity. PR state and
+ticket state stay in GitHub and Linear, read live, **never mirrored**. A review producing
+thirty observations with severity, status, and cross-run identity does not fit in a PR
+label; "this PR is awaiting review" does not need a row in our database.
 
 That split is why the `changes` table is an *artifact record* of what a run produced —
 branch, diff, test result, resulting PR URL — and not the source of truth for where
@@ -304,7 +304,7 @@ Base carries `claude`, `codex`, `git`, node. The project layer adds its toolchai
 **Credentials.** `~/.claude` and `~/.codex` mounted read-only. Worst case for a
 misbehaving agent is burning rate limit. **No git credential ever enters a sandbox.**
 
-**The sandbox never pushes.** [settled]
+**The sandbox never pushes.** [settled — ADR-0005]
 
 ```
 container:  clone at pinned SHA → agent works → commit locally → exit
@@ -318,8 +318,19 @@ exceeded) rather than an agent capability.
 
 Permission profiles still exist for what the agent may do *inside* the sandbox:
 `observer` (read), `reviewer` (read + run tests/scanners, emit findings), `modifier`
-(write + commit). Enforced by the sandbox where practical, not just described in
-prompts.
+(write + commit).
+
+**They are barely enforced.** [corrected] This said "enforced by the sandbox where
+practical, not just described in prompts", and that was never true of the code. The whole
+of it is `--disallowedTools Edit,Write,NotebookEdit,MultiEdit` on the claude runtime for
+non-modifier profiles, in a session that also passes `--dangerously-skip-permissions`.
+`Bash` is unrestricted, so a reviewer writes through the shell; codex gets no restriction
+at all; the container passes `OGUN_PERMISSIONS` into an environment nothing reads; and the
+workspace is mounted read-write for every profile. The structural protections above are
+independent of this and do hold — which is why a reviewer that writes in its workspace
+still cannot publish — but the profile is close to documentation. Closing the gap needs a
+per-runtime tool policy that covers the shell rather than a flag list that does not.
+**[open]**
 
 #### Basis: `claude-sandbox`, with a changed posture
 
@@ -353,8 +364,8 @@ a privileged container mounting `/`, so the container boundary is nominal. Mount
 `~/.config/gh` likewise hands the container a GitHub token, contradicting
 sandbox-never-pushes.
 
-**Self-contained: no siblings, no socket, no dind.** [settled] Everything a job needs
-runs inside its own container. The Docker socket is never mounted — it is
+**Self-contained: no siblings, no socket, no dind.** [settled — ADR-0006] Everything a
+job needs runs inside its own container. The Docker socket is never mounted — it is
 root-equivalent on the host, so mounting it makes the container boundary decorative.
 Docker-in-docker is not the escape hatch either: it needs `--privileged`, which is no
 better. Consequences, in order of when they bite:
@@ -746,15 +757,15 @@ The general `nodes`/`edges` form stays available underneath, and the sugar expan
 it in the CLI before anything else sees it, so the control plane and UI only ever handle
 one shape.
 
-**Staging is derived from the graph, not declared on the worker.** [settled] A run
-stages instead of publishing when something downstream depends on it. The alternative —
-a `stageOnly: true` flag on the worker — makes the same reviewer unusable standalone,
-and gets out of step with the graph the moment you edit one and not the other. The
-coverage ledger still records what the reviewer *reported*, so "found three things" does
-not become "clean" merely because triage has not run yet.
+**Staging is derived from the graph, not declared on the worker.** [settled — ADR-0007]
+A run stages instead of publishing when something downstream depends on it. The
+alternative — a `stageOnly: true` flag on the worker — makes the same reviewer unusable
+standalone, and gets out of step with the graph the moment you edit one and not the
+other. The coverage ledger still records what the reviewer *reported*, so "found three
+things" does not become "clean" merely because triage has not run yet.
 
-**A worker in a cycle loses its own schedule.** [settled] Every worker also has a
-one-node cycle so it can be triggered alone, and that cycle carries the worker's
+**A worker in a cycle loses its own schedule.** [settled — ADR-0007] Every worker also
+has a one-node cycle so it can be triggered alone, and that cycle carries the worker's
 `schedule:`. Once a named cycle drives the worker, two schedules would fire at the same
 hour and the standalone one would publish raw findings — precisely what triage exists to
 prevent. Membership therefore suppresses it, `ogun project sync` says so, and the UI
@@ -782,7 +793,7 @@ Decisions get their own files under `docs/adr/`, numbered and named as an assert
 what was decided:
 
 ```
-docs/adr/0007-runner-and-control-plane-talk-over-http.md
+docs/adr/0001-runner-and-control-plane-talk-over-http.md
 ```
 
 ```markdown
@@ -807,6 +818,10 @@ The `## Considered Options` section is what makes an ADR worth writing: it recor
 alternatives *and why they lost*, which is exactly the context that evaporates in six
 months and gets re-litigated. A decision without its rejected options is just a
 config file in prose.
+
+The records live in `docs/adr/`, and `docs/adr/README.md` covers numbering, statuses, and
+which decisions have earned one. Not every `[settled]` line here becomes an ADR — the ones
+that do are the decisions a reviewer would plausibly flag as wrong without the context.
 
 **ADRs are an agent output, not only a human one.** An architecture-review worker that
 finds a structural problem should be able to propose an ADR — a draft with `status:
@@ -961,7 +976,7 @@ reviewers and not enough for modifiers.
 - **Raw agent transcripts** are large and rarely read: written to disk as a run
   artifact with a pointer in `artifacts`, never into Postgres.
 
-**A single job is a one-node cycle.** [settled] Phase 1 creates a `CycleRun`
+**A single job is a one-node cycle.** [settled — ADR-0007] Phase 1 creates a `CycleRun`
 containing exactly one job. It costs one table and an FK, and it means "run this
 worker now" and "run the nightly cycle" are the same code path from the start. The
 coverage ledger forces this anyway: recording which workers ran in a batch requires a
@@ -1091,7 +1106,7 @@ ogun/
 Stack: Node 24+, Hono, Vite + React (no Next), Postgres + Drizzle, croner, Zod for all
 config and structured-output validation, Docker.
 
-**No build step for the server, runner, or CLI.** [settled] Node strips types
+**No build step for the server, runner, or CLI.** [settled — ADR-0008] Node strips types
 natively, so `node packages/server/src/main.ts` runs TypeScript directly and `tsc` is
 typecheck-only. The cost is a dialect restriction — `erasableSyntaxOnly`, so no enums
 and no parameter properties — which is a fair trade for deleting a compile step from
