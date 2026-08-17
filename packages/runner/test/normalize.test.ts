@@ -4,6 +4,7 @@ import { test } from 'node:test'
 import { claudeRuntime, codexRuntime, newParserState } from '../src/runtimes/index.ts'
 import type { RunEvent } from '@ogun/core'
 import type { RuntimeSpec } from '../src/runtimes/types.ts'
+import { failureMessage } from '../src/pipeline.ts'
 
 /**
  * Both fixtures are real captures from `claude -p --output-format stream-json` and
@@ -96,4 +97,41 @@ test('a truncated or non-JSON line is ignored rather than killing the run', () =
   assert.deepEqual(claudeRuntime.parseLine('{"type":"assis', state), [])
   assert.deepEqual(codexRuntime.parseLine('', state), [])
   assert.equal(state.seq, 0)
+})
+
+/**
+ * When a runtime exits non-zero, the run record has to say why in a sentence a person
+ * can act on. The stderr tail is not that: codex prints "Reading additional input from
+ * stdin…" on every invocation, so a run killed by a 400 from the model API reported
+ * that line — pointing at §4.7's stdin gotcha, which is fixed, instead of at the model
+ * name, which was wrong. These are the real payload shapes both runtimes emit.
+ */
+test('a failure reason is dug out of whatever the runtime nested it in', () => {
+  // Codex: the provider's response body arrives as a *string* of JSON.
+  assert.equal(
+    failureMessage({
+      error: {
+        message:
+          '{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The \'gpt-5.1-codex\' model is not supported when using Codex with a ChatGPT account."}}',
+      },
+    }),
+    "The 'gpt-5.1-codex' model is not supported when using Codex with a ChatGPT account.",
+  )
+
+  // Claude: nested objects, no string-encoded layer.
+  assert.equal(
+    failureMessage({ error: { message: 'Credit balance is too low' } }),
+    'Credit balance is too low',
+  )
+
+  // A plain string is already the answer.
+  assert.equal(failureMessage({ error: 'sandbox failed to provision' }), 'sandbox failed to provision')
+
+  // Nothing usable must stay undefined so the caller falls back to stderr rather than
+  // reporting a confidently empty reason.
+  assert.equal(failureMessage({}), undefined)
+  assert.equal(failureMessage(undefined), undefined)
+
+  // Unparseable JSON is still better than nothing.
+  assert.equal(failureMessage({ error: '{not json' }), '{not json')
 })
