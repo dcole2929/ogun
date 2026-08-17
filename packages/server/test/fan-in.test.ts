@@ -178,3 +178,121 @@ describe('triage fan-in', () => {
     )
   })
 })
+/**
+ * History outlives the definitions that produced it (§4.4).
+ *
+ * `jobs`, `coverage`, `staged_findings` and `cycle_runs` used to cascade off `workers`
+ * and `cycles`, and `reindexProject` deletes anything absent from config.yaml — so a
+ * *rename*, which reaches it as a delete plus an insert, destroyed every run the old name
+ * had ever produced. One worker toggle from the UI took a whole night's cycle run, its
+ * three runs and its coverage rows with it, and nothing failed or said so.
+ */
+describe('editing config.yaml does not delete run history', () => {
+  let h: Awaited<ReturnType<typeof startHarness>>
+  let db: Awaited<ReturnType<typeof startHarness>>['db']
+  const slug = `hist-${Date.now()}`
+  let projectId = ''
+  let cycleId = ''
+  let workerId = ''
+
+  before(async () => {
+    h = await startHarness()
+    db = h.db
+    const [p] = await db.insert(schema.projects).values({ slug }).returning()
+    projectId = p!.id
+    const [w] = await db
+      .insert(schema.workers)
+      .values({
+        projectId,
+        name: 'doomed',
+        skillRef: 'adversarial-review',
+        runtime: 'claude',
+        versionHash: 'v1',
+        config: {},
+      })
+      .returning()
+    workerId = w!.id
+    const [c] = await db
+      .insert(schema.cycles)
+      .values({
+        projectId,
+        name: 'doomed',
+        definition: { nodes: [{ key: 'doomed', worker: 'doomed' }], edges: [] },
+      })
+      .returning()
+    cycleId = c!.id
+  })
+
+  after(async () => {
+    await db.delete(schema.projects).where(eq(schema.projects.id, projectId))
+    await h.stop()
+  })
+
+  test('a run survives its worker and its cycle being deleted', async () => {
+    const { cycleRunId } = await startCycleRun(db, { cycleId, trigger: 'test' })
+    const [job] = await db
+      .select()
+      .from(schema.jobs)
+      .where(eq(schema.jobs.cycleRunId, cycleRunId))
+    const [run] = await db
+      .insert(schema.runs)
+      .values({ jobId: job!.id, runnerName: 'test' })
+      .returning()
+    await finalizeRun(db, {
+      runId: run!.id,
+      outcome: 'approved',
+      gates: [],
+      findings: {
+        findings: [
+          {
+            fingerprint: 'a/b/c/d',
+            title: 'problem',
+            body: 'detail',
+            severity: 'high',
+            citations: [{ path: 'src/x.ts', line: 1 }],
+          },
+        ] as never,
+      },
+      coverage: { outcome: 'found' },
+      artifacts: [],
+    })
+
+    // Exactly what `ogun project sync` does when a worker and cycle leave config.yaml.
+    await db.delete(schema.workers).where(eq(schema.workers.id, workerId))
+    await db.delete(schema.cycles).where(eq(schema.cycles.id, cycleId))
+
+    const runsLeft = await db.select().from(schema.runs).where(eq(schema.runs.id, run!.id))
+    assert.equal(runsLeft.length, 1, 'the run was deleted with its worker')
+
+    const [survivingJob] = await db
+      .select()
+      .from(schema.jobs)
+      .where(eq(schema.jobs.id, job!.id))
+    assert.ok(survivingJob, 'the job was deleted with its worker')
+    assert.equal(survivingJob!.workerId, null, 'the pointer goes, not the row')
+    assert.equal(survivingJob!.workerName, 'doomed', 'the name is what makes it readable')
+
+    const [cycleRun] = await db
+      .select()
+      .from(schema.cycleRuns)
+      .where(eq(schema.cycleRuns.id, cycleRunId))
+    assert.ok(cycleRun, 'the cycle run was deleted with its cycle')
+    assert.equal(cycleRun!.cycleId, null)
+    assert.equal(cycleRun!.cycleName, 'doomed')
+
+    const cov = await db
+      .select()
+      .from(schema.coverage)
+      .where(eq(schema.coverage.cycleRunId, cycleRunId))
+    assert.equal(cov.length, 1, 'the coverage ledger is the trust anchor — it must not vanish')
+    assert.equal(cov[0]!.workerName, 'doomed')
+
+    const staged = await db
+      .select()
+      .from(schema.stagedFindings)
+      .where(eq(schema.stagedFindings.runId, run!.id))
+    assert.equal(staged.length, 1, 'raw reviewer output is a run artifact and outlives the worker')
+    assert.equal(staged[0]!.workerName, 'doomed')
+  })
+})
+

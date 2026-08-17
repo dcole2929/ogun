@@ -120,9 +120,21 @@ export const cycleRuns = pgTable(
   'cycle_runs',
   {
     id: uuid('id').primaryKey().defaultRandom(),
-    cycleId: uuid('cycle_id')
-      .notNull()
-      .references(() => cycles.id, { onDelete: 'cascade' }),
+    /** Null once that cycle is gone from config.yaml; the two snapshots below survive it. */
+    cycleId: uuid('cycle_id').references(() => cycles.id, { onDelete: 'set null' }),
+    /** Snapshot, so history stays readable after a rename or a removal. */
+    cycleName: text('cycle_name').notNull(),
+    /**
+     * The definition this run was created from, frozen at creation.
+     *
+     * Not a convenience: `cycles.definition` is rewritten in place on every
+     * `ogun project sync`, and release and staging decisions used to re-read that live
+     * row mid-flight. Editing config.yaml while a cycle was running could therefore
+     * strand a dependent that had already been given its `dependsOn`, or flip a reviewer
+     * from staging to publishing raw between starting and finishing. A run is executed
+     * against the graph it began with.
+     */
+    definition: jsonb('definition').notNull(),
     trigger: text('trigger').notNull(),
     state: text('state').notNull().default('running'),
     startedAt: timestamp('started_at', { withTimezone: true }).notNull().defaultNow(),
@@ -138,9 +150,18 @@ export const jobs = pgTable(
     cycleRunId: uuid('cycle_run_id')
       .notNull()
       .references(() => cycleRuns.id, { onDelete: 'cascade' }),
-    workerId: uuid('worker_id')
-      .notNull()
-      .references(() => workers.id, { onDelete: 'cascade' }),
+    /**
+     * Null once that worker is gone from config.yaml; `workerName` below survives it.
+     *
+     * This used to cascade, which made a job a child of a config row rather than a
+     * historical fact — so renaming a worker (a delete plus an insert, as far as
+     * `reindexProject` is concerned) silently took every run, event and coverage row it
+     * had ever produced with it. §4.4 is explicit that runs and coverage are what this
+     * database exists to own; they cannot be deleted by editing a file.
+     */
+    workerId: uuid('worker_id').references(() => workers.id, { onDelete: 'set null' }),
+    /** Snapshot, so history stays readable after a rename or a removal. */
+    workerName: text('worker_name').notNull(),
     projectId: uuid('project_id')
       .notNull()
       .references(() => projects.id, { onDelete: 'cascade' }),
@@ -222,9 +243,14 @@ export const stagedFindings = pgTable(
     runId: uuid('run_id')
       .notNull()
       .references(() => runs.id, { onDelete: 'cascade' }),
-    workerId: uuid('worker_id')
-      .notNull()
-      .references(() => workers.id, { onDelete: 'cascade' }),
+    /**
+     * Null once that worker is gone. Staged output is a run artifact — §4.12 keeps it
+     * precisely so a finding triage discarded is recoverable rather than gone — so it
+     * outlives the worker that produced it, like everything else under a run.
+     */
+    workerId: uuid('worker_id').references(() => workers.id, { onDelete: 'set null' }),
+    /** Snapshot, so history stays readable after a rename or a removal. */
+    workerName: text('worker_name').notNull(),
     raw: jsonb('raw').notNull().$type<Record<string, unknown>>(),
   },
   (t) => [index('staged_findings_run_idx').on(t.runId)],
@@ -294,9 +320,10 @@ export const coverage = pgTable(
     cycleRunId: uuid('cycle_run_id')
       .notNull()
       .references(() => cycleRuns.id, { onDelete: 'cascade' }),
-    workerId: uuid('worker_id')
-      .notNull()
-      .references(() => workers.id, { onDelete: 'cascade' }),
+    /** Null once that worker is gone; `workerName` survives it. */
+    workerId: uuid('worker_id').references(() => workers.id, { onDelete: 'set null' }),
+    /** Snapshot, so history stays readable after a rename or a removal. */
+    workerName: text('worker_name').notNull(),
     runId: uuid('run_id').references(() => runs.id, { onDelete: 'set null' }),
     selected: boolean('selected').notNull().default(true),
     ran: boolean('ran').notNull().default(false),
@@ -304,7 +331,13 @@ export const coverage = pgTable(
     findingCount: integer('finding_count').notNull().default(0),
     reason: text('reason'),
   },
-  (t) => [uniqueIndex('coverage_cyclerun_worker_idx').on(t.cycleRunId, t.workerId)],
+  /**
+   * Keyed on the name rather than the id, because the id is now nullable and Postgres
+   * lets NULLs repeat in a unique index — an upsert targeting it would start inserting
+   * duplicate rows into the one table whose entire job is to be true (principle 6).
+   * The constraint is the same either way: one row per worker per cycle run.
+   */
+  (t) => [uniqueIndex('coverage_cyclerun_worker_idx').on(t.cycleRunId, t.workerName)],
 )
 
 /** Large blobs live on disk; this is the pointer. Never inlined into postgres. */
