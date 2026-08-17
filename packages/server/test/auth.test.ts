@@ -312,3 +312,107 @@ describe('runner names', () => {
     assert.equal(await idOf('addressed'), undefined, 'forget must actually remove the row')
   })
 })
+
+/**
+ * An invite enrols exactly one machine.
+ *
+ * It was a read, an `if (invite.usedAt)`, and an unconditional UPDATE at the far end of
+ * the handler. Two joins presenting the same token with different names both saw
+ * `usedAt` null, both passed, and both enrolled — the name-uniqueness check could not
+ * catch them precisely because the names differed. Both rows then carried the same
+ * `tokenHash`, and authentication resolves a credential by that hash alone, so revoking
+ * one left the other working: a lost laptop became a rotation across every machine that
+ * shared the invite, not a revocation.
+ */
+describe('a join token enrols one machine', () => {
+  let h: Awaited<ReturnType<typeof startHarness>>
+
+  before(async () => {
+    // Protected: on an unprotected control plane there is no invite to redeem.
+    h = await startHarness(undefined, true)
+  })
+  after(async () => {
+    await truncate(h.db)
+    await h.stop()
+  })
+
+  const mint = async (): Promise<string> => {
+    const res = await h.fetch('/api/runners/invites', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ note: 'test' }),
+    })
+    return ((await res.json()) as { token: string }).token
+  }
+
+  const join = (token: string, name: string) =>
+    h.fetch('/api/runners/join', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+      body: JSON.stringify({ name, labels: ['claude'], maxConcurrency: 1 }),
+    })
+
+  const enrolled = async (): Promise<Array<{ name: string }>> =>
+    ((await (await h.fetch('/api/runners')).json()) as { runners: Array<{ name: string }> }).runners
+
+  /**
+   * Sixteen, not two. Two joins issued together do not reliably interleave — measured
+   * against the unfixed handler, two racers produced one winner and the test passed
+   * while the bug was fully present. Four produced two winners, eight produced four, and
+   * sixteen produced *fifteen*. A concurrency test that does not reproduce the race on
+   * the broken code is not testing anything, so this is pinned above where it starts.
+   */
+  const RACERS = 16
+
+  test('machines racing one token: exactly one wins', async () => {
+    const token = await mint()
+
+    // Distinct names on purpose — that is precisely what defeated the uniqueness check,
+    // since two rows with different names never collide.
+    const results = await Promise.all(
+      Array.from({ length: RACERS }, (_, i) => join(token, `racer-${i}`)),
+    )
+
+    const won = results.filter((r) => r.status === 201).length
+    assert.equal(won, 1, `${won} of ${RACERS} machines enrolled on one single-use token`)
+    assert.equal(
+      results.filter((r) => r.status === 409).length,
+      RACERS - 1,
+      'every loser should be told the token is spent',
+    )
+
+    const names = (await enrolled()).map((r) => r.name).filter((n) => n.startsWith('racer-'))
+    assert.equal(names.length, 1, `enrolled: ${names.join(', ')}`)
+  })
+
+  test('a spent token cannot be replayed', async () => {
+    const token = await mint()
+    assert.equal((await join(token, 'first-in')).status, 201)
+
+    const again = await join(token, 'second-in')
+    assert.equal(again.status, 409)
+    assert.match(((await again.json()) as { error: string }).error, /already used by "first-in"/)
+  })
+
+  test('an unknown token is refused, and is not confused with a spent one', async () => {
+    const res = await join('ogr_not_a_real_token', 'nobody')
+    assert.equal(res.status, 401)
+    assert.match(((await res.json()) as { error: string }).error, /not valid/)
+  })
+
+  /**
+   * Refusing the name has to roll the claim back. Otherwise the remedy for picking a
+   * taken name is minting a new token, which makes single-use feel like a punishment for
+   * a typo.
+   */
+  test('a name collision does not burn the invite', async () => {
+    const first = await mint()
+    assert.equal((await join(first, 'contested')).status, 201)
+
+    const second = await mint()
+    assert.equal((await join(second, 'contested')).status, 409, 'the name is taken')
+
+    // Still spendable on a name that is free.
+    assert.equal((await join(second, 'uncontested')).status, 201)
+  })
+})
