@@ -26,6 +26,11 @@ coverage/
 .idea/
 *.swp
 
+# agent worktrees — a subagent given `isolation: worktree` checks the repo out under
+# here, so this directory holds entire copies of the tree. Untracked, it survives one
+# `git add -A` away from being committed into itself.
+.claude/worktrees/
+
 # runtime scratch
 .ogun/work/
 images/base/cli/
