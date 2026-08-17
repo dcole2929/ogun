@@ -120,6 +120,7 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
         reported.map((f) => ({
           runId: report.runId,
           workerId: job.workerId,
+          workerName: job.workerName,
           raw: f as unknown as Record<string, unknown>,
         })),
       )
@@ -166,7 +167,7 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
         })
     }
 
-    await markCoverage(tx, job.cycleRunId, job.workerId, {
+    await markCoverage(tx, job.cycleRunId, job, {
       outcome: coverageOutcome,
       ran: outcome !== 'skipped',
       runId: report.runId,
@@ -177,8 +178,15 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
       ...(coverageReason(report, gateFailed) ? { reason: coverageReason(report, gateFailed)! } : {}),
     })
 
+    /**
+     * The breaker is live state about a worker that still exists, not history — so it
+     * keeps its cascade, and there is nothing to record when the worker is already gone.
+     * A run can outlive its worker now; a breaker cannot.
+     */
     const threshold = DEFAULT_LIMITS.failureBreakerThreshold
-    if (jobState === 'failed') {
+    if (job.workerId === null) {
+      // nothing to latch
+    } else if (jobState === 'failed') {
       await tx
         .insert(breakers)
         .values({ workerId: job.workerId, consecutiveFailures: 1 })
@@ -245,17 +253,22 @@ const reopenReasonClause = sql`case
 end`
 
 /**
- * Does anything downstream in this cycle run depend on this node? Read from the cycle's
- * own definition rather than from the jobs, so it is true even before the dependent has
- * been released.
+ * Does anything downstream in this cycle run depend on this node? Read from the
+ * definition rather than from the jobs, so it is true even before the dependent has been
+ * released.
+ *
+ * From the run's frozen copy, not the live `cycles` row. This decides whether a
+ * reviewer stages or publishes, and it is the more dangerous of the two live reads: drop
+ * a reviewer from the cycle's `workers:` list while it is running, sync, and the run that
+ * started as a staged input finishes as a direct publish — putting raw findings in the
+ * inbox alongside whatever triage later consolidates, which is the exact outcome the
+ * fan-in exists to prevent.
  */
 async function hasDependents(db: Db, cycleRunId: string, nodeKey: string): Promise<boolean> {
   const cycleRun = await db.query.cycleRuns.findFirst({ where: eq(cycleRuns.id, cycleRunId) })
   if (!cycleRun) return false
-  const cycle = await db.query.cycles.findFirst({ where: eq(cycles.id, cycleRun.cycleId) })
-  if (!cycle) return false
 
-  const definition = cycleDefinitionSchema.safeParse(cycle.definition)
+  const definition = cycleDefinitionSchema.safeParse(cycleRun.definition)
   if (!definition.success) return false
   return nodesWithDependents(definition.data).has(nodeKey)
 }
