@@ -129,6 +129,45 @@ describe('scheduler', () => {
     assert.equal(row?.lastRunAt?.toISOString(), '2026-08-13T03:00:00.000Z')
   })
 
+  /**
+   * The driver is a `setInterval` that does not wait for its callback, so two ticks
+   * overlapping is ordinary rather than exotic — and `startCycleRun` writes a CycleRun
+   * plus a job per node, which is long enough for it to happen.
+   *
+   * Two concurrent ticks reproduced this 20/20 against the unfixed scheduler, and every
+   * racer started a run: four gave four. Four here rather than two, since the margin
+   * costs nothing and the reproduction should not depend on the read staying as cheap as
+   * it is today.
+   */
+  test('overlapping ticks start one run for one occurrence', async () => {
+    const cycleId = await nightly('overlap', 'skip', new Date('2026-08-13T02:00:00Z'))
+    const results = await Promise.all(
+      Array.from({ length: 4 }, () => tick(db, { now: at('2026-08-13T03:01:00Z') })),
+    )
+
+    assert.equal(await runsFor(cycleId), 1, 'one occurrence is one run, however many ticks saw it')
+    assert.equal(
+      results.flatMap((r) => r.started).filter((n) => n === 'overlap').length,
+      1,
+      'and only the tick that won the claim reports it as started',
+    )
+  })
+
+  test('overlapping ticks decide a missed occurrence once', async () => {
+    // The skip path writes `lastRunAt` too, so it races identically — and a doubled
+    // decision here would be a doubled "skipped" line in the log for one 3am nobody ran.
+    const cycleId = await nightly('overlap-missed', 'skip', new Date('2026-08-13T02:00:00Z'))
+    const results = await Promise.all(
+      Array.from({ length: 4 }, () => tick(db, { now: at('2026-08-13T11:00:00Z') })),
+    )
+
+    assert.equal(await runsFor(cycleId), 0)
+    assert.equal(
+      results.flatMap((r) => r.skipped).filter((n) => n === 'overlap-missed').length,
+      1,
+    )
+  })
+
   test('a disabled schedule is not evaluated', async () => {
     const cycleId = await nightly('off', 'runOnce', new Date('2026-08-12T03:00:00Z'))
     await db

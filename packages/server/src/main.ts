@@ -68,8 +68,20 @@ const server = serve(
  * own minute, and coarse enough that the query is nothing — and since due-ness is
  * derived from the last run rather than from a timer, a tick that is late or missed
  * entirely changes nothing except when the work starts.
+ *
+ * One tick at a time, though. `setInterval` does not wait for its callback, so a tick
+ * that outlives 30 seconds — `startCycleRun` writes a CycleRun and a job per node —
+ * overlaps the next one, and a database under load turns one overlap into a pile-up.
+ *
+ * Belt to the scheduler's braces rather than the correctness boundary: this guard is a
+ * variable in one process, and the occurrence is claimed in the database precisely
+ * because a second server, a manual trigger, or a restart mid-tick walks straight past
+ * it. What it buys is that the ordinary case never attempts the race at all.
  */
+let ticking = false
 const scheduler = setInterval(() => {
+  if (ticking) return
+  ticking = true
   tick(ctx.db)
     .then((r) => {
       for (const name of r.started) console.log(`[foreman] cron started ${name}`)
@@ -78,6 +90,9 @@ const scheduler = setInterval(() => {
       }
     })
     .catch((err) => console.error('[foreman] scheduler failed', err))
+    .finally(() => {
+      ticking = false
+    })
 }, 30_000)
 scheduler.unref()
 
