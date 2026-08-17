@@ -31,7 +31,7 @@ failed:
   "sources": [
     { "worker": "security-review", "ran": true,  "outcome": "approved", "findings": [ ... ] },
     { "worker": "idiomatic",       "ran": true,  "outcome": "approved", "findings": [] },
-    { "worker": "dependency-audit","ran": false, "outcome": "errored",  "detail": "..." }
+    { "worker": "dependency-audit","ran": false, "outcome": "error",    "detail": "..." }
   ]
 }
 ```

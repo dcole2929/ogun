@@ -180,8 +180,18 @@ jobsRoutes.get('/:id/inputs', async (c) => {
       worker: row.worker.name,
       node: row.job.nodeKey,
       outcome: row.run?.outcome ?? row.job.state,
-      // Named so triage can say "three of four reviewers ran" rather than inferring it.
-      ran: Boolean(row.run?.outcome),
+      /**
+       * Named so triage can say "three of four reviewers ran" rather than inferring it —
+       * which means it has to be false for a reviewer that started and died. It was
+       * `Boolean(row.run?.outcome)`, and a crashed run has an outcome (`error`), so a
+       * night where a reviewer never reviewed still reported four of four. The staged
+       * findings are empty either way, so nothing downstream corrected it: triage would
+       * read a full complement of reviewers and an empty result set as a clean surface.
+       *
+       * `skipped` is the same fact arriving by a different route — admission refused it,
+       * so no review happened.
+       */
+      ran: row.run?.outcome === 'approved' || row.run?.outcome === 'changes-requested',
       detail: row.run?.detail ?? null,
       findings: staged.map((f) => f.raw),
     })
