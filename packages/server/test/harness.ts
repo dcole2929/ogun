@@ -1,6 +1,7 @@
 import { serve } from '@hono/node-server'
 import { migrate } from 'drizzle-orm/postgres-js/migrator'
 import { fileURLToPath } from 'node:url'
+import { readFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import postgres from 'postgres'
 import { createDb, type Database } from '@ogun/core/db'
@@ -29,23 +30,72 @@ export type Harness = {
   stop: () => Promise<void>
 }
 
-/** Create the test database if it is not there, and bring its schema up to date. */
+/**
+ * Create the test database if it is not there, and bring its schema up to date.
+ *
+ * `migrate` only ever moves forward, and the database outlives any one branch — so
+ * checking out a branch whose schema is *behind* what the database already has leaves
+ * every test failing on a constraint the code has never heard of. That reads as a broken
+ * branch rather than a stale database, and it cost real time twice in one afternoon:
+ * `null value in column "cycle_name" violates not-null constraint` says nothing about
+ * the actual cause.
+ *
+ * So: if the database has applied migrations this checkout does not contain, it is
+ * ahead, and it is dropped and rebuilt. Nothing of value is in it — it is fixtures.
+ */
 async function ensureTestDatabase(): Promise<string> {
+  const here = dirname(fileURLToPath(import.meta.url))
+  const migrations = join(here, '../../core/drizzle')
+  const journal = JSON.parse(
+    await readFile(join(migrations, 'meta/_journal.json'), 'utf8'),
+  ) as { entries: Array<{ idx: number }> }
+  const known = journal.entries.length
+
   const admin = postgres(ADMIN_URL, { max: 1, onnotice: () => {} })
   try {
     const [row] = await admin`select 1 from pg_database where datname = ${TEST_DB}`
     // Not parameterised because an identifier cannot be; TEST_DB is ours, not input.
     if (!row) await admin.unsafe(`create database "${TEST_DB}"`)
+    else if (await isAhead(known)) {
+      // `with (force)` so a connection left by a killed test run cannot block this.
+      await admin.unsafe(`drop database "${TEST_DB}" with (force)`)
+      await admin.unsafe(`create database "${TEST_DB}"`)
+      console.warn(
+        `[harness] ${TEST_DB} had migrations this checkout does not — rebuilt it`,
+      )
+    }
   } finally {
     await admin.end({ timeout: 5 })
   }
 
-  const url = ADMIN_URL.replace(/\/[^/?]+(\?|$)/, `/${TEST_DB}$1`)
+  const url = testDbUrl()
   const { db, close } = createDb(url)
-  const here = dirname(fileURLToPath(import.meta.url))
-  await migrate(db, { migrationsFolder: join(here, '../../core/drizzle') })
+  await migrate(db, { migrationsFolder: migrations })
   await close()
   return url
+}
+
+const testDbUrl = (): string => ADMIN_URL.replace(/\/[^/?]+(\?|$)/, `/${TEST_DB}$1`)
+
+/**
+ * Has the database applied more migrations than this checkout has files for? Counting
+ * rather than comparing hashes: a *renamed* migration is the same schema and should not
+ * force a rebuild, but a migration that only exists on another branch is one this code
+ * cannot satisfy.
+ */
+async function isAhead(known: number): Promise<boolean> {
+  const sql = postgres(testDbUrl(), { max: 1, onnotice: () => {} })
+  try {
+    const [row] = await sql`
+      select count(*)::int as applied from drizzle.__drizzle_migrations
+    `
+    return (row?.applied ?? 0) > known
+  } catch {
+    // No drizzle schema yet, or the database is unreadable — migrate will deal with it.
+    return false
+  } finally {
+    await sql.end({ timeout: 5 })
+  }
 }
 
 /**
