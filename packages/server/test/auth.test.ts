@@ -1,7 +1,11 @@
 import { strict as assert } from 'node:assert'
 import { after, before, describe, test } from 'node:test'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { eq } from 'drizzle-orm'
+import { schema } from '@ogun/core/db'
+import { singleWorkerCycle } from '@ogun/core'
 import { startHarness, truncate } from './harness.ts'
+import { startCycleRun } from '../src/foreman/cycles.ts'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -414,5 +418,167 @@ describe('a join token enrols one machine', () => {
 
     // Still spendable on a name that is free.
     assert.equal((await join(second, 'uncontested')).status, 201)
+  })
+})
+
+/**
+ * A claim says which machine is claiming, and until now nothing checked that against the
+ * credential presented: the handler looked the runner up by `body.runnerName` alone. Any
+ * enrolled machine could therefore claim as any other by sending a different name, and
+ * every consequence of a claim followed the name — `jobs.claimed_by`, `runs.runner_name`,
+ * and the heartbeat, which writes the caller's labels and capacity onto the named row and
+ * marks it live. Nothing downstream can correct any of that — the claim is the only place
+ * the machine is named — so the record ends up showing a run on a box that never executed
+ * it, and a machine that has never connected reported as online.
+ */
+describe('a claim is bound to the credential that makes it', () => {
+  let h: Awaited<ReturnType<typeof startHarness>>
+  const slug = `claim-auth-${Date.now()}`
+  let cycleId = ''
+
+  before(async () => {
+    // Protected: on an unprotected control plane there is no credential to bind to, which
+    // is the case the last test in this suite covers.
+    h = await startHarness(undefined, true)
+    const [p] = await h.db.insert(schema.projects).values({ slug }).returning()
+    await h.db.insert(schema.workers).values({
+      projectId: p!.id,
+      name: 'reviewer',
+      skillRef: 'adversarial-review',
+      runtime: 'claude',
+      versionHash: 'v1',
+      config: {},
+    })
+    const [cy] = await h.db
+      .insert(schema.cycles)
+      .values({ projectId: p!.id, name: 'reviewer', definition: singleWorkerCycle('reviewer') })
+      .returning()
+    cycleId = cy!.id
+  })
+  after(async () => {
+    await truncate(h.db)
+    await h.stop()
+  })
+
+  /** Enrol a machine and return the credential it now holds. */
+  const enrol = async (name: string): Promise<string> => {
+    const invite = await h.fetch('/api/runners/invites', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ note: name }),
+    })
+    const { token } = (await invite.json()) as { token: string }
+    const joined = await h.fetch('/api/runners/join', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+      // Both labels, because a worker sandboxes in a container by default and a job whose
+      // `requires` is not a subset of the runner's labels is never handed out at all.
+      body: JSON.stringify({ name, labels: ['claude', 'docker'], maxConcurrency: 1 }),
+    })
+    assert.equal(joined.status, 201, `could not enrol ${name}`)
+    return token
+  }
+
+  const claim = (token: string | undefined, runnerName: string, capacity = 1) =>
+    h.fetch('/api/jobs/claim', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        ...(token ? { authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify({ runnerName, labels: ['claude', 'docker'], capacity }),
+    })
+
+  /** One queued job, so a substitution that gets through has something to take. */
+  const queueJob = async () => {
+    const { cycleRunId } = await startCycleRun(h.db, { cycleId, trigger: 'test' })
+    const [job] = await h.db
+      .select()
+      .from(schema.jobs)
+      .where(eq(schema.jobs.cycleRunId, cycleRunId))
+    assert.equal(job?.state, 'queued', 'the fixture job must be claimable')
+    return job!.id
+  }
+
+  const runnerRow = async (name: string) =>
+    h.db.query.runners.findFirst({ where: eq(schema.runners.name, name) })
+
+  test("one machine's token cannot claim as another machine", async () => {
+    const thief = await enrol('thief')
+    await enrol('victim')
+    const jobId = await queueJob()
+
+    const res = await claim(thief, 'victim')
+    assert.equal(res.status, 403, 'a name that is not the credential holder must be refused')
+    assert.match(
+      ((await res.json()) as { error: string }).error,
+      /belongs to runner "thief"/,
+      'the refusal should name the machine the credential actually is',
+    )
+
+    const [job] = await h.db.select().from(schema.jobs).where(eq(schema.jobs.id, jobId))
+    assert.equal(job?.state, 'queued', 'the job must still be waiting for its real runner')
+    assert.equal(job?.claimedBy, null)
+
+    const runs = await h.db.select().from(schema.runs).where(eq(schema.runs.jobId, jobId))
+    assert.equal(runs.length, 0, 'no run may be attributed to a machine that never ran it')
+
+    // The heartbeat is the other half of the damage: it flips the *named* row to live and
+    // overwrites its advertised capacity, so a machine that has never connected would be
+    // reported online and charged for work happening somewhere else.
+    assert.equal((await runnerRow('victim'))?.pending, true, 'victim has never connected')
+  })
+
+  test('a machine claiming under its own name is unaffected', async () => {
+    const token = await enrol('honest')
+    const jobId = await queueJob()
+
+    // Capacity 2: the job the refused claim left queued is older and would be handed out
+    // first, so asking for one slot would say nothing about this job.
+    const res = await claim(token, 'honest', 2)
+    assert.equal(res.status, 200)
+    const { jobs } = (await res.json()) as { jobs: Array<{ jobId: string }> }
+    assert.ok(
+      jobs.some((j) => j.jobId === jobId),
+      'the runner that holds the credential must still get work',
+    )
+
+    const [job] = await h.db.select().from(schema.jobs).where(eq(schema.jobs.id, jobId))
+    assert.equal(job?.claimedBy, 'honest')
+    const [run] = await h.db.select().from(schema.runs).where(eq(schema.runs.jobId, jobId))
+    assert.equal(run?.runnerName, 'honest')
+    assert.equal((await runnerRow('honest'))?.pending, false, 'a claim is also the heartbeat')
+  })
+
+  /**
+   * A localhost control plane has no admin token, so an enrolled runner has no credential
+   * either — `tokenHash` is null and there is nothing to bind a claim to. Binding must not
+   * become a requirement for a credential that the one-box case never issues, exactly as
+   * `/join` does not require an invite there.
+   */
+  test('an unprotected control plane still claims with no credential at all', async () => {
+    const open = await startHarness()
+    try {
+      const joined = await open.fetch('/api/runners/join', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name: 'one-box', labels: ['claude'], maxConcurrency: 1 }),
+      })
+      assert.equal(joined.status, 201)
+
+      const res = await open.fetch('/api/jobs/claim', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ runnerName: 'one-box', labels: ['claude'], capacity: 1 }),
+      })
+      assert.equal(res.status, 200, 'a tokenless runner must still be able to claim')
+      const row = await open.db.query.runners.findFirst({
+        where: eq(schema.runners.name, 'one-box'),
+      })
+      assert.equal(row?.pending, false, 'and the claim must still be its heartbeat')
+    } finally {
+      await open.db.delete(schema.runners).where(eq(schema.runners.name, 'one-box'))
+      await open.stop()
+    }
   })
 })
