@@ -378,3 +378,178 @@ describe('prompt resolution', () => {
     assert.equal(job!.prompt, 'Use the bare skill.')
   })
 })
+
+/**
+ * A run reaches a terminal state once (§5.1).
+ *
+ * Two callers finalize the same run: the runner reporting, and `sweepStaleClaims`
+ * writing off a claim that went quiet. A runner that was slow rather than dead reports
+ * afterwards, and whatever it says then arrives against a run that is already finished.
+ */
+describe('finalizing a run that is already finished', () => {
+  let h: Awaited<ReturnType<typeof startHarness>>
+  let db: Awaited<ReturnType<typeof startHarness>>['db']
+  const slug = `once-${Date.now()}`
+  let projectId = ''
+  let workerId = ''
+  let cycleId = ''
+
+  before(async () => {
+    h = await startHarness()
+    db = h.db
+    const [p] = await db.insert(schema.projects).values({ slug }).returning()
+    projectId = p!.id
+    const [w] = await db
+      .insert(schema.workers)
+      .values({
+        projectId,
+        name: 'reviewer',
+        skillRef: 'adversarial-review',
+        runtime: 'claude',
+        versionHash: 'v1',
+        config: {},
+      })
+      .returning()
+    workerId = w!.id
+    const [c] = await db
+      .insert(schema.cycles)
+      .values({ projectId, name: 'reviewer', definition: singleWorkerCycle('reviewer') })
+      .returning()
+    cycleId = c!.id
+  })
+
+  after(async () => {
+    await db.delete(schema.projects).where(eq(schema.projects.id, projectId))
+    await h.stop()
+  })
+
+  const startRun = async () => {
+    const { cycleRunId } = await startCycleRun(db, { cycleId, trigger: 'test' })
+    const [job] = await db.select().from(schema.jobs).where(eq(schema.jobs.cycleRunId, cycleRunId))
+    const [run] = await db
+      .insert(schema.runs)
+      .values({ jobId: job!.id, runnerName: 'test' })
+      .returning()
+    return { cycleRunId, jobId: job!.id, runId: run!.id }
+  }
+
+  /** What the runner sends when the agent finished and the gate passed. */
+  const approved = (runId: string) =>
+    ({
+      runId,
+      outcome: 'approved',
+      detail: 'the agent finished',
+      gates: [{ name: 'schema', method: 'tool', passed: true }],
+      findings: {
+        findings: [
+          {
+            fingerprint: 'security/orders/isolation/late-report',
+            title: 'Order lookup trusts a client id',
+            body: 'detail',
+            severity: 'high',
+            citations: [{ path: 'src/orders.ts', line: 12 }],
+          },
+        ],
+      },
+      coverage: { outcome: 'found' },
+      artifacts: [{ kind: 'transcript', ref: '/tmp/transcript.jsonl' }],
+    }) satisfies Parameters<typeof finalizeRun>[1]
+
+  const breaker = async () => {
+    const [row] = await db
+      .select()
+      .from(schema.breakers)
+      .where(eq(schema.breakers.workerId, workerId))
+    return row
+  }
+
+  test('a report arriving after the stale sweep changes nothing', async () => {
+    const { cycleRunId, jobId, runId } = await startRun()
+    // Exactly what sweepStaleClaims writes for a claim that stopped reporting.
+    await finalizeRun(db, {
+      runId,
+      outcome: 'error',
+      detail: 'stale claim: no report within 30m',
+      gates: [],
+      coverage: { outcome: 'errored', reason: 'runner went away' },
+      artifacts: [],
+    })
+
+    const late = await finalizeRun(db, approved(runId))
+    assert.equal(late.outcome, 'error', 'the first writer wins, and the late one is told so')
+
+    const [run] = await db.select().from(schema.runs).where(eq(schema.runs.id, runId))
+    assert.equal(run?.outcome, 'error', 'a run written off as failed must not flip to succeeded')
+    assert.match(run?.detail ?? '', /stale claim/)
+
+    const [job] = await db.select().from(schema.jobs).where(eq(schema.jobs.id, jobId))
+    assert.equal(job?.state, 'failed')
+
+    const published = await db
+      .select()
+      .from(schema.findings)
+      .where(eq(schema.findings.projectId, projectId))
+    assert.equal(published.length, 0, 'a run the ledger calls errored must not fill the inbox')
+    const staged = await db
+      .select()
+      .from(schema.stagedFindings)
+      .where(eq(schema.stagedFindings.runId, runId))
+    assert.equal(staged.length, 0)
+    const files = await db
+      .select()
+      .from(schema.artifacts)
+      .where(eq(schema.artifacts.runId, runId))
+    assert.equal(files.length, 0)
+
+    const [cov] = await db
+      .select()
+      .from(schema.coverage)
+      .where(eq(schema.coverage.cycleRunId, cycleRunId))
+    // The upsert here is what masked the rest of it: coverage was the one table that
+    // looked the same either way.
+    assert.equal(cov?.outcome, 'errored')
+    assert.equal(cov?.findingCount, 0)
+
+    assert.equal(
+      (await breaker())?.consecutiveFailures,
+      1,
+      'a late success must not clear a failure the sweep just latched',
+    )
+
+    assert.equal(late.alreadyFinalized, true)
+    assert.equal(late.findingsWritten, 0)
+    assert.equal(late.coverage, 'errored')
+  })
+
+  test('a retried report after a successful one does not count twice', async () => {
+    const { runId } = await startRun()
+    const first = await finalizeRun(db, approved(runId))
+    assert.equal(first.alreadyFinalized, undefined, 'the first report is not a repeat')
+    assert.equal(first.findingsWritten, 1)
+
+    // The runner never saw the response — a dropped connection, a restart — and sends
+    // the identical report again.
+    const retry = await finalizeRun(db, approved(runId))
+    assert.equal(retry.findingsWritten, 0, 'this call published nothing; the first one did')
+
+    const [finding] = await db
+      .select()
+      .from(schema.findings)
+      .where(eq(schema.findings.projectId, projectId))
+    assert.equal(finding?.seenCount, 1, 'one run cannot be two sightings of the same finding')
+
+    const staged = await db
+      .select()
+      .from(schema.stagedFindings)
+      .where(eq(schema.stagedFindings.runId, runId))
+    assert.equal(staged.length, 1, 'staging is what triage reads; a duplicate there is a lie')
+    const files = await db
+      .select()
+      .from(schema.artifacts)
+      .where(eq(schema.artifacts.runId, runId))
+    assert.equal(files.length, 1)
+
+    assert.equal(retry.alreadyFinalized, true)
+    assert.equal(retry.outcome, 'approved', 'what stands, not what this call proposed')
+  })
+})

@@ -81,14 +81,27 @@ runsRoutes.post('/:id/report', async (c) => {
     runId: c.req.param('id'),
   })
   const result = await finalizeRun(db, report)
+  /**
+   * The outcome on record, not the one in the body. The gate can overrule what the
+   * runner claims, and a report that lost the race to finalize has no outcome of its
+   * own at all — publishing the body's would close the timeline with `approved` on a
+   * run the database calls failed, which is the same lie the write path refuses.
+   */
   bus.publish(report.runId, [
     {
       type: 'run.completed',
       ts: new Date().toISOString(),
       seq: Number.MAX_SAFE_INTEGER,
-      payload: { outcome: report.outcome, detail: report.detail ?? null },
+      payload: {
+        outcome: result.outcome,
+        detail: result.alreadyFinalized
+          ? 'a report arrived after this run was finalized; nothing was applied'
+          : (report.detail ?? null),
+      },
     } satisfies RunEvent,
   ])
+  // 200, not a conflict: a slow machine reporting after the sweep gave up on it did
+  // nothing wrong, and a runner that throws here would only report again.
   return c.json(result)
 })
 

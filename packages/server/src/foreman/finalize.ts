@@ -1,4 +1,4 @@
-import { and, eq, sql } from 'drizzle-orm'
+import { and, eq, isNull, sql } from 'drizzle-orm'
 import { schema } from '@ogun/core/db'
 import type { Db } from '@ogun/core/db'
 import { cycleDefinitionSchema, nodesWithDependents } from '@ogun/core'
@@ -6,10 +6,17 @@ import type { CoverageOutcome, JobState, RunOutcome, RunReport } from '@ogun/cor
 import { DEFAULT_LIMITS } from './admission.ts'
 import { finalizeCycleIfDone, markCoverage, releaseDependents } from './cycles.ts'
 
-const { artifacts, breakers, cycleRuns, cycles, findings, jobs, runs, stagedFindings } = schema
+const { artifacts, breakers, coverage, cycleRuns, cycles, findings, jobs, runs, stagedFindings } =
+  schema
 
 export type FinalizeResult = {
   ok: true
+  /**
+   * This call found the run already terminal and wrote nothing. Everything else in the
+   * result then describes what the *first* writer recorded, not what this caller
+   * reported — a late report is answered with the truth, not with its own claim.
+   */
+  alreadyFinalized?: true
   /** Findings reported but withheld from the inbox because triage will consolidate them. */
   staged: number
   /** The outcome as derived, which may differ from what the runner reported. */
@@ -22,10 +29,20 @@ export type FinalizeResult = {
 }
 
 /**
- * The end of a run, as one transaction (§5.1).
+ * The end of a run, as one transaction (§5.1), and only ever once.
  *
  * Coverage is derived from the outcome rather than trusted from the runner for the
  * cases the runner can't know, so "gate failed" can never be filed as "clean".
+ *
+ * Two callers race for the same run: the runner reporting, and `sweepStaleClaims`
+ * marking a run whose claim went quiet. A runner that was slow rather than dead then
+ * reports afterwards, and the second write used to win — flipping a run recorded as
+ * failed back to succeeded, publishing its findings, bumping `seen_count` a second
+ * time, and resetting the failure breaker the sweep had just moved. Coverage's upsert
+ * hid half of it, which is why it went unnoticed for so long.
+ *
+ * So the run's terminal state is claimed, not assigned: whichever caller flips
+ * `outcome` from null wins, and the loser applies nothing (see the update below).
  */
 export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeResult> {
   const run = await db.query.runs.findFirst({ where: eq(runs.id, report.runId) })
@@ -81,8 +98,20 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
           ? 'found'
           : 'clean'
 
+  let already: FinalizeResult | undefined
+
   await db.transaction(async (tx) => {
-    await tx
+    /**
+     * The claim, and the first write in the transaction. `outcome` is null until a run
+     * is finalized and is set here together with `endedAt`, so `is null` is exactly
+     * "not yet terminal" — and a conditional update returning no row is the whole
+     * guard: a concurrent finalize blocks on this row until it commits, at which point
+     * the predicate no longer holds and this caller comes away empty-handed.
+     *
+     * Nothing else has been written yet at this point, so returning here leaves the
+     * transaction with nothing to undo.
+     */
+    const [claimed] = await tx
       .update(runs)
       .set({
         outcome,
@@ -95,7 +124,13 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
           : {}),
         ...(report.usage?.costCents !== undefined ? { costCents: report.usage.costCents } : {}),
       })
-      .where(eq(runs.id, report.runId))
+      .where(and(eq(runs.id, report.runId), isNull(runs.outcome)))
+      .returning()
+
+    if (!claimed) {
+      already = await recordedResult(tx, report.runId, job)
+      return
+    }
 
     await tx.update(jobs).set({ state: jobState }).where(eq(jobs.id, job.id))
 
@@ -222,6 +257,11 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
     }
   })
 
+  // The dependents were released by whoever won the claim; a second report has nothing
+  // left to move, and re-running the graph walk would only widen the window in which
+  // two callers are stepping over the same cycle run.
+  if (already) return already
+
   await releaseDependents(db, job.cycleRunId)
   await finalizeCycleIfDone(db, job.cycleRunId)
 
@@ -234,6 +274,46 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
     /** Reported but held for triage rather than published. */
     staged: consumed ? reported.length : 0,
     coverage: coverageOutcome,
+  }
+}
+
+/**
+ * What a caller that lost the claim is told: the state on record, with nothing of its
+ * own in it.
+ *
+ * A second report is not an error to throw back — a slow machine reporting after the
+ * sweep gave up on it did nothing wrong — so it gets an answer of the same shape as a
+ * first one, and the runner learns the outcome that actually stands rather than the one
+ * it proposed. Zeroes are literal: this call wrote no finding, staged none, and
+ * adjudicated nothing.
+ */
+async function recordedResult(
+  tx: Db,
+  runId: string,
+  job: { id: string; cycleRunId: string; workerName: string },
+): Promise<FinalizeResult> {
+  const run = await tx.query.runs.findFirst({ where: eq(runs.id, runId) })
+  // Losing the claim usually means someone else finalized it, but it also covers the run
+  // having been deleted underneath us — same answer as the check before the transaction.
+  if (!run) throw new Error(`no such run: ${runId}`)
+  const current = await tx.query.jobs.findFirst({ where: eq(jobs.id, job.id) })
+
+  const [ledger] = await tx
+    .select({ outcome: coverage.outcome })
+    .from(coverage)
+    .where(and(eq(coverage.cycleRunId, job.cycleRunId), eq(coverage.workerName, job.workerName)))
+
+  return {
+    ok: true,
+    alreadyFinalized: true,
+    outcome: run.outcome as RunOutcome,
+    jobState: (current?.state ?? 'failed') as JobState,
+    findingsWritten: 0,
+    staged: 0,
+    adjudicated: [],
+    // `abandoned` is what the sweep already calls a job that ended without the ledger
+    // being told (§4.11), so a missing row is reported as that rather than guessed at.
+    coverage: (ledger?.outcome ?? 'abandoned') as CoverageOutcome,
   }
 }
 
