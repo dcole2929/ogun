@@ -38,7 +38,15 @@ export async function startCycleRun(
   return db.transaction(async (tx) => {
     const [cycleRun] = await tx
       .insert(cycleRuns)
-      .values({ cycleId: cycle.id, trigger: input.trigger, state: 'running' })
+      .values({
+        cycleId: cycle.id,
+        // Frozen here, so everything downstream reads the graph this run began with
+        // rather than a `cycles` row that `ogun project sync` can rewrite mid-flight.
+        cycleName: cycle.name,
+        definition,
+        trigger: input.trigger,
+        state: 'running',
+      })
       .returning()
     if (!cycleRun) throw new Error('failed to create cycle run')
 
@@ -71,6 +79,7 @@ export async function startCycleRun(
         .values({
           cycleRunId: cycleRun.id,
           workerId: worker.id,
+          workerName: worker.name,
           projectId: cycle.projectId,
           nodeKey: node.key,
           prompt,
@@ -85,6 +94,7 @@ export async function startCycleRun(
       await tx.insert(coverage).values({
         cycleRunId: cycleRun.id,
         workerId: worker.id,
+        workerName: worker.name,
         selected: true,
         ran: false,
         // `pending`, not `not-selected`: this worker *was* selected. The row exists
@@ -110,8 +120,16 @@ export async function releaseDependents(db: Db, cycleRunId: string): Promise<str
   const byNode = new Map(all.map((j) => [j.nodeKey, j]))
   const cycleRun = await db.query.cycleRuns.findFirst({ where: eq(cycleRuns.id, cycleRunId) })
   if (!cycleRun) return []
-  const cycle = await db.query.cycles.findFirst({ where: eq(cycles.id, cycleRun.cycleId) })
-  const definition = cycleDefinitionSchema.parse(cycle?.definition ?? { nodes: [] })
+  /**
+   * The run's own frozen graph, not the `cycles` row.
+   *
+   * Re-reading the live row meant `ogun project sync` — an edit the docs actively
+   * encourage — could change a running cycle's shape underneath it: an edge dropped
+   * mid-flight leaves a dependent blocked on something that no longer points at it, and
+   * `jobs.dependsOn` (snapshotted at creation) and this graph would disagree about the
+   * same run.
+   */
+  const definition = cycleDefinitionSchema.parse(cycleRun.definition)
 
   const released: string[] = []
   for (const job of all) {
@@ -128,7 +146,7 @@ export async function releaseDependents(db: Db, cycleRunId: string): Promise<str
         .update(jobs)
         .set({ state: 'skipped' })
         .where(eq(jobs.id, job.id))
-      await markCoverage(db, cycleRunId, job.workerId, {
+      await markCoverage(db, cycleRunId, job, {
         // `blocked` in its narrow sense: a dependency in this cycle did not succeed.
         outcome: 'blocked',
         reason: `dependency ${blockedBy.map((b) => b.edge.from).join(', ')} did not succeed`,
@@ -155,17 +173,22 @@ export async function finalizeCycleIfDone(db: Db, cycleRunId: string): Promise<v
     .where(and(eq(cycleRuns.id, cycleRunId), eq(cycleRuns.state, 'running')))
 }
 
+/**
+ * `worker` is the job's own snapshot rather than a bare id, because the id is nullable
+ * once that worker leaves config.yaml and the name is what identifies the row either way.
+ */
 export async function markCoverage(
   db: Db,
   cycleRunId: string,
-  workerId: string,
+  worker: { workerId: string | null; workerName: string },
   fields: { outcome: string; reason?: string; ran?: boolean; runId?: string; findingCount?: number },
 ): Promise<void> {
   await db
     .insert(coverage)
     .values({
       cycleRunId,
-      workerId,
+      workerId: worker.workerId,
+      workerName: worker.workerName,
       selected: true,
       ran: fields.ran ?? false,
       outcome: fields.outcome,
@@ -174,7 +197,7 @@ export async function markCoverage(
       findingCount: fields.findingCount ?? 0,
     })
     .onConflictDoUpdate({
-      target: [coverage.cycleRunId, coverage.workerId],
+      target: [coverage.cycleRunId, coverage.workerName],
       set: {
         ran: fields.ran ?? false,
         outcome: fields.outcome,

@@ -1,6 +1,7 @@
 import { and, eq, inArray, not } from 'drizzle-orm'
 import { schema } from '@ogun/core/db'
 import type { Db } from '@ogun/core/db'
+import { markCoverage } from './foreman/cycles.ts'
 import {
   cycleMembers,
   hashContent,
@@ -9,7 +10,7 @@ import {
   type WorkerConfig,
 } from '@ogun/core'
 
-const { cycles, projects, schedules, skills, workers } = schema
+const { cycles, jobs, projects, schedules, skills, workers } = schema
 
 export type ReindexResult = {
   workers: Record<string, typeof workers.$inferSelect>
@@ -29,6 +30,11 @@ export type ReindexResult = {
  *
  * Everything not in the file is deleted. The file is the definition; a row that outlives
  * its entry is a worker nobody can find the source of.
+ *
+ * That applies to definitions only. Runs, coverage and staged output are not definitions
+ * — §4.4 keeps them here precisely because nothing else can — so they survive, holding a
+ * name snapshot and a nulled foreign key. Until this distinction existed, renaming a
+ * worker (a delete and an insert, from here) erased everything it had ever done.
  */
 export async function reindexProject(
   db: Db,
@@ -116,6 +122,44 @@ export async function reindexProject(
   }
 
   await syncNamedCycles(db, project.id, file.cycles ?? {}, names)
+
+  const doomed = await db
+    .select({ id: workers.id, name: workers.name })
+    .from(workers)
+    .where(
+      and(
+        eq(workers.projectId, project.id),
+        names.length > 0 ? not(inArray(workers.name, names)) : undefined,
+      ),
+    )
+
+  /**
+   * Retire the work queued for a worker that is about to stop existing.
+   *
+   * Jobs used to be deleted along with it, which is what destroyed the run history this
+   * schema now protects. Keeping them creates the opposite hazard: a queued job whose
+   * worker is gone can never be claimed — the claim needs its runtime and sandbox — so it
+   * would sit in the queue forever, counted as pending by a ledger that says it is still
+   * waiting for a machine. Retire it explicitly and say why, rather than leaving a row
+   * that quietly means nothing (principle 6).
+   *
+   * Only work that has not started: a claimed or running job belongs to a runner and
+   * finishes on its own.
+   */
+  for (const worker of doomed) {
+    const stranded = await db
+      .update(jobs)
+      .set({ state: 'skipped' })
+      .where(and(eq(jobs.workerId, worker.id), inArray(jobs.state, ['queued', 'blocked'])))
+      .returning({ cycleRunId: jobs.cycleRunId, workerName: jobs.workerName })
+
+    for (const job of stranded) {
+      await markCoverage(db, job.cycleRunId, { workerId: worker.id, workerName: job.workerName }, {
+        outcome: 'cancelled',
+        reason: `"${worker.name}" was removed from config.yaml before this ran`,
+      })
+    }
+  }
 
   const removed = await db
     .delete(workers)

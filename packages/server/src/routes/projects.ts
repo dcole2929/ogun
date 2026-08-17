@@ -1,12 +1,12 @@
 import { Hono } from 'hono'
-import { and, desc, eq } from 'drizzle-orm'
+import { and, desc, eq, inArray } from 'drizzle-orm'
 import { z } from 'zod'
 import { schema } from '@ogun/core/db'
 import { cycleDefinitionSchema, policiesSchema, workerSchema } from '@ogun/core'
 import { reindexProject } from '../reindex.ts'
 import type { Env } from '../context.ts'
 
-const { coverage, cycleRuns, cycles, projects, skills, workers } = schema
+const { coverage, cycleRuns, cycles, jobs, projects, skills, workers } = schema
 
 /**
  * The CLI reads the repo and posts the resolved config here — the server never touches
@@ -156,13 +156,31 @@ projectsRoutes.get('/:slug/coverage', async (c) => {
     where: eq(projects.slug, c.req.param('slug')),
   })
   if (!project) return c.json({ error: 'no such project' }, 404)
+  /**
+   * Names come from the snapshots on the run and the coverage row, not from `cycles` and
+   * `workers`. The ledger has to survive the definitions it describes — a nightly cycle
+   * you renamed last week must not erase the record of the nights it ran, which is the
+   * whole of principle 6. Joining those tables would also have silently dropped exactly
+   * those rows once the foreign keys went nullable.
+   *
+   * Scoped through `jobs`, which is where a cycle run's project is recorded and which
+   * outlives any definition.
+   */
+  const inProject = db
+    .select({ id: jobs.cycleRunId })
+    .from(jobs)
+    .where(eq(jobs.projectId, project.id))
+
   const rows = await db
-    .select({ coverage, cycleRun: cycleRuns, cycle: cycles, worker: { name: workers.name } })
+    .select({
+      coverage,
+      cycleRun: cycleRuns,
+      cycle: { name: cycleRuns.cycleName },
+      worker: { name: coverage.workerName },
+    })
     .from(coverage)
     .innerJoin(cycleRuns, eq(cycleRuns.id, coverage.cycleRunId))
-    .innerJoin(cycles, eq(cycles.id, cycleRuns.cycleId))
-    .innerJoin(workers, eq(workers.id, coverage.workerId))
-    .where(and(eq(cycles.projectId, project.id)))
+    .where(inArray(coverage.cycleRunId, inProject))
     .orderBy(desc(cycleRuns.startedAt))
     .limit(200)
   return c.json({ coverage: rows })

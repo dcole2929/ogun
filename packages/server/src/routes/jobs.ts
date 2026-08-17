@@ -164,11 +164,10 @@ jobsRoutes.get('/:id/inputs', async (c) => {
   const upstream = await db
     .select({
       job: { nodeKey: jobs.nodeKey, state: jobs.state },
-      worker: { name: workers.name },
+      worker: { name: jobs.workerName },
       run: { id: runs.id, outcome: runs.outcome, detail: runs.detail },
     })
     .from(jobs)
-    .innerJoin(workers, eq(workers.id, jobs.workerId))
     .leftJoin(runs, eq(runs.jobId, jobs.id))
     .where(and(eq(jobs.cycleRunId, job.cycleRunId), inArray(jobs.nodeKey, job.dependsOn)))
 
@@ -200,9 +199,9 @@ jobsRoutes.get('/', async (c) => {
   const { db } = c.var.ctx
   const state = c.req.query('state')
   const rows = await db
-    .select({ job: jobs, worker: workers })
+    .select({ job: jobs, worker: { id: workers.id, name: jobs.workerName } })
     .from(jobs)
-    .innerJoin(workers, eq(workers.id, jobs.workerId))
+    .leftJoin(workers, eq(workers.id, jobs.workerId))
     .where(state ? eq(jobs.state, state) : undefined)
     .orderBy(sql`${jobs.createdAt} desc`)
     .limit(100)
@@ -222,9 +221,10 @@ jobsRoutes.post('/:id/cancel', async (c) => {
   // The ledger has to say so. A cancelled job left at `pending` claims it is still
   // waiting for a runner, in the one table whose entire purpose is to be true about what
   // ran (principle 6).
-  await markCoverage(db, cancelled.cycleRunId, cancelled.workerId, {
+  await markCoverage(db, cancelled.cycleRunId, cancelled, {
     outcome: 'cancelled',
     reason: 'cancelled before it ran',
   })
   return c.json({ cancelled: true })
 })
+
