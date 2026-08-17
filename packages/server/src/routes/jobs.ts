@@ -1,12 +1,12 @@
 import { Hono } from 'hono'
-import { and, arrayContained, eq, inArray, isNull, sql } from 'drizzle-orm'
+import { and, arrayContained, desc, eq, inArray, isNull, ne, sql } from 'drizzle-orm'
 import { schema } from '@ogun/core/db'
 import { claimRequestSchema, claimedJobSchema, type ClaimedJob } from '@ogun/core'
 import type { Env } from '../context.ts'
 import { DEFAULT_LIMITS, remainingCapacity } from '../foreman/admission.ts'
 import { markCoverage } from '../foreman/cycles.ts'
 
-const { jobs, projects, runners, runs, stagedFindings, workers } = schema
+const { findings, jobs, projects, runners, runs, stagedFindings, workers } = schema
 
 const globalLimits = {
   ...DEFAULT_LIMITS,
@@ -238,3 +238,58 @@ jobsRoutes.post('/:id/cancel', async (c) => {
   return c.json({ cancelled: true })
 })
 
+/**
+ * What this project's inbox already says, for a job that is about to review it.
+ *
+ * A reviewer is one run in a series, and re-reporting something already known costs the
+ * reader attention and teaches them to skim. Both review skills therefore open by
+ * checking what has already been said — and until now they did it by shelling out to
+ * `ogun findings list`, which cannot work: the sandbox has no route to the control plane
+ * (§4.12), so the command failed on every run and every reviewer worked with no memory.
+ *
+ * Same shape as `/inputs`: the runner fetches this and writes it into the workspace, so
+ * the skill reads a file rather than making a query it has no way to make. Nothing new
+ * is exposed to the sandbox.
+ *
+ * Two representations, because the reviewer asks two different questions at two different
+ * moments (§4.11):
+ *
+ *   - `index`   — one compact record per finding. Answers "is this surface already
+ *                 accounted for?", which is exactly what the fingerprint encodes. Small
+ *                 enough to read whole.
+ *   - `details` — the full body, keyed by fingerprint, written to disk as separate files
+ *                 and opened only for the findings that turn out to matter. The body
+ *                 carries the previous reviewer's *argument*, and reading sixteen of
+ *                 those is how a reviewer stops generating hypotheses and starts
+ *                 pattern-matching someone else's.
+ *
+ * `duplicate` is excluded: the skills treat a duplicate as though it never existed.
+ * Everything else is included and labelled, because "seen and set aside" and "never
+ * looked at" are different facts (principle 6).
+ */
+jobsRoutes.get('/:id/history', async (c) => {
+  const { db } = c.var.ctx
+  const job = await db.query.jobs.findFirst({ where: eq(jobs.id, c.req.param('id')) })
+  if (!job) return c.json({ error: 'no such job' }, 404)
+
+  const rows = await db
+    .select()
+    .from(findings)
+    .where(and(eq(findings.projectId, job.projectId), ne(findings.status, 'duplicate')))
+    .orderBy(desc(findings.updatedAt))
+    .limit(Number(c.req.query('limit') ?? 500))
+
+  return c.json({
+    index: rows.map((f) => ({
+      fingerprint: f.fingerprint,
+      status: f.status,
+      severity: f.severity,
+      title: f.title,
+      ...(f.path ? { path: f.path } : {}),
+      seenCount: f.seenCount,
+      lastSeenAt: f.updatedAt.toISOString(),
+      ...(f.statusReason ? { statusReason: f.statusReason } : {}),
+    })),
+    details: Object.fromEntries(rows.map((f) => [f.fingerprint, f.body])),
+  })
+})

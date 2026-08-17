@@ -399,3 +399,99 @@ describe('editing config.yaml does not delete run history', () => {
   })
 })
 
+/**
+ * History reaches the sandbox as a file, not a query (§4.11, §4.12).
+ *
+ * Both review skills open by checking what has already been reported, and they used to
+ * do it with `ogun findings list` — which cannot work inside a sandbox that has no route
+ * to the control plane. Every reviewer therefore ran with no memory of any previous
+ * night, which is how the same invite bug reached the inbox three times under three
+ * fingerprints.
+ */
+describe('a job can read what the inbox already says', () => {
+  let h: Awaited<ReturnType<typeof startHarness>>
+  let db: Awaited<ReturnType<typeof startHarness>>['db']
+  const slug = `hist2-${Date.now()}`
+  let projectId = ''
+  let jobId = ''
+
+  before(async () => {
+    h = await startHarness()
+    db = h.db
+    const [p] = await db.insert(schema.projects).values({ slug }).returning()
+    projectId = p!.id
+    const [w] = await db
+      .insert(schema.workers)
+      .values({
+        projectId,
+        name: 'reviewer',
+        skillRef: 'adversarial-review',
+        runtime: 'claude',
+        versionHash: 'v1',
+        config: {},
+      })
+      .returning()
+    const [c] = await db
+      .insert(schema.cycles)
+      .values({
+        projectId,
+        name: 'reviewer',
+        definition: { nodes: [{ key: 'reviewer', worker: 'reviewer' }], edges: [] },
+      })
+      .returning()
+    const { cycleRunId } = await startCycleRun(db, { cycleId: c!.id, trigger: 'test' })
+    const [job] = await db
+      .select()
+      .from(schema.jobs)
+      .where(eq(schema.jobs.cycleRunId, cycleRunId))
+    jobId = job!.id
+
+    for (const [fingerprint, status] of [
+      ['security/invites/single-use/double-redeem', 'open'],
+      ['foreman/claim/cap/overrun', 'fixed'],
+      ['style/naming/casing/camel', 'wontfix'],
+      ['noise/dup/of-the-first/again', 'duplicate'],
+    ] as const) {
+      await db.insert(schema.findings).values({
+        projectId,
+        workerId: w!.id,
+        fingerprint,
+        severity: 'high',
+        title: `title for ${fingerprint}`,
+        body: `the full argument for ${fingerprint}`,
+        status,
+      })
+    }
+  })
+
+  after(async () => {
+    await db.delete(schema.projects).where(eq(schema.projects.id, projectId))
+    await h.stop()
+  })
+
+  test('the index carries every status that changes a decision, and drops duplicates', async () => {
+    const res = await h.fetch(`/api/jobs/${jobId}/history`)
+    assert.equal(res.status, 200)
+    const body = (await res.json()) as {
+      index: Array<{ fingerprint: string; status: string; title: string }>
+      details: Record<string, string>
+    }
+
+    const byStatus = Object.fromEntries(body.index.map((f) => [f.status, f.fingerprint]))
+    assert.ok(byStatus.open, 'an open finding accounts for its surface')
+    assert.ok(byStatus.fixed, 'a fixed finding recurring is a regression, which is worth knowing')
+    assert.ok(byStatus.wontfix, 're-litigating a decision is the loudest noise a reviewer makes')
+    assert.equal(
+      body.index.some((f) => f.status === 'duplicate'),
+      false,
+      'a duplicate is treated as though it never existed',
+    )
+
+    // Both halves are present and separate: the index states what, details hold why.
+    assert.ok(body.index.every((f) => !('body' in f)), 'the index must stay compact')
+    assert.match(
+      body.details['security/invites/single-use/double-redeem'] ?? '',
+      /the full argument/,
+    )
+  })
+})

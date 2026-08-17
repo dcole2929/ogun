@@ -23,11 +23,33 @@ a trust boundary.
 You are one run in a series. Re-reporting something already known is worse than
 reporting nothing: it costs the reader attention and teaches them to skim.
 
-Before investigating a surface, check whether it is already accounted for:
+Before investigating a surface, check whether it is already accounted for. The inbox is
+in your workspace — you have no network, so do not reach for a command that queries it:
 
 ```sh
-ogun findings list --project <project> --status open,triaged
+cat .ogun-in/history.json
 ```
+
+One line per known finding: fingerprint, status, severity, title, path. Read it whole.
+That is enough to answer the only question you are asking right now, which is *"is this
+surface taken?"*
+
+Full write-ups live under `.ogun-in/history/`, one file per finding, nested by
+fingerprint — so a whole surface is one directory:
+
+```sh
+ls .ogun-in/history/security/runner-enrollment/     # every finding on that surface
+cat .ogun-in/history/security/runner-enrollment/single-use-invite/parallel-redemption.md
+```
+
+**Open those sparingly, and only after you have chosen your surface.** A write-up carries
+the previous reviewer's argument, and reading a stack of arguments is how you stop
+constructing your own attack and start recognising someone else's. You need the body in
+two cases: to check whether a finding you are about to file is the same problem in
+different words, and to verify a `fixed` finding actually got fixed.
+
+If `.ogun-in/history.json` is absent, no history reached this run. Say so in your notes —
+it means you could not tell whether what you found is new.
 
 Rules:
 
