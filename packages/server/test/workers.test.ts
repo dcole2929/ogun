@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { eq } from 'drizzle-orm'
 import { schema } from '@ogun/core/db'
-import { startHarness } from './harness.ts'
+import { startHarness, type Harness } from './harness.ts'
 import { ConfigConflict, createLocalConfigStore, workerToYamlBlock } from '../src/config-store.ts'
 import { reindexProject } from '../src/reindex.ts'
 import type { WorkerConfig } from '@ogun/core'
@@ -256,5 +256,139 @@ describe('worker api', () => {
     })
     assert.equal(res.status, 400)
     assert.match(await errorOf(res), /directly on the host/)
+  })
+})
+
+/**
+ * A cycle is defined in the same file as the workers it runs, and `reindexProject`
+ * deletes any named cycle the file it is handed does not mention. So every path that
+ * hands it a file has to carry the cycles too — the UI's write-through as much as
+ * `ogun project sync`.
+ *
+ * It did not. `ConfigStore` returned workers only, so one PATCH from the Workers page
+ * deleted `nightly` and, by `schedules.cycle_id`'s cascade, the 3am schedule with it,
+ * while leaving the `cycles:` block in config.yaml looking untouched. Nothing failed and
+ * nothing ran.
+ */
+describe('a ui edit does not disturb the cycles in the same file', () => {
+  const slug = 'cyc'
+  const CYCLE_CONFIG = `project:
+  name: ${slug}
+  defaultBranch: main
+
+workers:
+  reviewer-a:
+    skill: review
+  reviewer-b:
+    skill: review
+  triage:
+    skill: review
+
+cycles:
+  nightly:
+    workers: [reviewer-a, reviewer-b]
+    then: triage
+    schedule: "0 3 * * *"
+`
+
+  let h: Harness
+  let root = ''
+  let configPath = ''
+
+  const cyclesNow = async (): Promise<Array<{ name: string; nodes: number; cron: string | null }>> => {
+    const res = await h.fetch(`/api/projects/${slug}/cycles`)
+    const body = (await res.json()) as {
+      cycles: Array<{ id: string; name: string; definition: { nodes: unknown[] } }>
+    }
+    const rows = await h.db.select().from(schema.schedules)
+    return body.cycles.map((c) => ({
+      name: c.name,
+      nodes: c.definition.nodes.length,
+      cron: rows.find((s) => s.cycleId === c.id)?.cron ?? null,
+    }))
+  }
+
+  before(async () => {
+    root = await mkdtemp(join(tmpdir(), 'ogun-cycles-'))
+    configPath = join(root, '.ogun', 'config.yaml')
+    await mkdir(join(root, '.ogun'), { recursive: true })
+    await writeFile(configPath, CYCLE_CONFIG)
+
+    const mapPath = join(root, 'projects.json')
+    await writeFile(mapPath, JSON.stringify({ projects: { [slug]: root } }))
+    h = await startHarness(createLocalConfigStore(mapPath))
+
+    // Registers the project the way `ogun project sync` does — sugar already expanded.
+    await h.fetch('/api/projects/sync', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        slug,
+        defaultBranch: 'main',
+        configHash: 'c1',
+        workers: {
+          'reviewer-a': defaults,
+          'reviewer-b': defaults,
+          triage: defaults,
+        },
+        cycles: {
+          nightly: {
+            nodes: [
+              { key: 'reviewer-a', worker: 'reviewer-a' },
+              { key: 'reviewer-b', worker: 'reviewer-b' },
+              { key: 'triage', worker: 'triage' },
+            ],
+            edges: [
+              { from: 'reviewer-a', to: 'triage', onDepFailure: 'degrade' },
+              { from: 'reviewer-b', to: 'triage', onDepFailure: 'degrade' },
+            ],
+            schedule: '0 3 * * *',
+            onMissed: 'skip',
+            enabled: true,
+          },
+        },
+        policies: {
+          directPush: false,
+          allowSandboxDowngrade: false,
+          maxConcurrentModifiers: 1,
+          failureBreakerThreshold: 3,
+        },
+        skills: [{ name: 'review', sourcePath: '.agents/skills/review', versionHash: 'sv1' }],
+      }),
+    })
+  })
+
+  after(async () => {
+    await h.stop()
+  })
+
+  test('the cycle and its schedule survive a worker patch', async () => {
+    const before = await cyclesNow()
+    const nightly = before.find((c) => c.name === 'nightly')
+    assert.equal(nightly?.nodes, 3, 'precondition: the fan-in is registered')
+    assert.equal(nightly?.cron, '0 3 * * *', 'precondition: the cycle owns the schedule')
+
+    const list = (await (await h.fetch(`/api/workers?project=${slug}`)).json()) as {
+      workers: Array<{ worker: { id: string; name: string } }>
+      hashes: Record<string, string>
+    }
+    const target = list.workers.find((w) => w.worker.name === 'reviewer-a')!.worker
+
+    const res = await h.fetch(`/api/workers/${target.id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ expectedHash: list.hashes[slug], enabled: true }),
+    })
+    assert.equal(res.status, 200)
+
+    const after = (await cyclesNow()).find((c) => c.name === 'nightly')
+    assert.equal(after?.nodes, 3, 'the ui edit deleted the cycle')
+    assert.equal(after?.cron, '0 3 * * *', 'the cycle survived but its schedule cascaded away')
+  })
+
+  test('the cycles block in config.yaml is left exactly as written', async () => {
+    const text = await readFile(configPath, 'utf8')
+    assert.match(text, /workers: \[reviewer-a, reviewer-b\]/)
+    assert.match(text, /then: triage/)
   })
 })
