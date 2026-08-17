@@ -27,7 +27,7 @@ export async function projectSync(args: string[], serverUrl: string): Promise<vo
   const { first } = parse(args, {}, 'ogun project sync [dir]')
   const root = resolve(first ?? process.cwd())
   const loaded = await loadProjectConfig(root).catch((err) => {
-    fail(`could not read ${root}/.ogun/config.yaml: ${(err as Error).message}`)
+    fail(`could not load ${root}/.ogun/config.yaml:\n  ${problemsIn(err)}`)
     throw err
   })
   const skills = await discoverSkills(root, [builtinSkillsRoot()])
@@ -295,6 +295,21 @@ export async function projectAdd(args: string[], serverUrl: string): Promise<voi
  */
 export function builtinSkillsRoot(): string {
   return resolve(fileURLToPath(new URL('../../../..', import.meta.url)), 'skills')
+}
+
+/**
+ * What is actually wrong with a config.yaml, one line per problem.
+ *
+ * A zod error's `message` is its issue list rendered as JSON, and this command printed
+ * that raw. It is unreadable at exactly the moment it matters: a `cycles:` block whose
+ * graph could never finish comes back as a page of brackets wrapped around the one
+ * sentence worth reading. An issue's path is already the path into the file, so
+ * `cycles.nightly: …` is all of it that helps.
+ */
+const problemsIn = (err: unknown): string => {
+  const { issues } = err as { issues?: Array<{ path: PropertyKey[]; message: string }> }
+  if (!Array.isArray(issues)) return (err as Error).message
+  return issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('\n  ')
 }
 
 const gitRemote = async (root: string): Promise<string | undefined> => {

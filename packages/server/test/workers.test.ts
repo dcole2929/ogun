@@ -308,6 +308,46 @@ cycles:
     }))
   }
 
+  /** What `ogun project sync` posts — sugar already expanded, as the CLI expands it. */
+  const sync = (cycles: unknown, configHash = 'c1') =>
+    h.fetch('/api/projects/sync', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        slug,
+        defaultBranch: 'main',
+        configHash,
+        workers: {
+          'reviewer-a': defaults,
+          'reviewer-b': defaults,
+          triage: defaults,
+        },
+        cycles,
+        policies: {
+          directPush: false,
+          allowSandboxDowngrade: false,
+          maxConcurrentModifiers: 1,
+          failureBreakerThreshold: 3,
+        },
+        skills: [{ name: 'review', sourcePath: '.agents/skills/review', versionHash: 'sv1' }],
+      }),
+    })
+
+  const fanIn = {
+    nodes: [
+      { key: 'reviewer-a', worker: 'reviewer-a' },
+      { key: 'reviewer-b', worker: 'reviewer-b' },
+      { key: 'triage', worker: 'triage' },
+    ],
+    edges: [
+      { from: 'reviewer-a', to: 'triage', onDepFailure: 'degrade' },
+      { from: 'reviewer-b', to: 'triage', onDepFailure: 'degrade' },
+    ],
+    schedule: '0 3 * * *',
+    onMissed: 'skip',
+    enabled: true,
+  }
+
   before(async () => {
     root = await mkdtemp(join(tmpdir(), 'ogun-cycles-'))
     configPath = join(root, '.ogun', 'config.yaml')
@@ -318,44 +358,7 @@ cycles:
     await writeFile(mapPath, JSON.stringify({ projects: { [slug]: root } }))
     h = await startHarness(createLocalConfigStore(mapPath))
 
-    // Registers the project the way `ogun project sync` does — sugar already expanded.
-    await h.fetch('/api/projects/sync', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        slug,
-        defaultBranch: 'main',
-        configHash: 'c1',
-        workers: {
-          'reviewer-a': defaults,
-          'reviewer-b': defaults,
-          triage: defaults,
-        },
-        cycles: {
-          nightly: {
-            nodes: [
-              { key: 'reviewer-a', worker: 'reviewer-a' },
-              { key: 'reviewer-b', worker: 'reviewer-b' },
-              { key: 'triage', worker: 'triage' },
-            ],
-            edges: [
-              { from: 'reviewer-a', to: 'triage', onDepFailure: 'degrade' },
-              { from: 'reviewer-b', to: 'triage', onDepFailure: 'degrade' },
-            ],
-            schedule: '0 3 * * *',
-            onMissed: 'skip',
-            enabled: true,
-          },
-        },
-        policies: {
-          directPush: false,
-          allowSandboxDowngrade: false,
-          maxConcurrentModifiers: 1,
-          failureBreakerThreshold: 3,
-        },
-        skills: [{ name: 'review', sourcePath: '.agents/skills/review', versionHash: 'sv1' }],
-      }),
-    })
+    await sync({ nightly: fanIn })
   })
 
   after(async () => {
@@ -384,6 +387,64 @@ cycles:
     const after = (await cyclesNow()).find((c) => c.name === 'nightly')
     assert.equal(after?.nodes, 3, 'the ui edit deleted the cycle')
     assert.equal(after?.cron, '0 3 * * *', 'the cycle survived but its schedule cascaded away')
+  })
+
+  test('a graph that could never finish is refused, and nothing is written', async () => {
+    /**
+     * The payload schema checks the shape of a definition, not what its graph does, so a
+     * loop can still arrive here from an older CLI or anything posting by hand. Stored,
+     * it becomes a 3am run with every job `blocked` and no error to find in the morning.
+     *
+     * The refusal has to come before any write: this payload also drops `nightly`, and
+     * `reindexProject` deletes cycles a file does not mention. A half-applied sync would
+     * take the working fan-in down with the broken graph.
+     */
+    const res = await sync(
+      {
+        knotted: {
+          nodes: [
+            { key: 'reviewer-a', worker: 'reviewer-a' },
+            { key: 'reviewer-b', worker: 'reviewer-b' },
+          ],
+          edges: [
+            { from: 'reviewer-a', to: 'reviewer-b', onDepFailure: 'block' },
+            { from: 'reviewer-b', to: 'reviewer-a', onDepFailure: 'block' },
+          ],
+          onMissed: 'skip',
+          enabled: true,
+        },
+      },
+      'c2',
+    )
+    assert.equal(res.ok, false, 'a loop was accepted and stored')
+    assert.match(
+      ((await res.json()) as { error?: string }).error ?? '',
+      /cycle "knotted" could never finish — a loop, so nothing in it can ever start: reviewer-a → reviewer-b → reviewer-a/,
+    )
+
+    const after = await cyclesNow()
+    assert.ok(!after.some((c) => c.name === 'knotted'), 'the loop was stored anyway')
+    assert.equal(after.find((c) => c.name === 'nightly')?.cron, '0 3 * * *', 'the sync half-applied')
+  })
+
+  test('an edge naming a node that does not exist is refused as well', async () => {
+    // Same hang, quieter cause: reviewer-b waits on a key nothing will ever report against.
+    const res = await sync(
+      {
+        dangling: {
+          nodes: [{ key: 'reviewer-b', worker: 'reviewer-b' }],
+          edges: [{ from: 'triaje', to: 'reviewer-b', onDepFailure: 'block' }],
+          onMissed: 'skip',
+          enabled: true,
+        },
+      },
+      'c3',
+    )
+    assert.equal(res.ok, false, 'an edge to a node that does not exist was accepted')
+    assert.match(
+      ((await res.json()) as { error?: string }).error ?? '',
+      /no node has the key "triaje"/,
+    )
   })
 
   test('the cycles block in config.yaml is left exactly as written', async () => {

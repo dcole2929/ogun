@@ -3,6 +3,7 @@ import { schema } from '@ogun/core/db'
 import type { Db } from '@ogun/core/db'
 import { markCoverage } from './foreman/cycles.ts'
 import {
+  cycleGraphProblems,
   cycleMembers,
   hashContent,
   singleWorkerCycle,
@@ -48,6 +49,24 @@ export async function reindexProject(
 ): Promise<ReindexResult> {
   const project = await db.query.projects.findFirst({ where: eq(projects.slug, slug) })
   if (!project) throw new Error(`no such project: ${slug}`)
+
+  /**
+   * A graph that could never finish is refused before a single row is written.
+   *
+   * `ogun project sync` will not load a config.yaml containing one, but the sync payload
+   * is parsed against a schema that checks a definition's shape and not what its graph
+   * does — so a definition arriving by any other route (an older CLI, a hand-made POST)
+   * was stored intact, and the first anyone heard of it was a 3am run in which every job
+   * sat `blocked`: a node is released only once its dependencies are terminal, and in a
+   * loop none of them ever is. Nothing errors and nothing times out. This function is
+   * where both write paths meet, which makes it the last place able to say so.
+   */
+  for (const [name, definition] of Object.entries(file.cycles ?? {})) {
+    const problems = cycleGraphProblems(definition)
+    if (problems.length > 0) {
+      throw new Error(`cycle "${name}" could never finish — ${problems.join('; ')}`)
+    }
+  }
 
   const known = await db.select().from(skills).where(eq(skills.projectId, project.id))
   const skillByName = new Map(known.map((s) => [s.name, s]))
