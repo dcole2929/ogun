@@ -1,5 +1,5 @@
 import { Hono } from 'hono'
-import { and, arrayContained, desc, eq, inArray, isNull, ne, sql } from 'drizzle-orm'
+import { and, arrayContained, desc, eq, inArray, isNull, notInArray, sql } from 'drizzle-orm'
 import { schema } from '@ogun/core/db'
 import { claimRequestSchema, claimedJobSchema, type ClaimedJob } from '@ogun/core'
 import type { Env } from '../context.ts'
@@ -263,9 +263,13 @@ jobsRoutes.post('/:id/cancel', async (c) => {
  *                 those is how a reviewer stops generating hypotheses and starts
  *                 pattern-matching someone else's.
  *
- * `duplicate` is excluded: the skills treat a duplicate as though it never existed.
- * Everything else is included and labelled, because "seen and set aside" and "never
- * looked at" are different facts (principle 6).
+ * `duplicate` and `obsolete` are excluded: both describe something that is not in the
+ * current tree — one collapsed into another finding, the other pointing at a surface that
+ * no longer exists — so neither can help decide whether a surface is taken, and both
+ * would grow without bound. `fixed` stays, because a fixed finding reappearing is a
+ * regression and that is worth catching. `wontfix` stays, because re-litigating a
+ * decision is the loudest noise a reviewer makes. Everything else is included and
+ * labelled: "seen and set aside" and "never looked at" are different facts (principle 6).
  */
 jobsRoutes.get('/:id/history', async (c) => {
   const { db } = c.var.ctx
@@ -275,7 +279,12 @@ jobsRoutes.get('/:id/history', async (c) => {
   const rows = await db
     .select()
     .from(findings)
-    .where(and(eq(findings.projectId, job.projectId), ne(findings.status, 'duplicate')))
+    .where(
+      and(
+        eq(findings.projectId, job.projectId),
+        notInArray(findings.status, ['duplicate', 'obsolete']),
+      ),
+    )
     .orderBy(desc(findings.updatedAt))
     .limit(Number(c.req.query('limit') ?? 500))
 

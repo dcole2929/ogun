@@ -281,6 +281,21 @@ export const findings = pgTable(
      */
     revisitOf: text('revisit_of'),
     revisitReason: text('revisit_reason'),
+    /**
+     * The fingerprint this finding was merged into, set alongside `status = 'duplicate'`.
+     *
+     * Kept as a pointer rather than folded away, because triage never deletes, it marks
+     * (§4.12). A merge that turns out to be wrong has to be visible and reversible — and
+     * "these four rows are one bug" is itself worth reading, since it says something
+     * about the reviewers rather than about the code.
+     */
+    duplicateOf: text('duplicate_of'),
+    /**
+     * The run that last set `status`, so a status nobody can account for is impossible.
+     * Distinct from `lastSeenRun`, which is the last run that *reported* the finding —
+     * re-adjudication changes a status precisely when nothing reported it again.
+     */
+    statusRun: uuid('status_run').references(() => runs.id, { onDelete: 'set null' }),
     firstSeenRun: uuid('first_seen_run').references(() => runs.id, { onDelete: 'set null' }),
     lastSeenRun: uuid('last_seen_run').references(() => runs.id, { onDelete: 'set null' }),
     seenCount: integer('seen_count').notNull().default(1),
