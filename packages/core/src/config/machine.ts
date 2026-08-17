@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 import { z } from 'zod'
@@ -103,6 +103,45 @@ export async function loadLocalConfig(path = localConfigPath()): Promise<LocalCo
   return expandPaths(parsed.data)
 }
 
+/** It holds the admin secret and this machine's runner credential (§4.5). */
+const CONFIG_MODE = 0o600
+
+/**
+ * Write into a fresh 0600 file and rename it over the old one, so the mode is a property
+ * of every write rather than of the first one.
+ *
+ * `writeFile`'s `mode` is applied only when it *creates* the file. A `config.json` that
+ * already existed at 0644 — restored from a backup, copied off another machine, or
+ * written before this mode was set — therefore stayed 0644 while `ogun runner join` or
+ * the server's first bind wrote an admin token into it, and every later write left it
+ * that way too.
+ *
+ * Rename rather than write-then-chmod because the two are not equivalent under failure:
+ * a crash between the write and the chmod leaves the token sitting in a world-readable
+ * file permanently, which is the state this is meant to prevent.
+ */
+async function writeConfigFile(path: string, body: string): Promise<void> {
+  // Follow a symlinked config.json instead of replacing the link with a regular file —
+  // `writeFile` honoured the link, and rename() would silently break that setup.
+  const target = await realpath(path).catch(() => path)
+  const tmp = `${target}.tmp-${process.pid}`
+  try {
+    await writeFile(tmp, body, { mode: CONFIG_MODE })
+    // The same create-only rule applies to the temp file: one left behind by a killed
+    // process, with a recycled pid, is reused with whatever mode it already carried.
+    await chmod(tmp, CONFIG_MODE).catch((err: Error) => {
+      // Filesystems without POSIX modes — Windows, exFAT, some network mounts — reject
+      // or ignore this. Say so rather than swallow it, but do not lose the credential
+      // over a permission bit we cannot set.
+      console.error(`ogun: could not set mode 0600 on ${target}: ${err.message}`)
+    })
+    await rename(tmp, target)
+  } catch (err) {
+    await rm(tmp, { force: true })
+    throw err
+  }
+}
+
 /** Read-modify-write, preserving anything this version does not know about. */
 export async function updateLocalConfig(
   fn: (config: LocalConfig) => LocalConfig,
@@ -110,8 +149,7 @@ export async function updateLocalConfig(
 ): Promise<LocalConfig> {
   const next = fn(await loadLocalConfig(path))
   await mkdir(dirname(path), { recursive: true })
-  // 0600: it holds the admin secret and this machine's runner credential.
-  await writeFile(path, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 })
+  await writeConfigFile(path, `${JSON.stringify(next, null, 2)}\n`)
   return next
 }
 

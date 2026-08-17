@@ -1,9 +1,9 @@
 import { strict as assert } from 'node:assert'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { chmod, lstat, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { loadLocalConfig } from '../src/config/machine.ts'
+import { loadLocalConfig, updateLocalConfig } from '../src/config/machine.ts'
 
 /**
  * Paths in this file are hand-edited, so `~` has to work. It stopped being expanded when
@@ -54,4 +54,49 @@ test('a missing file is an empty config, not an error', async () => {
   const config = await loadLocalConfig('/nonexistent/ogun/config.json')
   assert.deepEqual(config.projects, {})
   assert.equal(config.runner, undefined)
+})
+
+const modeOf = async (path: string): Promise<string> => ((await stat(path)).mode & 0o777).toString(8)
+
+const mintToken = (path: string) =>
+  updateLocalConfig((c) => ({ ...c, server: { token: 'ogun_admin_secret' } }), path)
+
+test('writing a token tightens a config.json that already exists world-readable', async (t) => {
+  /**
+   * The one that regressed: `writeFile`'s `mode` only applies on create, so a file
+   * restored from a backup or copied off another machine at 0644 stayed 0644 while
+   * `ogun runner join` and the server's first bind wrote credentials into it.
+   */
+  const { path, cleanup } = await withConfig({ projects: {} })
+  t.after(cleanup)
+  await chmod(path, 0o644)
+
+  await mintToken(path)
+
+  assert.equal(await modeOf(path), '600')
+  assert.match(await readFile(path, 'utf8'), /ogun_admin_secret/)
+})
+
+test('a config.json this machine creates is 0600', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'ogun-cfg-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+
+  await mintToken(join(dir, 'nested', 'config.json'))
+
+  assert.equal(await modeOf(join(dir, 'nested', 'config.json')), '600')
+})
+
+test('a symlinked config.json is written through, not replaced', async (t) => {
+  // Writing via a temp file and a rename would otherwise turn the link into a regular
+  // file, silently detaching a config.json someone pointed somewhere deliberate.
+  const { path, cleanup } = await withConfig({ projects: {} })
+  t.after(cleanup)
+  const link = `${path}.link`
+  await symlink(path, link)
+
+  await mintToken(link)
+
+  assert.ok((await lstat(link)).isSymbolicLink())
+  assert.match(await readFile(path, 'utf8'), /ogun_admin_secret/)
+  assert.equal(await modeOf(path), '600')
 })
