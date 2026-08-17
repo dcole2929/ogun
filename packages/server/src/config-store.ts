@@ -2,7 +2,14 @@ import { createHash } from 'node:crypto'
 import { readFile, rename, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { Document, parseDocument } from 'yaml'
-import { loadLocalConfig, projectConfigSchema, workerSchema, type WorkerConfig } from '@ogun/core'
+import {
+  expandCycle,
+  loadLocalConfig,
+  projectConfigSchema,
+  workerSchema,
+  type CycleDefinition,
+  type WorkerConfig,
+} from '@ogun/core'
 
 /**
  * Worker definitions live in the repo's `.ogun/config.yaml`, and the control plane edits
@@ -37,6 +44,18 @@ export type ConfigFile = {
   text: string
   hash: string
   workers: Record<string, WorkerConfig>
+  /**
+   * Named cycles, already expanded from sugar into nodes and edges — the same shape
+   * `ogun project sync` ships, because both paths feed one `reindexProject`.
+   *
+   * Carrying these is not optional. `reindexProject` treats the file as the whole truth
+   * and deletes any named cycle the file does not mention, so a `ConfigFile` that omits
+   * them tells it every cycle is gone. That is not theoretical: editing one worker from
+   * the UI used to drop `nightly` and, through `schedules.cycle_id`'s cascade, its 3am
+   * schedule — leaving the `cycles:` block sitting in config.yaml looking healthy while
+   * nothing ran it.
+   */
+  cycles: Record<string, CycleDefinition>
 }
 
 export class ConfigConflict extends Error {}
@@ -74,7 +93,7 @@ export function createLocalConfigStore(projectMapPath?: string): ConfigStore {
       throw new ConfigUnreachable(`${path} is not readable`)
     })
     const parsed = projectConfigSchema.parse(parseDocument(text).toJS())
-    return { path, text, hash: hashOf(text), workers: parsed.workers }
+    return { path, text, hash: hashOf(text), workers: parsed.workers, cycles: expand(parsed.cycles) }
   }
 
   return {
@@ -102,7 +121,13 @@ export function createLocalConfigStore(projectMapPath?: string): ConfigStore {
       // a UI you stop trusting with the file.
       const doc = parseDocument(current.text)
       fn(doc)
-      const next = doc.toString()
+      /**
+       * `flowCollectionPadding` defaults to true, which rewrites every inline list in
+       * the file — `[a, b]` becomes `[ a, b ]` — including lists on lines the edit never
+       * touched. Small, but it is exactly the silent reformatting this store exists to
+       * avoid, and it shows up as noise in the diff a person is meant to review.
+       */
+      const next = doc.toString({ flowCollectionPadding: false })
 
       // Validate the *result*, not the input. The UI must not be able to leave a
       // config.yaml on disk that the next `ogun project sync` refuses to load.
@@ -122,10 +147,26 @@ export function createLocalConfigStore(projectMapPath?: string): ConfigStore {
       await writeFile(tmp, next, 'utf8')
       await rename(tmp, current.path)
 
-      return { path: current.path, text: next, hash: hashOf(next), workers: parsed.data.workers }
+      return {
+        path: current.path,
+        text: next,
+        hash: hashOf(next),
+        workers: parsed.data.workers,
+        cycles: expand(parsed.data.cycles),
+      }
     },
   }
 }
+
+/**
+ * Sugar → nodes and edges, matching what the CLI does before it POSTs a sync. Expanding
+ * on the way out of the store means the control plane and the UI only ever handle one
+ * shape, whichever path the edit arrived by (§4.12).
+ */
+const expand = (
+  cycles: Record<string, Parameters<typeof expandCycle>[0]>,
+): Record<string, CycleDefinition> =>
+  Object.fromEntries(Object.entries(cycles).map(([name, c]) => [name, expandCycle(c)]))
 
 /** Drops undefined and anything equal to the schema default, so the file stays readable
  *  rather than accumulating every field at its default value. */
