@@ -25,6 +25,12 @@ That makes the rule structural rather than policed. There is no credential to mi
 no remote to push to, so an agent that decides to publish cannot, and no prompt has to ask
 it not to.
 
+The two halves are not equally built. The container half is: workspace materialization
+strips the remote, the image carries no `gh` and no token, and the entrypoint drops
+`origin` again in case a repository committed one. The runner and host halves — patch
+extraction, branch, draft PR — are phase 3 and do not exist yet. What this ADR settles is
+that when they are built they live host-side.
+
 ## Considered Options
 
 - **Install `gh` and mount `~/.config/gh` read-write, as `claude-sandbox` does.** Rejected
@@ -39,12 +45,24 @@ it not to.
 
 ## Consequences
 
-- Permission profiles describe only what an agent may do *inside* the sandbox: `observer`
+- **What is structural is what this ADR settles.** No credential and no remote reach a
+  container; the image has no `gh`; the socket is never mounted (ADR-0006); the container
+  runs `--cap-drop ALL` with `no-new-privileges`. Those hold for every profile and are
+  what make the never-pushes rule true.
+- Permission profiles describe what an agent may do *inside* the sandbox: `observer`
   (read), `reviewer` (read, run tests and scanners, emit findings), `modifier` (write and
-  commit). They are enforced by the sandbox where practical, not just described in
-  prompts.
-- The publisher is a host-side pipeline step, which is where the PR cap and the diff-size
-  limit go.
+  commit). This ADR settles their scope. **It does not settle that they are enforced.**
+- **In-sandbox enforcement is one flag, and the gap is live and reportable.** All of it is
+  `--disallowedTools Edit,Write,NotebookEdit,MultiEdit` on the claude runtime for
+  non-modifier profiles, in a session that also passes `--dangerously-skip-permissions`.
+  `Bash` is unrestricted, so a `reviewer` writes whatever it likes through the shell. The
+  codex runtime restricts nothing at all. The container does exactly one thing with the
+  profile — passes `OGUN_PERMISSIONS` into an environment nothing reads — and mounts the
+  workspace read-write regardless. §4.6 claimed these were "enforced by the sandbox where
+  practical"; that sentence is marked `[corrected]` there now. A finding that the profiles
+  are not enforced is a real finding and must not be discarded against this ADR.
+- The publisher becomes a host-side pipeline step, which is where the PR cap and the
+  diff-size limit go. It is not built.
 - Egress cannot be `none` for an agent run — the runtime itself calls `api.anthropic.com`
   or OpenAI's endpoint, so a reviewer container cannot be an airgap.
 - **The per-host egress allowlist is not built, and this ADR does not say it should not

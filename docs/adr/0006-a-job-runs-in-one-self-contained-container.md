@@ -31,10 +31,19 @@ In the order these bite:
 
 - **Reviewers need no services at all.** They read code and reason about it. Phases 1–2
   never reach this question.
-- **A modifier needing postgres or redis gets them inside the image.** This is what
-  per-project images are for. Tag by content hash of Dockerfile plus lockfile, rebuild
-  when either changes, build at `ogun project add` rather than at 2am, and mount a
-  persistent package-manager cache volume or every nightly run re-downloads the world.
+- **A modifier needing postgres or redis gets them inside the image**, installed by the
+  project's `.ogun/Dockerfile` and started by its entrypoint before the agent runs. That
+  is the prescribed route and nothing exercises it yet, because modifier workers are
+  phase 3.
+- What exists today: `ogun image build [dir]` builds `ogun/base` or a project image from
+  `<dir>/.ogun/Dockerfile`; the runner refuses a job whose image is absent rather than
+  building one at 2am; and each runtime gets a persistent package-manager cache volume,
+  without which every nightly run re-downloads the world.
+- **Image freshness is not implemented, and a finding about it is a real finding.**
+  Project images are tagged `:latest` and built by hand. There is no content-hash tag, no
+  rebuild when the Dockerfile or lockfile changes, and no age-based rebuild — §4.6 and
+  §5.1 describe all three in the present tense, and the runner does none of them. It
+  checks that the image exists.
 - **A project whose suite genuinely requires orchestrating multiple containers is out of
   scope for autonomous runs**, until there is a better answer. That is a recorded
   limitation rather than a solved problem, and reaching for the socket is not the answer

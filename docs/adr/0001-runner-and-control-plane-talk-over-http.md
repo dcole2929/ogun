@@ -32,9 +32,10 @@ stresses it hardest, rather than only by a browser.
 
 ## Consequences
 
-- Everything the runner needs from the control plane is an endpoint: claim, the admission
-  re-check at claim time, batched run events carrying a per-run sequence number, and the
-  staged upstream findings a fan-in node consumes.
+- Everything the runner needs from the control plane is an endpoint: claim, the job's
+  upstream inputs and findings history, run start, batched run events carrying a per-run
+  sequence number, and the final report. The machine-wide concurrency cap is applied
+  inside the claim endpoint, server-side, rather than by a separate call from the runner.
 - The cost is JSON over loopback, against jobs that run an agent for minutes. It does not
   register.
 - The runner holds no database credentials, so exactly one process writes to Postgres.

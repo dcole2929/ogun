@@ -30,10 +30,15 @@ express.
 
 - `changes` is an *artifact record* of what a run produced — branch, diff, test result,
   resulting PR URL — and not the source of truth for where that PR is in its lifecycle.
-- Anything needing current PR or ticket state makes a call at read time. That is a latency
-  and rate-limit cost, and it is the cost that was chosen.
-- Linear is polled with a deterministic filter — status, label, not-blocked — before any
-  AI sees a ticket. Polling is not mirroring: nothing about the ticket is written down.
+  The table exists; nothing writes it until the publish path does, in phase 3.
+- **Neither integration is built.** There is no GitHub client and no Linear client in the
+  tree today. This ADR constrains what they may do rather than describing what they do:
+  anything needing current PR or ticket state makes a call at read time and writes nothing
+  down, and Linear's deterministic pre-filter — status, label, not-blocked, applied before
+  any AI sees a ticket — is a filter on a live read, not a synced copy.
+- Read-time calls are a latency and rate-limit cost, and it is the cost that was chosen.
+  A finding that a specific call site should be cached for the length of one request is
+  not contradicting this ADR; a durable table of PR state is.
 - How PR lifecycle state is *represented* once modifier workers exist — labels, checks,
   review state, or some combination — is still open, and is a phase 3 concern. This ADR
   settles where that state lives, not how it is expressed.

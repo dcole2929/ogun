@@ -54,9 +54,14 @@ re-litigated. A decision without its rejected options is just a config file in p
 Two habits the records here follow:
 
 - **Say what the ADR does not settle.** A decision with an open edge — a gap left on
-  purpose, a choice marked reversible — names it, so the ADR gags the settled part and
-  only the settled part. ADR-0005 settles that no credential enters the sandbox and says
-  outright that the egress allowlist is still open.
+  purpose, a choice marked reversible, a half that is designed but unbuilt — names it, so
+  the ADR gags the settled part and only the settled part. ADR-0005 settles that no
+  credential enters the sandbox, and says outright that the egress allowlist is not built
+  and that the in-sandbox permission profiles are barely enforced. Both remain reportable.
+- **Check a consequence against the code before writing it down.** `docs/architecture.md`
+  is a design document and its present tense is sometimes an intention. An ADR that
+  inherits that uncritically suppresses true findings about the gap between them, which is
+  the one thing this directory must never do.
 - **Keep the honest caveat.** ADR-0003 records that SQLite would have been fine. That is
   more useful than a decision written as though it were obvious.
 

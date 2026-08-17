@@ -318,8 +318,19 @@ exceeded) rather than an agent capability.
 
 Permission profiles still exist for what the agent may do *inside* the sandbox:
 `observer` (read), `reviewer` (read + run tests/scanners, emit findings), `modifier`
-(write + commit). Enforced by the sandbox where practical, not just described in
-prompts.
+(write + commit).
+
+**They are barely enforced.** [corrected] This said "enforced by the sandbox where
+practical, not just described in prompts", and that was never true of the code. The whole
+of it is `--disallowedTools Edit,Write,NotebookEdit,MultiEdit` on the claude runtime for
+non-modifier profiles, in a session that also passes `--dangerously-skip-permissions`.
+`Bash` is unrestricted, so a reviewer writes through the shell; codex gets no restriction
+at all; the container passes `OGUN_PERMISSIONS` into an environment nothing reads; and the
+workspace is mounted read-write for every profile. The structural protections above are
+independent of this and do hold — which is why a reviewer that writes in its workspace
+still cannot publish — but the profile is close to documentation. Closing the gap needs a
+per-runtime tool policy that covers the shell rather than a flag list that does not.
+**[open]**
 
 #### Basis: `claude-sandbox`, with a changed posture
 
