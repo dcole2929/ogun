@@ -55,12 +55,16 @@ async function ensureTestDatabase(): Promise<string> {
  */
 let cleaned = false
 
-export async function startHarness(config?: ConfigStore): Promise<Harness> {
+export async function startHarness(
+  config?: ConfigStore,
+  /** True exercises the protected paths — invites, name uniqueness, bearer auth. */
+  adminTokenConfigured = false,
+): Promise<Harness> {
   const url = await ensureTestDatabase()
   const previous = process.env.DATABASE_URL
   process.env.DATABASE_URL = url
 
-  const ctx = createContext(config ?? unreachableConfigStore(), false)
+  const ctx = createContext(config ?? unreachableConfigStore(), adminTokenConfigured)
 
   /**
    * Start from empty — but only once per process.

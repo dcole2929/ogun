@@ -119,6 +119,18 @@ const joinSchema = z.object({
 })
 
 /**
+ * A refusal that has to roll back whatever the transaction already did — chiefly the
+ * consumed invite. Thrown rather than returned so the two cannot drift apart.
+ */
+class JoinRefused extends Error {
+  readonly status: 401 | 409
+  constructor(message: string, status: 401 | 409) {
+    super(message)
+    this.status = status
+  }
+}
+
+/**
  * Redeem a join token. Called by the runner, presenting the invite as its bearer token —
  * this is the one route an unenrolled machine may reach, since by definition it has no
  * runner credential yet.
@@ -131,87 +143,127 @@ runnersRoutes.post('/join', async (c) => {
   const presented = (c.req.header('authorization') ?? '').replace(/^Bearer /, '')
   const body = joinSchema.parse(await c.req.json())
 
-  /**
-   * An invite is only required when the control plane is protected. On localhost there
-   * is nothing to protect against and no credential to carry, so `ogun runner init`
-   * registers through this same endpoint with no token.
-   *
-   * One registration path rather than two: it is the only place that can enforce name
-   * uniqueness, and a second path that skipped it would be the hole.
-   */
-  const invite = adminTokenConfigured
-    ? await db.query.invites.findFirst({
-        where: and(eq(invites.tokenHash, hashToken(presented)), isNull(invites.revokedAt)),
+  try {
+    /**
+     * One transaction, because every check here guards the same decision: may this
+     * machine enrol, under this name, on this token. Split across statements, they were
+     * only ever advisory.
+     */
+    await db.transaction(async (tx) => {
+      /**
+       * An invite is only required when the control plane is protected. On localhost
+       * there is nothing to protect against and no credential to carry, so
+       * `ogun runner init` registers through this same endpoint with no token.
+       *
+       * One registration path rather than two: it is the only place that can enforce
+       * name uniqueness, and a second path that skipped it would be the hole.
+       */
+      let invite: typeof invites.$inferSelect | undefined
+
+      if (adminTokenConfigured) {
+        /**
+         * Consume the invite by *writing* it, not by reading it and deciding.
+         *
+         * This was a read, an `if (invite.usedAt)`, and an unconditional UPDATE at the
+         * end of the handler. Two joins presenting the same token with different names
+         * both saw `usedAt` null, both passed, and both enrolled — the name-uniqueness
+         * check below could not catch them precisely because the names differed. Both
+         * rows were then written with the same `tokenHash`, and authentication resolves
+         * a credential to a runner by that hash alone, so the two were interchangeable
+         * at the door: revoking one left the other working, and which row answered for
+         * the token was arbitrary. A lost laptop became a rotation across every machine
+         * that shared the invite rather than a revocation, which is the exact property
+         * the comment above claims this route enforces.
+         *
+         * `WHERE used_at IS NULL ... RETURNING` makes the check and the claim the same
+         * statement, so exactly one racer gets a row back. The loser blocks on the row
+         * lock until this transaction settles, then sees it taken.
+         */
+        const [claimed] = await tx
+          .update(invites)
+          .set({ usedAt: new Date(), usedBy: body.name })
+          .where(
+            and(
+              eq(invites.tokenHash, hashToken(presented)),
+              isNull(invites.revokedAt),
+              isNull(invites.usedAt),
+            ),
+          )
+          .returning()
+
+        if (!claimed) {
+          // Losing the race and presenting a bad token are different facts, and the
+          // remedy differs, so re-read to say which it was.
+          const known = await tx.query.invites.findFirst({
+            where: and(eq(invites.tokenHash, hashToken(presented)), isNull(invites.revokedAt)),
+          })
+          throw known
+            ? new JoinRefused(
+                `that join token was already used by "${known.usedBy}" — mint a new one`,
+                409,
+              )
+            : new JoinRefused('that join token is not valid', 401)
+        }
+        invite = claimed
+      }
+
+      /**
+       * Names are unique. Two machines answering to one name would share a claim
+       * identity and a run history, and neither would be attributable — so the second
+       * one is refused rather than quietly taking over the first one's row.
+       *
+       * Except on an unprotected control plane, where there is nothing to protect
+       * against: it is only reachable from this machine, so a collision cannot mean
+       * "another machine" and always means "me again" — re-running `ogun runner init`,
+       * or reconnecting after the local config was lost. Refusing there would strand the
+       * one-box case with an error whose only remedy is revoking a machine that is not
+       * gone.
+       *
+       * Refusing here throws rather than returns, which rolls back the claim above: a
+       * name collision must not burn the invite, or the remedy for picking a taken name
+       * would be minting a new token.
+       */
+      const taken = await tx.query.runners.findFirst({
+        where: and(eq(runners.name, body.name), isNull(runners.revokedAt)),
       })
-    : undefined
-
-  if (adminTokenConfigured) {
-    if (!invite) return c.json({ error: 'that join token is not valid' }, 401)
-    if (invite.usedAt) {
-      return c.json(
-        { error: `that join token was already used by "${invite.usedBy}" — mint a new one` },
-        409,
-      )
-    }
-  }
-
-  /**
-   * Names are unique. Two machines answering to one name would share a claim identity
-   * and a run history, and neither would be attributable — so the second one is refused
-   * rather than quietly taking over the first one's row.
-   *
-   * Except on an unprotected control plane, where there is nothing to protect against:
-   * it is only reachable from this machine, so a collision cannot mean "another machine"
-   * and always means "me again" — re-running `ogun runner init`, or reconnecting after
-   * the local config was lost. Refusing there would strand the one-box case with an
-   * error whose only remedy is revoking a machine that is not gone.
-   */
-  const taken = await db.query.runners.findFirst({
-    where: and(eq(runners.name, body.name), isNull(runners.revokedAt)),
-  })
-  if (taken && !taken.revokedAt && adminTokenConfigured) {
-    const age = Date.now() - taken.lastSeenAt.getTime()
-    const seen = taken.pending
-      ? 'has never connected'
-      : `was last seen ${Math.round(age / 60_000)} minutes ago`
-    return c.json(
-      {
-        error:
+      if (taken && !taken.revokedAt && adminTokenConfigured) {
+        const age = Date.now() - taken.lastSeenAt.getTime()
+        const seen = taken.pending
+          ? 'has never connected'
+          : `was last seen ${Math.round(age / 60_000)} minutes ago`
+        throw new JoinRefused(
           `a runner called "${body.name}" is already registered and ${seen}. ` +
-          'Choose another name with --name, or revoke that one from the Runners page ' +
-          'if it is the same machine being re-registered.',
-      },
-      409,
-    )
-  }
+            'Choose another name with --name, or revoke that one from the Runners page ' +
+            'if it is the same machine being re-registered.',
+          409,
+        )
+      }
 
-  // The invite becomes this machine's credential. One token, one machine, revocable on
-  // its own — which is the property that makes a lost laptop a revocation rather than a
-  // rotation across every machine.
-  const values = {
-    name: body.name,
-    labels: body.labels,
-    maxConcurrency: body.maxConcurrency,
-    // Null on a localhost control plane: there is no credential because none is needed.
-    tokenHash: invite?.tokenHash ?? null,
-    enrolledAt: new Date(),
-    updatedAt: new Date(),
-    revokedAt: null,
-    pending: true,
-  }
-  // `taken` is the live row with this name, when one exists — re-registering the same
-  // machine updates it in place rather than minting a second identity for it.
-  if (taken && !taken.revokedAt) {
-    await db.update(runners).set(values).where(eq(runners.id, taken.id))
-  } else {
-    await db.insert(runners).values(values)
-  }
-
-  if (invite) {
-    await db
-      .update(invites)
-      .set({ usedAt: new Date(), usedBy: body.name })
-      .where(eq(invites.id, invite.id))
+      // The invite becomes this machine's credential. One token, one machine, revocable
+      // on its own — which is the property that makes a lost laptop a revocation rather
+      // than a rotation across every machine.
+      const values = {
+        name: body.name,
+        labels: body.labels,
+        maxConcurrency: body.maxConcurrency,
+        // Null on a localhost control plane: there is no credential because none is needed.
+        tokenHash: invite?.tokenHash ?? null,
+        enrolledAt: new Date(),
+        updatedAt: new Date(),
+        revokedAt: null,
+        pending: true,
+      }
+      // `taken` is the live row with this name, when one exists — re-registering the same
+      // machine updates it in place rather than minting a second identity for it.
+      if (taken && !taken.revokedAt) {
+        await tx.update(runners).set(values).where(eq(runners.id, taken.id))
+      } else {
+        await tx.insert(runners).values(values)
+      }
+    })
+  } catch (err) {
+    if (err instanceof JoinRefused) return c.json({ error: err.message }, err.status)
+    throw err
   }
 
   return c.json({ runner: { name: body.name, labels: body.labels } }, 201)
