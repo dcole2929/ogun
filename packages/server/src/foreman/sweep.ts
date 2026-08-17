@@ -30,6 +30,13 @@ export async function sweepStaleClaims(db: Db, maxAgeMs: number): Promise<number
       await db.update(jobs).set({ state: 'failed' }).where(eq(jobs.id, row.jobId))
       continue
     }
+    /**
+     * Racing the runner, in both directions: this row was selected as un-ended, and the
+     * runner it gave up on may report between that select and this write — or minutes
+     * after it. `finalizeRun` claims the run's terminal state rather than assigning it,
+     * so whichever of the two gets there first is the one that stands and the other
+     * applies nothing. Nothing here needs to check; the loser is told what was recorded.
+     */
     await finalizeRun(db, {
       runId: row.runId,
       outcome: 'error',
