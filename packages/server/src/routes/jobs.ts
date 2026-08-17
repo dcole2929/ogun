@@ -3,6 +3,7 @@ import { and, arrayContained, desc, eq, inArray, isNull, notInArray, sql } from 
 import { schema } from '@ogun/core/db'
 import { claimRequestSchema, claimedJobSchema, type ClaimedJob } from '@ogun/core'
 import type { Env } from '../context.ts'
+import { runnerForRequest } from '../auth.ts'
 import { DEFAULT_LIMITS, remainingCapacity } from '../foreman/admission.ts'
 import { markCoverage } from '../foreman/cycles.ts'
 
@@ -16,13 +17,51 @@ const globalLimits = {
 export const jobsRoutes = new Hono<Env>()
 
 jobsRoutes.post('/claim', async (c) => {
-  const { db } = c.var.ctx
+  const { db, adminTokenConfigured } = c.var.ctx
   const body = claimRequestSchema.parse(await c.req.json())
 
+  /**
+   * Who is claiming is decided by the credential, never by the body.
+   *
+   * The runner used to be looked up by `body.runnerName` alone, with no check that the
+   * bearer token presented belonged to it — so any enrolled machine could claim as any
+   * other by sending a different name. Everything downstream of a claim records that
+   * name: `jobs.claimed_by`, `runs.runner_name`, and the heartbeat below, which writes
+   * the caller's labels and capacity onto the named row and flips its enrollment from
+   * pending to live. One machine's poll could therefore charge another machine's
+   * capacity, mark a machine that has never connected as online, and leave a run
+   * attributed to a box that never executed it — with nothing downstream able to correct
+   * any of it, since `runs.runner_name` is the only record of which machine did the work.
+   * It also outlived revocation: the revoked runner's own token was never consulted, so
+   * it kept working under any live name it cared to send.
+   *
+   * Undefined when no credential identifies a machine, which is not an error: an
+   * unprotected control plane is reachable only from its own box and carries no token at
+   * all (§4.5), exactly as `/join` treats an absent invite, and the admin token is an
+   * operator rather than a machine. In both cases the name stands on its own, as before.
+   * A *wrong* token cannot arrive here undefined and pass — `requireScope` has already
+   * refused anything that is neither the admin token nor a live runner's.
+   */
+  const credentialed = adminTokenConfigured
+    ? await runnerForRequest(db, c.req.header('authorization'))
+    : undefined
+  if (credentialed && credentialed.name !== body.runnerName) {
+    return c.json(
+      {
+        error:
+          `that credential belongs to runner "${credentialed.name}", not ` +
+          `"${body.runnerName}" — a machine claims under the name it enrolled with`,
+      },
+      403,
+    )
+  }
+
   // A claim is also the heartbeat, and the moment a pending enrollment becomes real.
-  const runner = await db.query.runners.findFirst({
-    where: and(eq(runners.name, body.runnerName), isNull(runners.revokedAt)),
-  })
+  const runner =
+    credentialed ??
+    (await db.query.runners.findFirst({
+      where: and(eq(runners.name, body.runnerName), isNull(runners.revokedAt)),
+    }))
   if (!runner) {
     // Registration happens at join, so a claim from an unknown name means the runner was
     // revoked or forgotten out from under a still-running process. Saying so beats
@@ -57,11 +96,14 @@ jobsRoutes.post('/claim', async (c) => {
    *
    * `requires <@ labels` — a job's capability requirements must be a subset of what the
    * runner advertises, so a machine without docker never claims a container job.
+   *
+   * `claimed_by` is the resolved runner's name, not the body's, so the ledger records the
+   * identity that was actually authenticated and the two cannot drift apart later.
    */
   const claimed = await db.execute(sql`
     update ${jobs} set
       state = 'claimed',
-      claimed_by = ${body.runnerName},
+      claimed_by = ${runner.name},
       claimed_at = now(),
       attempts = ${jobs.attempts} + 1
     where ${jobs.id} in (

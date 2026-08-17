@@ -192,3 +192,23 @@ export async function findRunnerByToken(
     where: and(eq(runners.tokenHash, hashToken(token)), isNull(runners.revokedAt)),
   })
 }
+
+/**
+ * The runner a request is *speaking as*: the machine its credential resolves to, rather
+ * than whatever the body says about itself.
+ *
+ * Undefined means nothing in the request names a machine — an unprotected control plane,
+ * which carries no credential at all, or the admin token, which is an operator and not a
+ * machine. Both are legitimate, so a caller that has to attribute work decides for itself
+ * what undefined means rather than being handed a guess (§4.5).
+ */
+export async function runnerForRequest(
+  db: Env['Variables']['ctx']['db'],
+  authorization: string | undefined,
+): Promise<typeof runners.$inferSelect | undefined> {
+  // Same tolerance as `/join`, which reads the header the same way: the runner sends
+  // `Bearer <token>`, and a bare token from a hand-run curl still resolves.
+  const presented = (authorization ?? '').replace(/^Bearer /, '').trim()
+  if (!presented) return undefined
+  return findRunnerByToken(db, presented)
+}
