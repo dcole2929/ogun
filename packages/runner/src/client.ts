@@ -1,6 +1,21 @@
 import type { ClaimedJob, RunEvent, RunReport } from '@ogun/core'
 import { claimResponseSchema } from '@ogun/core'
 
+/** One compact record per known finding, plus its full body keyed by fingerprint. */
+export type FindingsHistory = {
+  index: Array<{
+    fingerprint: string
+    status: string
+    severity: string
+    title: string
+    path?: string
+    seenCount: number
+    lastSeenAt: string
+    statusReason?: string
+  }>
+  details: Record<string, string>
+}
+
 /**
  * The runner's only interface to state. It never opens a database connection, so
  * moving the control plane off this box is a change to `baseUrl` (§3).
@@ -45,6 +60,24 @@ export class ControlPlane {
     }
     const body = (await res.json()) as { sources?: unknown[] }
     return body.sources && body.sources.length > 0 ? body : null
+  }
+
+  /**
+   * What this project's inbox already says, so a reviewer is not blind to its own
+   * previous nights.
+   *
+   * Unlike `inputs`, a failure here is not fatal. A review that runs without history is
+   * degraded — it may re-report something known — but a review that does not run at all
+   * is worse, and the coverage ledger would record the wrong fact about the surface. The
+   * caller notes the absence on the timeline instead.
+   */
+  async history(jobId: string): Promise<FindingsHistory | null> {
+    const res = await fetch(`${this.#baseUrl}/api/jobs/${jobId}/history`, {
+      headers: this.#headers,
+    })
+    if (!res.ok) return null
+    const body = (await res.json()) as FindingsHistory
+    return body.index.length > 0 ? body : null
   }
 
   async started(runId: string, fields: Record<string, unknown>): Promise<void> {

@@ -1,9 +1,10 @@
 import { existsSync } from 'node:fs'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { execFile } from 'node:child_process'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { promisify } from 'node:util'
 import {
+  parseFingerprint,
   verifySchema,
   type ClaimedJob,
   type GateResult,
@@ -11,7 +12,7 @@ import {
   type RunOutcome,
   type RunReport,
 } from '@ogun/core'
-import { ControlPlane, EventFlusher } from './client.ts'
+import { ControlPlane, EventFlusher, type FindingsHistory } from './client.ts'
 import {
   createSandbox,
   GUEST_WORKSPACE,
@@ -39,6 +40,28 @@ export const OUTPUT_PATH = '.ogun-out/findings.json'
  * or "nothing ran".
  */
 export const INPUT_PATH = '.ogun-in/upstream.json'
+
+/**
+ * What the inbox already says. Written only when there is history, for the same reason
+ * as above — an empty file and no file mean different things.
+ */
+export const HISTORY_INDEX_PATH = '.ogun-in/history.json'
+
+/**
+ * Full bodies, one file per finding, nested by fingerprint.
+ *
+ * The fingerprint *is* a path — `<area>/<surface>/<invariant>/<technique>` — so the tree
+ * mirrors the taxonomy, and `ls .ogun-in/history/security/runner-enrollment/` scopes an
+ * entire surface by prefix. That is the property §4.11 gives as the reason for a
+ * hierarchical fingerprint rather than a content hash, and nothing had used it yet.
+ *
+ * Split out from the index deliberately. The index says *what* was found and is meant to
+ * be read whole; a body carries the previous reviewer's *argument*, and a reviewer that
+ * reads every argument stops constructing its own attacks and starts recognising
+ * someone else's. One file per finding is what makes "open only the records that matter"
+ * an actual affordance rather than an instruction to skim.
+ */
+export const HISTORY_DIR = '.ogun-in/history'
 
 /**
  * The runner's loop, once per job (§5.2):
@@ -136,6 +159,20 @@ export async function executeJob(
       )
     }
 
+    /**
+     * Caught, unlike `inputs`. A review with no history may re-report something already
+     * known, which is noise; a review that refused to start reports nothing at all, and
+     * the ledger would record "errored" for a surface that is in fact still unexamined.
+     * Noise is the better failure, so long as it is not silent — hence the note.
+     */
+    const history = await cp.history(job.jobId).catch(() => null)
+    if (history) {
+      await writeHistory(workspace.path, history)
+    }
+    const historyNote = history
+      ? `history: ${history.index.length} known finding(s) at ${HISTORY_INDEX_PATH}`
+      : 'history: none reachable — this review cannot tell what has already been reported'
+
     // Make the worker's skill discoverable where *this* runtime looks — the two do not
     // agree on a location, so it depends on which one is about to run (§5.1).
     const spec = resolveRuntime(job.runtime)
@@ -177,7 +214,7 @@ export async function executeJob(
 
     const guestRoot = job.sandbox === 'worktree' ? workspace.path : GUEST_WORKSPACE
     const ctx = {
-      prompt: composePrompt(job, guestRoot, skill.path, Boolean(upstream)),
+      prompt: composePrompt(job, guestRoot, skill.path, Boolean(upstream), history?.index.length ?? 0),
       ...(model ? { model } : {}),
       workspace: guestRoot,
       outputFile: `${guestRoot}/.ogun-out/last-message.txt`,
@@ -216,6 +253,22 @@ export async function executeJob(
           origin: skill.origin,
           path: skill.path,
           injected: skill.injected,
+        },
+      },
+      /**
+       * Recorded whether or not history arrived. A review that ran without it is not
+       * wrong, but it is a review that could not check what it already knows — and
+       * "reported again because it could not tell" must be distinguishable later from
+       * "reported again on purpose".
+       */
+      {
+        type: 'runner.note',
+        ts: new Date().toISOString(),
+        seq: nextSeq(parser),
+        payload: {
+          note: historyNote,
+          knownFindings: history?.index.length ?? 0,
+          historyAvailable: Boolean(history),
         },
       },
     ])
@@ -299,6 +352,7 @@ function composePrompt(
   guestRoot: string,
   skillPath: string,
   hasUpstream: boolean,
+  knownFindings: number,
 ): string {
   return [
     job.prompt,
@@ -308,6 +362,19 @@ function composePrompt(
           `What the workers before you produced is at ${guestRoot}/${INPUT_PATH}, including`,
           'the ones that found nothing and the ones that failed. Read it first — it is your',
           'input, not the repository.',
+          '',
+        ]
+      : []),
+    ...(knownFindings > 0
+      ? [
+          `This project's inbox already holds ${knownFindings} finding(s). The index is at`,
+          `${guestRoot}/${HISTORY_INDEX_PATH} — read it before you choose a surface, so you do`,
+          'not spend the run re-reporting something already known.',
+          '',
+          `Full write-ups are one file per finding under ${guestRoot}/${HISTORY_DIR}/, nested by`,
+          'fingerprint, so `<area>/<surface>/` is every finding on that surface. Open only the',
+          'ones you need. Reading all of them will anchor you to the last reviewer\'s framing,',
+          'which is the opposite of the job.',
           '',
         ]
       : []),
@@ -432,5 +499,37 @@ function usageFrom(event: RunEvent | undefined): RunReport['usage'] {
     ...(u.costUsdEstimate !== undefined
       ? { costCents: Math.round(u.costUsdEstimate * 100) }
       : {}),
+  }
+}
+
+/**
+ * Lay the inbox out in the workspace: one index to read whole, one file per finding to
+ * open on demand.
+ *
+ * Fingerprints are validated before they become paths. `parseFingerprint` already
+ * requires exactly four lowercase kebab-case segments, which cannot contain a dot or a
+ * separator and therefore cannot traverse — but this writes attacker-adjacent data (a
+ * previous agent authored those strings) into a directory tree, so it is checked here
+ * rather than assumed from a schema enforced somewhere else. A record with an
+ * unparseable fingerprint keeps its place in the index and simply has no body file; it
+ * is still a fact worth knowing about the surface.
+ */
+export async function writeHistory(workspace: string, history: FindingsHistory): Promise<void> {
+  await mkdir(join(workspace, '.ogun-in'), { recursive: true })
+  await writeFile(
+    join(workspace, HISTORY_INDEX_PATH),
+    `${JSON.stringify({ findings: history.index }, null, 2)}\n`,
+    { mode: 0o600 },
+  )
+
+  for (const [fingerprint, body] of Object.entries(history.details)) {
+    if (!parseFingerprint(fingerprint).ok) continue
+    const file = join(workspace, HISTORY_DIR, `${fingerprint}.md`)
+    await mkdir(dirname(file), { recursive: true })
+    const entry = history.index.find((i) => i.fingerprint === fingerprint)
+    const header = entry
+      ? `# ${entry.title}\n\n- fingerprint: \`${fingerprint}\`\n- status: ${entry.status}\n- severity: ${entry.severity}\n- seen: ${entry.seenCount} time(s), last ${entry.lastSeenAt}\n${entry.path ? `- path: ${entry.path}\n` : ''}\n`
+      : `# ${fingerprint}\n\n`
+    await writeFile(file, `${header}${body}\n`, { mode: 0o600 })
   }
 }

@@ -17,11 +17,29 @@ one reviewer lost its discipline, and its findings deserve more scepticism, not 
 ## 2. Check what is already known
 
 You are publishing into an inbox with history. A finding that duplicates an open one is
-noise no matter how well the reviewer argued it:
+noise no matter how well the reviewer argued it. The inbox is in your workspace — you
+have no network, so do not reach for a command that queries it:
 
 ```sh
-ogun findings list --project <project> --status open,triaged
+cat .ogun-in/history.json
 ```
+
+Unlike a reviewer, **you should open the write-ups**. Deciding whether a staged finding
+is the same problem as a known one is a comparison of arguments, and you cannot make it
+from two titles. They are under `.ogun-in/history/`, one file per finding, nested by
+fingerprint:
+
+```sh
+ls .ogun-in/history/security/runner-enrollment/     # every finding on that surface
+cat .ogun-in/history/<area>/<surface>/<invariant>/<technique>.md
+```
+
+You are not reviewing code here, so the anchoring risk that makes a reviewer read these
+sparingly does not apply to you. Read every one that plausibly overlaps something staged.
+
+If `.ogun-in/history.json` is absent, no history reached this run. Say so in `notes`: an
+inbox where nothing was checked against history is a different artifact from one where it
+was, and only you can tell the difference.
 
 - Matches an **open** finding → drop it, and note the merge in that finding's terms.
 - Matches a **fixed** finding → this is a regression. Publish it, at the reported
