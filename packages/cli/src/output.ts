@@ -25,6 +25,31 @@ export const outcomeColor = (s: string): string =>
       ? red(s)
       : yellow(s)
 
+/**
+ * Coarse on purpose: the question a listing answers is "tonight or next week", not the
+ * minute. One implementation for both directions, because `in 8h` and `8h ago` disagreeing
+ * about what counts as an hour is the kind of thing nobody notices and nobody trusts.
+ */
+const gap = (ms: number): string => {
+  const mins = Math.round(Math.abs(ms) / 60_000)
+  if (mins < 1) return ''
+  if (mins < 60) return `${mins}m`
+  if (mins < 60 * 24) return `${Math.round(mins / 60)}h`
+  return `${Math.round(mins / (60 * 24))}d`
+}
+
+/** A future instant: `in 8h`. */
+export const until = (iso: string): string => {
+  const g = gap(new Date(iso).getTime() - Date.now())
+  return g === '' ? 'now' : `in ${g}`
+}
+
+/** A past instant: `8h ago`. */
+export const ago = (iso: string): string => {
+  const g = gap(Date.now() - new Date(iso).getTime())
+  return g === '' ? 'just now' : `${g} ago`
+}
+
 export function table(rows: string[][]): string {
   if (rows.length === 0) return ''
   const widths = rows[0]!.map((_, i) => Math.max(...rows.map((r) => stripAnsi(r[i] ?? '').length)))

@@ -15,6 +15,7 @@ import { imageBuild } from './commands/image.ts'
 import { skillsList, skillsShow } from './commands/skills.ts'
 import { skillLink, skillNew } from './commands/skill-new.ts'
 import { workersList } from './commands/workers.ts'
+import { cyclesList, cyclesShow } from './commands/cycles.ts'
 import { runnerInit, runnerInvite, runnerJoin } from './commands/runner.ts'
 import { tokenRotate, tokenShow } from './commands/token.ts'
 import { runnerStart, serverStart } from './commands/serve.ts'
@@ -124,6 +125,14 @@ try {
 
     case 'workers':
       await workersList([sub, ...rest].filter(Boolean) as string[], serverUrl)
+      break
+
+    case 'cycles':
+      // `ogun cycles <project>` filters, the same positional `workers` takes — so a bare
+      // name that is a cycle rather than a project is a 404 the command explains, not a
+      // second meaning for the same argument.
+      if (sub === 'show') await cyclesShow(rest, serverUrl)
+      else await cyclesList([sub, ...rest].filter(Boolean) as string[], serverUrl)
       break
 
     case 'trigger':
