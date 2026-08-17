@@ -95,7 +95,14 @@ function ProjectWorkers({ slug }: { slug: string }) {
       {drift?.state === 'drifted' && (
         <div className="drift-banner">
           <div>
-            <strong>config.yaml has changed since it was last published.</strong>
+            <strong>
+              {drift.what?.length === 2
+                ? 'config.yaml and the skills beside it have'
+                : drift.what?.[0] === 'skills'
+                  ? 'A skill has'
+                  : 'config.yaml has'}{' '}
+              changed since last published.
+            </strong>
             <p>
               The factory is still running the previous definition — a worker you added or
               a schedule you edited is not live yet.

@@ -39,6 +39,21 @@ export const projects = pgTable('projects', {
    * which reads as "unknown" rather than as drift.
    */
   configHash: text('config_hash'),
+  /**
+   * The skills that were indexed alongside that config, hashed together.
+   *
+   * A second hash rather than one combined with the config's, so the warning can say
+   * which of the two moved — they are edited by different acts and the remedy reads
+   * differently even though the command is the same.
+   *
+   * Skills are not in `config.yaml` at all; `ogun project sync` discovers them from the
+   * repo and ships them with it. A drift check that hashed only the config would
+   * therefore report `synced` after a `SKILL.md` edit, while the indexed copy went stale
+   * — and `worker.version_hash` folds the skill hash in precisely so a run can answer
+   * "did this finding stop appearing because we fixed the code, or because I edited the
+   * skill?" (§6). Stale skill versions corrupt that answer quietly.
+   */
+  skillsHash: text('skills_hash'),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 })
 

@@ -46,6 +46,18 @@ export async function loadProjectConfig(root: string): Promise<LoadedProject> {
  *   project — in the repo being reviewed. Most skills are this: what "security review"
  *             means is a property of the codebase, not of the tool.
  */
+/**
+ * One hash over a whole skill set, order-independent.
+ *
+ * Written when a project is indexed and recomputed when checking for drift, so it has to
+ * be the same function in both places — two implementations of "what did we index" is
+ * how the check ends up disagreeing with the thing it checks.
+ */
+export const hashSkillSet = (skills: Array<{ name: string; versionHash: string }>): string =>
+  hashContent(
+    ...[...skills].sort((a, b) => a.name.localeCompare(b.name)).map((s) => `${s.name}:${s.versionHash}`),
+  )
+
 export type SkillOrigin = 'builtin' | 'machine' | 'project'
 
 export type DiscoveredSkill = {

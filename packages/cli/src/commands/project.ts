@@ -157,7 +157,10 @@ export async function projectList(serverUrl: string): Promise<void> {
       slug: string
       defaultBranch: string
       remoteUrl: string | null
-      drift: { state: 'current' | 'drifted' | 'unreachable' | 'unknown' }
+      drift: {
+        state: 'current' | 'drifted' | 'unreachable' | 'unknown'
+        what?: Array<'config' | 'skills'>
+      }
     }>
   }
   if (projects.length === 0) {
@@ -180,15 +183,26 @@ export async function projectList(serverUrl: string): Promise<void> {
    * Said once, under the table, rather than repeated per row: the remedy is the same
    * command whether one project has drifted or four have.
    */
-  const drifted = projects.filter((p) => p.drift.state === 'drifted').map((p) => p.slug)
+  const drifted = projects.filter((p) => p.drift.state === 'drifted')
   if (drifted.length > 0) {
     console.log()
-    console.log(
-      yellow(
-        `${drifted.join(', ')}: config.yaml has changed since it was last published, so the ` +
-          'factory is still running the previous definition.',
-      ),
-    )
+    for (const p of drifted) {
+      // Naming which half moved, because they are edited by different acts: one is you
+      // changing what runs, the other is you changing how a reviewer thinks.
+      const what = p.drift.what ?? []
+      const subject =
+        what.length === 2
+          ? 'config.yaml and the skills beside it have'
+          : what[0] === 'skills'
+            ? 'a skill has'
+            : 'config.yaml has'
+      console.log(
+        yellow(
+          `${p.slug}: ${subject} changed since last published, so the factory is still ` +
+            'running the previous definition.',
+        ),
+      )
+    }
     console.log(dim('run `ogun project sync` in the repo to publish it'))
   }
 }

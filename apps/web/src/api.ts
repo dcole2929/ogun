@@ -228,7 +228,12 @@ export const startSession = (token: string) =>
     body: JSON.stringify({ token }),
   })
 
-export type Drift = { state: 'current' | 'drifted' | 'unreachable' | 'unknown'; path?: string }
+export type Drift = {
+  state: 'current' | 'drifted' | 'unreachable' | 'unknown'
+  path?: string
+  /** Which half moved — config.yaml, the skills beside it, or both. */
+  what?: Array<'config' | 'skills'>
+}
 
 /** The three things that stop work while every page still reports success. */
 export type Status = {

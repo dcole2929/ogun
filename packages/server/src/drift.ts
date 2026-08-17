@@ -1,4 +1,7 @@
+import { resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { eq } from 'drizzle-orm'
+import { discoverSkills, hashSkillSet } from '@ogun/core'
 import { schema } from '@ogun/core/db'
 import type { Db } from '@ogun/core/db'
 import type { ConfigStore } from './config-store.ts'
@@ -15,6 +18,13 @@ const { projects } = schema
  * fan-in merged and ran nothing for fourteen hours because the file changed and nothing
  * said so.
  *
+ * Two things are compared, because `ogun project sync` publishes two: the config file,
+ * and the skills it discovers from the repo beside it. Skills are not in `config.yaml` at
+ * all, so hashing only the config would report `synced` after a `SKILL.md` edit while the
+ * indexed copy went stale — and a stale skill version quietly corrupts `worker.version_hash`,
+ * which exists to answer whether a finding stopped appearing because the code changed or
+ * because the skill did (§6).
+ *
  * Deliberately compared against the file on **disk** rather than against the committed
  * HEAD. Disk is what `ogun project sync` would publish, so "drifted" means exactly
  * "running sync would change something", which is the only phrasing a person can act on.
@@ -23,8 +33,11 @@ const { projects } = schema
  */
 export type Drift =
   | { state: 'current' }
-  /** The file on disk differs from what was indexed. `ogun project sync` resolves it. */
-  | { state: 'drifted'; path: string }
+  /**
+   * Something on disk differs from what was indexed. `ogun project sync` resolves it.
+   * `what` names which half moved, since they are edited by different acts.
+   */
+  | { state: 'drifted'; path: string; what: Array<'config' | 'skills'> }
   /** No local checkout, so there is nothing to compare — the hosted case, not a problem. */
   | { state: 'unreachable' }
   /** Indexed before the hash was recorded. Absence of evidence, reported as such. */
@@ -44,7 +57,34 @@ export async function driftOf(
   // control plane working as designed, the other is a sync nobody ran.
   if (!file) return { state: 'unreachable' }
 
-  return file.hash === project.configHash ? { state: 'current' } : { state: 'drifted', path: file.path }
+  const what: Array<'config' | 'skills'> = []
+  if (file.hash !== project.configHash) what.push('config')
+
+  /**
+   * Skipped when `skillsHash` is null — indexed before this existed, which is unknown
+   * rather than changed. Reading the skills off disk costs a directory walk and a read
+   * per `SKILL.md`; there are a handful, they are local, and the alternative is a cache
+   * that can itself go stale, which is the bug this whole file is about.
+   */
+  const root = await config.root(slug)
+  if (project.skillsHash && root) {
+    const found = await discoverSkills(root, [builtinSkillsRoot()]).catch(() => null)
+    if (found && hashSkillSet(found) !== project.skillsHash) what.push('skills')
+  }
+
+  return what.length === 0 ? { state: 'current' } : { state: 'drifted', path: file.path, what }
+}
+
+/**
+ * Ogun's own shipped skills, resolved from this file rather than the working directory —
+ * the server starts from wherever its supervisor puts it. Deliberately not
+ * `.agents/skills/`: that is Ogun reviewing Ogun, exactly as any project has its own.
+ *
+ * Exported because the sync-local route needs the same answer, and two components
+ * computing an install path their own way is how they end up disagreeing.
+ */
+export function builtinSkillsRoot(): string {
+  return resolve(fileURLToPath(new URL('../../..', import.meta.url)), 'skills')
 }
 
 /** Every project's drift, for the callers that summarise rather than inspect one. */

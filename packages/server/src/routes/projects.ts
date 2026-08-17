@@ -4,10 +4,8 @@ import { z } from 'zod'
 import { schema } from '@ogun/core/db'
 import type { Db } from '@ogun/core/db'
 import { cycleDefinitionSchema, policiesSchema, workerSchema } from '@ogun/core'
-import { resolve } from 'node:path'
-import { fileURLToPath } from 'node:url'
-import { discoverSkills, expandCycle, loadProjectConfig } from '@ogun/core'
-import { driftAcross } from '../drift.ts'
+import { discoverSkills, expandCycle, hashSkillSet, loadProjectConfig } from '@ogun/core'
+import { builtinSkillsRoot, driftAcross } from '../drift.ts'
 import { reindexProject } from '../reindex.ts'
 import type { Env } from '../context.ts'
 
@@ -113,6 +111,16 @@ async function applySync(db: Db, body: SyncPayload) {
     if (row) skillIds.set(s.name, row.id)
   }
 
+  /**
+   * Recorded here rather than in `reindexProject`, because this is where the skills are
+   * — that function never sees them. A UI worker edit therefore leaves this column alone,
+   * which is correct: editing a worker does not change a skill.
+   */
+  await db
+    .update(projects)
+    .set({ skillsHash: hashSkillSet(body.skills) })
+    .where(eq(projects.id, project.id))
+
   const { workers: indexed, removed, overriddenSchedules } = await reindexProject(
     db,
     project.slug,
@@ -212,15 +220,6 @@ projectsRoutes.post('/:slug/sync-local', async (c) => {
   return c.json(result)
 })
 
-/**
- * Where Ogun's own shipped skills live, resolved from this file rather than from the
- * process's working directory — the server is started from wherever systemd happens to
- * put it. Deliberately not `.agents/skills/`: that is Ogun reviewing Ogun, exactly as any
- * project has its own, and shipping those to other repositories would be nonsense.
- */
-function builtinSkillsRoot(): string {
-  return resolve(fileURLToPath(new URL('../../../..', import.meta.url)), 'skills')
-}
 
 projectsRoutes.get('/', async (c) => {
   const { db, config } = c.var.ctx

@@ -46,6 +46,14 @@ describe('config drift', () => {
     configPath = join(root, '.ogun', 'config.yaml')
     await mkdir(join(root, '.ogun'), { recursive: true })
     await writeFile(configPath, CONFIG.replace('SLUG', slug))
+    // The workers below bind this skill, and a worker pointing at a skill that is not
+    // indexed is refused — so it has to exist before the first sync, as it would in a
+    // real repo.
+    await mkdir(join(root, '.agents', 'skills', 'review'), { recursive: true })
+    await writeFile(
+      join(root, '.agents', 'skills', 'review', 'SKILL.md'),
+      '---\nname: review\n---\n\nLook at things.\n',
+    )
     const mapPath = join(root, 'projects.json')
     await writeFile(mapPath, JSON.stringify({ projects: { [slug]: root } }))
     store = createLocalConfigStore(mapPath)
@@ -57,35 +65,13 @@ describe('config drift', () => {
     await h.stop()
   })
 
-  const sync = async () => {
-    const text = await readFile(configPath, 'utf8')
-    const { createHash } = await import('node:crypto')
-    const hash = createHash('sha256').update(text).digest('hex').slice(0, 16)
-    return send('/api/projects/sync', {
-      slug,
-      defaultBranch: 'main',
-      configHash: hash,
-      workers: {
-        reviewer: {
-          skill: 'review',
-          runtime: 'claude',
-          model: 'worker',
-          permissions: 'reviewer',
-          sandbox: 'container',
-          onMissed: 'skip',
-          enabled: true,
-          timeoutMs: 1_800_000,
-        },
-      },
-      policies: {
-        directPush: false,
-        allowSandboxDowngrade: false,
-        maxConcurrentModifiers: 1,
-        failureBreakerThreshold: 3,
-      },
-      skills: [{ name: 'review', sourcePath: '.agents/skills/review', versionHash: 'sv1' }],
-    })
-  }
+  /**
+   * Publishes the way both real paths do — `applySync`, over the files actually on disk.
+   * An earlier version of this test posted a hand-written payload with an invented skill
+   * list, which set `skills_hash` to something no checkout could ever produce and made
+   * every project read as drifted the moment it was synced.
+   */
+  const sync = () => send(`/api/projects/${slug}/sync-local`, {})
 
   test('a project indexed before the hash existed reads as unknown, not as drift', async () => {
     await h.db.insert(schema.projects).values({ slug })
@@ -94,6 +80,15 @@ describe('config drift', () => {
 
   test('a freshly synced project is current', async () => {
     assert.equal((await sync()).status, 200)
+    assert.equal(await stateNow(), 'current')
+  })
+
+  test('the skills indexed are the ones on disk, builtins included', async () => {
+    const res = await sync()
+    const body = (await res.json()) as { skills: string[] }
+    // Ogun's own shipped skills come along with every project — that is what `builtin`
+    // precedence means (§4.8), and the drift check has to hash the same set.
+    assert.ok(body.skills.length > 0, 'a sync that indexed no skills would hash to nothing')
     assert.equal(await stateNow(), 'current')
   })
 
@@ -130,6 +125,30 @@ describe('config drift', () => {
     })
     assert.equal(res.status, 200)
     assert.equal(await stateNow(), 'current', 'using the UI must not raise a drift warning')
+  })
+
+  /**
+   * Skills are not in `config.yaml` at all — sync discovers them from the repo and ships
+   * them alongside it. A check that hashed only the config would report `synced` after a
+   * `SKILL.md` edit while the indexed copy went stale, and a stale skill version quietly
+   * corrupts `worker.version_hash`, which exists to answer whether a finding stopped
+   * appearing because the code changed or because the skill did (§6).
+   */
+  test('editing a skill is drift, and is named as such', async () => {
+    assert.equal((await sync()).status, 200)
+    assert.equal(await stateNow(), 'current')
+
+    await writeFile(
+      join(root, '.agents', 'skills', 'review', 'SKILL.md'),
+      '---\nname: review\n---\n\nLook at things, adversarially.\n',
+    )
+    const drift = await driftOf(h.db, store, slug)
+    assert.equal(drift.state, 'drifted')
+    assert.deepEqual(
+      drift.state === 'drifted' ? drift.what : [],
+      ['skills'],
+      'config.yaml did not move; saying it did would send you to the wrong file',
+    )
   })
 
   test('no local checkout is unreachable, which is not a problem to report', async () => {
