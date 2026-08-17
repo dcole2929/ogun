@@ -162,6 +162,7 @@ export async function startHarness(
 }
 
 const unreachableConfigStore = (): ConfigStore => ({
+  root: async () => undefined,
   writable: async () => false,
   read: async () => {
     throw new Error('no config store in this test')

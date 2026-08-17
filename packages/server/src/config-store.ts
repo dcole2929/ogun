@@ -27,6 +27,13 @@ import {
  */
 export type ConfigStore = {
   writable: (slug: string) => Promise<boolean>
+  /**
+   * Where this project's repo is on this machine, or undefined when there is no local
+   * copy. Exposed because publishing a config needs more of the repo than the config
+   * file — the skills beside it — and a second component resolving the path its own way
+   * is how the two end up disagreeing about which checkout they mean.
+   */
+  root: (slug: string) => Promise<string | undefined>
   read: (slug: string) => Promise<ConfigFile>
   /**
    * Read-modify-write. `expectedHash` makes it a compare-and-swap: two concurrent edits,
@@ -97,6 +104,8 @@ export function createLocalConfigStore(projectMapPath?: string): ConfigStore {
   }
 
   return {
+    root: async (slug) => (await readProjectMap(projectMapPath))[slug],
+
     writable: async (slug) => {
       try {
         await load(slug)
