@@ -1,5 +1,5 @@
 import { Cron } from 'croner'
-import { eq } from 'drizzle-orm'
+import { and, eq, isNull } from 'drizzle-orm'
 import { schema } from '@ogun/core/db'
 import type { Db } from '@ogun/core/db'
 import { startCycleRun } from './cycles.ts'
@@ -22,6 +22,11 @@ const { cycles, schedules } = schema
  * an exception. Firing is therefore derived from `nextRun(lastRunAt)` rather than from a
  * timer: a schedule is due when its next occurrence after the last one has passed, which
  * is true whether the machine was awake for it or not.
+ *
+ * **An occurrence is claimed, not assumed.** `lastRunAt` is both the cursor the decision
+ * is read from and the record that the decision was acted on, so evaluating and acting
+ * are a compare-and-set on one row rather than a read, a slow start, and a later write
+ * (see `tick`).
  */
 export type SchedulerOptions = {
   /**
@@ -38,6 +43,12 @@ export type Due = {
   cycleId: string
   /** The occurrence this run is *for*, not the moment we noticed. */
   occurrence: Date
+  /**
+   * The cursor this decision was derived from. `tick` advances `lastRunAt` only while it
+   * is still this value, which is what makes the decision a claim rather than an opinion
+   * another tick can hold at the same time.
+   */
+  readFrom: Date
   missed: boolean
   policy: 'skip' | 'runOnce'
 }
@@ -94,7 +105,14 @@ export async function findDue(db: Db, opts: SchedulerOptions = {}): Promise<Due[
      * catch up on — the schedule did not exist then.
      */
     if (!row.lastRunAt) {
-      await db.update(schedules).set({ lastRunAt: now }).where(eq(schedules.id, row.id))
+      // Conditional for the same reason the claim below is: a tick that read the row
+      // while it was still unanchored could otherwise land its `now` on top of a cursor
+      // a later tick had already advanced past an occurrence, rewinding the schedule and
+      // re-firing that occurrence.
+      await db
+        .update(schedules)
+        .set({ lastRunAt: now })
+        .where(and(eq(schedules.id, row.id), isNull(schedules.lastRunAt)))
       continue
     }
 
@@ -105,6 +123,7 @@ export async function findDue(db: Db, opts: SchedulerOptions = {}): Promise<Due[
       scheduleId: row.id,
       cycleId: row.cycleId,
       occurrence,
+      readFrom: row.lastRunAt,
       missed: now.getTime() - occurrence.getTime() > graceMs,
       policy: row.onMissed === 'runOnce' ? 'runOnce' : 'skip',
     })
@@ -117,6 +136,14 @@ export type TickResult = { started: string[]; skipped: string[] }
 /**
  * Evaluate and act. Returns what it did rather than logging, so a caller can report it
  * and a test can assert it.
+ *
+ * Concurrent ticks are ordinary, not exceptional: the driver is a `setInterval` that does
+ * not wait for the previous callback (§4.2, and see `main.ts`), and `startCycleRun`
+ * creates a CycleRun plus a job per node, which is not fast. Two ticks that overlapped
+ * therefore both read the same `lastRunAt`, both found the same occurrence due, and both
+ * fired it — two nightly runs, twice the containers, and two sets of findings racing into
+ * one inbox. Nothing downstream could tell them apart, because both were legitimately
+ * "the 3am run".
  */
 export async function tick(db: Db, opts: SchedulerOptions = {}): Promise<TickResult> {
   const now = opts.now?.() ?? new Date()
@@ -127,10 +154,37 @@ export async function tick(db: Db, opts: SchedulerOptions = {}): Promise<TickRes
     if (!cycle) continue
 
     /**
+     * The claim, and it comes *before* the run rather than after it.
+     *
+     * `lastRunAt` is the only thing that says an occurrence has been dealt with, so
+     * advancing it conditionally on it still being what `findDue` read makes the check
+     * and the claim one statement: exactly one racer gets a row back, the loser sees the
+     * predicate no longer holds and does nothing at all. Same shape as consuming an
+     * invite (`routes/runners.ts`) and claiming a run's terminal state (`finalize.ts`).
+     *
+     * Advanced to the *latest* occurrence, never to `now`, and whether or not the run is
+     * skipped. Using now would drift the schedule; leaving it behind would re-fire every
+     * tick, and `runOnce` would become "run once per tick until you catch up", which is
+     * the opposite of what it says.
+     *
+     * Claiming first means a `startCycleRun` that throws burns the occurrence instead of
+     * leaving it to be retried, and that is the direction to fail in: the alternative
+     * retries on every tick, so a cycle that cannot start — an unknown worker, an
+     * unparseable definition — would spend the night creating a half-built CycleRun every
+     * 30 seconds. At most once is what a nightly review means.
+     */
+    const [claimed] = await db
+      .update(schedules)
+      .set({ lastRunAt: item.occurrence })
+      .where(and(eq(schedules.id, item.scheduleId), eq(schedules.lastRunAt, item.readFrom)))
+      .returning()
+    if (!claimed) continue
+
+    /**
      * A missed occurrence under `skip` is deliberately not run. A nightly review that
      * slept through 3am should wait for tonight rather than start at 11am against a tree
-     * that has moved on — and either way `lastRunAt` advances, so the catch-up does not
-     * accumulate.
+     * that has moved on — and either way `lastRunAt` advanced above, so the catch-up does
+     * not accumulate.
      */
     const shouldRun = !item.missed || item.policy === 'runOnce'
 
@@ -140,15 +194,6 @@ export async function tick(db: Db, opts: SchedulerOptions = {}): Promise<TickRes
     } else {
       result.skipped.push(cycle.name)
     }
-
-    // Advanced to the *latest* occurrence in both cases, never to `now`. Using now would
-    // drift the schedule; leaving it behind would re-fire every tick, and `runOnce`
-    // would become "run once per tick until you catch up", which is the opposite of what
-    // it says.
-    await db
-      .update(schedules)
-      .set({ lastRunAt: item.occurrence })
-      .where(eq(schedules.id, item.scheduleId))
   }
 
   void now
