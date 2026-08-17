@@ -38,6 +38,8 @@ export type RunSummary = {
     id: string
     outcome: string | null
     detail: string | null
+    /** What the node wrote for a person to read. Not `detail` — see `runs.notes`. */
+    notes: string | null
     startedAt: string
     endedAt: string | null
     durationMs: number | null
@@ -106,6 +108,22 @@ export type FindingRow = {
   project: { slug: string }
 }
 
+/**
+ * A note one run wrote, carrying the batch it belongs to.
+ *
+ * Notes are written per run and read per batch — "which surface did nobody look at last
+ * night" is a coverage question — so the ledger matches these on `runId`.
+ */
+export type RunNote = {
+  runId: string
+  cycleRunId: string
+  startedAt: string
+  outcome: string | null
+  notes: string
+  worker: { name: string }
+  project: { slug: string }
+}
+
 export type CoverageRow = {
   coverage: {
     outcome: string
@@ -113,6 +131,8 @@ export type CoverageRow = {
     selected: boolean
     findingCount: number
     reason: string | null
+    /** Null when the worker never ran. What a `RunNote` is matched on. */
+    runId: string | null
   }
   cycleRun: { id: string; startedAt: string; state: string }
   cycle: { name: string }
@@ -257,6 +277,7 @@ export const api = {
       `/api/projects/${slug}/workers`,
     ),
   coverage: (slug: string) => json<{ coverage: CoverageRow[] }>(`/api/projects/${slug}/coverage`),
+  runNotes: (slug: string) => json<{ notes: RunNote[] }>(`/api/runs/notes?project=${slug}`),
   runs: () =>
     json<{ runs: RunSummary[]; pending: PendingJob[]; onlineRunners: number }>(
       '/api/runs?limit=50',
