@@ -4,9 +4,10 @@ import { z } from 'zod'
 import { schema } from '@ogun/core/db'
 import { cycleDefinitionSchema, policiesSchema, workerSchema } from '@ogun/core'
 import { reindexProject } from '../reindex.ts'
+import { parseSchedule } from '../foreman/scheduler.ts'
 import type { Env } from '../context.ts'
 
-const { coverage, cycleRuns, cycles, jobs, projects, skills, workers } = schema
+const { coverage, cycleRuns, cycles, jobs, projects, schedules, skills, workers } = schema
 
 /**
  * The CLI reads the repo and posts the resolved config here — the server never touches
@@ -135,6 +136,19 @@ projectsRoutes.get('/:slug/workers', async (c) => {
   return c.json({ workers: rows })
 })
 
+/**
+ * A project's cycles, each with what decides whether it runs at all.
+ *
+ * The definition alone says nothing about when — the schedule is a second table and the
+ * evidence it ever fired is a third — so a caller reading only `definition` can show a
+ * fan-in that has been inert for a fortnight and look entirely healthy doing it. The
+ * three are assembled here rather than by the caller for the same reason the cron
+ * preview is (`/api/workers/schedule/preview`): the answer wanted is what *this* foreman
+ * will do, and a second cron implementation is a second set of answers.
+ *
+ * The cycle row is spread rather than nested, so a reader that only wants the graph is
+ * unaffected by any of this.
+ */
 projectsRoutes.get('/:slug/cycles', async (c) => {
   const { db } = c.var.ctx
   const project = await db.query.projects.findFirst({
@@ -146,8 +160,95 @@ projectsRoutes.get('/:slug/cycles', async (c) => {
     .from(cycles)
     .where(eq(cycles.projectId, project.id))
     .orderBy(cycles.name)
-  return c.json({ cycles: rows })
+
+  // Every worker also has a one-node cycle carrying its own schedule (§5.1). It is the
+  // worker, not a graph anyone wrote, so it is flagged here and the caller decides
+  // whether to show it — the alternative is each caller re-deriving membership.
+  const owned = new Set(
+    (
+      await db
+        .select({ name: workers.name })
+        .from(workers)
+        .where(eq(workers.projectId, project.id))
+    ).map((w) => w.name),
+  )
+
+  const ids = rows.map((r) => r.id)
+  const scheduleRows = ids.length
+    ? await db.select().from(schedules).where(inArray(schedules.cycleId, ids))
+    : []
+  const byCycle = new Map(scheduleRows.map((s) => [s.cycleId, s]))
+
+  /**
+   * One query per cycle, not one query with a limit: the last run of a cycle that has
+   * not fired in months is exactly the row worth seeing, and it is the one a bounded
+   * scan over all of them would drop. Indexed on (cycle_id, started_at).
+   */
+  const lastRuns = await Promise.all(
+    rows.map((r) =>
+      db.query.cycleRuns.findFirst({
+        where: eq(cycleRuns.cycleId, r.id),
+        orderBy: desc(cycleRuns.startedAt),
+      }),
+    ),
+  )
+
+  return c.json({
+    cycles: rows.map((row, i) => {
+      const schedule = byCycle.get(row.id)
+      const last = lastRuns[i]
+      return {
+        ...row,
+        standalone: owned.has(row.name),
+        schedule: schedule
+          ? {
+              cron: schedule.cron,
+              tz: schedule.tz,
+              onMissed: schedule.onMissed,
+              enabled: schedule.enabled,
+              lastRunAt: schedule.lastRunAt,
+            }
+          : null,
+        // Computed, never stored: a next-run time written to the database is wrong the
+        // moment the process restarts or the expression changes.
+        nextRuns: schedule?.enabled ? nextRuns(schedule.cron, schedule.tz) : [],
+        lastRun: last
+          ? {
+              id: last.id,
+              state: last.state,
+              trigger: last.trigger,
+              startedAt: last.startedAt,
+              endedAt: last.endedAt,
+            }
+          : null,
+      }
+    }),
+  })
 })
+
+/**
+ * The next few occurrences. Three, because one date tells you nothing about the interval
+ * and "every 5 minutes" only looks like itself as a list.
+ *
+ * An unparseable expression is an empty list rather than an error: the schedule is real,
+ * it simply never fires, and one bad cron must not take the whole listing with it.
+ */
+function nextRuns(expression: string, tz: string, count = 3): string[] {
+  const out: string[] = []
+  try {
+    const cron = parseSchedule(expression, tz)
+    let cursor = new Date()
+    for (let i = 0; i < count; i++) {
+      const next = cron.nextRun(cursor)
+      if (!next) break
+      out.push(next.toISOString())
+      cursor = next
+    }
+  } catch {
+    return []
+  }
+  return out
+}
 
 /** The coverage ledger for a batch — what was selected, what ran, and why not (§4.11). */
 projectsRoutes.get('/:slug/coverage', async (c) => {

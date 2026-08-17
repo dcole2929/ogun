@@ -478,6 +478,45 @@ const topics: Record<string, Topic> = {
     see: ['ogun trigger', 'ogun project sync'],
   },
 
+  cycles: {
+    summary: 'every cycle: its graph, its schedule, and when it next fires',
+    usage: ['ogun cycles [project]', 'ogun cycles show <name> [--project <slug>]'],
+    notes: [
+      'A cycle is a DAG of jobs and is the unit that schedules — a nightly fan-in of two ' +
+        'reviewers into triage is one row here and three jobs a night.',
+      'One row per cycle: its shape, the cron expression driving it, when that fires ' +
+        'next, and how the last run ended. A cycle correct in config.yaml but never ' +
+        'registered looks identical to a healthy one everywhere else, which is the gap ' +
+        'this closes.',
+      'The optional argument filters to one project. It is positional, not a flag.',
+      "Single-worker cycles are left out. Every worker has one carrying its own " +
+        'schedule, so listing them here would be `ogun workers` again under another name.',
+    ],
+    see: ['ogun cycles show', 'ogun workers', 'ogun trigger'],
+  },
+
+  'cycles show': {
+    summary: 'one cycle in full: every node, what it waits for, and what it writes',
+    usage: ['ogun cycles show <name> [--project <slug>]'],
+    notes: [
+      'Nodes in execution order, each with what it waits for and whether it stages or ' +
+        'writes to the finding inbox. Staging is read off the graph rather than declared ' +
+        'on the worker (§4.12), so this is the only place it is written down — a reviewer ' +
+        'feeding triage publishes nothing itself, and nothing in config.yaml says so.',
+      'Also the next three occurrences, computed by the same parser the foreman uses, so ' +
+        'the answer is what this control plane will do rather than what the expression ' +
+        'means in the abstract.',
+    ],
+    flags: [
+      [
+        '--project <slug>',
+        'which project owns the cycle. Only needed when two projects have a cycle of the ' +
+          'same name',
+      ],
+    ],
+    see: ['ogun cycles', 'ogun coverage'],
+  },
+
   trigger: {
     summary: 'queue a run now',
     usage: ['ogun trigger <project> <worker>'],
@@ -723,6 +762,8 @@ ${bold('what can run')}
   ogun skills                      every skill, and which workers bind it
   ogun skills show <name>          read one, including its SKILL.md
   ogun workers [project]           every worker
+  ogun cycles [project]            every cycle: graph, schedule, next fire
+  ogun cycles show <name>          one cycle's full graph
 
 ${bold('running')}
   ogun trigger <project> <worker>  queue a run now

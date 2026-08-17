@@ -331,6 +331,47 @@ Workers are defined in the repo's `.ogun/config.yaml` or created in the UI — t
 writes `config.yaml` and leaves the diff uncommitted for you to review. There is one
 definition of a worker and it is in git.
 
+### `ogun cycles [project]`
+
+Every cycle: its graph, the schedule that drives it, when that next fires, and how the
+last run ended. The optional argument filters to one project and is positional, not a
+flag.
+
+A cycle is a DAG of jobs and is the unit that schedules — the nightly fan-in of two
+reviewers into triage is one row here and three jobs a night. Nothing else prints one:
+`ogun workers` says "via nightly" against each member and stops there, so a cycle that is
+correct in `config.yaml` and absent from the database looks exactly like a healthy one.
+The columns are chosen against that.
+
+```
+   CYCLE    PROJECT  GRAPH                                         SCHEDULE   NEXT    LAST RUN
+●  nightly  ogun     adversarial-review, security-review → triage  0 3 * * *  in 10h  complete 14h ago
+```
+
+Single-worker cycles are left out. Every worker has one carrying its own `schedule:`, so
+listing them here would be `ogun workers` again under another name; the count that was
+left out is printed under the table rather than silently dropped.
+
+The timezone is shown beside the expression only when it is not this machine's. `0 3 * * *`
+means three in the morning wherever the control plane resolved it, and those are the same
+string on every machine.
+
+### `ogun cycles show <name> [--project <slug>]`
+
+One cycle in full: every node in execution order, what each waits for, and whether it
+stages or writes to the finding inbox — plus the next three occurrences and the last run.
+
+Staging is derived from the graph rather than declared on the worker (§4.12), so this is
+the only place it is written down. A reviewer that feeds triage publishes nothing itself,
+and nothing in `config.yaml` says so.
+
+The next occurrences come from the control plane, computed by the same parser the foreman
+uses. The question a cron expression raises is "will *this system* fire when I think",
+which a second implementation cannot answer.
+
+- `--project <slug>` — which project owns it. Only needed when two projects have a cycle
+  of the same name.
+
 ### `ogun runs`
 
 The last 30 runs: when, project, worker, outcome, duration, and the run id. No flags and

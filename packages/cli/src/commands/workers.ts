@@ -1,4 +1,4 @@
-import { bold, cyan, dim, fail, green, table, yellow } from '../output.ts'
+import { bold, cyan, dim, fail, green, table, until, yellow } from '../output.ts'
 import { authHeaders } from '../auth.ts'
 import { parse } from '../args.ts'
 
@@ -24,19 +24,10 @@ const runsWhen = (r: {
 }): string => {
   if (r.drivenBy) {
     const via = `via ${r.drivenBy.cycle}`
-    return r.drivenBy.nextRun ? `${via} · ${relative(r.drivenBy.nextRun)}` : dim(via)
+    return r.drivenBy.nextRun ? `${via} · ${until(r.drivenBy.nextRun)}` : dim(via)
   }
   if (!r.schedule) return dim('on trigger')
-  return r.nextRun ? relative(r.nextRun) : yellow('never — bad expression')
-}
-
-/** Coarse on purpose: the question is "tonight or next week", not the minute. */
-const relative = (iso: string): string => {
-  const mins = Math.round((new Date(iso).getTime() - Date.now()) / 60_000)
-  if (mins < 1) return 'now'
-  if (mins < 60) return `in ${mins}m`
-  if (mins < 60 * 24) return `in ${Math.round(mins / 60)}h`
-  return `in ${Math.round(mins / (60 * 24))}d`
+  return r.nextRun ? until(r.nextRun) : yellow('never — bad expression')
 }
 
 export async function workersList(args: string[], serverUrl: string): Promise<void> {
