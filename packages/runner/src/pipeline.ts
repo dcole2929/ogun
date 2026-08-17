@@ -188,6 +188,15 @@ export async function executeJob(
     const maxRounds = 1
     const parser = newParserState()
     let lastEvent: RunEvent | undefined
+    /**
+     * Why the runtime said it failed, as opposed to whatever it happened to leave on
+     * stderr. Both runtimes report a structured reason and then exit non-zero, and the
+     * stderr tail is frequently the more misleading of the two: codex prints
+     * "Reading additional input from stdin…" on every invocation, so a run killed by a
+     * 400 from the model API surfaced that line instead — pointing at §4.7's stdin
+     * gotcha, which is fixed, rather than at the model name, which was wrong.
+     */
+    let reportedFailure: string | undefined
 
     /**
      * Recorded on every run, not only when something was copied. Which skill a run
@@ -217,12 +226,19 @@ export async function executeJob(
         const events = spec.parseLine(line, parser)
         if (events.length === 0) continue
         lastEvent = events.at(-1)
+        for (const e of events) {
+          if (e.type === 'run.failed') reportedFailure = failureMessage(e.payload) ?? reportedFailure
+        }
         flusher.push(events)
       }
       const { code, stderr } = await handle.done
       await flusher.flush()
       if (code !== 0) {
-        return await fail(`${job.runtime} exited ${code}: ${stderr.slice(-1500)}`)
+        return await fail(
+          reportedFailure
+            ? `${job.runtime} exited ${code}: ${reportedFailure}`
+            : `${job.runtime} exited ${code}: ${stderr.slice(-1500)}`,
+        )
       }
       if (parser.sessionId) await cp.started(job.runId, { sessionId: parser.sessionId })
     }
@@ -364,6 +380,45 @@ const safeJsonParse = (raw: string): unknown => {
   } catch {
     return { __unparseable: raw.slice(0, 2000) }
   }
+}
+
+/**
+ * The sentence a person needs out of a `run.failed` payload.
+ *
+ * Neither runtime reports a flat message. Claude nests `{error: {message}}`; codex hands
+ * back the provider's response body as a *string* of JSON, sometimes wrapped in its own
+ * `{error: …}` first. So this walks: parse a string that looks like JSON, follow `error`
+ * inward, and take the deepest `message` — falling back to whatever scalar it ended on
+ * rather than returning nothing, since an ugly reason still beats the stderr tail.
+ */
+export function failureMessage(payload: unknown, depth = 0): string | undefined {
+  if (depth > 6 || payload === null || payload === undefined) return undefined
+
+  if (typeof payload === 'string') {
+    const text = payload.trim()
+    if (!text) return undefined
+    if (text.startsWith('{') || text.startsWith('[')) {
+      try {
+        return failureMessage(JSON.parse(text), depth + 1) ?? text
+      } catch {
+        return text
+      }
+    }
+    return text
+  }
+
+  if (typeof payload !== 'object') return String(payload)
+
+  const obj = payload as Record<string, unknown>
+  // `message` last: an outer envelope often carries a generic one ("codex reported a
+  // failure") while the useful text sits further in under `error`.
+  for (const key of ['error', 'detail', 'message']) {
+    if (key in obj) {
+      const found = failureMessage(obj[key], depth + 1)
+      if (found) return found
+    }
+  }
+  return undefined
 }
 
 function usageFrom(event: RunEvent | undefined): RunReport['usage'] {
