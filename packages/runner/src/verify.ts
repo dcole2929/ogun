@@ -137,11 +137,24 @@ async function groundingCheck(input: VerifyInput): Promise<GateResult> {
   }
 
   const bad: string[] = []
-  for (const f of parsed.data.findings) {
+  /**
+   * Adjudications are grounded too, and a `fixed` verdict is the one that most needs it:
+   * closing a finding is as consequential as opening one, and it is the direction with
+   * no second reviewer downstream to catch a mistake. A citation pointing at a fix that
+   * is not there fails the whole run, exactly as a hallucinated finding does.
+   */
+  const cited = [
+    ...parsed.data.findings.map((f) => ({ id: f.fingerprint, citations: f.citations })),
+    ...(parsed.data.adjudications ?? []).flatMap((a) =>
+      a.verdict === 'fixed' ? [{ id: `${a.fingerprint} (fixed)`, citations: a.citations }] : [],
+    ),
+  ]
+
+  for (const f of cited) {
     for (const c of f.citations) {
       const path = normalize(c.path)
       if (!input.knownPaths.has(path)) {
-        bad.push(`${f.fingerprint} cites ${c.path}, which is not in the tree`)
+        bad.push(`${f.id} cites ${c.path}, which is not in the tree`)
         continue
       }
       const end = c.endLine ?? c.line
@@ -149,7 +162,7 @@ async function groundingCheck(input: VerifyInput): Promise<GateResult> {
       const lines = await input.lineCountOf(path)
       if (lines === null) continue
       if (end > lines) {
-        bad.push(`${f.fingerprint} cites ${c.path}:${end}, but that file has ${lines} lines`)
+        bad.push(`${f.id} cites ${c.path}:${end}, but that file has ${lines} lines`)
       }
     }
   }

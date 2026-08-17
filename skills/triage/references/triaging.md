@@ -47,7 +47,62 @@ was, and only you can tell the difference.
 - Matches a **wontfix** finding → drop it. That was a decision, and re-litigating it
   through a different reviewer is still re-litigating it.
 
-## 3. Merge on the invariant, not the location
+## 3. Adjudicate what nobody re-reported
+
+Checking the inbox against the code is the other half of your job, and the half nothing
+else does. A reviewer only tells you what it found tonight. It cannot tell you that a
+finding from three weeks ago was fixed last Tuesday, because nothing asked it to look.
+
+So findings accumulate. They stay `open` long after the code stopped being wrong, the
+inbox stops being a list of things to do, and people stop reading it. **That is the
+failure this step exists to prevent, and it is terminal** — an inbox nobody trusts is
+worth less than no inbox.
+
+Go through the open findings in `.ogun-in/history.json` and, for each one you can reach
+a defensible verdict on, emit an adjudication. You do not have to judge all of them; a
+finding you did not get to simply stays as it was.
+
+| verdict | when | requires |
+|---|---|---|
+| `still-applies` | you read the code and the problem is still there | `reason` |
+| `fixed` | the code now upholds the invariant | `reason` + `citations` |
+| `no-longer-applicable` | the surface is gone — file deleted, path restructured | `reason` |
+| `duplicate-of` | it is the same invariant as another finding | `reason` + `duplicateOf` |
+
+```json
+{
+  "findings": [ ... ],
+  "adjudications": [
+    { "fingerprint": "security/invites/single-use/toctou",
+      "verdict": "fixed",
+      "reason": "redemption is now a conditional UPDATE ... WHERE used_at IS NULL RETURNING, so one racer wins",
+      "citations": [{ "path": "packages/server/src/routes/runners.ts", "line": 168 }] },
+    { "fingerprint": "security/invites/single-use/parallel-redeem",
+      "verdict": "duplicate-of",
+      "duplicateOf": "security/invites/single-use/toctou",
+      "reason": "same invariant, same trigger, described from the runner's side" }
+  ]
+}
+```
+
+Four rules, in the order they get broken:
+
+1. **Open the code before you close anything.** `fixed` needs a citation and the
+   grounding check verifies it — a citation pointing at a fix that is not there fails the
+   whole run, including the findings you got right.
+2. **`still-applies` is a real verdict, not a no-op.** It records that somebody looked.
+   Without it, "still broken" and "nobody checked since March" are the same row.
+3. **`fixed` and `no-longer-applicable` are different.** The first says someone corrected
+   the behaviour. The second says the question stopped existing. Do not use the first for
+   a deleted file.
+4. **You cannot touch a `wontfix`.** That is a person deciding they accept a risk. It is
+   refused if you try, and re-litigating it is the fastest way to be ignored.
+
+Merging duplicates is the same act as merging within a night (§below), just across runs
+instead of within one. Keep the clearest statement as the survivor and point the others
+at it.
+
+## 4. Merge on the invariant, not the location
 
 Two staged findings are the same finding when they describe the same way the same
 invariant can be violated. Not when they cite the same file, and not when they use the
@@ -64,7 +119,7 @@ same words.
 When you merge, the surviving finding cites every path and line the inputs cited. You
 are compressing the argument, not the evidence.
 
-## 4. Drop what cannot be defended
+## 5. Drop what cannot be defended
 
 Drop a staged finding when:
 
@@ -82,7 +137,7 @@ Dropping is not deletion. Everything stays staged and attributed, so a dropped f
 can be recovered by looking at the run. Say what you dropped and why in `notes` —
 briefly, in aggregate, not one line per item.
 
-## 5. Rank what survives
+## 6. Rank what survives
 
 Severity is about consequence, not about how interesting the problem is.
 
@@ -99,7 +154,7 @@ judge of it. Raise one only when merging revealed something the individual revie
 could not see: two mediums that compose into a high is exactly the thing only triage is
 positioned to notice, and it is the strongest argument for running triage at all.
 
-## 6. Publish through the CLI
+## 7. Publish through the CLI
 
 ```sh
 ogun findings schema     # print the shape
@@ -114,7 +169,7 @@ Publishing nothing is a legitimate result. Four reviewers producing only specula
 a clean night, and saying so plainly is worth more than promoting the best of a bad
 set.
 
-## 7. Leave the tree clean
+## 8. Leave the tree clean
 
 Do not commit, do not create branches, do not modify source files. Your entire output
 is the findings document.

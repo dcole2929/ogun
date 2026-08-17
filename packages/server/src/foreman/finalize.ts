@@ -1,4 +1,4 @@
-import { eq, sql } from 'drizzle-orm'
+import { and, eq, sql } from 'drizzle-orm'
 import { schema } from '@ogun/core/db'
 import type { Db } from '@ogun/core/db'
 import { cycleDefinitionSchema, nodesWithDependents } from '@ogun/core'
@@ -17,6 +17,8 @@ export type FinalizeResult = {
   jobState: JobState
   findingsWritten: number
   coverage: CoverageOutcome
+  /** One entry per verdict on a pre-existing finding, applied or refused with a reason. */
+  adjudicated: AdjudicationOutcome[]
 }
 
 /**
@@ -55,6 +57,7 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
    * publish in the first case without being reconfigured.
    */
   const consumed = await hasDependents(db, job.cycleRunId, job.nodeKey)
+  let adjudicated: AdjudicationOutcome[] = []
   const reported = outcome === 'approved' ? (report.findings?.findings ?? []) : []
   const raw = consumed ? [] : reported
 
@@ -167,6 +170,15 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
         })
     }
 
+    /**
+     * Re-adjudication (§4.11): verdicts on findings nobody re-reported this run.
+     *
+     * Applied under exactly the same gate as findings — only a node that publishes may
+     * change the inbox, read off the graph rather than declared (§4.12). A reviewer
+     * feeding triage stages its verdicts along with everything else and triage decides.
+     */
+    adjudicated = consumed ? [] : await applyAdjudications(tx, job.projectId, report)
+
     await markCoverage(tx, job.cycleRunId, job, {
       outcome: coverageOutcome,
       ran: outcome !== 'skipped',
@@ -218,6 +230,7 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
     outcome,
     jobState,
     findingsWritten: raw.length,
+    adjudicated,
     /** Reported but held for triage rather than published. */
     staged: consumed ? reported.length : 0,
     coverage: coverageOutcome,
@@ -281,3 +294,107 @@ const gateSummary = (report: RunReport): string | undefined => {
 
 const coverageReason = (report: RunReport, gateFailed: boolean): string | undefined =>
   gateFailed ? gateSummary(report) : (report.coverage.reason ?? report.detail)
+
+
+/**
+ * What happened to one verdict. Refusals are returned rather than thrown: a single bad
+ * adjudication must not discard a night's real work, and "triage tried to close
+ * something that does not exist" is a fact about triage worth surfacing.
+ */
+export type AdjudicationOutcome = {
+  fingerprint: string
+  verdict: string
+  applied: boolean
+  /** Present when `applied` is false. */
+  refused?: string
+}
+
+/**
+ * Statuses a verdict may move a finding *to*.
+ *
+ * `wontfix` is not reachable from here and must not become so. It means a person looked
+ * at a real problem and accepted it, and nothing that runs unattended at 3am should be
+ * able to write that down on their behalf.
+ */
+const VERDICT_STATUS: Record<string, string> = {
+  'still-applies': 'open',
+  fixed: 'fixed',
+  'no-longer-applicable': 'obsolete',
+  'duplicate-of': 'duplicate',
+}
+
+async function applyAdjudications(
+  tx: Db,
+  projectId: string,
+  report: RunReport,
+): Promise<AdjudicationOutcome[]> {
+  const verdicts = report.findings?.adjudications ?? []
+  if (verdicts.length === 0) return []
+
+  const known = await tx
+    .select({ fingerprint: findings.fingerprint, status: findings.status })
+    .from(findings)
+    .where(eq(findings.projectId, projectId))
+  const statusOf = new Map(known.map((f) => [f.fingerprint, f.status]))
+
+  const out: AdjudicationOutcome[] = []
+  for (const a of verdicts) {
+    const refuse = (why: string): void => {
+      out.push({ fingerprint: a.fingerprint, verdict: a.verdict, applied: false, refused: why })
+    }
+
+    const current = statusOf.get(a.fingerprint)
+    if (current === undefined) {
+      // The adjudicator was handed this inbox; naming something absent from it means it
+      // invented the fingerprint, which is the same class of error as a hallucinated
+      // citation and gets the same treatment.
+      refuse('no such finding in this project')
+      continue
+    }
+
+    /**
+     * A `wontfix` is a decision a person made. Re-opening it, closing it, or merging it
+     * away are all forms of overruling them, and the skills already say to treat it like
+     * an ADR. Enforced here rather than only in prose.
+     */
+    if (current === 'wontfix') {
+      refuse('wontfix is a human decision and is not adjudicable')
+      continue
+    }
+
+    if (a.verdict === 'duplicate-of') {
+      if (a.duplicateOf === a.fingerprint) {
+        refuse('a finding cannot be a duplicate of itself')
+        continue
+      }
+      const target = statusOf.get(a.duplicateOf)
+      if (target === undefined) {
+        refuse(`merge target ${a.duplicateOf} is not a finding in this project`)
+        continue
+      }
+      // Otherwise a chain of merges can end nowhere, and the row a reader is sent to is
+      // itself pointing somewhere else.
+      if (target === 'duplicate') {
+        refuse(`merge target ${a.duplicateOf} is itself a duplicate`)
+        continue
+      }
+    }
+
+    await tx
+      .update(findings)
+      .set({
+        status: VERDICT_STATUS[a.verdict]!,
+        statusReason: `${a.verdict}: ${a.reason}`,
+        statusRun: report.runId,
+        ...(a.verdict === 'duplicate-of' ? { duplicateOf: a.duplicateOf } : {}),
+        updatedAt: new Date(),
+      })
+      .where(and(eq(findings.projectId, projectId), eq(findings.fingerprint, a.fingerprint)))
+
+    // Keep the local view current, so two verdicts in one document that disagree about
+    // the same finding cannot both look valid.
+    statusOf.set(a.fingerprint, VERDICT_STATUS[a.verdict]!)
+    out.push({ fingerprint: a.fingerprint, verdict: a.verdict, applied: true })
+  }
+  return out
+}

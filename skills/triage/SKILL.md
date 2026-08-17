@@ -46,13 +46,20 @@ not equipped for it in one pass over three reviewers' leftovers.
 `references/triaging.md` owns the merge rules, the severity ladder, and publication.
 Follow it. This file owns only the mission:
 
-**Produce the smallest set of findings that loses nothing.**
+**Produce the smallest set of findings that loses nothing**, and **keep the inbox true
+about the code as it is now.**
+
+The second half is easy to skip and it is the one that decays. Reviewers only report what
+they found tonight; nothing else in the system ever goes back and asks whether a finding
+from three weeks ago is still real. You are the only node that reads both the inbox and
+the repository, so if you do not adjudicate, findings stay `open` forever and the list
+slowly stops describing anything.
 
 Every finding you publish costs a person attention. Every one you drop that was real
 costs them a bug. Triage is the trade between those two, made deliberately once, rather
 than made accidentally by whoever reads the inbox on Monday.
 
-Three failure modes, in order of how often they happen:
+Four failure modes, in order of how often they happen:
 
 1. **Passing everything through.** If your output is the concatenation of your inputs,
    you did nothing. There was no reason to run.
@@ -60,12 +67,21 @@ Three failure modes, in order of how often they happen:
    duplicates. Two findings on the same *invariant* are.
 3. **Dropping the inconvenient one.** The finding that is hardest to summarise is
    disproportionately often the real one.
+4. **Publishing tonight's work and leaving the rest untouched.** The inbox is not only
+   what arrived this run. Findings that nobody re-reported are still your responsibility,
+   and a fixed one left `open` costs a reader exactly as much attention as a new one.
 
 ## What you must not do
 
 - **Do not invent findings.** Every finding you publish traces to at least one staged
   finding. If you noticed something new while reading the code, that is a note, not a
   finding.
+- **Do not close what you have not read.** An adjudication is a claim about the code, and
+  `fixed` has to cite the code that fixes it. Marking something fixed because it looks
+  stale is worse than leaving it open: the reader loses the finding *and* gains a false
+  record that it was dealt with.
+- **Do not touch a `wontfix`.** Somebody decided to accept that risk. It is refused if you
+  try.
 - **Do not re-review.** You are not checking whether the reviewers were right about the
   code being wrong — only whether their evidence supports what they claimed. A finding
   with no evidence is dropped, not investigated.

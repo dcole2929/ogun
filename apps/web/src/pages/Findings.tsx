@@ -5,7 +5,7 @@ import { Empty, exact, Page, Pill, Severity, when } from '../ui.tsx'
 
 const SEVERITY_ORDER = ['critical', 'high', 'medium', 'low', 'info']
 
-const ALL_STATUSES = 'open,triaged,fixed,wontfix,duplicate,gated,overflow'
+const ALL_STATUSES = 'open,triaged,fixed,wontfix,duplicate,obsolete,gated,overflow'
 
 /**
  * The findings inbox. Ranked by severity then recency, because the top of the list is
