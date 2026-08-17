@@ -878,7 +878,26 @@ Seven things that flow is deliberate about:
 
 1. **The trigger only says "fire."** Croner knows a cadence and nothing else. All
    resolution — which cycle, which workers, what depends on what — is Foreman's, read
-   fresh from `.ogun/` at fire time so a config edit needs no restart.
+   fresh at fire time so a config edit needs no restart.
+
+   **From the database, not from `.ogun/`.** [corrected] This said "read fresh from
+   `.ogun/`", and it was never true: Foreman reads the `cycles` row, and nothing under
+   `foreman/` opens a YAML file. It cannot — §4.5 forbids an absolute path in the
+   database, so the control plane only learns where a repo sits from a machine-local
+   file, and a hosted control plane has no checkout at all. The database is the only
+   thing Foreman can always reach.
+
+   What that costs is a publish step, and it is load-bearing: **`.ogun/config.yaml` is
+   the definition, but the database is what runs.** The UI closes the gap itself — an
+   edit writes the file and re-indexes in the same request — so the gap only opens when
+   the file changes by some other route: a hand-edit, or a `git pull` that brings in
+   someone else's. Then `ogun project sync` is what publishes it, and until it runs the
+   factory is still executing the previous definition with nothing saying so. The
+   triage fan-in shipped and sat inert for fourteen hours exactly this way.
+
+   The server holds the file's content hash already — it is how the UI's compare-and-swap
+   works — so detecting the drift is cheap and it should say so rather than leave it to
+   be noticed. **[open]**
 2. **The job carries its own prompt.** Not a reference the runner has to expand — the
    literal text handed to the agent, often as short as *"Use the
    staging-error-reviews skill."* Layered like all config: the worker supplies a
