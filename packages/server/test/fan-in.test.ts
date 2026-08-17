@@ -177,7 +177,110 @@ describe('triage fan-in', () => {
       'membership in a fan-in cycle is what stages a run, not a property of the worker',
     )
   })
+
+  /** Finish a node as a crash rather than a review — the case the edge policy is for. */
+  const crash = async (cycleRunId: string, nodeKey: string, detail: string) => {
+    const [job] = await db
+      .select()
+      .from(schema.jobs)
+      .where(and(eq(schema.jobs.cycleRunId, cycleRunId), eq(schema.jobs.nodeKey, nodeKey)))
+    const [run] = await db
+      .insert(schema.runs)
+      .values({ jobId: job!.id, runnerName: 'test' })
+      .returning()
+    await finalizeRun(db, {
+      runId: run!.id,
+      outcome: 'error',
+      detail,
+      gates: [],
+      coverage: { outcome: 'errored', reason: detail },
+      artifacts: [],
+    })
+    await releaseDependents(db, cycleRunId)
+    return { job: job!, run: run! }
+  }
+
+  const jobState = async (cycleRunId: string, nodeKey: string): Promise<string> => {
+    const [job] = await db
+      .select()
+      .from(schema.jobs)
+      .where(and(eq(schema.jobs.cycleRunId, cycleRunId), eq(schema.jobs.nodeKey, nodeKey)))
+    return job!.state
+  }
+
+  /**
+   * `degrade` is the whole reason the nightly cycle is written the way it is: one
+   * crashed reviewer must not bury the other's findings. It ran in production before it
+   * ran in a test, which is the wrong order for the branch that decides whether a
+   * night's work reaches anybody.
+   */
+  test('degrade: a failed dependency still releases triage, and says so', async () => {
+    const { cycleRunId } = await startCycleRun(db, { cycleId, trigger: 'test' })
+    await finish(cycleRunId, 'reviewer-a', [finding('auth/session/fixation/reuse', 'src/auth.ts')])
+    await crash(cycleRunId, 'reviewer-b', 'codex exited 1: model not supported')
+
+    assert.equal(
+      await jobState(cycleRunId, 'triage'),
+      'queued',
+      'triage must run on a partial night rather than be buried with the crash',
+    )
+
+    const [triageJob] = await db
+      .select()
+      .from(schema.jobs)
+      .where(and(eq(schema.jobs.cycleRunId, cycleRunId), eq(schema.jobs.nodeKey, 'triage')))
+    const body = (await (await h.fetch(`/api/jobs/${triageJob!.id}/inputs`)).json()) as {
+      degraded: boolean
+      sources: { worker: string; ran: boolean; outcome: string; detail: string | null }[]
+    }
+
+    assert.equal(body.degraded, true, 'a night missing a reviewer is not a clean night')
+    const dead = body.sources.find((s) => s.worker === 'reviewer-b')
+    assert.equal(dead?.ran, false, 'a crash is not a result')
+    assert.match(dead?.detail ?? '', /model not supported/, 'triage names what did not run')
+
+    // The surviving reviewer's work is intact and still staged, not published raw.
+    const survivor = body.sources.find((s) => s.worker === 'reviewer-a')
+    assert.equal(survivor?.outcome, 'approved')
+  })
+
+  /**
+   * `block` is the other half of the same switch, and it has to skip rather than hang:
+   * a dependent left `blocked` forever would keep the cycle run open and never reach a
+   * terminal state.
+   */
+  test('block: a failed dependency skips the dependent and records why', async () => {
+    const definition = expandCycle(
+      cycleConfigSchema.parse({
+        workers: ['reviewer-a'],
+        then: 'triage',
+        onDepFailure: 'block',
+      }),
+    )
+    const [strict] = await db
+      .insert(schema.cycles)
+      .values({ projectId, name: 'strict-nightly', definition })
+      .returning()
+
+    const { cycleRunId } = await startCycleRun(db, { cycleId: strict!.id, trigger: 'test' })
+    await crash(cycleRunId, 'reviewer-a', 'sandbox failed to provision')
+
+    assert.equal(await jobState(cycleRunId, 'triage'), 'skipped')
+
+    const [row] = await db
+      .select()
+      .from(schema.coverage)
+      .where(
+        and(
+          eq(schema.coverage.cycleRunId, cycleRunId),
+          eq(schema.coverage.workerId, workerIds.get('triage')!),
+        ),
+      )
+    assert.equal(row?.outcome, 'blocked', '"blocked" is narrower than "errored" — say which')
+    assert.match(row?.reason ?? '', /reviewer-a/, 'name the dependency that stopped it')
+  })
 })
+
 /**
  * History outlives the definitions that produced it (§4.4).
  *
