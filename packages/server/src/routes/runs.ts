@@ -98,12 +98,12 @@ runsRoutes.get('/', async (c) => {
     .select({
       run: runs,
       job: { id: jobs.id, nodeKey: jobs.nodeKey, state: jobs.state, cycleRunId: jobs.cycleRunId },
-      worker: { id: workers.id, name: workers.name },
+      worker: { id: workers.id, name: jobs.workerName },
       project: { slug: projects.slug },
     })
     .from(runs)
     .innerJoin(jobs, eq(jobs.id, runs.jobId))
-    .innerJoin(workers, eq(workers.id, jobs.workerId))
+    .leftJoin(workers, eq(workers.id, jobs.workerId))
     .innerJoin(projects, eq(projects.id, jobs.projectId))
     .orderBy(desc(runs.startedAt))
     .limit(Number(c.req.query('limit') ?? 50))
@@ -117,11 +117,11 @@ runsRoutes.get('/', async (c) => {
     .select({
       job: { id: jobs.id, nodeKey: jobs.nodeKey, state: jobs.state, createdAt: jobs.createdAt },
       requires: jobs.requires,
-      worker: { id: workers.id, name: workers.name },
+      worker: { id: workers.id, name: jobs.workerName },
       project: { slug: projects.slug },
     })
     .from(jobs)
-    .innerJoin(workers, eq(workers.id, jobs.workerId))
+    .leftJoin(workers, eq(workers.id, jobs.workerId))
     .innerJoin(projects, eq(projects.id, jobs.projectId))
     .where(inArray(jobs.state, ['queued', 'blocked']))
     .orderBy(desc(jobs.createdAt))
@@ -164,12 +164,12 @@ runsRoutes.get('/:id', async (c) => {
     .select({
       run: runs,
       job: jobs,
-      worker: { id: workers.id, name: workers.name, permissions: workers.permissions },
+      worker: { id: workers.id, name: jobs.workerName, permissions: workers.permissions },
       project: { slug: projects.slug },
     })
     .from(runs)
     .innerJoin(jobs, eq(jobs.id, runs.jobId))
-    .innerJoin(workers, eq(workers.id, jobs.workerId))
+    .leftJoin(workers, eq(workers.id, jobs.workerId))
     .innerJoin(projects, eq(projects.id, jobs.projectId))
     .where(eq(runs.id, id))
   if (!row) return c.json({ error: 'no such run' }, 404)
