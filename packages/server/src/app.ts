@@ -6,6 +6,7 @@ import { existsSync } from 'node:fs'
 import type { AppContext, Env } from './context.ts'
 import { deleteCookie, setCookie } from 'hono/cookie'
 import { requireScope, scopeForPath, SESSION_COOKIE } from './auth.ts'
+import { ConfigInvalid } from './reindex.ts'
 import { jobsRoutes } from './routes/jobs.ts'
 import { runsRoutes } from './routes/runs.ts'
 import { projectsRoutes } from './routes/projects.ts'
@@ -73,7 +74,15 @@ export function createApp(ctx: AppContext, token?: string) {
 
   app.onError((err, c) => {
     console.error('[api]', err)
-    const status = err instanceof SyntaxError ? 400 : 500
+    /**
+     * 400 only for an error whose type says a person's input caused it. Deliberately not
+     * inferred from a `status` property, and deliberately not from `ZodError`: the same
+     * schemas parse rows read back out of the database — `startCycleRun` parses the
+     * definition stored on a cycle — and a failure there is this control plane's problem,
+     * not the caller's. Calling it a bad request sends someone to go and edit a file that
+     * is fine.
+     */
+    const status = err instanceof SyntaxError || err instanceof ConfigInvalid ? 400 : 500
     return c.json({ error: err.message }, status)
   })
 

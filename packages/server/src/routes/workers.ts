@@ -18,7 +18,7 @@ import {
   workerToYamlBlock,
   workerToYamlNode,
 } from '../config-store.ts'
-import { reindexProject } from '../reindex.ts'
+import { ConfigInvalid, reindexProject } from '../reindex.ts'
 import { parseSchedule } from '../foreman/scheduler.ts'
 
 const { breakers, cycles, projects, schedules, skills, workers } = schema
@@ -389,7 +389,7 @@ const stripUndefined = (o: Record<string, unknown>): Record<string, unknown> =>
  * plane on a VPS has no local copy of your repo. Hand back the yaml block so the edit is
  * still possible by hand, rather than failing with nothing to act on.
  */
-type Failure = { body: Record<string, unknown>; status: 409 | 500 }
+type Failure = { body: Record<string, unknown>; status: 400 | 409 | 500 }
 
 function handle(err: unknown, slug: string, name: string, fields: WorkerConfig): Failure {
   if (err instanceof ConfigUnreachable) {
@@ -403,5 +403,13 @@ function handle(err: unknown, slug: string, name: string, fields: WorkerConfig):
     }
   }
   if (err instanceof ConfigConflict) return { status: 409, body: { error: err.message } }
+  /**
+   * A worker edit can leave the file's `cycles:` block inconsistent — creating a worker
+   * whose name a cycle already has, or deleting the last worker a cycle names. That is
+   * the editor's mistake and the message names what to rename or remove, so it has to
+   * reach the page rather than becoming a 500 with the sentence buried in it. This route
+   * catches its own errors, so `app.onError` never sees them.
+   */
+  if (err instanceof ConfigInvalid) return { status: err.status, body: { error: err.message } }
   return { status: 500, body: { error: err instanceof Error ? err.message : String(err) } }
 }
