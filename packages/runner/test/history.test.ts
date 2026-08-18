@@ -1,5 +1,5 @@
 import { strict as assert } from 'node:assert'
-import { mkdtemp, readFile, readdir } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, readdir, stat, symlink, writeFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -110,4 +110,51 @@ test('a fingerprint that is not a fingerprint never becomes a path', async () =>
     findings: unknown[]
   }
   assert.equal(parsed.findings.length, 2)
+})
+
+const modeOf = async (path: string): Promise<string> => ((await stat(path)).mode & 0o777).toString(8)
+
+/**
+ * The inbox is a list of problems nobody has fixed yet, laid out on the host before the
+ * sandbox exists. `writeFile`'s `mode` reaches `open(2)` and is honoured only when it
+ * creates the file, so one of these paths already present in the clone — a repository
+ * that tracks `.ogun-in/` — kept git's 0644 and published the inbox to every other user
+ * on the runner.
+ */
+test('an inbox file the clone already carried is rewritten owner-only', async () => {
+  const ws = await workspace()
+  await mkdir(join(ws, HISTORY_DIR, 'a', 'b', 'c'), { recursive: true })
+  const body = join(ws, HISTORY_DIR, 'a', 'b', 'c', 'd.md')
+  const index = join(ws, HISTORY_INDEX_PATH)
+  for (const path of [body, index]) {
+    await writeFile(path, 'from the repository\n')
+    await chmod(path, 0o644)
+  }
+
+  await writeHistory(ws, { index: [entry('a/b/c/d')], details: { 'a/b/c/d': 'the argument' } })
+
+  assert.equal(await modeOf(index), '600', 'the index kept the mode it was cloned with')
+  assert.equal(await modeOf(body), '600', 'the write-up kept the mode it was cloned with')
+  assert.match(await readFile(body, 'utf8'), /the argument/)
+})
+
+/**
+ * Reading back out of a workspace already refuses to follow a symlink (§5.3), because a
+ * path inside the workspace is resolved by the *runner*, on the *host*. Writing into one
+ * did not: a repository that tracks `.ogun-in/history.json` as a link to a host file had
+ * that file overwritten by the runner, with the runner's privileges, before anything was
+ * sandboxed.
+ */
+test('a symlink in the clone does not redirect the write onto a host file', async () => {
+  const ws = await workspace()
+  const outside = join(await mkdtemp(join(tmpdir(), 'ogun-host-')), 'config.json')
+  await writeFile(outside, 'the machine credential\n')
+  await mkdir(join(ws, '.ogun-in'), { recursive: true })
+  await symlink(outside, join(ws, HISTORY_INDEX_PATH))
+
+  await writeHistory(ws, history)
+
+  assert.equal(await readFile(outside, 'utf8'), 'the machine credential\n')
+  // The run still gets its inbox — the link is replaced, not honoured and not refused.
+  assert.match(await readFile(join(ws, HISTORY_INDEX_PATH), 'utf8'), /parallel-redemption/)
 })

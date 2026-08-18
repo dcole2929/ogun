@@ -3,7 +3,7 @@ import { chmod, lstat, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'n
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { loadLocalConfig, updateLocalConfig } from '../src/config/machine.ts'
+import { loadLocalConfig, updateLocalConfig, writeSecretFile } from '../src/config/machine.ts'
 
 /**
  * Paths in this file are hand-edited, so `~` has to work. It stopped being expanded when
@@ -98,5 +98,41 @@ test('a symlinked config.json is written through, not replaced', async (t) => {
 
   assert.ok((await lstat(link)).isSymbolicLink())
   assert.match(await readFile(path, 'utf8'), /ogun_admin_secret/)
+  assert.equal(await modeOf(path), '600')
+})
+
+/**
+ * `writeSecretFile` is the same rule for the files a run writes — a findings document, a
+ * workspace inbox — where the path can already exist and the mode passed to `writeFile`
+ * was therefore doing nothing.
+ */
+test('a secret file replaces the mode of whatever was at the path', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'ogun-secret-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const path = join(dir, 'findings.json')
+  await writeFile(path, 'someone else wrote this first\n')
+  await chmod(path, 0o644)
+
+  await writeSecretFile(path, 'the secret\n')
+
+  assert.equal(await modeOf(path), '600')
+  assert.equal(await readFile(path, 'utf8'), 'the secret\n')
+})
+
+test('a secret file is never written through a symlink', async (t) => {
+  // The opposite of config.json, deliberately: a link at one of these paths came from a
+  // repository the runner cloned, not from a person, and following it would let that
+  // repository choose a host file for the runner to overwrite (§5.3).
+  const dir = await mkdtemp(join(tmpdir(), 'ogun-secret-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const outside = join(dir, 'host-file')
+  await writeFile(outside, 'not yours\n')
+  const path = join(dir, 'findings.json')
+  await symlink(outside, path)
+
+  await writeSecretFile(path, 'the secret\n')
+
+  assert.equal(await readFile(outside, 'utf8'), 'not yours\n')
+  assert.ok(!(await lstat(path)).isSymbolicLink(), 'the link should have been replaced')
   assert.equal(await modeOf(path), '600')
 })
