@@ -338,6 +338,73 @@ describe('triage fan-in', () => {
     )
     assert.equal(batch.find((n) => n.worker.name === 'triage')?.notes, account)
   })
+
+  /**
+   * The guard that decides staging reads the run's frozen definition, and it used to
+   * answer "I cannot read this" with the same value as "nothing depends on this node" —
+   * which is publish. A reviewer feeding triage would then put its raw findings in the
+   * inbox next to the consolidated ones, the one outcome the fan-in exists to prevent,
+   * and nothing anywhere would say so.
+   *
+   * Defence in depth rather than a live bug: #38 made every write path parse with
+   * `runnableCycleSchema`, so an unparseable definition should be unreachable through the
+   * API. The bad state is therefore built directly — a row written before that check
+   * existed, or edited by hand, is what this stands guard over. Last in the file because
+   * it deliberately leaves a corrupt cycle run behind.
+   */
+  test('a graph that cannot be read withholds rather than publishes, and says so', async () => {
+    const { cycleRunId } = await startCycleRun(db, { cycleId, trigger: 'test' })
+    await db
+      .update(schema.cycleRuns)
+      .set({ definition: { nodes: 'not a graph' } })
+      .where(eq(schema.cycleRuns.id, cycleRunId))
+
+    const fingerprint = 'graph/unreadable/publishes-raw'
+    /**
+     * The call itself still throws: `releaseDependents` walks the same definition with a
+     * strict parse once the transaction has committed. That is cycles.ts's answer to the
+     * same corruption and it is not this guard's to change — what is under test is what
+     * the transaction wrote before it.
+     */
+    await assert.rejects(
+      finish(cycleRunId, 'reviewer-a', [finding(fingerprint, 'src/a.ts')]),
+      'an unreadable graph is not something to be quiet about',
+    )
+
+    const published = await db
+      .select()
+      .from(schema.findings)
+      .where(
+        and(eq(schema.findings.projectId, projectId), eq(schema.findings.fingerprint, fingerprint)),
+      )
+    assert.equal(published.length, 0, 'a guard that cannot tell must not publish')
+
+    const [job] = await db
+      .select()
+      .from(schema.jobs)
+      .where(and(eq(schema.jobs.cycleRunId, cycleRunId), eq(schema.jobs.nodeKey, 'reviewer-a')))
+    const [run] = await db.select().from(schema.runs).where(eq(schema.runs.jobId, job!.id))
+    const staged = await db
+      .select()
+      .from(schema.stagedFindings)
+      .where(eq(schema.stagedFindings.runId, run!.id))
+    assert.equal(staged.length, 1, 'withholding is only recoverable because it is still staged')
+    assert.equal(run!.outcome, 'approved', 'the reviewer did its job; the graph is what is broken')
+
+    const [row] = await db
+      .select()
+      .from(schema.coverage)
+      .where(
+        and(eq(schema.coverage.cycleRunId, cycleRunId), eq(schema.coverage.workerName, 'reviewer-a')),
+      )
+    assert.equal(row?.outcome, 'found', '"errored" already means the reviewer produced nothing')
+    assert.equal(row?.findingCount, 1, 'the ledger records what was reported, not what was published')
+    assert.match(
+      row?.reason ?? '',
+      /does not parse/,
+      'a night withheld because nobody could read the graph must not read as a normal fan-in',
+    )
+  })
 })
 
 /**
