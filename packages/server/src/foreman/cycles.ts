@@ -53,6 +53,13 @@ export async function startCycleRun(
     const jobIds: string[] = []
     for (const node of definition.nodes) {
       const worker = byName.get(node.worker)
+      /**
+       * `reindexProject` refuses a definition naming a worker the file does not define,
+       * so by the time a cycle is stored this cannot be a typo anyone can go and fix.
+       * Reaching it means a graph written before that check existed, or a worker row that
+       * went missing some other way — a fault of ours, and it stays a 500. Kept because
+       * the alternative is a run whose jobs reference nothing.
+       */
       if (!worker) throw new Error(`cycle references unknown worker: ${node.worker}`)
 
       const dependsOn = definition.edges.filter((e) => e.to === node.key).map((e) => e.from)

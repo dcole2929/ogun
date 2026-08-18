@@ -177,18 +177,6 @@ projectsRoutes.post('/:slug/sync-local', async (c) => {
   const cycles = Object.fromEntries(
     Object.entries(loaded.config.cycles).map(([name, cycle]) => [name, expandCycle(cycle)]),
   )
-  // The same guard the CLI applies: a typo in `then:` is otherwise a cycle that runs its
-  // reviewers and then waits forever on a node no worker sits behind.
-  for (const [name, definition] of Object.entries(cycles)) {
-    for (const node of definition.nodes) {
-      if (!loaded.config.workers[node.worker]) {
-        return c.json(
-          { error: `cycle "${name}" refers to worker "${node.worker}", which is not defined` },
-          400,
-        )
-      }
-    }
-  }
 
   const discovered = await discoverSkills(root, [builtinSkillsRoot()])
   const result = await applySync(db, {

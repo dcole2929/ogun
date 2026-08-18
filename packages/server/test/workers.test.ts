@@ -416,7 +416,10 @@ cycles:
       },
       'c2',
     )
-    assert.equal(res.ok, false, 'a loop was accepted and stored')
+    // 400, not 500: the graph is wrong because of what someone typed, and the message
+    // names the loop to go and cut. Reported as an internal error, it reads as "the
+    // control plane is broken" and the one useful sentence looks like a stack trace.
+    assert.equal(res.status, 400, 'a config someone mistyped was reported as a server fault')
     assert.match(
       ((await res.json()) as { error?: string }).error ?? '',
       /cycle "knotted" could never finish — a loop, so nothing in it can ever start: reviewer-a → reviewer-b → reviewer-a/,
@@ -440,10 +443,70 @@ cycles:
       },
       'c3',
     )
-    assert.equal(res.ok, false, 'an edge to a node that does not exist was accepted')
+    assert.equal(res.status, 400, 'a config someone mistyped was reported as a server fault')
     assert.match(
       ((await res.json()) as { error?: string }).error ?? '',
       /no node has the key "triaje"/,
+    )
+  })
+
+  /**
+   * The CLI has always refused this before posting, but nothing on the server did, so a
+   * payload from an older CLI or from the UI's own sync was stored and only failed when
+   * someone pressed run — `startCycleRun` throwing `cycle references unknown worker`,
+   * hours later and nowhere near the file that says it.
+   */
+  test('a cycle naming a worker that does not exist is refused at sync, not at trigger', async () => {
+    const res = await sync(
+      {
+        typo: {
+          nodes: [
+            { key: 'reviewer-a', worker: 'reviewer-a' },
+            { key: 'triage', worker: 'triaje' },
+          ],
+          edges: [{ from: 'reviewer-a', to: 'triage', onDepFailure: 'block' }],
+          onMissed: 'skip',
+          enabled: true,
+        },
+      },
+      'c4',
+    )
+    assert.equal(res.status, 400, 'a cycle pointing at a worker that does not exist was stored')
+    assert.match(
+      ((await res.json()) as { error?: string }).error ?? '',
+      /cycle "typo" refers to worker "triaje", which is not defined/,
+    )
+
+    const after = await cyclesNow()
+    assert.ok(!after.some((c) => c.name === 'typo'), 'the broken cycle was stored anyway')
+    assert.equal(after.find((c) => c.name === 'nightly')?.cron, '0 3 * * *', 'the sync half-applied')
+  })
+
+  /**
+   * The same refusal reached through the Workers page, which catches its own errors
+   * rather than falling through to `app.onError` — the two have to agree, or the fix
+   * holds for `ogun project sync` and not for the UI that writes the same file.
+   */
+  test('a worker whose name a cycle already has is a 400 from the workers route', async () => {
+    const res = await h.fetch('/api/workers', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ projectSlug: slug, name: 'nightly', skill: 'review' }),
+    })
+    assert.equal(res.status, 400, 'a name collision in the file was reported as a server fault')
+    assert.match(
+      ((await res.json()) as { error?: string }).error ?? '',
+      /cycle "nightly" has the same name as a worker — rename one/,
+    )
+
+    // Refused before anything is written, so the collision does not also leave a worker
+    // row behind for a worker the page just told you it would not create.
+    const list = (await (await h.fetch(`/api/workers?project=${slug}`)).json()) as {
+      workers: Array<{ worker: { name: string } }>
+    }
+    assert.ok(
+      !list.workers.some((w) => w.worker.name === 'nightly'),
+      'the refused worker was inserted anyway',
     )
   })
 

@@ -13,6 +13,20 @@ import {
 
 const { cycles, jobs, projects, schedules, skills, workers } = schema
 
+/**
+ * A refusal caused by what somebody wrote, not by anything going wrong in here.
+ *
+ * The status travels on the error because only the thrower knows whose mistake it was.
+ * Every caller of `reindexProject` used to raise a plain `Error`, and `app.onError` maps
+ * anything it does not recognise to 500 — so a typo in `then:` came back to the person
+ * who made it as an internal server error, and the one sentence naming the line to fix
+ * arrived looking like a crash. Same shape as `JoinRefused` in routes/runners.ts and the
+ * `Config*` errors in config-store.ts.
+ */
+export class ConfigInvalid extends Error {
+  readonly status = 400
+}
+
 export type ReindexResult = {
   workers: Record<string, typeof workers.$inferSelect>
   removed: string[]
@@ -50,21 +64,45 @@ export async function reindexProject(
   const project = await db.query.projects.findFirst({ where: eq(projects.slug, slug) })
   if (!project) throw new Error(`no such project: ${slug}`)
 
+  const names = Object.keys(file.workers)
+
   /**
-   * A graph that could never finish is refused before a single row is written.
+   * Everything about `cycles:` that a person could have got wrong, checked before a
+   * single row is written.
    *
-   * `ogun project sync` will not load a config.yaml containing one, but the sync payload
-   * is parsed against a schema that checks a definition's shape and not what its graph
-   * does — so a definition arriving by any other route (an older CLI, a hand-made POST)
-   * was stored intact, and the first anyone heard of it was a 3am run in which every job
-   * sat `blocked`: a node is released only once its dependencies are terminal, and in a
-   * loop none of them ever is. Nothing errors and nothing times out. This function is
-   * where both write paths meet, which makes it the last place able to say so.
+   * `ogun project sync` will not load a config.yaml containing any of it, but the sync
+   * payload is parsed against a schema that checks a definition's shape and not what its
+   * graph does — so a definition arriving by any other route (an older CLI, the UI's own
+   * sync, a hand-made POST) was stored intact. This function is where both write paths
+   * meet, which makes it the last place able to say so.
+   *
+   * The three failures, and what each one looks like if it gets through:
+   *
+   * - A graph that could never finish. The 3am run has every job sitting `blocked`: a
+   *   node is released only once its dependencies are terminal, and in a loop none of
+   *   them ever is. Nothing errors and nothing times out.
+   * - A cycle sharing a worker's name. The worker's one-node cycle and this one fight
+   *   over the same row, and whichever wrote last decides what "run nightly" means.
+   * - A node naming a worker that is not in the file. `startCycleRun` throws when
+   *   somebody presses run — hours later, and nowhere near the file that says it.
+   *
+   * Up front rather than where each is detected: `reindexProject` is not a transaction,
+   * so a refusal raised mid-way leaves the workers it had already inserted behind.
    */
   for (const [name, definition] of Object.entries(file.cycles ?? {})) {
+    if (names.includes(name)) {
+      throw new ConfigInvalid(`cycle "${name}" has the same name as a worker — rename one`)
+    }
     const problems = cycleGraphProblems(definition)
     if (problems.length > 0) {
-      throw new Error(`cycle "${name}" could never finish — ${problems.join('; ')}`)
+      throw new ConfigInvalid(`cycle "${name}" could never finish — ${problems.join('; ')}`)
+    }
+    for (const node of definition.nodes) {
+      if (!(node.worker in file.workers)) {
+        throw new ConfigInvalid(
+          `cycle "${name}" refers to worker "${node.worker}", which is not defined`,
+        )
+      }
     }
   }
 
@@ -72,7 +110,6 @@ export async function reindexProject(
   const skillByName = new Map(known.map((s) => [s.name, s]))
 
   const out: Record<string, typeof workers.$inferSelect> = {}
-  const names = Object.keys(file.workers)
 
   // Computed before the worker loop, because it decides whether each worker's standalone
   // schedule survives.
@@ -209,9 +246,8 @@ export async function reindexProject(
 /**
  * Named cycles, and the schedules that drive them.
  *
- * A cycle whose name collides with a worker's is rejected rather than merged: the
- * worker's one-node cycle and the named one would fight over the same row, and whichever
- * wrote last would decide what "run nightly" means.
+ * Everything a definition could be wrong about has already been refused above, before
+ * any worker was written — this only writes.
  */
 async function syncNamedCycles(
   db: Db,
@@ -220,9 +256,6 @@ async function syncNamedCycles(
   workerNames: string[],
 ): Promise<void> {
   for (const [name, definition] of Object.entries(defined)) {
-    if (workerNames.includes(name)) {
-      throw new Error(`cycle "${name}" has the same name as a worker — rename one`)
-    }
     const [cycle] = await db
       .insert(cycles)
       .values({ projectId, name, definition })
