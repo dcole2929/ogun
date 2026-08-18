@@ -6,6 +6,7 @@ import { promisify } from 'node:util'
 import {
   parseFingerprint,
   verifySchema,
+  writeSecretFile,
   type ClaimedJob,
   type GateResult,
   type RunEvent,
@@ -152,10 +153,9 @@ export async function executeJob(
     const upstream = await cp.inputs(job.jobId)
     if (upstream) {
       await mkdir(join(workspace.path, '.ogun-in'), { recursive: true })
-      await writeFile(
+      await writeSecretFile(
         join(workspace.path, INPUT_PATH),
         `${JSON.stringify(upstream, null, 2)}\n`,
-        { mode: 0o600 },
       )
     }
 
@@ -437,6 +437,9 @@ async function writeTranscript(
   // artifact and served over the API.
   const raw = await readContained(workspace, OUTPUT_PATH).catch(() => null)
   if (raw === null) return undefined
+  // `mode` on create is enough here, unlike the workspace writes: a run id is a fresh
+  // uuid per claim — a re-claim after a stale sweep mints another — so this directory is
+  // new every time and there is never a looser mode already on the path to inherit.
   await writeFile(ref, raw, { mode: 0o600 })
   return ref
 }
@@ -516,10 +519,9 @@ function usageFrom(event: RunEvent | undefined): RunReport['usage'] {
  */
 export async function writeHistory(workspace: string, history: FindingsHistory): Promise<void> {
   await mkdir(join(workspace, '.ogun-in'), { recursive: true })
-  await writeFile(
+  await writeSecretFile(
     join(workspace, HISTORY_INDEX_PATH),
     `${JSON.stringify({ findings: history.index }, null, 2)}\n`,
-    { mode: 0o600 },
   )
 
   for (const [fingerprint, body] of Object.entries(history.details)) {
@@ -530,6 +532,6 @@ export async function writeHistory(workspace: string, history: FindingsHistory):
     const header = entry
       ? `# ${entry.title}\n\n- fingerprint: \`${fingerprint}\`\n- status: ${entry.status}\n- severity: ${entry.severity}\n- seen: ${entry.seenCount} time(s), last ${entry.lastSeenAt}\n${entry.path ? `- path: ${entry.path}\n` : ''}\n`
       : `# ${fingerprint}\n\n`
-    await writeFile(file, `${header}${body}\n`, { mode: 0o600 })
+    await writeSecretFile(file, `${header}${body}\n`)
   }
 }

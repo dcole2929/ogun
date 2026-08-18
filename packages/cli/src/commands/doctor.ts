@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process'
 import { existsSync } from 'node:fs'
+import { stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
@@ -10,6 +11,36 @@ import { authHeaders } from '../auth.ts'
 const run = promisify(execFile)
 
 type Check = { name: string; ok: boolean; detail: string; fatal: boolean }
+
+/**
+ * Who else on this box can read the tokens.
+ *
+ * Writing config.json now always creates it fresh at 0600, but that only reaches a file
+ * something writes again. One left at 0644 by an older version, a backup, or a copy off
+ * another machine keeps its mode and its admin token indefinitely, and nothing anywhere
+ * says so — tightening on write is invisible to a file that is only ever read.
+ *
+ * A warning, not fatal: the runner can still claim jobs, and refusing to work over a
+ * permission bit would be a worse outcome than saying it out loud every time.
+ * Returns nothing when there is no config at all, which is an ordinary state for a
+ * machine that has never been set up.
+ */
+export async function configPermissions(path = localConfigPath()): Promise<Check | undefined> {
+  const mode = await stat(path).then(
+    (s) => s.mode & 0o777,
+    () => null,
+  )
+  if (mode === null) return undefined
+  const shared = (mode & 0o077) !== 0
+  return {
+    name: 'config permissions',
+    ok: !shared,
+    detail: shared
+      ? `${path} is 0${mode.toString(8)} — it holds this machine's tokens. \`chmod 600 ${path}\``
+      : `${path} is 0${mode.toString(8)}`,
+    fatal: false,
+  }
+}
 
 /**
  * `ogun runner doctor` — which runtimes and tools are present on *this* machine.
@@ -69,6 +100,11 @@ export async function doctor(serverUrl: string): Promise<void> {
       fatal: true,
     })
   }
+
+  // Independent of whether it parsed: a config too broken to load is still a file with a
+  // token in it and a mode.
+  const permissions = await configPermissions()
+  if (permissions) checks.push(permissions)
 
   const dockerOk = checks.find((c) => c.name === 'docker')?.ok === true
   if (dockerOk) {

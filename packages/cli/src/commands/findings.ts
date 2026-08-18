@@ -1,8 +1,9 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readFile } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 import {
   findingsDocumentSchema,
   parseFingerprint,
+  writeSecretFile,
   type FindingsDocument,
 } from '@ogun/core'
 import { bold, cyan, dim, fail, green, red, severityColor, table } from '../output.ts'
@@ -51,7 +52,7 @@ export async function findingsWrite(args: string[]): Promise<void> {
   }
 
   await mkdir(dirname(target), { recursive: true })
-  await writeFile(target, `${JSON.stringify(doc.data, null, 2)}\n`, { mode: 0o600 })
+  await writeSecretFile(target, `${JSON.stringify(doc.data, null, 2)}\n`)
   const n = doc.data.findings.length
   console.log(
     green(

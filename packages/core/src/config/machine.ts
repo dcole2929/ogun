@@ -103,8 +103,11 @@ export async function loadLocalConfig(path = localConfigPath()): Promise<LocalCo
   return expandPaths(parsed.data)
 }
 
-/** It holds the admin secret and this machine's runner credential (§4.5). */
-const CONFIG_MODE = 0o600
+/**
+ * Owner only. `config.json` holds the admin secret and this machine's runner credential
+ * (§4.5); the files `writeSecretFile` writes hold findings nobody has fixed yet.
+ */
+const SECRET_MODE = 0o600
 
 /**
  * Write into a fresh 0600 file and rename it over the old one, so the mode is a property
@@ -126,10 +129,10 @@ async function writeConfigFile(path: string, body: string): Promise<void> {
   const target = await realpath(path).catch(() => path)
   const tmp = `${target}.tmp-${process.pid}`
   try {
-    await writeFile(tmp, body, { mode: CONFIG_MODE })
+    await writeFile(tmp, body, { mode: SECRET_MODE })
     // The same create-only rule applies to the temp file: one left behind by a killed
     // process, with a recycled pid, is reused with whatever mode it already carried.
-    await chmod(tmp, CONFIG_MODE).catch((err: Error) => {
+    await chmod(tmp, SECRET_MODE).catch((err: Error) => {
       // Filesystems without POSIX modes — Windows, exFAT, some network mounts — reject
       // or ignore this. Say so rather than swallow it, but do not lose the credential
       // over a permission bit we cannot set.
@@ -140,6 +143,38 @@ async function writeConfigFile(path: string, body: string): Promise<void> {
     await rm(tmp, { force: true })
     throw err
   }
+}
+
+/**
+ * The same rule, for the files a *run* writes: a fresh 0600 file, replacing whatever the
+ * path held.
+ *
+ * `writeFile`'s `mode` reaches `open(2)` and is applied only on create, so passing it and
+ * calling the file protected was wrong everywhere the path could already exist. It could:
+ * the runner lays `.ogun-in/` out inside a clone of a repository that may itself track
+ * those paths, and an agent that hand-writes `.ogun-out/findings.json` before calling
+ * `ogun findings write` — which the prompt forbids, which is why it happens — leaves it
+ * at its own umask. What stayed world-readable is a list of vulnerabilities nobody has
+ * fixed yet, on a box with other users on it.
+ *
+ * Unlink and create, rather than the temp-file-and-rename `writeConfigFile` uses. The two
+ * want opposite things and that is the point of them being separate:
+ *
+ *  - Nothing may be written *through* a symlink here. These paths sit in a workspace, and
+ *    a path in a workspace is resolved by the runner on the host — the reason reads back
+ *    out of one already refuse to follow a link (§5.3). A tracked symlink at
+ *    `.ogun-in/history.json` redirected a host-side write, before the sandbox existed.
+ *    `config.json` wants the reverse: someone who put a link there meant it.
+ *  - Atomicity buys nothing. One writer, one reader, and the tree is deleted when the run
+ *    ends, so there is no concurrent reader to hand a half-written file to, and no
+ *    long-lived secret to strand at 0644 if the process dies mid-write.
+ *
+ * `wx` so that a path recreated between the unlink and the open — by whatever planted the
+ * link the unlink just removed — fails the run instead of being written through.
+ */
+export async function writeSecretFile(path: string, body: string): Promise<void> {
+  await rm(path, { force: true })
+  await writeFile(path, body, { mode: SECRET_MODE, flag: 'wx' })
 }
 
 /** Read-modify-write, preserving anything this version does not know about. */
