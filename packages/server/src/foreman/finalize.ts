@@ -72,11 +72,15 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
    * Decided from the graph rather than from a flag on the worker: the same reviewer can
    * be a standalone one-node cycle on Monday and feed triage on Tuesday, and it should
    * publish in the first case without being reconfigured.
+   *
+   * `destinationOf` withholds when it cannot read that graph, so the two things this
+   * branch must never confuse — "nothing depends on this node" and "I could not tell" —
+   * do not arrive here wearing the same value.
    */
-  const consumed = await hasDependents(db, job.cycleRunId, job.nodeKey)
+  const destination = await destinationOf(db, job.cycleRunId, job.nodeKey)
   let adjudicated: AdjudicationOutcome[] = []
   const reported = outcome === 'approved' ? (report.findings?.findings ?? []) : []
-  const raw = consumed ? [] : reported
+  const raw = destination.withheld ? [] : reported
 
   /**
    * The node's own account of the pass, kept whatever else this run did.
@@ -110,6 +114,18 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
           reported.length > 0
           ? 'found'
           : 'clean'
+
+  /**
+   * Why the ledger row reads the way it does — and, when the graph could not be read,
+   * that the empty inbox is this control plane's doing rather than triage's.
+   *
+   * Recorded here rather than returned to the caller, because the caller may never get an
+   * answer: `releaseDependents` walks the same definition with a strict parse a few lines
+   * below, so a run whose graph is unreadable throws *after* this transaction commits.
+   * The coverage row survives that, and is where a person goes to ask why a night looks
+   * empty anyway.
+   */
+  const reason = coverageReason(report, gateFailed, destination.blind)
 
   let already: FinalizeResult | undefined
 
@@ -226,7 +242,7 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
      * change the inbox, read off the graph rather than declared (§4.12). A reviewer
      * feeding triage stages its verdicts along with everything else and triage decides.
      */
-    adjudicated = consumed ? [] : await applyAdjudications(tx, job.projectId, report)
+    adjudicated = destination.withheld ? [] : await applyAdjudications(tx, job.projectId, report)
 
     await markCoverage(tx, job.cycleRunId, job, {
       outcome: coverageOutcome,
@@ -236,7 +252,7 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
       // found; the ledger should say so rather than showing zero because triage has not
       // run yet.
       findingCount: reported.length,
-      ...(coverageReason(report, gateFailed) ? { reason: coverageReason(report, gateFailed)! } : {}),
+      ...(reason ? { reason } : {}),
     })
 
     /**
@@ -286,7 +302,7 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
     findingsWritten: raw.length,
     adjudicated,
     /** Reported but held for triage rather than published. */
-    staged: consumed ? reported.length : 0,
+    staged: destination.withheld ? reported.length : 0,
     coverage: coverageOutcome,
   }
 }
@@ -359,6 +375,18 @@ const reopenReasonClause = sql`case
   else ${findings.statusReason}
 end`
 
+/** Where a run's findings go, and — when it is not the graph's doing — why. */
+type Destination = {
+  /** True when the findings are kept out of the inbox and left in staging. */
+  withheld: boolean
+  /**
+   * Set only when the withholding is this control plane's ignorance rather than the
+   * graph's instruction: nothing is known to be coming to consolidate what was staged,
+   * and the ledger has to say so rather than let the night read as a normal fan-in.
+   */
+  blind?: string
+}
+
 /**
  * Does anything downstream in this cycle run depend on this node? Read from the
  * definition rather than from the jobs, so it is true even before the dependent has been
@@ -370,14 +398,57 @@ end`
  * started as a staged input finishes as a direct publish — putting raw findings in the
  * inbox alongside whatever triage later consolidates, which is the exact outcome the
  * fan-in exists to prevent.
+ *
+ * Which is why not-knowing is answered with `withheld` and not with the default. This
+ * returned a bare boolean, and every way of failing to read the graph came back `false` —
+ * the same value a genuine standalone node gets, and `false` means publish. The guard was
+ * choosing the one outcome it exists to prevent, in precisely the case where it had least
+ * ground to. The two mistakes are not symmetric: withholding leaves the findings in
+ * staging, which §4.12 keeps so that nothing a run reported is ever lost, and they can be
+ * promoted once the graph is readable again; publishing puts raw findings in the inbox
+ * beside triage's consolidated ones with nothing to tell them apart, and no later run
+ * undoes that.
  */
-async function hasDependents(db: Db, cycleRunId: string, nodeKey: string): Promise<boolean> {
+async function destinationOf(db: Db, cycleRunId: string, nodeKey: string): Promise<Destination> {
   const cycleRun = await db.query.cycleRuns.findFirst({ where: eq(cycleRuns.id, cycleRunId) })
-  if (!cycleRun) return false
+  /**
+   * Not the same fact as an unreadable graph, and not answered as one.
+   *
+   * `jobs.cycle_run_id` is not null and cascades, so a job whose cycle run is gone cannot
+   * exist, and neither can that job's run — `finalizeRun` would have thrown `no such run`
+   * before reaching here. Missing therefore means the row went away between two reads in
+   * one call, and every write below is about to fail on that same foreign key regardless.
+   * So it joins the preconditions at the top of `finalizeRun` and names the invariant that
+   * broke, instead of being quietly reinterpreted as a statement about the graph.
+   */
+  if (!cycleRun) throw new Error(`job's cycle run is gone: ${cycleRunId}`)
 
   const definition = cycleDefinitionSchema.safeParse(cycleRun.definition)
-  if (!definition.success) return false
-  return nodesWithDependents(definition.data).has(nodeKey)
+  if (!definition.success) {
+    /**
+     * Withheld — and the run still succeeds, which is the deliberate half.
+     *
+     * Failing the run instead would file it as `errored`, and in the coverage ledger that
+     * already means "the reviewer produced nothing". This reviewer produced three
+     * findings and they are in staging; giving those two nights the same name is the
+     * collapse principle 6 exists to forbid, in the table whose entire job is keeping
+     * "didn't run", "ran and found nothing" and "found something that was filtered"
+     * apart. Failing would also discard the staged output and the run's note on the way
+     * past, and latch the failure breaker against a worker that did nothing wrong — three
+     * such nights and it stops being dispatched at all.
+     *
+     * So the run reports what it did, and the ledger carries the fault: `found`, with the
+     * count, plus a reason separating a night withheld *for* triage from a night withheld
+     * because nobody could read the graph. Never silent, and never published.
+     */
+    return {
+      withheld: true,
+      blind:
+        `withheld from the inbox: this run's frozen cycle definition does not parse, so ` +
+        `whether anything consumes ${nodeKey} could not be determined`,
+    }
+  }
+  return { withheld: nodesWithDependents(definition.data).has(nodeKey) }
 }
 
 const gateSummary = (report: RunReport): string | undefined => {
@@ -386,8 +457,19 @@ const gateSummary = (report: RunReport): string | undefined => {
   return failed.map((g) => `${g.name}: ${g.detail ?? 'failed'}`).join('; ')
 }
 
-const coverageReason = (report: RunReport, gateFailed: boolean): string | undefined =>
-  gateFailed ? gateSummary(report) : (report.coverage.reason ?? report.detail)
+/**
+ * `blind` is appended rather than substituted: both are true of the same row, and the
+ * run's own account of itself is the one a reader came for.
+ */
+const coverageReason = (
+  report: RunReport,
+  gateFailed: boolean,
+  blind?: string,
+): string | undefined => {
+  const own = gateFailed ? gateSummary(report) : (report.coverage.reason ?? report.detail)
+  const parts = [own, blind].filter((p): p is string => Boolean(p))
+  return parts.length > 0 ? parts.join('; ') : undefined
+}
 
 
 /**
