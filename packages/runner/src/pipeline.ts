@@ -15,6 +15,7 @@ import {
 } from '@ogun/core'
 import { ControlPlane, EventFlusher, type FindingsHistory } from './client.ts'
 import {
+  containedTarget,
   createSandbox,
   GUEST_WORKSPACE,
   readContained,
@@ -144,7 +145,8 @@ export async function executeJob(
     })
     cleanup = workspace.cleanup
 
-    await mkdir(join(workspace.path, '.ogun-out'), { recursive: true })
+    // `containedTarget` creates the parent, and refuses if the clone redirected it.
+    await containedTarget(workspace.path, OUTPUT_PATH)
     // Harness input and output, not changes the worker made.
     await excludeFromGit(workspace.path, ['/.ogun-out/', '/.ogun-in/'])
 
@@ -152,9 +154,8 @@ export async function executeJob(
     // rather than run against an empty one. The outer catch turns it into a failed run.
     const upstream = await cp.inputs(job.jobId)
     if (upstream) {
-      await mkdir(join(workspace.path, '.ogun-in'), { recursive: true })
       await writeSecretFile(
-        join(workspace.path, INPUT_PATH),
+        await containedTarget(workspace.path, INPUT_PATH),
         `${JSON.stringify(upstream, null, 2)}\n`,
       )
     }
@@ -518,16 +519,14 @@ function usageFrom(event: RunEvent | undefined): RunReport['usage'] {
  * is still a fact worth knowing about the surface.
  */
 export async function writeHistory(workspace: string, history: FindingsHistory): Promise<void> {
-  await mkdir(join(workspace, '.ogun-in'), { recursive: true })
   await writeSecretFile(
-    join(workspace, HISTORY_INDEX_PATH),
+    await containedTarget(workspace, HISTORY_INDEX_PATH),
     `${JSON.stringify({ findings: history.index }, null, 2)}\n`,
   )
 
   for (const [fingerprint, body] of Object.entries(history.details)) {
     if (!parseFingerprint(fingerprint).ok) continue
-    const file = join(workspace, HISTORY_DIR, `${fingerprint}.md`)
-    await mkdir(dirname(file), { recursive: true })
+    const file = await containedTarget(workspace, `${HISTORY_DIR}/${fingerprint}.md`)
     const entry = history.index.find((i) => i.fingerprint === fingerprint)
     const header = entry
       ? `# ${entry.title}\n\n- fingerprint: \`${fingerprint}\`\n- status: ${entry.status}\n- severity: ${entry.severity}\n- seen: ${entry.seenCount} time(s), last ${entry.lastSeenAt}\n${entry.path ? `- path: ${entry.path}\n` : ''}\n`

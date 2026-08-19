@@ -1,9 +1,16 @@
 import { strict as assert } from 'node:assert'
-import { mkdtemp, mkdir, symlink, writeFile } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import { mkdtemp, mkdir, readFile, realpath, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { test } from 'node:test'
-import { MAX_READBACK_BYTES, readContained, safeJoin, UnsafeReadback } from '../src/sandbox/paths.ts'
+import { before, describe, test } from 'node:test'
+import {
+  containedTarget,
+  MAX_READBACK_BYTES,
+  readContained,
+  safeJoin,
+  UnsafeReadback,
+} from '../src/sandbox/paths.ts'
 
 /**
  * Anything read back from a sandbox goes through this. A container that can write a
@@ -95,4 +102,67 @@ test('traversal and absolute paths are still refused at the read boundary', asyn
   const { workspace } = await fixture()
   await assert.rejects(() => readContained(workspace, '../secret.txt'), /parent traversal/)
   await assert.rejects(() => readContained(workspace, '/etc/passwd'), /absolute/)
+})
+
+/**
+ * Writes *into* a workspace, which had no containment at all until now.
+ *
+ * The asymmetry with reads is not symmetric in risk. `.ogun-in/` is laid out on the host
+ * *before the sandbox exists*, inside a checkout of a repository the runner does not
+ * trust — so a repo that ships `.ogun-in` as a symlink names a host file for the runner
+ * to overwrite with the runner's own privileges.
+ */
+describe('containedTarget', () => {
+  let root = ''
+  let outside = ''
+
+  before(async () => {
+    root = await mkdtemp(join(tmpdir(), 'ogun-write-'))
+    outside = join(root, 'outside')
+    await mkdir(join(root, 'ws'), { recursive: true })
+    await mkdir(outside, { recursive: true })
+  })
+
+  const ws = () => join(root, 'ws')
+
+  test('an ordinary path is created and returned inside the workspace', async () => {
+    const target = await containedTarget(ws(), '.ogun-in/history.json')
+    assert.equal(target, join(await realpath(ws()), '.ogun-in', 'history.json'))
+    await writeFile(target, 'ok')
+    assert.equal(await readFile(target, 'utf8'), 'ok')
+  })
+
+  /**
+   * The case `writeSecretFile` alone does not cover: it unlinks and creates the leaf, so
+   * a symlinked *file* is replaced rather than followed — but a symlinked *directory*
+   * moves the whole parent, and the leaf write then happens safely in the wrong place.
+   */
+  test('a symlinked parent directory does not redirect the write', async () => {
+    const link = join(ws(), '.ogun-redirected')
+    await symlink(outside, link)
+    await writeFile(join(outside, 'target.txt'), 'HOST SECRET')
+
+    await assert.rejects(
+      () => containedTarget(ws(), '.ogun-redirected/target.txt'),
+      /outside the workspace/,
+    )
+    assert.equal(
+      await readFile(join(outside, 'target.txt'), 'utf8'),
+      'HOST SECRET',
+      'the host file was overwritten',
+    )
+  })
+
+  /** Checked before `mkdir`, or a link to a missing directory is used to create one. */
+  test('a link pointing at a directory that does not exist creates nothing', async () => {
+    const missing = join(root, 'not-yet')
+    await symlink(missing, join(ws(), '.ogun-missing'))
+    await assert.rejects(() => containedTarget(ws(), '.ogun-missing/x.json'))
+    assert.equal(existsSync(missing), false, 'mkdir -p walked through the link')
+  })
+
+  test('absolute and traversing paths are refused before anything is touched', async () => {
+    await assert.rejects(() => containedTarget(ws(), '/etc/passwd'), /absolute/)
+    await assert.rejects(() => containedTarget(ws(), '../escape.json'), /traversal/)
+  })
 })
