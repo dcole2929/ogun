@@ -58,9 +58,17 @@ inbox stops being a list of things to do, and people stop reading it. **That is 
 failure this step exists to prevent, and it is terminal** — an inbox nobody trusts is
 worth less than no inbox.
 
-Go through the open findings in `.ogun-in/history.json` and, for each one you can reach
-a defensible verdict on, emit an adjudication. You do not have to judge all of them; a
-finding you did not get to simply stays as it was.
+**Go through the open findings in `.ogun-in/history.json` before you publish.** Not the
+ones tonight's reviewers happened to touch — all of them. For each, either emit a verdict
+or decide you cannot defend one; a finding you genuinely cannot judge stays as it was.
+
+What you must not do is skip the pass. It is easy to: the staged findings are in front of
+you, the inbox is not, and checking tonight's output against history (step 2) *feels* like
+having dealt with history. It is not the same act. Step 2 asks "is this new?"; this step
+asks "is that still true?", and nothing else in the system ever asks it.
+
+`ogun findings write` will tell you how many findings the inbox holds and how many you
+judged. If that says you judged none, you skipped this step — go back and do it.
 
 | verdict | when | requires |
 |---|---|---|
