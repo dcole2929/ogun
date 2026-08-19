@@ -22,7 +22,7 @@ import {
   type Sandbox,
 } from './sandbox/index.ts'
 import { nextSeq, newParserState, resolveModel, resolveRuntime } from './runtimes/index.ts'
-import { materializeWorkspace, resolveHeadSha, stageAll } from './workspace.ts'
+import { gitIn, materializeWorkspace, resolveHeadSha, stageAll } from './workspace.ts'
 import { runVerifyGate } from './verify.ts'
 import {
   defaultSearchPaths,
@@ -401,7 +401,7 @@ const imageFor = (job: ClaimedJob): string =>
     : (process.env.OGUN_BASE_IMAGE ?? 'ogun/base:latest')
 
 async function trackedPaths(workspace: string): Promise<Set<string>> {
-  const { stdout } = await run('git', ['-C', workspace, 'ls-files'], {
+  const stdout = await gitIn(workspace, ['ls-files'], {
     maxBuffer: 32 * 1024 * 1024,
   })
   return new Set(stdout.split('\n').filter(Boolean))
