@@ -52,8 +52,18 @@ export const COVERAGE_OUTCOMES = [
   // Ran.
   /** Reported findings. */
   'found',
-  /** Looked and reported nothing — a result, not an absence. */
+  /**
+   * Looked and produced nothing — a result, not an absence. A reviewer that reported no
+   * findings, or a modifier that read the code and concluded nothing needed changing.
+   */
   'clean',
+  /**
+   * A modifier ran and left a patch. Distinct from `found` because nothing was reported
+   * and the finding count is zero, and distinct from `clean` because there is work
+   * waiting to be published — collapsing either way makes "the night produced a change"
+   * unreadable from the ledger.
+   */
+  'changed',
   /** Produced output the verify gate rejected, so nothing was persisted. */
   'gate-failed',
   /** Started and failed. */

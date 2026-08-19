@@ -87,26 +87,27 @@ export async function stageAll(workspace: string): Promise<void> {
 }
 
 /**
- * Git configuration a workspace is not allowed to supply, for every git command the
+ * Git configuration the workspace is not allowed to supply, for every git command the
  * runner runs there **after** the container has exited.
  *
- * The workspace is mounted read-write with `.git` inside it, so by the time the agent is
- * done the repository's configuration and hooks are agent-authored — and git executes
- * both, on the host, as the runner, with the runner's control-plane token in its
- * environment. The container escapes nothing: it leaves a string behind and waits for the
- * host to run it, exactly the shape of the symlink readback §5.3 already guards.
+ * The workspace is mounted read-write and `.git` is inside it, so by the time the agent
+ * is done the repository's configuration and hooks are agent-authored — and git executes
+ * both. This is not theoretical and it is not limited to `commit`:
  *
- * Measured rather than assumed, with a canary file:
+ *   core.fsmonitor   an arbitrary command, run on every command that refreshes the
+ *                    index. Measured: it fires on `add`, `ls-files`, `status` and
+ *                    `diff` — which is to say on the calls this runner already made
+ *                    before any of this existed.
+ *   .git/hooks       pre-commit and friends, run by `commit`.
+ *   diff.external    an arbitrary command, run instead of the diff machinery.
  *
- *   core.fsmonitor   an arbitrary command, run whenever the index is refreshed — it
- *                    fires on `add`, `ls-files`, `status` and `diff`, which is to say on
- *                    the two calls the runner already made on every run of every profile
- *   .git/hooks       pre-commit and friends, run by `commit`
- *   diff.external    an arbitrary command, run instead of the diff machinery
+ * Each of those runs on the host, as the runner, with the runner's control-plane token
+ * in its environment. The container never escapes anything — it leaves a string behind
+ * and waits for the host to execute it, the same shape as the symlink readback in §5.3.
  *
- * `-c` beats repository configuration, so this neutralises them wherever git is invoked
- * from. Diff-producing commands additionally pass `--no-ext-diff --no-textconv`, since
- * `.gitattributes` can name a driver per path.
+ * `-c` beats repository configuration, so this neutralises them wherever the command is
+ * run from. Diff-producing commands additionally pass `--no-ext-diff --no-textconv`,
+ * since `.gitattributes` can name a driver per path.
  */
 export const GIT_HARDENING = [
   '-c',
@@ -118,11 +119,13 @@ export const GIT_HARDENING = [
 ]
 
 /**
- * And nothing from the *host's* git configuration either. One developer's global
- * `diff.noprefix` is enough to change what the runner reads out of a workspace, which
- * makes the result depend on whose machine it ran on. `GIT_TERMINAL_PROMPT=0` because a
- * workspace has no remote, and a git that decides to ask for a credential must fail
- * rather than hold a nightly run open until morning.
+ * And nothing from the *host's* git configuration either.
+ *
+ * A patch that differs depending on whose laptop the runner is on is not an artefact —
+ * one developer's global `diff.noprefix` or `format.signature` is enough to change what
+ * the publisher receives. `GIT_TERMINAL_PROMPT=0` because there is no remote in a
+ * workspace and a git that decides to ask for a credential must fail rather than hold a
+ * nightly run open until morning.
  */
 export const GIT_ENV = {
   ...process.env,
@@ -131,28 +134,42 @@ export const GIT_ENV = {
   GIT_TERMINAL_PROMPT: '0',
 }
 
-/** Every git call the runner makes inside a workspace goes through this. */
+/**
+ * Every git call the runner makes inside a workspace goes through this.
+ *
+ * `tolerateExit` is for the predicates — `diff --quiet` and `merge-base --is-ancestor`
+ * report their answer as an exit code, and treating that as a failure would turn "there
+ * are changes" into a thrown error.
+ */
 export async function gitIn(
   workspace: string,
   args: string[],
-  opts: { maxBuffer?: number } = {},
-): Promise<string> {
-  const diffLike = args[0] === 'diff' || args[0] === 'show' || args[0] === 'log'
-  const { stdout } = await run(
-    'git',
-    [
-      '-C',
-      workspace,
-      ...GIT_HARDENING,
-      ...args.slice(0, 1),
-      ...(diffLike ? ['--no-ext-diff', '--no-textconv'] : []),
-      ...args.slice(1),
-    ],
-    { env: GIT_ENV, ...(opts.maxBuffer ? { maxBuffer: opts.maxBuffer } : {}) },
-  )
-  return stdout
+  opts: { tolerateExit?: number } = {},
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  try {
+    const { stdout, stderr } = await run('git', [...GIT_HARDENING, '-C', workspace, ...args], {
+      maxBuffer: 32 * 1024 * 1024,
+      env: GIT_ENV,
+    })
+    return { code: 0, stdout, stderr }
+  } catch (err) {
+    const e = err as { code?: number | string; stdout?: string; stderr?: string; message?: string }
+    if (typeof e.code === 'number' && e.code === opts.tolerateExit) {
+      return { code: e.code, stdout: e.stdout ?? '', stderr: e.stderr ?? '' }
+    }
+    // Named by subcommand, not just by stderr: `fatal: bad object` says nothing about
+    // which of half a dozen calls in extraction produced it.
+    throw new Error(
+      `git ${subcommandOf(args)} failed: ${(e.stderr || e.message || '').slice(-1000)}`,
+    )
+  }
 }
 
-export async function diffAgainst(workspace: string, base: string): Promise<string> {
-  return gitIn(workspace, ['diff', '--unified=0', base], { maxBuffer: 64 * 1024 * 1024 })
+/** The first thing in the argv that is a verb rather than a `-c key=value` override. */
+function subcommandOf(args: string[]): string {
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '-c') i++
+    else if (!args[i]!.startsWith('-')) return args[i]!
+  }
+  return 'command'
 }

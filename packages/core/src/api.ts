@@ -78,6 +78,27 @@ export const gateResultSchema = z.object({
 export type GateResult = z.infer<typeof gateResultSchema>
 
 /**
+ * What a modifier run did to the tree (§4.4).
+ *
+ * Reported for every modifier run that got as far as looking, including the ones that
+ * changed nothing — `filesChanged: 0` with no `patchRef` is the record of "it ran and
+ * decided nothing needed doing", which is a different fact from no record at all
+ * (principle 6).
+ *
+ * `patchRef` is a host path, not the patch: blobs live on disk with a pointer in
+ * postgres. `branch` and `prUrl` are deliberately absent — the runner cannot know either,
+ * because both are produced host-side after the container has exited (ADR-0005), and a
+ * runner that proposed a branch name would be guessing at the publisher's collision
+ * handling.
+ */
+export const runChangeSchema = z.object({
+  baseSha: z.string(),
+  filesChanged: z.number().int().nonnegative(),
+  patchRef: z.string().optional(),
+})
+export type RunChange = z.infer<typeof runChangeSchema>
+
+/**
  * The single write that ends a run. Outcome, findings, and coverage land in one
  * transaction — partial findings from a crashed run are worse than none (§5.1).
  */
@@ -96,6 +117,8 @@ export const runReportSchema = z.object({
   gates: z.array(gateResultSchema).default([]),
   /** Absent when the gate failed or the run errored before producing output. */
   findings: findingsDocumentSchema.optional(),
+  /** Only a modifier reports one. Absent for a reviewer, which produces no diff. */
+  change: runChangeSchema.optional(),
   coverage: z.object({
     outcome: z.enum(COVERAGE_OUTCOMES),
     reason: z.string().optional(),
