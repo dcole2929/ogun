@@ -50,9 +50,24 @@ async function bundleCli(): Promise<void> {
     target: 'node24',
     format: 'esm',
     outfile: out,
-    // Only what the agent-facing subcommands need travels into the sandbox. Anything
-    // that talks to postgres is server-side and must not be reachable from in here.
-    external: ['drizzle-orm', 'postgres'],
+    /**
+     * Only what the agent-facing subcommands need travels into the sandbox. Anything
+     * that talks to postgres is server-side and must not be reachable from in here.
+     *
+     * `@ogun/core/db` is external for a reason that is easy to miss: marking only
+     * `drizzle-orm` and `postgres` external stops them being *bundled*, but does not stop
+     * them being *imported*. `ogun db …` reaches the client through `await import()`, and
+     * esbuild inlines a dynamically-imported internal module into the same file — at
+     * which point that module's own top-level `import 'drizzle-orm/pg-core'` is hoisted
+     * to the top of the bundle. Every command then failed to load:
+     *
+     *     Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'drizzle-orm'
+     *         imported from /opt/ogun/ogun.mjs
+     *
+     * Externalising the boundary module keeps the import lazy, so it is reached only by
+     * the `db` subcommands, which are host-side and never run in a sandbox.
+     */
+    external: ['drizzle-orm', 'postgres', '@ogun/core/db'],
     // yaml is CJS and calls require() at module scope. Bundling CJS into ESM needs a
     // createRequire shim or it dies on the first dynamic require at startup.
     banner: {
