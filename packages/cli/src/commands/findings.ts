@@ -1,5 +1,5 @@
 import { mkdir, readFile } from 'node:fs/promises'
-import { dirname, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import {
   findingsDocumentSchema,
   parseFingerprint,
@@ -17,6 +17,7 @@ import { authHeaders } from '../auth.ts'
  * downstream can depend on it.
  */
 
+const HISTORY_INDEX = '.ogun-in/history.json'
 const OUTPUT_PATH = process.env.OGUN_OUTPUT_PATH ?? '.ogun-out/findings.json'
 
 /** `ogun findings write` — reads a findings document on stdin, validates, writes it. */
@@ -51,15 +52,55 @@ export async function findingsWrite(args: string[]): Promise<void> {
     if (!fp.ok) fail(`bad fingerprint "${f.fingerprint}": ${fp.error}`)
   }
 
+  for (const a of doc.data.adjudications ?? []) {
+    const fp = parseFingerprint(a.fingerprint)
+    if (!fp.ok) fail(`bad fingerprint "${a.fingerprint}" in adjudications: ${fp.error}`)
+    if (a.verdict === 'duplicate-of' && !parseFingerprint(a.duplicateOf).ok) {
+      fail(`bad duplicateOf "${a.duplicateOf}" on ${a.fingerprint}`)
+    }
+  }
+
   await mkdir(dirname(target), { recursive: true })
   await writeSecretFile(target, `${JSON.stringify(doc.data, null, 2)}\n`)
+
   const n = doc.data.findings.length
+  const verdicts = doc.data.adjudications?.length ?? 0
+  const parts = [
+    n === 0
+      ? // A clean result and a run that never happened are different facts (§4.11).
+        'a clean review (0 findings)'
+      : `${n} finding${n === 1 ? '' : 's'}`,
+    ...(verdicts > 0 ? [`${verdicts} verdict${verdicts === 1 ? '' : 's'}`] : []),
+  ]
+  console.log(green(`recorded ${parts.join(' and ')} to ${target}`))
+
+  await remarkOnUnjudgedHistory(verdicts)
+}
+
+/**
+ * Say when a document leaves the inbox untouched.
+ *
+ * Not a refusal — plenty of runs have nothing defensible to say about old findings, and a
+ * gate here would push an agent into inventing verdicts, which is far worse than leaving
+ * a finding open. But silence at this moment is what let two nights pass with nine
+ * already-fixed findings sitting in the inbox: the write succeeded, said "recorded 1
+ * finding", and nothing indicated half the job had gone undone.
+ *
+ * Printed at the one moment the agent can still act on it, and phrased as the count
+ * rather than an instruction — the skill says what to do; this says what is true.
+ */
+async function remarkOnUnjudgedHistory(verdicts: number): Promise<void> {
+  if (verdicts > 0) return
+  const index = await readFile(join(dirname(OUTPUT_PATH), '..', HISTORY_INDEX), 'utf8').catch(
+    () => null,
+  )
+  if (!index) return
+  const known = (JSON.parse(index) as { findings?: unknown[] }).findings?.length ?? 0
+  if (known === 0) return
   console.log(
-    green(
-      n === 0
-        ? // A clean result and a run that never happened are different facts (§4.11).
-          `recorded a clean review (0 findings) to ${target}`
-        : `recorded ${n} finding${n === 1 ? '' : 's'} to ${target}`,
+    dim(
+      `note: ${HISTORY_INDEX} lists ${known} finding${known === 1 ? '' : 's'} already in the ` +
+        'inbox and this document judges none of them.',
     ),
   )
 }
@@ -126,9 +167,30 @@ export async function checkCitations(args: string[]): Promise<void> {
 }
 
 /** `ogun findings schema` — what a skill prints when it needs to remind itself. */
+/**
+ * The whole document, not the half of it a reviewer uses.
+ *
+ * This command is what §4.10 means by "the CLI owns every format the agent touches", and
+ * the skills point an agent here to confirm the shape. So a field that exists in the
+ * schema and not in this output is a field that does not exist: `adjudications` shipped
+ * without being described here, and triage — which had been told to emit them, checked
+ * the authority, and found nothing — correctly emitted none. Two nights of an inbox with
+ * nine already-fixed findings in it, because the format was documented in one place and
+ * owned in another.
+ */
 export function findingsSchema(): void {
   console.log(bold('A findings document:'))
   console.log(EXAMPLE)
+
+  console.log(bold('\nfindings') + dim('  — what you found this run'))
+  console.log(
+    [
+      '  Every finding cites a real path and line in the tree you are looking at. A',
+      '  citation that is not there fails the grounding check and discards the whole',
+      "  run's output, so check them rather than reconstructing them from memory.",
+    ].join('\n'),
+  )
+
   console.log(bold('\nfingerprint'))
   console.log(
     [
@@ -136,6 +198,38 @@ export function findingsSchema(): void {
       '  It names the *meaning* of the issue, so the same problem found again next week',
       '  is recognised as the same finding. Deliberately excludes line numbers: a rebase',
       '  must not mint a new identity for an unchanged finding.',
+    ].join('\n'),
+  )
+
+  console.log(bold('\nadjudications') + dim('  — verdicts on findings that already exist'))
+  console.log(
+    [
+      '  Optional, and only a node that publishes may use them — a reviewer feeding',
+      '  triage stages its verdicts like everything else. The inbox you are judging is',
+      '  at .ogun-in/history.json, with the full write-ups under .ogun-in/history/.',
+      '',
+      `  ${bold('still-applies')}         you read the code and the problem is still there`,
+      `  ${bold('fixed')}                 the code now upholds the invariant — needs citations`,
+      `  ${bold('no-longer-applicable')}  the surface is gone: file deleted, path restructured`,
+      `  ${bold('duplicate-of')}          same invariant as another finding — needs duplicateOf`,
+      '',
+      '  Every verdict carries a `reason` in your own words, including still-applies:',
+      '  "I checked and it still holds" is a result, and without it "still broken" and',
+      '  "nobody has looked since March" are the same row.',
+      '',
+      '  A `fixed` citation is checked exactly as a finding\'s is. Closing something is as',
+      '  consequential as opening it, and it is the direction with no reviewer after you.',
+      '',
+      `  ${dim('wontfix is not a verdict. A person decided to accept that risk.')}`,
+    ].join('\n'),
+  )
+
+  console.log(bold('\nnotes') + dim('  — what a reader needs that is not a finding'))
+  console.log(
+    [
+      '  A degraded night belongs here, naming the workers that did not run. An inbox',
+      '  with three findings from four reviewers looks identical to one from three',
+      '  reviewers, and they mean different things.',
     ].join('\n'),
   )
 }
@@ -215,5 +309,14 @@ const EXAMPLE = `{
       "confidence": 0.85,
       "citations": [{ "path": "src/routes/orders.ts", "line": 44 }]
     }
-  ]
+  ],
+  "adjudications": [
+    {
+      "fingerprint": "security/invites/single-use/toctou",
+      "verdict": "fixed",
+      "reason": "redemption is now one conditional UPDATE, so exactly one racer wins",
+      "citations": [{ "path": "src/routes/runners.ts", "line": 168 }]
+    }
+  ],
+  "notes": "security-review crashed, so nothing looked at the auth surface tonight."
 }`

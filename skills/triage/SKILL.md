@@ -71,6 +71,12 @@ Four failure modes, in order of how often they happen:
    what arrived this run. Findings that nobody re-reported are still your responsibility,
    and a fixed one left `open` costs a reader exactly as much attention as a new one.
 
+   This is the one that actually happens. Checking tonight's findings against history to
+   see whether they are duplicates is *not* adjudication — it asks whether the new thing
+   is new, never whether the old thing is still true. A run that publishes findings and
+   returns no verdicts has done half the job, and the half it skipped is the half nothing
+   else in the system will ever do.
+
 ## What you must not do
 
 - **Do not invent findings.** Every finding you publish traces to at least one staged
