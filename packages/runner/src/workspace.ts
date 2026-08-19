@@ -83,12 +83,76 @@ export async function resolveHeadSha(repo: string, ref: string): Promise<string>
 /** Files the agent added but never staged do not appear in `git diff <base>`, so the
  *  grounding check would call a real new test file a hallucination (§5.3). */
 export async function stageAll(workspace: string): Promise<void> {
-  await run('git', ['-C', workspace, 'add', '-A'])
+  await gitIn(workspace, ['add', '-A'])
+}
+
+/**
+ * Git configuration a workspace is not allowed to supply, for every git command the
+ * runner runs there **after** the container has exited.
+ *
+ * The workspace is mounted read-write with `.git` inside it, so by the time the agent is
+ * done the repository's configuration and hooks are agent-authored — and git executes
+ * both, on the host, as the runner, with the runner's control-plane token in its
+ * environment. The container escapes nothing: it leaves a string behind and waits for the
+ * host to run it, exactly the shape of the symlink readback §5.3 already guards.
+ *
+ * Measured rather than assumed, with a canary file:
+ *
+ *   core.fsmonitor   an arbitrary command, run whenever the index is refreshed — it
+ *                    fires on `add`, `ls-files`, `status` and `diff`, which is to say on
+ *                    the two calls the runner already made on every run of every profile
+ *   .git/hooks       pre-commit and friends, run by `commit`
+ *   diff.external    an arbitrary command, run instead of the diff machinery
+ *
+ * `-c` beats repository configuration, so this neutralises them wherever git is invoked
+ * from. Diff-producing commands additionally pass `--no-ext-diff --no-textconv`, since
+ * `.gitattributes` can name a driver per path.
+ */
+export const GIT_HARDENING = [
+  '-c',
+  'core.hooksPath=/dev/null',
+  '-c',
+  'core.fsmonitor=',
+  '-c',
+  'diff.external=',
+]
+
+/**
+ * And nothing from the *host's* git configuration either. One developer's global
+ * `diff.noprefix` is enough to change what the runner reads out of a workspace, which
+ * makes the result depend on whose machine it ran on. `GIT_TERMINAL_PROMPT=0` because a
+ * workspace has no remote, and a git that decides to ask for a credential must fail
+ * rather than hold a nightly run open until morning.
+ */
+export const GIT_ENV = {
+  ...process.env,
+  GIT_CONFIG_GLOBAL: '/dev/null',
+  GIT_CONFIG_SYSTEM: '/dev/null',
+  GIT_TERMINAL_PROMPT: '0',
+}
+
+/** Every git call the runner makes inside a workspace goes through this. */
+export async function gitIn(
+  workspace: string,
+  args: string[],
+  opts: { maxBuffer?: number } = {},
+): Promise<string> {
+  const diffLike = args[0] === 'diff' || args[0] === 'show' || args[0] === 'log'
+  const { stdout } = await run(
+    'git',
+    [
+      '-C',
+      workspace,
+      ...GIT_HARDENING,
+      ...args.slice(0, 1),
+      ...(diffLike ? ['--no-ext-diff', '--no-textconv'] : []),
+      ...args.slice(1),
+    ],
+    { env: GIT_ENV, ...(opts.maxBuffer ? { maxBuffer: opts.maxBuffer } : {}) },
+  )
+  return stdout
 }
 
 export async function diffAgainst(workspace: string, base: string): Promise<string> {
-  const { stdout } = await run('git', ['-C', workspace, 'diff', '--unified=0', base], {
-    maxBuffer: 64 * 1024 * 1024,
-  })
-  return stdout
+  return gitIn(workspace, ['diff', '--unified=0', base], { maxBuffer: 64 * 1024 * 1024 })
 }
