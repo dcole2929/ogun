@@ -62,7 +62,9 @@ export function createContainerSandbox(opts: ContainerOptions): Sandbox {
   }
 }
 
-function buildRunArgs(opts: ContainerOptions, image: string): string[] {
+/** Exported for the tests: the mount flags are the profile enforcement, so they are
+ *  worth asserting without starting a container. */
+export function buildRunArgs(opts: ContainerOptions, image: string): string[] {
   const args = [
     'run',
     '--rm',
@@ -89,8 +91,30 @@ function buildRunArgs(opts: ContainerOptions, image: string): string[] {
     '--tmpfs',
     '/tmp:rw,nosuid,nodev,exec,size=2g',
 
+    /**
+     * The tree under review is read-only for anything that is not a modifier.
+     *
+     * This is what makes the permission profiles real. Until now they were a comment:
+     * claude got `--disallowedTools Edit,Write,…` alongside `--dangerously-skip-permissions`,
+     * so `Bash` wrote whatever it liked; codex got no profile restriction at all; and the
+     * container passed `OGUN_PERMISSIONS` into an environment nothing read. `reviewer` and
+     * `modifier` were the same capability.
+     *
+     * At the mount rather than in the runtime argv, because the mount is the one place
+     * both runtimes go through. Anything expressed as a flag is applied by whichever
+     * runtime happens to support it — which is how codex ended up unrestricted.
+     */
     '--volume',
-    `${opts.hostWorkspace}:${GUEST_WORKSPACE}:rw`,
+    `${opts.hostWorkspace}:${GUEST_WORKSPACE}:${opts.permissions === 'modifier' ? 'rw' : 'ro'}`,
+
+    /**
+     * …except where the agent is *supposed* to write. `.ogun-out/` is inside the tree, so
+     * a blanket read-only mount would stop a reviewer reporting its findings at all —
+     * which is not a stricter reviewer, it is a broken one. Layered over the mount above,
+     * so the tree stays read-only and the one directory the harness reads back does not.
+     */
+    '--volume',
+    `${join(opts.hostWorkspace, '.ogun-out')}:${GUEST_WORKSPACE}/.ogun-out:rw`,
   ]
 
   if ((opts.egress ?? 'open') === 'none') args.push('--network', 'none')

@@ -16,8 +16,16 @@ export const claudeRuntime: RuntimeSpec = {
     'stream-json',
     '--verbose',
     ...(ctx.model ? ['--model', ctx.model] : []),
-    // The container is the boundary (§4.6), so in-agent permission prompts are both
-    // unanswerable and redundant. A reviewer additionally gets a read-only tool set.
+    /**
+     * The container is the boundary (§4.6), so in-agent permission prompts are both
+     * unanswerable and redundant.
+     *
+     * A non-modifier also loses the edit tools — kept, but no longer load-bearing: it
+     * never restricted `Bash`, so it never stopped a reviewer writing, and codex has no
+     * equivalent. Enforcement is the read-only mount in `container.ts`. This stays
+     * because it costs nothing and makes the intent legible to the agent itself, which
+     * is a better failure than a write that dies on a read-only filesystem mid-task.
+     */
     '--dangerously-skip-permissions',
     ...(ctx.permissions === 'modifier'
       ? []

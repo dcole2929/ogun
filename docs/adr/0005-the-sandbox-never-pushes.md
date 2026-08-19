@@ -52,7 +52,15 @@ that when they are built they live host-side.
 - Permission profiles describe what an agent may do *inside* the sandbox: `observer`
   (read), `reviewer` (read, run tests and scanners, emit findings), `modifier` (write and
   commit). This ADR settles their scope. **It does not settle that they are enforced.**
-- **In-sandbox enforcement is one flag, and the gap is live and reportable.** All of it is
+- **In-sandbox enforcement is the mount.** [updated] The tree under review is mounted
+  read-only for `observer` and `reviewer`, read-write only for `modifier`, with
+  `.ogun-out/` layered over it writable so a reviewer can still report. At the mount
+  because it is the one place both runtimes go through — a guarantee expressed as a
+  runtime flag is applied by whichever runtime happens to support it. Codex's own sandbox
+  cannot be used here: it needs an unprivileged user namespace that `--cap-drop ALL` plus
+  `no-new-privileges` denies, so every command fails rather than just the writes.
+
+  What this replaced, kept because it is why the ADR said what it said: All of it is
   `--disallowedTools Edit,Write,NotebookEdit,MultiEdit` on the claude runtime for
   non-modifier profiles, in a session that also passes `--dangerously-skip-permissions`.
   `Bash` is unrestricted, so a `reviewer` writes whatever it likes through the shell. The
