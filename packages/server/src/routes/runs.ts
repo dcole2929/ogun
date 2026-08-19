@@ -268,7 +268,12 @@ runsRoutes.get('/:id', async (c) => {
         seenCount: f.seenCount,
         firstSeenHere: f.firstSeenRun === id,
       })),
-      /** Phase 3: branch, patch, PR. Empty until modifier workers exist. */
+      /**
+       * What a modifier did to the tree: base sha, files changed, and a pointer to the
+       * patch when there is one. `branch` and `prUrl` stay null until the host-side
+       * publisher exists — the runner cannot know either, and a row here is a record of
+       * work done, not a claim that it was published (§4.4).
+       */
       changes: change,
     },
   })

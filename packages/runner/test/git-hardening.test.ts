@@ -65,6 +65,6 @@ test('the hardened calls still do their job', async () => {
   const { repo } = await hostile()
   await writeFile(join(repo, 'new.ts'), 'export const x = 1\n')
   await stageAll(repo)
-  const tracked = await gitIn(repo, ['ls-files'])
+  const { stdout: tracked } = await gitIn(repo, ['ls-files'])
   assert.ok(tracked.includes('new.ts'), 'staging an untracked file is why stageAll exists (§5.3)')
 })

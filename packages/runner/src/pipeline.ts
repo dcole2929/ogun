@@ -1,8 +1,6 @@
 import { existsSync } from 'node:fs'
 import { mkdir, writeFile } from 'node:fs/promises'
-import { execFile } from 'node:child_process'
-import { dirname, join } from 'node:path'
-import { promisify } from 'node:util'
+import { join } from 'node:path'
 import {
   parseFingerprint,
   verifySchema,
@@ -22,6 +20,7 @@ import {
   type Sandbox,
 } from './sandbox/index.ts'
 import { nextSeq, newParserState, resolveModel, resolveRuntime } from './runtimes/index.ts'
+import { extractPatch, type PatchExtraction } from './patch.ts'
 import { gitIn, materializeWorkspace, resolveHeadSha, stageAll } from './workspace.ts'
 import { runVerifyGate } from './verify.ts'
 import {
@@ -30,8 +29,6 @@ import {
   excludeFromGit,
   listAvailableSkills,
 } from './skills.ts'
-
-const run = promisify(execFile)
 
 /** Where a reviewer is told to write its findings, workspace-relative. */
 export const OUTPUT_PATH = '.ogun-out/findings.json'
@@ -85,7 +82,17 @@ export async function executeJob(
   let sandbox: Sandbox | undefined
   let cleanup: (() => Promise<void>) | undefined
 
-  const fail = async (detail: string, gates: GateResult[] = []): Promise<RunOutcome> => {
+  /**
+   * `extra` carries what the run had already produced when it failed. A modifier whose
+   * patch could not be extracted still changed files, and the record of *what* it
+   * touched is the only thing left to look at once the workspace is deleted — dropping
+   * it would make the failure unexplainable from the control plane.
+   */
+  const fail = async (
+    detail: string,
+    gates: GateResult[] = [],
+    extra: Partial<Pick<RunReport, 'artifacts' | 'change'>> = {},
+  ): Promise<RunOutcome> => {
     await flusher.flush()
     await cp
       .report({
@@ -96,6 +103,7 @@ export async function executeJob(
         gates,
         coverage: { outcome: 'errored', reason: detail },
         artifacts: [],
+        ...extra,
       })
       .catch((err) => console.error('[runner] failed to report failure', err))
     return 'error'
@@ -322,15 +330,72 @@ export async function executeJob(
     const transcriptRef = await writeTranscript(config, job, workspace.path)
     const usage = usageFrom(lastEvent)
 
+    /**
+     * The crossing (ADR-0005). A modifier's work exists only as commits in a clone this
+     * function deletes in its `finally`, and the container had no remote to put it
+     * anywhere else — so if it is not extracted here it is gone, and the run reads as an
+     * agent that did nothing.
+     *
+     * After the gate, not before: a modifier gate will eventually run the project's test
+     * suite (§9), which needs the tree the agent left rather than a patch of it, and an
+     * extraction that ran first would be extracting a tree the gate might still change.
+     *
+     * The patch is written under `scratch/patches`, outside the workspace, because the
+     * workspace is deleted in this function's `finally`. Nothing prunes that directory
+     * yet — the same gap transcripts already have, and the natural place to close it is
+     * the publisher, which is the step that knows a patch has been consumed.
+     */
+    let change: PatchExtraction | undefined
+    if (job.permissions === 'modifier') {
+      change = await extractPatch({
+        workspace: workspace.path,
+        baseSha: workspace.sha,
+        destDir: join(config.scratch, 'patches', job.runId),
+      })
+      flusher.push([
+        {
+          type: 'runner.note',
+          ts: new Date().toISOString(),
+          seq: nextSeq(parser),
+          payload: {
+            note: describeExtraction(change),
+            filesChanged: change.filesChanged,
+            commits: change.commits,
+            ...(change.patch ? { patchRef: change.patch.ref, bytes: change.patch.bytes } : {}),
+          },
+        },
+      ])
+      if (change.unextractable) {
+        // Loud, and with the file count kept: a modifier whose work cannot be published
+        // is a broken factory, not a quiet night.
+        return await fail(change.unextractable, gates, { change: changeRecord(change) })
+      }
+    }
+
     const report: RunReport = {
       runId: job.runId,
-      outcome: 'approved',
+      /**
+       * `dispatched` means exactly "there is a patch waiting for the publisher" (§5.2).
+       * A modifier that changed nothing is `approved` — it ran, the gate was satisfied,
+       * and it decided nothing needed doing. Filing that as `dispatched` would put an
+       * empty change in front of whoever built the PR step next.
+       */
+      outcome: change?.patch ? 'dispatched' : 'approved',
       durationMs: Date.now() - startedAt,
       ...(usage ? { usage } : {}),
       gates,
       ...(output !== undefined ? { findings: output as never } : {}),
-      coverage: { outcome: 'clean' },
-      artifacts: transcriptRef ? [{ kind: 'transcript', ref: transcriptRef }] : [],
+      ...(change ? { change: changeRecord(change) } : {}),
+      coverage: { outcome: change?.patch ? 'changed' : 'clean' },
+      artifacts: [
+        ...(transcriptRef ? [{ kind: 'transcript', ref: transcriptRef }] : []),
+        // Both records, and they answer different questions: `artifacts` is "what files
+        // did this run leave on disk", which the run page lists; `changes` is "what did
+        // this run do to the code", which the publisher reads (§4.4).
+        ...(change?.patch
+          ? [{ kind: 'patch', ref: change.patch.ref, bytes: change.patch.bytes }]
+          : []),
+      ],
     }
     const result = (await cp.report(report)) as { outcome?: RunOutcome }
     return result.outcome ?? 'approved'
@@ -386,11 +451,59 @@ function composePrompt(
     'files it points to under references/. It defines the mission, the evidence standard,',
     'and the severity scale for this run.',
     '',
-    `Write your findings to ${guestRoot}/${OUTPUT_PATH} by running \`ogun findings write\`.`,
-    'Do not hand-write that file and do not invent a format — the CLI owns the schema.',
-    'If you looked and found nothing, still write the file with an empty findings array:',
-    'a clean result and a run that never happened are different facts.',
+    /**
+     * A modifier is told how its work leaves, because the shape of this sandbox is not the
+     * shape it expects. There is no remote and no credential here (ADR-0005), and an agent
+     * that spends its round trying to push learns that the hard way with nothing to show
+     * for it.
+     *
+     * The uncommitted case is stated rather than left implicit: the runner collects it
+     * either way, so silence would be safe — but an agent that knows its message becomes
+     * the pull request writes a better one than an agent that thinks committing is
+     * bookkeeping.
+     */
+    ...(job.permissions === 'modifier'
+      ? [
+          'Commit your work in this workspace with `git commit`. The message is what a',
+          'person reviewing the pull request reads first, so write it for them.',
+          '',
+          'This workspace has no git remote and no credential, by design: you cannot push',
+          'and there is nothing to push to. The runner extracts your commits as a patch',
+          'after you exit and the host opens the pull request. Anything you leave',
+          'uncommitted is collected too, but under a commit that says nobody wrote a',
+          'message for it — which is a worse pull request, not a lost one.',
+          '',
+          `If there is something a reader needs that is not code, run \`ogun findings write\``,
+          `to ${guestRoot}/${OUTPUT_PATH} with an empty findings array and your note.`,
+        ]
+      : [
+          `Write your findings to ${guestRoot}/${OUTPUT_PATH} by running \`ogun findings write\`.`,
+          'Do not hand-write that file and do not invent a format — the CLI owns the schema.',
+          'If you looked and found nothing, still write the file with an empty findings array:',
+          'a clean result and a run that never happened are different facts.',
+        ]),
   ].join('\n')
+}
+
+/** The wire shape of an extraction: the durable facts, without the host-only detail. */
+const changeRecord = (change: PatchExtraction): RunReport['change'] => ({
+  baseSha: change.baseSha,
+  filesChanged: change.filesChanged,
+  ...(change.patch ? { patchRef: change.patch.ref } : {}),
+})
+
+/**
+ * Said on the timeline whatever happened, including "nothing". A modifier that changed
+ * no files and a modifier whose patch was thrown away are both runs that produce no
+ * branch, and the timeline is where a person finds out which one they are looking at.
+ */
+function describeExtraction(change: PatchExtraction): string {
+  if (change.unextractable) return `no patch extracted: ${change.unextractable}`
+  if (!change.patch) return 'the agent changed nothing — no patch to extract'
+  return (
+    `patch extracted: ${change.filesChanged} file(s) over ${change.commits} commit(s), ` +
+    `${change.patch.bytes} bytes, against ${change.baseSha.slice(0, 12)}`
+  )
 }
 
 /** Each project has its own image; absent one, `ogun/base` — enough for a reviewer and
@@ -401,9 +514,10 @@ const imageFor = (job: ClaimedJob): string =>
     : (process.env.OGUN_BASE_IMAGE ?? 'ogun/base:latest')
 
 async function trackedPaths(workspace: string): Promise<Set<string>> {
-  const stdout = await gitIn(workspace, ['ls-files'], {
-    maxBuffer: 32 * 1024 * 1024,
-  })
+  // Through `gitIn`, like every git call made after the container has exited: `ls-files`
+  // refreshes the index, and refreshing the index is enough to run a `core.fsmonitor`
+  // command the agent left in the workspace's own config.
+  const { stdout } = await gitIn(workspace, ['ls-files'])
   return new Set(stdout.split('\n').filter(Boolean))
 }
 

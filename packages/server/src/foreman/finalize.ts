@@ -6,8 +6,18 @@ import type { CoverageOutcome, JobState, RunOutcome, RunReport } from '@ogun/cor
 import { DEFAULT_LIMITS } from './admission.ts'
 import { finalizeCycleIfDone, markCoverage, releaseDependents } from './cycles.ts'
 
-const { artifacts, breakers, coverage, cycleRuns, cycles, findings, jobs, runs, stagedFindings } =
-  schema
+const {
+  artifacts,
+  breakers,
+  changes,
+  coverage,
+  cycleRuns,
+  cycles,
+  findings,
+  jobs,
+  runs,
+  stagedFindings,
+} = schema
 
 export type FinalizeResult = {
   ok: true
@@ -58,9 +68,17 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
    * decided — and the gate decides. A reviewer whose output keeps failing the schema or
    * grounding check is malfunctioning, so this also feeds the breaker (§4.3): three
    * consecutive gate failures stop the worker being dispatched at all.
+   *
+   * `dispatched` is overruled for the same reason and it matters more there. It means
+   * "there is a patch waiting to be published", and the modifier gate is the one that
+   * will run the project's tests (§9) — so a `dispatched` that survived a failed gate is
+   * an instruction to open a pull request from work the gate has just rejected. The
+   * patch is still recorded below; what the gate withdraws is the claim that it is ready.
    */
   const outcome: RunOutcome =
-    gateFailed && report.outcome === 'approved' ? 'changes-requested' : report.outcome
+    gateFailed && (report.outcome === 'approved' || report.outcome === 'dispatched')
+      ? 'changes-requested'
+      : report.outcome
 
   /**
    * Whether this run's findings reach the inbox, or only the staging area.
@@ -108,12 +126,18 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
       ? 'errored'
       : outcome === 'skipped'
         ? 'refused'
-        : // What the run reported, not what reached the inbox. A reviewer feeding triage
-          // still found what it found; the ledger recording `clean` would be a lie that
-          // makes the coverage picture depend on whether triage has run yet.
-          reported.length > 0
-          ? 'found'
-          : 'clean'
+        : // A modifier reports no findings at all, so the finding count cannot separate
+          // "wrote a patch" from "read the code and left it alone". Without this the two
+          // nights are both `clean`, and the ledger stops being able to answer the only
+          // question anyone asks of a modifier.
+          outcome === 'dispatched'
+          ? 'changed'
+          : // What the run reported, not what reached the inbox. A reviewer feeding triage
+            // still found what it found; the ledger recording `clean` would be a lie that
+            // makes the coverage picture depend on whether triage has run yet.
+            reported.length > 0
+            ? 'found'
+            : 'clean'
 
   /**
    * Why the ledger row reads the way it does — and, when the graph could not be read,
@@ -173,6 +197,28 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
           ...(a.bytes !== undefined ? { bytes: a.bytes } : {}),
         })),
       )
+    }
+
+    /**
+     * What a modifier did to the tree, kept whatever the run's outcome turned out to be.
+     *
+     * This is an artifact record, not a work queue (§4.4) — which is the distinction the
+     * publisher has to respect: it must select on the *run's* terminal outcome, because a
+     * row exists for a gate-failed run, for a run whose patch was too large to extract,
+     * and for a run that changed nothing. Reading "there is a changes row" as "open a
+     * pull request" would publish all three.
+     *
+     * Written inside the claim, so a report that lost the race to a stale-claim sweep
+     * adds nothing: a second row would double-count a modifier's night in every query
+     * that goes near this table, and there is no unique key to catch it.
+     */
+    if (report.change) {
+      await tx.insert(changes).values({
+        runId: report.runId,
+        baseSha: report.change.baseSha,
+        filesChanged: report.change.filesChanged,
+        ...(report.change.patchRef ? { patchRef: report.change.patchRef } : {}),
+      })
     }
 
     /**
