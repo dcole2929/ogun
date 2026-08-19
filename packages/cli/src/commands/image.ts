@@ -3,6 +3,7 @@ import { fileURLToPath } from 'node:url'
 import { mkdir } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { existsSync } from 'node:fs'
+import { sandboxStamp, STAMP_LABEL } from '@ogun/core'
 import { bold, dim, fail, green } from '../output.ts'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -29,7 +30,24 @@ export async function imageBuild(args: string[]): Promise<void> {
   if (!project) await bundleCli()
 
   console.log(dim(`building ${tag} from ${dockerfile}`))
-  const code = await runDocker(['build', '-t', tag, '-f', dockerfile, context])
+  /**
+   * Stamp the base image with a hash of what went into it, so a later check can tell
+   * whether the installed image still matches the source. §7 claims the bundled CLI
+   * "cannot drift from the validator on the way in"; it drifted for a week here, and hid
+   * both a `findings schema` fix that never reached a reviewer and a bundle that would
+   * not load at all. Project images are unstamped — they are `FROM ogun/base` plus a
+   * toolchain, and the base is where the CLI lives.
+   */
+  const stamp = project ? undefined : await sandboxStamp()
+  const code = await runDocker([
+    'build',
+    '-t',
+    tag,
+    ...(stamp ? ['--label', `${STAMP_LABEL}=${stamp}`] : []),
+    '-f',
+    dockerfile,
+    context,
+  ])
   if (code !== 0) fail(`docker build exited ${code}`)
   console.log(green(`built ${tag}`))
 }
