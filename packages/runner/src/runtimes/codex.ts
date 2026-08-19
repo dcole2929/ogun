@@ -19,8 +19,26 @@ export const codexRuntime: RuntimeSpec = {
     '-o',
     ctx.outputFile,
     ...(ctx.model ? ['-m', ctx.model] : []),
-    // Codex ships its own landlock/seccomp sandbox. Nesting it inside our container is
-    // redundant at best; the container is the boundary, so we bypass it here.
+    /**
+     * Codex ships its own sandbox, and it cannot run inside ours — so the container is
+     * the boundary and this bypasses it. §10 recorded that as a guess ("probably right
+     * *because* the container is the boundary. Untested under Docker"); it is now tested.
+     *
+     * `-s read-only` shells out to bubblewrap, which needs an unprivileged user
+     * namespace, and the sandbox runs `--cap-drop ALL` with `no-new-privileges`. Every
+     * command execution then fails, not merely the writes:
+     *
+     *     bwrap: No permissions to create a new namespace, likely because the kernel
+     *     does not allow non-privileged user namespaces.
+     *
+     * A reviewer that cannot run `ls` is not a stricter reviewer. Granting the container
+     * what bwrap needs would mean handing back the privilege the profile exists to
+     * remove, to gain a second copy of a boundary we already have.
+     *
+     * So the profile is enforced at the *mount* instead (see `container.ts`), which is
+     * the one place both runtimes go through — and is why codex having no equivalent of
+     * claude's `--disallowedTools` costs nothing.
+     */
     '--dangerously-bypass-approvals-and-sandbox',
     ctx.prompt,
   ],

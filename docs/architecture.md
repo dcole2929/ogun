@@ -320,17 +320,23 @@ Permission profiles still exist for what the agent may do *inside* the sandbox:
 `observer` (read), `reviewer` (read + run tests/scanners, emit findings), `modifier`
 (write + commit).
 
-**They are barely enforced.** [corrected] This said "enforced by the sandbox where
-practical, not just described in prompts", and that was never true of the code. The whole
-of it is `--disallowedTools Edit,Write,NotebookEdit,MultiEdit` on the claude runtime for
-non-modifier profiles, in a session that also passes `--dangerously-skip-permissions`.
-`Bash` is unrestricted, so a reviewer writes through the shell; codex gets no restriction
-at all; the container passes `OGUN_PERMISSIONS` into an environment nothing reads; and the
-workspace is mounted read-write for every profile. The structural protections above are
-independent of this and do hold — which is why a reviewer that writes in its workspace
-still cannot publish — but the profile is close to documentation. Closing the gap needs a
-per-runtime tool policy that covers the shell rather than a flag list that does not.
-**[open]**
+**Enforced at the mount.** [settled] The tree under review is mounted read-only for
+`observer` and `reviewer`, and read-write only for `modifier`. `.ogun-out/` is layered
+over it read-write, because it lives inside the tree and a blanket read-only mount stops
+a reviewer reporting at all — which is not a stricter reviewer, it is a broken one.
+
+The mount, rather than the runtime, because it is the one place both runtimes go through.
+This was previously "enforced by the sandbox where practical", which was never true of the
+code: the whole of it was `--disallowedTools Edit,Write,NotebookEdit,MultiEdit` on claude,
+in a session that also passes `--dangerously-skip-permissions`, so `Bash` wrote whatever
+it liked. Codex had no restriction at all, and the container passed `OGUN_PERMISSIONS`
+into an environment nothing read. A guarantee expressed as a runtime flag is applied by
+whichever runtime happens to support it, which is exactly how that happened.
+
+Verified against a real review rather than asserted: a reviewer on a read-only tree
+completed in 181s, reported a finding, and produced no filesystem errors. The claude flag
+list stays — no longer load-bearing, but free, and it tells the agent the intent up front
+rather than letting a write die on a read-only filesystem mid-task.
 
 #### Basis: `claude-sandbox`, with a changed posture
 
@@ -1198,11 +1204,15 @@ canvas, auto-merge, agent memory, model auto-selection, remote runner mesh.
 
 1. **Image staleness policy.** Rebuild on Dockerfile/lockfile change is obvious; what
    the age-based trigger should be is not.
-2. **Codex sandbox mode inside a container.** Codex ships its own sandbox
-   (`-s read-only | workspace-write | danger-full-access`, landlock/seccomp on Linux).
-   Nesting it inside our container is redundant at best and may not work at all, so
-   `--dangerously-bypass-approvals-and-sandbox` is probably right *because* the
-   container is the boundary. Untested under Docker.
+2. ~~**Codex sandbox mode inside a container.**~~ [answered] It cannot run inside ours.
+   `-s read-only` shells out to bubblewrap, which needs an unprivileged user namespace,
+   and the sandbox runs `--cap-drop ALL` with `no-new-privileges` — so *every* command
+   execution fails, not merely the writes: `bwrap: No permissions to create a new
+   namespace`. A reviewer that cannot run `ls` is not a stricter reviewer, and granting
+   the container what bwrap needs would hand back the privilege the profile exists to
+   remove, for a second copy of a boundary we already have.
+   `--dangerously-bypass-approvals-and-sandbox` is therefore right, and the profile is
+   enforced at the mount instead (§4.6).
 3. **Re-adjudication mechanism.** The approach (show prior unresolved findings
    verbatim, classify) is a proposal, not a decision. Revisit at implementation.
 4. **Triage prompt and calibration.** What the severity scale actually is, and how
