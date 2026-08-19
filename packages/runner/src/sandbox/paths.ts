@@ -1,6 +1,6 @@
 import { constants } from 'node:fs'
-import { open, realpath } from 'node:fs/promises'
-import { dirname, isAbsolute, join, resolve, sep } from 'node:path'
+import { mkdir, open, realpath } from 'node:fs/promises'
+import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path'
 
 /**
  * Path safety for anything read back from a sandbox (§5.3).
@@ -34,6 +34,63 @@ export async function safeJoin(workspace: string, relPath: string): Promise<stri
   }
   return join(parent, target.slice(dirname(target).length + 1))
 }
+
+/**
+ * The same containment, for writing *into* a workspace.
+ *
+ * The read side has had this since §5.3; the write side had nothing, and the asymmetry
+ * is not symmetric in risk. `.ogun-in/` is laid out **on the host, before the sandbox
+ * exists**, inside a checkout of a repository the runner does not trust — so a repo that
+ * ships `.ogun-in` as a symlink names a host file for the runner to overwrite with the
+ * runner's privileges. Demonstrated: a link to a directory outside the workspace turned
+ * an inbox write into `OVERWRITTEN BY THE RUNNER` in that directory.
+ *
+ * Refusing to follow the *leaf* is not enough, which is the trap. `writeSecretFile`
+ * unlinks and creates with `wx`, so a symlinked `history.json` is replaced rather than
+ * followed — but a symlinked `.ogun-in` moves the whole parent, and the leaf write then
+ * happens somewhere else entirely, perfectly safely, in the wrong place.
+ *
+ * So the parent is resolved and required to be inside the workspace, before anything is
+ * created and again after — `mkdir -p` through a link that points at a directory which
+ * does not exist yet would otherwise create it outside.
+ */
+export async function containedTarget(workspace: string, relPath: string): Promise<string> {
+  if (isAbsolute(relPath)) throw new Error(`absolute path rejected: ${relPath}`)
+  if (relPath.split(/[\\/]/).includes('..')) throw new Error(`parent traversal rejected: ${relPath}`)
+
+  const root = await realpath(workspace)
+  const target = resolve(root, relPath)
+  const parent = dirname(target)
+
+  // The deepest ancestor that exists decides whether we are still inside. Checked before
+  // `mkdir`, so a link pointing at a missing directory cannot be used to create one.
+  let existing = parent
+  for (;;) {
+    try {
+      const real = await realpath(existing)
+      if (real !== root && !real.startsWith(root + sep)) {
+        throw new UnsafeWrite(`${relPath} resolves outside the workspace, via ${existing}`)
+      }
+      break
+    } catch (err) {
+      if (err instanceof UnsafeWrite) throw err
+      const up = dirname(existing)
+      if (up === existing) throw new UnsafeWrite(`no containing directory for ${relPath}`)
+      existing = up
+    }
+  }
+
+  await mkdir(parent, { recursive: true })
+
+  // Again, because the check above only covered what existed at the time.
+  const real = await realpath(parent)
+  if (real !== root && !real.startsWith(root + sep)) {
+    throw new UnsafeWrite(`${relPath} resolves outside the workspace, via ${parent}`)
+  }
+  return join(real, basename(target))
+}
+
+export class UnsafeWrite extends Error {}
 
 /**
  * A runaway or hostile agent can write an arbitrarily large file. The runner holds this
