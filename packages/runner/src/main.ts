@@ -1,7 +1,8 @@
 import { parseArgs } from 'node:util'
-import { loadLocalConfig, LocalConfigError } from '@ogun/core'
+import { imageState, loadLocalConfig, LocalConfigError } from '@ogun/core'
 import { ControlPlane } from './client.ts'
 import { executeJob } from './pipeline.ts'
+
 
 // The runner takes no flags — it reads ~/.ogun/config.json. Parsed anyway so that a
 // flag someone reasonably expects to work is refused rather than silently dropped.
@@ -52,6 +53,28 @@ if (missing.length > 0) {
   // This one is worth saying: a job needing something absent is simply never claimed,
   // which looks like nothing happening rather than like a misconfiguration.
   console.log(`  cannot run jobs needing: ${missing.join(', ')}  —  \`ogun runner doctor\``)
+}
+
+/**
+ * The image is what a job actually runs inside, and a stale one is silent: every
+ * container starts, every run reports success, and the CLI inside it is whatever was
+ * bundled the last time somebody thought to rebuild. That went unnoticed for a week here
+ * — long enough for a fix to `ogun findings schema` never to reach a reviewer, and for a
+ * bundle that would not load at all to sit undetected.
+ *
+ * Said once at startup rather than per job. The runner is long-lived, so per-job would be
+ * noise, and this is a fact about the machine rather than about any one run. Not a
+ * rebuild: §4.6 builds images at project-add time, not at 2am.
+ */
+const image = await imageState()
+if (image.state !== 'current') {
+  console.log(
+    image.state === 'missing'
+      ? '  ogun/base is not built — jobs needing a container will fail  —  `ogun image build`'
+      : image.state === 'unstamped'
+        ? '  ogun/base predates stamping, so it cannot be compared  —  `ogun image build`'
+        : '  ogun/base was built from different source than this checkout  —  `ogun image build`',
+  )
 }
 
 if (!(await cp.authorized())) {

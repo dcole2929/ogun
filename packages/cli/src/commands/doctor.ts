@@ -4,9 +4,10 @@ import { stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
-import { loadLocalConfig, localConfigPath } from '@ogun/core'
+import { imageState, loadLocalConfig, localConfigPath } from '@ogun/core'
 import { bold, cyan, dim, green, red, yellow } from '../output.ts'
 import { authHeaders } from '../auth.ts'
+
 
 const run = promisify(execFile)
 
@@ -39,6 +40,43 @@ export async function configPermissions(path = localConfigPath()): Promise<Check
       ? `${path} is 0${mode.toString(8)} — it holds this machine's tokens. \`chmod 600 ${path}\``
       : `${path} is 0${mode.toString(8)}`,
     fatal: false,
+  }
+}
+
+/**
+ * Whether the sandbox image still matches the source it was built from.
+ *
+ * §7 says the bundled CLI "cannot drift from the validator on the way in". It drifted for
+ * a week here, and hid two things while it did: a fix to `ogun findings schema` that
+ * never reached a reviewer, and a bundle that would not load at all. Both were invisible
+ * because nothing rebuilds the image when the CLI changes and nothing compares them.
+ *
+ * A warning rather than a rebuild — §4.6 builds images at project-add time, not at 2am,
+ * because a nightly that has to build first is a nightly that fails on a bad network.
+ */
+export async function sandboxImage(): Promise<Check> {
+  const state = await imageState()
+  const rebuild = 'run `ogun image build`'
+  switch (state.state) {
+    case 'current':
+      return { name: 'sandbox image', ok: true, detail: 'ogun/base matches the current source', fatal: false }
+    case 'stale':
+      return {
+        name: 'sandbox image',
+        ok: false,
+        detail: `ogun/base was built from different source (built ${state.built.slice(0, 10)}) — ${rebuild}`,
+        fatal: false,
+      }
+    case 'unstamped':
+      return {
+        name: 'sandbox image',
+        ok: false,
+        // Not "stale": it may be identical. It cannot be compared, which is its own fact.
+        detail: `ogun/base predates stamping, so it cannot be compared — ${rebuild}`,
+        fatal: false,
+      }
+    default:
+      return { name: 'sandbox image', ok: false, detail: `ogun/base is not built — ${rebuild}`, fatal: true }
   }
 }
 
@@ -105,6 +143,7 @@ export async function doctor(serverUrl: string): Promise<void> {
   // token in it and a mode.
   const permissions = await configPermissions()
   if (permissions) checks.push(permissions)
+  checks.push(await sandboxImage())
 
   const dockerOk = checks.find((c) => c.name === 'docker')?.ok === true
   if (dockerOk) {
