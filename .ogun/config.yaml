@@ -38,6 +38,15 @@ cycles:
     # incomplete. `block` would mean one crashed reviewer buries the other's findings.
     onDepFailure: degrade
 
+# How a modifier's patch is proved before it can be published (§9). Read from the blob at
+# the pinned base rather than from the workspace — a modifier can write to its checkout,
+# and an agent that edits this line to `true` would be setting its own gate.
+#
+# `install` first because the workspace is a clone with no node_modules; the pnpm store
+# lives in the cache volume the runner mounts, so only the first run pays for it.
+tests:
+  command: pnpm install --frozen-lockfile && pnpm -s test
+
 policies:
   directPush: false
   allowSandboxDowngrade: false
