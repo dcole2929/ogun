@@ -97,7 +97,25 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
    */
   const destination = await destinationOf(db, job.cycleRunId, job.nodeKey)
   let adjudicated: AdjudicationOutcome[] = []
-  const reported = outcome === 'approved' ? (report.findings?.findings ?? []) : []
+  /**
+   * `dispatched` as well as `approved`, so a modifier can report what it noticed.
+   *
+   * A modifier that fixes one bug and spots another had its findings silently discarded:
+   * this read `outcome === 'approved'`, and a modifier's terminal outcome is
+   * `dispatched`. The patch survived, the observation did not, and nothing said so.
+   *
+   * They become ordinary findings rather than a second kind of record. A thing a
+   * modifier noticed is the same *sort* of thing a reviewer files — it wants a
+   * fingerprint, dedupe against the inbox, triage, and eventually adjudication — and a
+   * parallel channel would need all of that again, worse. Real ticketing is phase 4's
+   * Linear intake; until then the inbox is where a person reads what the factory found.
+   *
+   * `changes-requested` stays excluded, and that is the point of listing outcomes rather
+   * than negating the failures: it is what a gate failure derives to, and findings from a
+   * run whose own output failed the gate have not earned the inbox.
+   */
+  const reported =
+    outcome === 'approved' || outcome === 'dispatched' ? (report.findings?.findings ?? []) : []
   const raw = destination.withheld ? [] : reported
 
   /**

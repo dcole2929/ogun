@@ -70,7 +70,12 @@ that when they are built they live host-side.
   practical"; that sentence is marked `[corrected]` there now. A finding that the profiles
   are not enforced is a real finding and must not be discarded against this ADR.
 - The publisher becomes a host-side pipeline step, which is where the PR cap and the
-  diff-size limit go. It is not built.
+  diff-size limit go. [updated] The *extraction* half is built: a modifier's work leaves
+  the container as a `git format-patch` mbox on the runner's disk, with an `artifacts` row
+  and a `changes` row. The publishing half — apply, push, open a draft PR — is not, and it
+  runs **on the runner**, which is the only machine that has both a checkout and a GitHub
+  credential. That places a credential on the runner *host*; this ADR's rule is about the
+  *container*, and the container still has neither credential nor remote.
 - Egress cannot be `none` for an agent run — the runtime itself calls `api.anthropic.com`
   or OpenAI's endpoint, so a reviewer container cannot be an airgap.
 - **The per-host egress allowlist is not built, and this ADR does not say it should not
