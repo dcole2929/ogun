@@ -95,6 +95,19 @@ export const runChangeSchema = z.object({
   baseSha: z.string(),
   filesChanged: z.number().int().nonnegative(),
   patchRef: z.string().optional(),
+  /**
+   * Whether the project's suite actually executed against this tree, and whether it was
+   * green. Two fields rather than one tri-state boolean because they answer different
+   * questions and only one of them is about the code: `testsRun: false` says nothing was
+   * proved, `testsPassed: false` says something was disproved.
+   *
+   * Absent — not false — when there is no test outcome to report at all: a run recorded
+   * before this gate existed, or one whose patch could not be extracted. `null` in the
+   * column means "nobody said", and a publisher reading it as "the tests did not pass"
+   * would be right by accident rather than by evidence (principle 6).
+   */
+  testsRun: z.boolean().optional(),
+  testsPassed: z.boolean().optional(),
 })
 export type RunChange = z.infer<typeof runChangeSchema>
 

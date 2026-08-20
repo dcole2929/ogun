@@ -2,9 +2,16 @@ import { and, eq, inArray } from 'drizzle-orm'
 import { schema } from '@ogun/core/db'
 import type { Db } from '@ogun/core/db'
 import { cycleDefinitionSchema, isTerminal, type CycleDefinition, type JobState } from '@ogun/core'
-import { admit, DEFAULT_LIMITS, type AdmissionLimits } from './admission.ts'
+import {
+  admit,
+  DEFAULT_LIMITS,
+  modifierReadiness,
+  probeProject,
+  type AdmissionLimits,
+  type ModifierReadiness,
+} from './admission.ts'
 
-const { coverage, cycleRuns, cycles, jobs, skills, workers } = schema
+const { coverage, cycleRuns, cycles, jobs, projects, skills, workers } = schema
 
 export type StartCycleRunInput = {
   cycleId: string
@@ -12,6 +19,12 @@ export type StartCycleRunInput = {
   limits?: AdmissionLimits
   /** Per-node prompt override, keyed by node key. Used by a manual trigger. */
   promptOverrides?: Record<string, string>
+  /**
+   * What the project can offer a modifier (§4.3). Established by this function from the
+   * disk when omitted; a seam, because a test that has to lay out a real repository to
+   * assert an admission rule is a test about filesystems.
+   */
+  modifierReadiness?: ModifierReadiness
 }
 
 /**
@@ -34,6 +47,18 @@ export async function startCycleRun(
   const definition = cycleDefinitionSchema.parse(cycle.definition)
   const byName = await resolveWorkers(db, cycle.projectId, definition)
   const skillPrompts = await resolveSkillPrompts(db, cycle.projectId)
+
+  /**
+   * Established once, here, and only when the graph actually contains a modifier.
+   *
+   * Once because it is a property of the project rather than of a node, and here because
+   * it reads the disk — a probe inside the transaction below would hold a write
+   * transaction open across filesystem I/O, and would repeat it per node for an answer
+   * that cannot differ between them.
+   */
+  const readiness = [...byName.values()].some((w) => w.permissions === 'modifier')
+    ? (input.modifierReadiness ?? (await probeReadiness(db, cycle.projectId)))
+    : undefined
 
   return db.transaction(async (tx) => {
     const [cycleRun] = await tx
@@ -64,7 +89,7 @@ export async function startCycleRun(
 
       const dependsOn = definition.edges.filter((e) => e.to === node.key).map((e) => e.from)
       const verdict = worker.enabled
-        ? await admit(tx, worker.id, limits)
+        ? await admit(tx, { id: worker.id, permissions: worker.permissions }, limits, readiness)
         : ({ allowed: false, reason: 'worker disabled' } as const)
 
       const state: JobState = !verdict.allowed ? 'skipped' : dependsOn.length ? 'blocked' : 'queued'
@@ -213,6 +238,16 @@ export async function markCoverage(
         findingCount: fields.findingCount ?? 0,
       },
     })
+}
+
+/**
+ * The slug is what a person types and what the path map is keyed by, so the refusal can
+ * name the project rather than a uuid nobody can look up.
+ */
+async function probeReadiness(db: Db, projectId: string): Promise<ModifierReadiness> {
+  const project = await db.query.projects.findFirst({ where: eq(projects.id, projectId) })
+  if (!project) return { ready: false, reason: 'this cycle has no project' }
+  return modifierReadiness(project.slug, await probeProject(project.slug))
 }
 
 /** A skill with no agents/*.yaml has no declared prompt; the caller falls back. */

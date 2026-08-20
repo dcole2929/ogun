@@ -28,7 +28,15 @@ export function spawnJsonl(command: string, argv: string[], opts: SpawnOptions):
     stderr = (stderr + chunk).slice(-64_000)
   })
 
+  /**
+   * Remembered rather than inferred. A process killed here exits with a null code and no
+   * stderr of its own, which reads exactly like a crash — and for the test gate the
+   * difference decides whether the reason says "the suite failed" or "the suite ran out
+   * of the job's time", which are different facts about a change (principle 6).
+   */
+  let timedOut = false
   const timer = setTimeout(() => {
+    timedOut = true
     child.kill('SIGTERM')
     setTimeout(() => child.kill('SIGKILL'), 10_000).unref()
   }, opts.timeoutMs)
@@ -36,16 +44,18 @@ export function spawnJsonl(command: string, argv: string[], opts: SpawnOptions):
 
   const rl = createInterface({ input: child.stdout, crlfDelay: Infinity })
 
-  const done = new Promise<{ code: number | null; stderr: string }>((resolveDone, rejectDone) => {
-    child.on('error', (err) => {
-      clearTimeout(timer)
-      rejectDone(err)
-    })
-    child.on('close', (code) => {
-      clearTimeout(timer)
-      resolveDone({ code, stderr })
-    })
-  })
+  const done = new Promise<{ code: number | null; stderr: string; timedOut: boolean }>(
+    (resolveDone, rejectDone) => {
+      child.on('error', (err) => {
+        clearTimeout(timer)
+        rejectDone(err)
+      })
+      child.on('close', (code) => {
+        clearTimeout(timer)
+        resolveDone({ code, stderr, timedOut })
+      })
+    },
+  )
 
   return { lines: rl, done }
 }

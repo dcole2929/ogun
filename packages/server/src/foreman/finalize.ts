@@ -71,9 +71,9 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
    *
    * `dispatched` is overruled for the same reason and it matters more there. It means
    * "there is a patch waiting to be published", and the modifier gate is the one that
-   * will run the project's tests (§9) — so a `dispatched` that survived a failed gate is
-   * an instruction to open a pull request from work the gate has just rejected. The
-   * patch is still recorded below; what the gate withdraws is the claim that it is ready.
+   * runs the project's tests (§9) — so a `dispatched` that survived a failed gate is an
+   * instruction to open a pull request from work whose suite is red. The patch is still
+   * recorded below; what the gate withdraws is the claim that it is ready.
    */
   const outcome: RunOutcome =
     gateFailed && (report.outcome === 'approved' || report.outcome === 'dispatched')
@@ -236,6 +236,23 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
         baseSha: report.change.baseSha,
         filesChanged: report.change.filesChanged,
         ...(report.change.patchRef ? { patchRef: report.change.patchRef } : {}),
+        /**
+         * The two columns that had been on this table since it was created with nothing
+         * writing them (§9). Copied rather than derived from `report.gates`: reading a
+         * lens by name here would make the control plane responsible for knowing which
+         * gate happens to be the test one, and a renamed lens would silently start
+         * writing nulls.
+         *
+         * Left null when the runner reported neither, which is not the same as false. A
+         * run recorded before this gate existed, and one whose patch could not be
+         * extracted, both say nothing about tests — and a publisher that read null as
+         * "did not pass" would be refusing on the absence of evidence rather than on
+         * evidence (principle 6).
+         */
+        ...(report.change.testsRun !== undefined ? { testsRun: report.change.testsRun } : {}),
+        ...(report.change.testsPassed !== undefined
+          ? { testsPassed: report.change.testsPassed }
+          : {}),
       })
     }
 

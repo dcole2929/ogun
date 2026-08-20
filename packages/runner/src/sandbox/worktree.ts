@@ -14,11 +14,17 @@ export function createWorktreeSandbox(spec: SandboxSpec): Sandbox {
   return {
     kind: 'worktree',
     provision: async () => {},
-    exec: (argv) =>
-      spawnJsonl(binary, argv, {
+    /**
+     * A `raw` command runs as itself, on the host, in the workspace — which is what this
+     * sandbox is, and why a modifier needs `allowSandboxDowngrade` to reach it at all.
+     * There is nothing weaker about it than the agent invocation it sits beside: the same
+     * process, the same user, the same machine.
+     */
+    exec: (argv, exec = {}) =>
+      spawnJsonl(exec.raw ? (argv[0] ?? '') : binary, exec.raw ? argv.slice(1) : argv, {
         cwd: spec.hostWorkspace,
-        timeoutMs: spec.timeoutMs,
-        env: { ...process.env, ...spec.env },
+        timeoutMs: exec.timeoutMs ?? spec.timeoutMs,
+        env: { ...process.env, ...(exec.raw ? { CI: '1' } : {}), ...spec.env },
       }),
     readFile: (relPath) => readContained(spec.hostWorkspace, relPath),
     dispose: async () => {},
