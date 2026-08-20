@@ -46,6 +46,27 @@ test('a modifier gets the tree writable — it is the profile that exists to wri
 })
 
 /**
+ * The test gate (§9) runs the project's suite in this same mount, and a suite writes:
+ * `node_modules/.cache`, a compiled `dist/`, `coverage/`, `.pytest_cache`. That it can
+ * was checked against a real container rather than inferred from the flag — the reviewer
+ * profile refused `touch /workspace/x` with "Read-only file system" and the modifier
+ * profile left `node_modules/.cache/suite-artifact` behind in the host workspace.
+ *
+ * Which is also why the patch is extracted *before* the gate runs, in pipeline.ts:
+ * extraction begins with `git add -A`, and that artifact is exactly what would otherwise
+ * be committed into a modifier's pull request.
+ */
+test("a modifier's suite can write where it runs", () => {
+  const args = argsFor('modifier')
+  assert.ok(mountOf(args, GUEST_WORKSPACE)?.endsWith(':rw'), 'the suite writes into the tree')
+  // And a scratch space that is not the tree, for the suites that respect TMPDIR.
+  assert.ok(
+    args.some((a) => a.startsWith('/tmp:rw')),
+    'a suite needs somewhere to put temporary files',
+  )
+})
+
+/**
  * The half that makes read-only survivable. `.ogun-out/` is inside the tree, so a blanket
  * read-only mount stops a reviewer writing its findings — which is not a stricter
  * reviewer, it is one that cannot report. Layered over the tree mount, and writable for

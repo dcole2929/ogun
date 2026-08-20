@@ -141,7 +141,7 @@ describe('run lifecycle', () => {
     await runOnce(fail)
     await runOnce(fail)
 
-    const verdict = await admit(db, workerId)
+    const verdict = await admit(db, { id: workerId })
     assert.equal(verdict.allowed, false)
 
     const r = await runOnce(fail)

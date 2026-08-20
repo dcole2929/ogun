@@ -13,15 +13,25 @@ const sandbox = {
   dispose: async () => {},
 } as unknown as Sandbox
 
-const gate = (output: unknown, files: Record<string, number>) =>
-  runVerifyGate({
-    config: undefined,
-    permissions: 'reviewer',
-    output,
-    knownPaths: new Set(Object.keys(files)),
-    lineCountOf: async (p) => files[p] ?? null,
-    sandbox,
-  })
+/**
+ * A reviewer's gate never reaches the deadline — no lens it runs shells out — so this is
+ * a plausible one rather than a fixture with meaning. The modifier gate, which does use
+ * it, is exercised in tests-gate.test.ts.
+ */
+const deadline = () => Date.now() + 60_000
+
+const gate = async (output: unknown, files: Record<string, number>) =>
+  (
+    await runVerifyGate({
+      config: undefined,
+      permissions: 'reviewer',
+      output,
+      knownPaths: new Set(Object.keys(files)),
+      lineCountOf: async (p) => files[p] ?? null,
+      sandbox,
+      deadline: deadline(),
+    })
+  ).gates
 
 const finding = (over: Record<string, unknown> = {}) => ({
   fingerprint: 'security/orders/isolation/id-swap',
@@ -64,13 +74,14 @@ test('a citation to a file that is not in the tree is not grounded', async () =>
 test('an unreadable file is not judged either way', async () => {
   // null means "cannot judge", which must not become a failure — a generated or
   // gitignored-but-tracked file should not discard a whole run's findings.
-  const gates = await runVerifyGate({
+  const { gates } = await runVerifyGate({
     config: undefined,
     permissions: 'reviewer',
     output: { findings: [finding({ citations: [{ path: 'src/orders.ts', line: 9999 }] })] },
     knownPaths: new Set(['src/orders.ts']),
     lineCountOf: async () => null,
     sandbox,
+    deadline: deadline(),
   })
   assert.equal(named(gates, 'grounded')?.passed, true)
 })
@@ -94,7 +105,7 @@ test('zero findings is a valid document — clean is a real result', async () =>
 })
 
 test('agent lenses are recorded as skipped, never as silently passed', async () => {
-  const gates = await runVerifyGate({
+  const { gates } = await runVerifyGate({
     config: {
       expectations: [
         { name: 'actionable', method: 'agent', prompt: 'is each finding actionable?' },
@@ -107,6 +118,7 @@ test('agent lenses are recorded as skipped, never as silently passed', async () 
     knownPaths: new Set(),
     lineCountOf: async () => null,
     sandbox,
+    deadline: deadline(),
   })
   const lens = named(gates, 'actionable')
   assert.equal(lens?.method, 'agent')

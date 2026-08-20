@@ -33,7 +33,6 @@ export const GUEST_WORKSPACE = '/workspace'
  */
 export function createContainerSandbox(opts: ContainerOptions): Sandbox {
   const image = opts.image ?? 'ogun/base:latest'
-  const runArgs = buildRunArgs(opts, image)
 
   return {
     kind: 'container',
@@ -44,23 +43,53 @@ export function createContainerSandbox(opts: ContainerOptions): Sandbox {
         )
       }
     },
-    exec: (argv) =>
+    exec: (argv, exec = {}) =>
       // `docker run` per exec rather than a long-lived container + `docker exec`: the
       // job is one agent invocation, and a fresh container makes cleanup automatic.
-      spawnJsonl('docker', [...runArgs, ...containerCommand(opts.runtime, argv)], {
-        timeoutMs: opts.timeoutMs,
-      }),
+      spawnJsonl(
+        'docker',
+        [
+          ...buildRunArgs(exec.raw ? verificationOptions(opts) : opts, image),
+          ...(exec.raw ? argv : containerCommand(opts.runtime, argv)),
+        ],
+        { timeoutMs: exec.timeoutMs ?? opts.timeoutMs },
+      ),
     // Read through the host bind-mount rather than `docker cp`: the container may
     // already be gone, and the path check has to happen host-side anyway (§5.3).
     readFile: (relPath) => readContained(opts.hostWorkspace, relPath),
     dispose: async () => {
-      // --rm handles the normal path; this catches a container left behind by a kill.
-      await spawnJsonl('docker', ['rm', '-f', opts.name], { timeoutMs: 15_000 }).done.catch(
-        () => undefined,
-      )
+      // --rm handles the normal path; this catches a container left behind by a kill —
+      // including the verification one, which is exactly the container most likely to
+      // have been killed, since the gate is what runs against a deadline.
+      for (const name of [opts.name, verificationName(opts.name)]) {
+        await spawnJsonl('docker', ['rm', '-f', name], { timeoutMs: 15_000 }).done.catch(
+          () => undefined,
+        )
+      }
     },
   }
 }
+
+/**
+ * A verification command runs in its own container, under its own name.
+ *
+ * Not a shared one, because the agent's `docker run` may still be shutting down when the
+ * gate starts — a killed agent's container outlives the `docker run` that started it —
+ * and a second `--name` collision would fail the gate with "name already in use", which
+ * reads as a broken test suite.
+ *
+ * `CI=1` because the gate needs a suite that exits. Watch mode is the default for enough
+ * runners (vitest, jest --watch, cargo-watch) that a project whose `command` is a bare
+ * `pnpm test` would otherwise sit there until the job's budget ran out and be reported as
+ * a timeout, which points at the wrong thing entirely.
+ */
+const verificationOptions = (opts: ContainerOptions): ContainerOptions => ({
+  ...opts,
+  name: verificationName(opts.name),
+  env: { CI: '1', ...opts.env },
+})
+
+const verificationName = (name: string): string => `${name}-verify`
 
 /** Exported for the tests: the mount flags are the profile enforcement, so they are
  *  worth asserting without starting a container. */

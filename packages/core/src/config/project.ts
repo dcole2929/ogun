@@ -1,3 +1,4 @@
+import { parse as parseYaml } from 'yaml'
 import { z } from 'zod'
 import { cycleConfigSchema } from './cycle.ts'
 
@@ -56,6 +57,23 @@ export const workerSchema = z.object({
 })
 export type WorkerConfig = z.infer<typeof workerSchema>
 
+/**
+ * How this repository runs its own suite (§9's tests-must-pass gate).
+ *
+ * Project-level, not per-worker: one repo has one way to run its tests, and a command
+ * that could differ per worker is a knob whose only use is letting one modifier hold
+ * itself to a weaker standard than another.
+ *
+ * The command is run by a shell inside the sandbox, so `pnpm -s test && pnpm lint` is a
+ * legitimate value. There is no default: guessing at `npm test` for a project that never
+ * said so produces a gate that passes because the script is missing, which is worse than
+ * no gate at all because it looks like one.
+ */
+export const testsSchema = z.object({
+  command: z.string().min(1).optional(),
+})
+export type TestsConfig = z.infer<typeof testsSchema>
+
 export const policiesSchema = z.object({
   directPush: z.boolean().default(false),
   /** A modifier on `worktree` is an agent editing files directly on the host. */
@@ -76,6 +94,33 @@ export const projectConfigSchema = z.object({
   workers: z.record(z.string(), workerSchema).default({}),
   /** Multi-worker graphs. A single worker needs none — it is already a one-node cycle. */
   cycles: z.record(z.string(), cycleConfigSchema).default({}),
+  tests: testsSchema.prefault({}),
   policies: policiesSchema.prefault({}),
 })
 export type ProjectConfig = z.infer<typeof projectConfigSchema>
+
+/**
+ * The test command out of a `config.yaml`, from text, without demanding the rest of the
+ * file be valid.
+ *
+ * Two callers read this from places the full schema cannot survive. Admission reads the
+ * control plane's working copy, which a person may be halfway through editing; the
+ * runner reads the blob at the commit the workspace was pinned to, which may have been
+ * written by a different version of Ogun than the one reading it. A `workers:` block
+ * this build cannot parse must not be able to answer "does this project declare a way to
+ * test itself" — and `projectConfigSchema.parse` would answer it by throwing.
+ *
+ * Every failure returns `undefined`, and every caller treats `undefined` as "cannot be
+ * verified" and refuses. So the tolerance only ever widens what is accepted as a
+ * command; it never turns a broken file into a passing gate.
+ */
+export function readTestCommand(yamlText: string): string | undefined {
+  let raw: unknown
+  try {
+    raw = parseYaml(yamlText)
+  } catch {
+    return undefined
+  }
+  const parsed = z.object({ tests: testsSchema.optional() }).safeParse(raw)
+  return parsed.success ? parsed.data.tests?.command : undefined
+}

@@ -3,6 +3,7 @@ import { mkdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import {
   parseFingerprint,
+  readTestCommand,
   verifySchema,
   writeSecretFile,
   type ClaimedJob,
@@ -22,7 +23,7 @@ import {
 import { nextSeq, newParserState, resolveModel, resolveRuntime } from './runtimes/index.ts'
 import { extractPatch, type PatchExtraction } from './patch.ts'
 import { gitIn, materializeWorkspace, resolveHeadSha, stageAll } from './workspace.ts'
-import { runVerifyGate } from './verify.ts'
+import { runVerifyGate, type VerifyOutcome } from './verify.ts'
 import {
   defaultSearchPaths,
   ensureSkillAvailable,
@@ -109,6 +110,45 @@ export async function executeJob(
     return 'error'
   }
 
+  /**
+   * The job cannot be run, and nothing went wrong — the two halves that make this a
+   * different report from `fail`.
+   *
+   * `skipped` is what admission's refusals already record, and this is the same refusal
+   * arriving late: the control plane admitted a modifier because the project's working
+   * copy looked ready, and the commit the workspace actually pinned says otherwise.
+   * Filing it as an error would put it in the ledger beside runs that broke, and would
+   * latch the failure breaker against a worker that has not failed at anything — three
+   * such nights and it stops being dispatched at all, for a project setting nobody has
+   * looked at.
+   */
+  const refuse = async (detail: string): Promise<RunOutcome> => {
+    await flusher.flush()
+    await cp
+      .report({
+        runId: job.runId,
+        outcome: 'skipped',
+        detail,
+        durationMs: Date.now() - startedAt,
+        gates: [],
+        coverage: { outcome: 'refused', reason: detail },
+        artifacts: [],
+      })
+      .catch((err) => console.error('[runner] failed to report refusal', err))
+    return 'skipped'
+  }
+
+  /**
+   * One clock for the whole job, started where the job started.
+   *
+   * The sandbox's own timeout is applied per exec, so the agent alone may use all of
+   * `timeoutMs`; anything the gate runs afterwards would then be a second helping of the
+   * same allowance. Deriving a deadline here instead means every step after this point
+   * shares one budget, and a job with a 30 minute timeout is over in 30 minutes rather
+   * than in 30 plus however long its suite takes.
+   */
+  const deadline = startedAt + job.timeoutMs
+
   try {
     /**
      * A local checkout is an optimisation, not a requirement. If this machine has the
@@ -157,6 +197,31 @@ export async function executeJob(
     await containedTarget(workspace.path, OUTPUT_PATH)
     // Harness input and output, not changes the worker made.
     await excludeFromGit(workspace.path, ['/.ogun-out/', '/.ogun-in/'])
+
+    /**
+     * A modifier has to be able to prove its work, and this is where that becomes
+     * knowable: read the project's test command before the agent starts, and refuse the
+     * job if the pinned commit does not declare one.
+     *
+     * Admission asks the same question of the control plane's working copy and refuses
+     * there (§4.3), which is where a person finds out. This is the drift case — the file
+     * on the control plane's disk is not necessarily the file at `workspace.sha`, and a
+     * `tests.command` deleted, moved to a branch, or added but not committed puts the two
+     * answers apart. Asked here, the cost is a clone; asked after the run, it is a
+     * modifier's whole round spent producing a patch nothing can check.
+     */
+    let testCommand: string | undefined
+    if (job.permissions === 'modifier') {
+      testCommand = await projectTestCommand(workspace.path, workspace.sha)
+      if (!testCommand) {
+        return await refuse(
+          `${PROJECT_CONFIG_PATH} at ${workspace.sha.slice(0, 12)} declares no tests.command, ` +
+            'so nothing could show this modifier\'s patch works. A modifier that cannot be ' +
+            'verified does not run unattended — add `tests:\n  command: …` to ' +
+            `${PROJECT_CONFIG_PATH} and commit it to ${job.projectDefaultBranch}.`,
+        )
+      }
+    }
 
     // Deliberately not caught: a node that cannot read its input must fail loudly
     // rather than run against an empty one. The outer catch turns it into a failed run.
@@ -318,17 +383,6 @@ export async function executeJob(
       return await fail(err instanceof Error ? err.message : String(err))
     }
     const output = raw === null ? undefined : safeJsonParse(raw)
-    const gates = await runVerifyGate({
-      config: job.verify ? verifySchema.parse(job.verify) : undefined,
-      permissions: job.permissions as 'observer' | 'reviewer' | 'modifier',
-      output,
-      knownPaths: await trackedPaths(workspace.path),
-      lineCountOf: (path) => countLines(workspace.path, path),
-      sandbox,
-    })
-
-    const transcriptRef = await writeTranscript(config, job, workspace.path)
-    const usage = usageFrom(lastEvent)
 
     /**
      * The crossing (ADR-0005). A modifier's work exists only as commits in a clone this
@@ -336,9 +390,20 @@ export async function executeJob(
      * anywhere else — so if it is not extracted here it is gone, and the run reads as an
      * agent that did nothing.
      *
-     * After the gate, not before: a modifier gate will eventually run the project's test
-     * suite (§9), which needs the tree the agent left rather than a patch of it, and an
-     * extraction that ran first would be extracting a tree the gate might still change.
+     * **Before the gate, which is the reverse of where this sat.** The gate now runs the
+     * project's suite in the same workspace, and a suite writes: `node_modules/.cache`,
+     * `coverage/`, `.pytest_cache`, a compiled `dist/` — verified by running one against
+     * a modifier's read-write mount, which left `node_modules/.cache/suite-artifact` in
+     * the tree. Extraction begins with `git add -A`, so anything the suite dropped and
+     * the repo does not ignore would be committed under "work the agent left
+     * uncommitted" and published in the pull request. The patch has to be the agent's
+     * work, so it is taken before anything else touches the tree.
+     *
+     * Nothing is lost by the swap: extraction commits what the agent left but does not
+     * change a file in the worktree, so the suite still runs against exactly the tree the
+     * agent produced. A patch written for a run the gate then rejects is not waste
+     * either — the run records the patch and refuses to call it ready, and the person
+     * reading the failure wants to see the diff that failed.
      *
      * The patch is written under `scratch/patches`, outside the workspace, because the
      * workspace is deleted in this function's `finally`. Nothing prunes that directory
@@ -367,10 +432,39 @@ export async function executeJob(
       ])
       if (change.unextractable) {
         // Loud, and with the file count kept: a modifier whose work cannot be published
-        // is a broken factory, not a quiet night.
-        return await fail(change.unextractable, gates, { change: changeRecord(change) })
+        // is a broken factory, not a quiet night. Running the suite first would spend the
+        // rest of the budget grading work that cannot leave this machine either way.
+        return await fail(change.unextractable, [], { change: changeRecord(change) })
       }
     }
+
+    const verdict = await runVerifyGate({
+      config: job.verify ? verifySchema.parse(job.verify) : undefined,
+      permissions: job.permissions as 'observer' | 'reviewer' | 'modifier',
+      output,
+      knownPaths: await trackedPaths(workspace.path),
+      lineCountOf: (path) => countLines(workspace.path, path),
+      sandbox,
+      ...(testCommand ? { testCommand } : {}),
+      deadline,
+    })
+    if (verdict.tests) {
+      flusher.push([
+        {
+          type: 'runner.note',
+          ts: new Date().toISOString(),
+          seq: nextSeq(parser),
+          payload: {
+            note: describeTests(verdict),
+            testsRun: verdict.tests.ran,
+            testsPassed: verdict.tests.passed,
+          },
+        },
+      ])
+    }
+
+    const transcriptRef = await writeTranscript(config, job, workspace.path)
+    const usage = usageFrom(lastEvent)
 
     const report: RunReport = {
       runId: job.runId,
@@ -383,9 +477,9 @@ export async function executeJob(
       outcome: change?.patch ? 'dispatched' : 'approved',
       durationMs: Date.now() - startedAt,
       ...(usage ? { usage } : {}),
-      gates,
+      gates: verdict.gates,
       ...(output !== undefined ? { findings: output as never } : {}),
-      ...(change ? { change: changeRecord(change) } : {}),
+      ...(change ? { change: changeRecord(change, verdict.tests) } : {}),
       coverage: { outcome: change?.patch ? 'changed' : 'clean' },
       artifacts: [
         ...(transcriptRef ? [{ kind: 'transcript', ref: transcriptRef }] : []),
@@ -485,12 +579,67 @@ function composePrompt(
   ].join('\n')
 }
 
-/** The wire shape of an extraction: the durable facts, without the host-only detail. */
-const changeRecord = (change: PatchExtraction): RunReport['change'] => ({
+/**
+ * The wire shape of an extraction: the durable facts, without the host-only detail.
+ *
+ * The test outcome rides on the change rather than being derived from the gate list
+ * downstream, because the gate reports one bit and the record needs two — and because
+ * the control plane would otherwise have to recognise a lens by name to fill in a column
+ * (§4.4). Omitted entirely when the gate produced no verdict, so `null` in the column
+ * keeps meaning "nobody said" rather than "no".
+ */
+const changeRecord = (
+  change: PatchExtraction,
+  tests?: VerifyOutcome['tests'],
+): RunReport['change'] => ({
   baseSha: change.baseSha,
   filesChanged: change.filesChanged,
   ...(change.patch ? { patchRef: change.patch.ref } : {}),
+  ...(tests ? { testsRun: tests.ran, testsPassed: tests.passed } : {}),
 })
+
+/** Where a project says how it is built and how it is tested (§4.6, §9). */
+const PROJECT_CONFIG_PATH = '.ogun/config.yaml'
+
+/**
+ * The project's test command as of the commit the workspace was pinned to, read out of
+ * git rather than off disk.
+ *
+ * `git show <sha>:<path>` and not `readFile`, because the file on disk is inside a tree
+ * the modifier had write access to. An agent that edits `tests.command` to `true` — one
+ * line, no cleverness — would be setting its own gate, and the harness would faithfully
+ * run it and report a pass. The blob at the pinned base is the version a person reviewed
+ * and merged, and it is the only copy the agent could not reach.
+ *
+ * The consequence is deliberate: a modifier whose patch legitimately changes the test
+ * command is still gated by the old one. The gate belongs to the project, not to the
+ * patch asking to be let in.
+ */
+export async function projectTestCommand(
+  workspace: string,
+  baseSha: string,
+): Promise<string | undefined> {
+  // Missing file, unreadable object, a repository without that path at that commit —
+  // all of them mean the same thing to the caller, which refuses rather than guessing.
+  const shown = await gitIn(workspace, ['show', `${baseSha}:${PROJECT_CONFIG_PATH}`]).catch(
+    () => null,
+  )
+  return shown === null ? undefined : readTestCommand(shown.stdout)
+}
+
+/**
+ * Said on the timeline whether the suite passed, failed or never started — the same rule
+ * the extraction note follows. A run whose gate could not be reached at all is the one a
+ * person most needs an account of, and "took 4s" is how somebody notices a command that
+ * is not running the suite it claims to.
+ */
+function describeTests(verdict: VerifyOutcome): string {
+  const detail = verdict.gates.find((g) => g.name === 'tests')?.detail
+  if (!verdict.tests?.ran) {
+    return `the project's suite did not run: ${detail ?? 'no reason recorded'}`
+  }
+  return `the project's suite: ${detail ?? (verdict.tests.passed ? 'passed' : 'failed')}`
+}
 
 /**
  * Said on the timeline whatever happened, including "nothing". A modifier that changed
