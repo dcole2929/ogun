@@ -1030,17 +1030,54 @@ round` shape running exactly once so phase 3 is an unwrapping, not a rewrite.
 
 ### 5.3 Patch reconciliation
 
-For any provider whose agent edited a workspace we then need to grade or publish:
+Two directions, and this section only ever described one of them.
 
-1. Reset workspace to base ref (a retry would otherwise fail to apply)
-2. Apply patch
-3. **Stage it** — `git apply` leaves changes unstaged, and untracked new files do not
-   appear in `git diff <base>`, so an unstaged new test file is invisible to the gate
-4. Write any extra files
+**Getting work out of a workspace**, which is what actually runs first:
+
+1. **Stage what the agent left** — untracked new files do not appear in `git diff <base>`,
+   so an unstaged new test file is invisible to the gate.
+2. **Commit the remainder if the agent did not.** `git format-patch` reads commits, so an
+   agent that forgot its final commit would otherwise be recorded as a run that changed
+   nothing, seconds before the workspace is deleted. The runner commits the leftovers
+   under its own identity, with a message saying nobody wrote one.
+3. **Refuse a HEAD that is not a descendant of the pinned base.** An `--amend` or a
+   `reset` produces something `git am` cannot express against the base the host holds.
+   That is an error with the file count kept, not a run that changed nothing.
+4. **Bound the size.** A patch is agent output; an unbounded one is a denial of service
+   against the host, as `MAX_READBACK_BYTES` already assumes for findings. Over the
+   limit is an error, and the partial file is removed — a truncated mbox still applies.
+
+`format-patch`, not a diff and not a bundle. [settled] A diff loses the commit message,
+which is the first thing a PR reviewer reads, and the authorship. A bundle keeps
+everything and is opaque, and this artefact is also a review surface. format-patch is
+text, survives binaries and renames, and `git am` applies it.
+
+**Putting work back into a workspace**, for the retry loop and the publisher:
+
+1. Apply the patch.
+2. **Stage it** — `git apply` leaves changes unstaged, with the same consequence as above.
+3. Write any extra files.
+
+There is deliberately no "reset the workspace to base ref" step. [corrected] It used to
+lead this list, and it contradicts §5.2's settled rule that the workspace is provisioned
+once and every retry reuses it, with the previous attempt's changes still present. Both
+cannot hold. §5.2 is the newer and the reasoned one — reprovisioning per round turns three
+cheap rounds into three full-price ones — so the reset is gone rather than left for the
+retry loop to trip over.
 
 **Path safety for anything written back from a sandbox:** reject absolute and `..`
 paths, resolve symlinks on both the workspace and the target's parent and require
 containment, open with `O_NOFOLLOW`, mode 0600.
+
+**And for anything the host *runs* there.** [added] The file rules above are file-shaped
+and miss the larger exposure: a workspace's `.git` is agent-authored, and git executes
+repository configuration and hooks. `core.fsmonitor` fires on any command that refreshes
+the index — `add`, `ls-files`, `status`, `diff` — so an agent could leave a string behind
+and have the host run it as the runner, with the runner's control-plane token in its
+environment. Every git call the runner makes in a workspace therefore passes
+`-c core.hooksPath=/dev/null -c core.fsmonitor= -c diff.external=`, adds
+`--no-ext-diff --no-textconv` to diff-producing commands, and blanks the host's own git
+configuration so the result does not depend on whose machine it ran on.
 
 ---
 
@@ -1070,7 +1107,7 @@ staged_findings     id, run_id, worker_id, raw (jsonb)   -- pre-triage, queryabl
 findings            id, project_id, worker_id, fingerprint, path, snippet,
                     severity, title, body, status, first_seen_run,
                     last_seen_run, seen_count
-changes             id, run_id, branch, base_sha, patch, files_changed,
+changes             id, run_id, branch, base_sha, patch_ref, files_changed,
                     tests_run, tests_passed, pr_url
                     -- artifact record only; PR lifecycle state lives in GitHub
 coverage            id, cycle_run_id, worker_id, selected, ran, outcome, reason
