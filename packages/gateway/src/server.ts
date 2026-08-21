@@ -170,8 +170,8 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
     if (!authorized(req.headers, tokens)) {
       // A CONNECT with no valid token is refused rather than tunnelled. Serving it would
       // mean copying bytes to any host the client names, with no allowlist and no
-      // injection — an open relay reachable from every container on this host's bridge
-      // network, which is precisely what the gateway exists to not be.
+      // injection — an open relay reachable by anything that can open the socket, which is
+      // precisely what the gateway exists to not be.
       socket.end(
         'HTTP/1.1 407 Proxy Authentication Required\r\n' +
           // Without the challenge header many clients never retry with credentials, and
@@ -390,14 +390,26 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
     caCertificatePath: ca.certificatePath,
     caCertificatePem: ca.certificatePem,
     open: (containerAuthority?: string) => {
+      // A socket has no authority to put in a URL. A caller listening on one and not
+      // saying where the container reaches it has not finished wiring the sandbox, and a
+      // silently wrong `HTTPS_PROXY` is a container that talks to nothing and says nothing
+      // about why. Refused before a token is minted, so a caller that recovers from this
+      // has not left one behind that never gets revoked.
+      if (!containerAuthority && listening.kind === 'socket') {
+        throw new Error(
+          'the gateway listens on a unix socket — open() needs the authority the ' +
+            "container's proxy forwarder listens on",
+        )
+      }
+
       /**
        * A token per job, not one per gateway.
        *
-       * The listener is reachable from every container on the host's bridge network, not
-       * only from the one it was started for, so "is this the gateway?" is not the same
-       * question as "may this caller use it?". A per-job token that is revoked when the
-       * job ends means a container that somehow outlives its job — a leaked `docker run`,
-       * a `--rm` that did not fire — cannot keep spending the host's credentials.
+       * The socket is 0600 and only the containers the runner mounted it into can reach
+       * it, so "can you reach it" is already narrow — but it is not per-*job*. A container
+       * that outlives its run (a leaked `docker run`, a `--rm` that did not fire) would
+       * otherwise keep spending the host's credentials, and nothing would notice. The
+       * token is what ends that at the same moment the job does.
        *
        * 256 bits from the CSPRNG, compared by set membership. There is no timing oracle
        * worth defending against on a full-entropy secret that is never partially matched.
@@ -406,17 +418,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
       tokens.add(token)
       const authority =
         containerAuthority ??
-        (listening.kind === 'tcp'
-          ? `${listening.host}:${listening.port}`
-          : // A socket has no authority to put in a URL. A caller listening on one and not
-            // saying where the container reaches it has not finished wiring the sandbox,
-            // and a silently wrong `HTTPS_PROXY` is a container that talks to nothing.
-            (() => {
-              throw new Error(
-                'the gateway listens on a unix socket — open() needs the authority the ' +
-                  "container's proxy forwarder listens on",
-              )
-            })())
+        (listening.kind === 'tcp' ? `${listening.host}:${listening.port}` : '')
       return {
         token,
         proxyUrl: `http://x:${token}@${authority}`,
