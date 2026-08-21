@@ -330,6 +330,20 @@ permission profile):
 A `modifier` worker downgrading to `worktree` means an agent editing files directly
 on the host. Gate it behind `policies.allowSandboxDowngrade: false`.
 
+What setting it `true` actually grants, so that nobody has to find out by running it:
+the agent is a process on the runner's machine, started as the runner's own user with
+the runner's environment, working in the run's clone under `scratch`. There is no
+read-only mount, so the permission profile has nothing enforcing it; there is no network
+namespace, so a worker's `egress` list cannot be applied and is dropped. Only the file
+state is isolated, and only because the clone is a separate directory.
+
+The policy is read from `.ogun/config.yaml` **in the blob at the commit the workspace
+was pinned to**, never from the workspace — the same rule `tests.command` follows, and
+for the same reason: that tree is one the modifier can write, and a gate the agent can
+edit is not a gate. A config that cannot be read there refuses the run, and says that it
+could not be read rather than that the project said no. The two are different facts
+(principle 6): one points at a line to change, the other at a file that does not parse.
+
 **Images.** Each project has its own image: `.ogun/Dockerfile` doing `FROM ogun/base`.
 Base carries `claude`, `codex`, `git`, node. The project layer adds its toolchain.
 

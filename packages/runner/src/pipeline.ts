@@ -225,6 +225,59 @@ export async function executeJob(
     await excludeFromGit(workspace.path, ['/.ogun-out/', '/.ogun-in/'])
 
     /**
+     * The project's own config as of the commit this workspace was pinned to, read once,
+     * before the agent starts.
+     *
+     * Three separate gates come out of this one blob — the sandbox downgrade below, the
+     * test command after it, and the publisher's `maxOpenPullRequests` later — and the
+     * shared read is not an economy. It is that all three have to agree about *which copy
+     * of the file counts*: the blob at `workspace.sha`, never the tree on disk. The tree
+     * is one a modifier can write, and each of these settings is a gate on the agent
+     * doing the writing. See `pinnedProjectConfig`.
+     *
+     * Read for every permission profile, not only for `modifier` as it once was. The
+     * settings here belong to the project, not to the profile, and a `policies` that is
+     * `undefined` for a reviewer only because nobody asked is a value waiting to be
+     * misread as "this project's config could not be read".
+     */
+    const pinned = await pinnedProjectConfig(workspace.path, workspace.sha)
+    /**
+     * Read here rather than where each policy is used, and in particular the publisher's
+     * `maxOpenPullRequests` is read here rather than at publish time. Partly because the
+     * publisher runs after the report, by which point this function is on its way into the
+     * `finally` that deletes the workspace and the pinned `config.yaml` is unreachable —
+     * but that is the accident. The reason is that a gate read after the agent has run is
+     * a gate the agent could have edited.
+     *
+     * `undefined` when the blob is missing or its `policies:` block does not parse — an
+     * *absent* block is the defaults, not a failure (see `readPolicies`). Every consumer
+     * treats `undefined` as "this project's policy could not be established" and takes
+     * the strict side of whatever it was deciding: the publisher withholds the pull
+     * request, and the gate immediately below refuses the run.
+     */
+    const policies: Policies | undefined = pinned === undefined ? undefined : readPolicies(pinned)
+
+    /**
+     * Whether this job may run in the sandbox its worker asked for — the containment
+     * question, asked before the verifiability one below.
+     *
+     * Both gates read the same file and both can refuse the same run, so the order
+     * decides which sentence a person is left with. "This worker may not edit files
+     * directly on your host" explains why nothing ran; "declares no tests.command" would
+     * send them to inspect a key that is very likely fine.
+     *
+     * This is also the value `createSandbox` is given further down. It used to be given
+     * the literal `false` — see `sandboxDowngrade` for what that cost.
+     */
+    const downgrade = sandboxDowngrade({
+      sandbox: job.sandbox === 'worktree' ? 'worktree' : 'container',
+      permissions: job.permissions as 'observer' | 'reviewer' | 'modifier',
+      policies,
+      baseSha: workspace.sha,
+    })
+    if (downgrade.refusal) return await refuse(downgrade.refusal)
+
+    /**
      * A modifier has to be able to prove its work, and this is where that becomes
      * knowable: read the project's test command before the agent starts, and refuse the
      * job if the pinned commit does not declare one.
@@ -236,35 +289,14 @@ export async function executeJob(
      * answers apart. Asked here, the cost is a clone; asked after the run, it is a
      * modifier's whole round spent producing a patch nothing can check.
      */
-    let testCommand: string | undefined
-    /**
-     * Read here rather than at publish time, from the same blob and for the same reason.
-     *
-     * The publisher runs after the report, by which point this function is on its way into
-     * the `finally` that deletes the workspace — so the only place the pinned
-     * `config.yaml` is still reachable is up here. That is a happy accident; the reason it
-     * *should* be read here is that `policies.maxOpenPullRequests` is the modifier's own
-     * cap, the workspace is a tree the modifier can write, and a gate read after the agent
-     * has run is a gate the agent could have edited.
-     *
-     * `undefined` when the file at the pinned base does not parse, which the publisher
-     * treats as "this project's policy could not be established" and refuses on. It does
-     * not refuse the *run*, unlike `tests.command` — a broken policies block should not
-     * stop a modifier producing a patch a person can still read.
-     */
-    let policies: Policies | undefined
-    if (job.permissions === 'modifier') {
-      const pinned = await pinnedProjectConfig(workspace.path, workspace.sha)
-      testCommand = pinned === undefined ? undefined : readTestCommand(pinned)
-      policies = pinned === undefined ? undefined : readPolicies(pinned)
-      if (!testCommand) {
-        return await refuse(
-          `${PROJECT_CONFIG_PATH} at ${workspace.sha.slice(0, 12)} declares no tests.command, ` +
-            'so nothing could show this modifier\'s patch works. A modifier that cannot be ' +
-            'verified does not run unattended — add `tests:\n  command: …` to ' +
-            `${PROJECT_CONFIG_PATH} and commit it to ${job.projectDefaultBranch}.`,
-        )
-      }
+    const testCommand = pinned === undefined ? undefined : readTestCommand(pinned)
+    if (job.permissions === 'modifier' && !testCommand) {
+      return await refuse(
+        `${PROJECT_CONFIG_PATH} at ${workspace.sha.slice(0, 12)} declares no tests.command, ` +
+          'so nothing could show this modifier\'s patch works. A modifier that cannot be ' +
+          'verified does not run unattended — add `tests:\n  command: …` to ' +
+          `${PROJECT_CONFIG_PATH} and commit it to ${job.projectDefaultBranch}.`,
+      )
     }
 
     // Deliberately not caught: a node that cannot read its input must fail loudly
@@ -326,7 +358,11 @@ export async function executeJob(
       runtime: spec.provider,
       timeoutMs: job.timeoutMs,
       image: process.env.OGUN_IMAGE_OVERRIDE ?? imageFor(job),
-      allowSandboxDowngrade: false,
+      // The project's answer, from the blob at the pinned base — not a constant, and not
+      // anything the agent about to run in here could have written. `sandboxDowngrade`
+      // has already refused the run if this is `false` and the sandbox needed it `true`,
+      // so the throw inside `createSandbox` is the backstop rather than the message.
+      allowSandboxDowngrade: downgrade.allow,
       // Absent is not "unrestricted" — it resolves to the default allowlist for the
       // runtime, inside the sandbox (§4.6).
       ...(job.egress === undefined ? {} : { egress: job.egress }),
@@ -817,12 +853,79 @@ export async function projectTestCommand(
 }
 
 /**
- * The raw text of that blob, which two gates now read: the test command before the agent
- * runs, and the publisher's policies after it has. One read rather than two, and more
- * importantly one definition of *which* copy of the file counts — two call sites each
- * doing their own is how they end up disagreeing about it.
+ * Whether a job may have the sandbox its worker asked for, and — when it may not — which
+ * of the two reasons it was.
+ *
+ * ### What this replaces
+ *
+ * `createSandbox` was called with the literal `allowSandboxDowngrade: false`. That failed
+ * *closed*, so nothing was ever contained less than it should have been; what it did was
+ * make `policies.allowSandboxDowngrade` a setting that does nothing. A project that set
+ * it `true` got exactly the refusal of a project that had never heard of it, and from
+ * outside the three explanations — misspelled the key, misunderstood what it does, found
+ * a bug — are indistinguishable, so the only way to tell them apart was to read this
+ * file. A knob wired to nothing is not a safe default; it is a day of somebody's time.
+ *
+ * ### Why `policies` is a parameter rather than something read here
+ *
+ * Because of *where* it has to come from: the blob at the pinned base (see
+ * `pinnedProjectConfig`), never the workspace. The workspace is mounted read-write for
+ * the profile this gate exists to contain, and `.ogun/config.yaml` is a file in it — an
+ * agent that appends `allowSandboxDowngrade: true` in its own checkout would be voting
+ * itself out of the container it is running in. `tests.command` is read from the same
+ * blob for the same reason, and one caller passing both is what keeps them agreeing.
+ *
+ * ### Why `undefined` is not folded into `false`
+ *
+ * Both take the strict side — an unreadable policy must never open the sandbox — but they
+ * are different facts and principle 6's rule applies to refusals as much as to coverage.
+ * "Your project says no" points at a line somebody can change; "your project's policy
+ * could not be established" points at a file that does not parse. Told the first when it
+ * is the second, a person edits a `true` that was already `true` and learns nothing. This
+ * is the same null-vs-false distinction the publisher's gate makes about
+ * `maxOpenPullRequests`, arrived at from the other direction.
+ *
+ * Only `modifier` on `worktree` is gated. A reviewer on a worktree is §4.6's documented
+ * fast path — file-state isolation for an agent that cannot write anyway — and needs no
+ * policy; a modifier there is an agent editing files directly on the host, as the runner
+ * user, on the runner's network, with no capability isolation at all.
  */
-async function pinnedProjectConfig(
+export function sandboxDowngrade(input: {
+  sandbox: 'container' | 'worktree'
+  permissions: 'observer' | 'reviewer' | 'modifier'
+  /** From the blob at `baseSha`. `undefined` means it could not be read. */
+  policies: Policies | undefined
+  /** Named in the refusal, because "which copy of the config" is the whole question. */
+  baseSha: string
+}): { allow: boolean; refusal?: string } {
+  const allow = input.policies?.allowSandboxDowngrade ?? false
+  if (allow || input.sandbox !== 'worktree' || input.permissions !== 'modifier') return { allow }
+
+  const at = input.baseSha.slice(0, 12)
+  return {
+    allow: false,
+    refusal:
+      input.policies === undefined
+        ? `this worker is a modifier on the worktree sandbox, which would edit files ` +
+          `directly on this host, and ${PROJECT_CONFIG_PATH} at ${at} could not be read — ` +
+          'so whether the project allows that could not be established. The policies block ' +
+          'is missing or malformed at that commit; fix it and commit it. A run is refused ' +
+          'rather than uncontained.'
+        : `this worker is a modifier on the worktree sandbox, which would edit files ` +
+          `directly on this host, and ${PROJECT_CONFIG_PATH} at ${at} sets ` +
+          'policies.allowSandboxDowngrade: false. Give the worker `sandbox: container`, or ' +
+          'set that policy true and commit it if you mean to allow it.',
+  }
+}
+
+/**
+ * The raw text of that blob, which every gate that belongs to the project reads: the
+ * sandbox downgrade and the test command before the agent runs, and the publisher's
+ * policies after it has. One read rather than three, and more importantly one definition
+ * of *which* copy of the file counts — call sites each doing their own is how they end up
+ * disagreeing about it.
+ */
+export async function pinnedProjectConfig(
   workspace: string,
   baseSha: string,
 ): Promise<string | undefined> {
