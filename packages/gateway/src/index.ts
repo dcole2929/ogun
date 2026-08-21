@@ -42,9 +42,11 @@ export type {
 } from './credentials.ts'
 
 export {
+  ALLOWED_CONNECT_PORT,
   DEFAULT_ALLOWED_HOSTS,
   hostMatches,
   isAllowedHost,
+  isAllowedPort,
   isGitPushRequest,
   parseAuthority,
 } from './hosts.ts'

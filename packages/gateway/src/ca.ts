@@ -15,12 +15,12 @@ import {
   boolean,
   explicit,
   implicit,
+  integer,
   namedBits,
   octetString,
   oid,
   seq,
   set,
-  smallInteger,
   time,
   toPem,
   unsignedInteger,
@@ -208,7 +208,7 @@ function mintLeaf(
       // Without this the certificate is nameless to anything modern: CN-as-hostname was
       // removed from Chrome in 2017 and from Node's default checkServerIdentity behaviour
       // for certs that carry any SAN. `dNSName` is `[2] IMPLICIT IA5String`.
-      extension(EXT_SUBJECT_ALT_NAME, false, seq(implicit(2, Buffer.from(hostname, 'ascii')))),
+      extension(EXT_SUBJECT_ALT_NAME, false, seq(implicit(2, ia5(hostname)))),
       extension(EXT_AUTHORITY_KEY_ID, false, seq(implicit(0, issuerKeyId))),
     ],
     signingKey: caKey,
@@ -221,6 +221,20 @@ function mintLeaf(
     // shipping it removes a whole class of "works for node, fails for git" report.
     cert: toPem('CERTIFICATE', der) + caCertPem,
   }
+}
+
+/**
+ * A `dNSName` is an IA5String — ASCII, and only ASCII.
+ *
+ * `Buffer.from(s, 'ascii')` does not reject a non-ASCII name, it masks each code unit to
+ * seven bits: `xn--` is what a real client sends for an internationalised domain, and
+ * anything else here would produce a certificate naming a *different, corrupted* host that
+ * still parses and still verifies. Refusing is the only safe answer, and it is unreachable
+ * for a hostname that arrived over the wire in a CONNECT line.
+ */
+function ia5(value: string): Uint8Array {
+  if (!/^[\x21-\x7e]+$/.test(value)) throw new Error(`not an ASCII hostname: ${value}`)
+  return Buffer.from(value, 'ascii')
 }
 
 const caName = (): Uint8Array =>
@@ -253,7 +267,7 @@ function signCertificate(spec: CertificateSpec): Uint8Array {
   const tbs = seq(
     // `[0] EXPLICIT INTEGER 2` — v3. Certificates without it are v1, and a v1 cert may
     // not carry extensions at all, so every extension above would be silently dropped.
-    explicit(0, smallInteger(2)),
+    explicit(0, integer(2)),
     unsignedInteger(randomBytes(16)),
     algorithm,
     spec.issuer,

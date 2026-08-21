@@ -2,9 +2,11 @@ import { strict as assert } from 'node:assert'
 import { test } from 'node:test'
 import type { CredentialSet } from '../src/credentials.ts'
 import {
+  ALLOWED_CONNECT_PORT,
   DEFAULT_ALLOWED_HOSTS,
   hostMatches,
   isAllowedHost,
+  isAllowedPort,
   isGitPushRequest,
   parseAuthority,
 } from '../src/hosts.ts'
@@ -234,4 +236,65 @@ test('the default allowlist grants no wildcards', () => {
   assert.ok(!DEFAULT_ALLOWED_HOSTS.includes('*'))
   assert.ok(DEFAULT_ALLOWED_HOSTS.every((h) => !h.startsWith('*')))
   assert.ok(!isAllowedHost('example.com', DEFAULT_ALLOWED_HOSTS))
+})
+
+/**
+ * GitHub percent-decodes a path before it routes, so `/git-receive-pac%6b` reaches
+ * `git-receive-pack`. A matcher comparing the raw bytes says it is not a push — a
+ * one-`curl` walk around ADR-0005, live in exactly the configuration the rule exists for
+ * (a GitHub token configured), and completely invisible to a test that only ever sends the
+ * literal spelling.
+ *
+ * Double-encoding is checked because one round of decoding is the obvious fix and is also
+ * wrong: `%256b` decodes to `%6b` decodes to `k`.
+ */
+test('an encoded or oddly-cased push is still a push', () => {
+  assert.ok(isGitPushRequest('POST', '/o/r.git/git-receive-pac%6b'))
+  assert.ok(isGitPushRequest('POST', '/o/r.git/git-receive-pac%256b'))
+  assert.ok(isGitPushRequest('POST', '/o/r.git/GIT-RECEIVE-PACK'))
+  assert.ok(isGitPushRequest('GET', '/o/r.git/info/refs?service=git-receive-pac%6b'))
+})
+
+/** …and decoding must not widen the rule into "anything that mentions git". */
+test('decoding does not turn a fetch into a push', () => {
+  assert.ok(!isGitPushRequest('GET', '/o/r.git/info/refs?service=git-upload-pac%6b'))
+  assert.ok(!isGitPushRequest('GET', '/o/git-receive-pack-notes/info/refs?service=git-upload-pack'))
+})
+
+/**
+ * A malformed escape cannot be decoded, so it cannot be reasoned about. This rule refuses
+ * rather than permits when it cannot tell — the opposite default would make an invalid
+ * escape the bypass.
+ */
+test('a path that cannot be decoded is treated as a push if it looks like one', () => {
+  assert.ok(isGitPushRequest('POST', '/o/r.git/git-receive-pack%'))
+  assert.ok(isGitPushRequest('POST', '/o/r.git/git-%receive-%pack'))
+})
+
+/**
+ * `Number()` is not a port parser. It accepts `0x1bb`, `1e3`, `+443` and `" 443"`, all
+ * from a string the *client* wrote — and the IPv6 branch used to return before the range
+ * check ran at all.
+ */
+test('a port is digits, in range, on both branches', () => {
+  assert.equal(parseAuthority('api.anthropic.com:0x1bb'), null)
+  assert.equal(parseAuthority('api.anthropic.com:1e3'), null)
+  assert.equal(parseAuthority('api.anthropic.com:+443'), null)
+  assert.equal(parseAuthority('api.anthropic.com: 443'), null)
+  assert.equal(parseAuthority('api.anthropic.com:0'), null)
+  assert.equal(parseAuthority('[::1]:99999'), null)
+  assert.deepEqual(parseAuthority('[::1]:8443'), { hostname: '::1', port: 8443 })
+})
+
+/**
+ * The allowlist matches hostnames, so the port needs its own gate or `api.anthropic.com:22`
+ * is an allowlisted name pointing at somebody else's SSH server — intercepted and
+ * credentialed. Every host on the list is an HTTPS API; there is no second legitimate port.
+ */
+test('only the HTTPS port is reachable, however allowlisted the host', () => {
+  assert.equal(ALLOWED_CONNECT_PORT, 443)
+  assert.ok(isAllowedPort(443))
+  assert.ok(!isAllowedPort(22))
+  assert.ok(!isAllowedPort(80))
+  assert.ok(!isAllowedPort(8443))
 })

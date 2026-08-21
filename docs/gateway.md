@@ -236,6 +236,39 @@ and it would be a test that fails when the internet does:
   `403 push_refused`; the same repository's `service=git-upload-pack` → `200` with a real
   pkt-line response. Reading works, writing does not.
 
+### Found by adversarial review, after it all passed
+
+Worth recording, because the tests that existed at the time did not catch any of it:
+
+- **Absolute-form `http://` put a real credential on plaintext TCP/80.** The scheme check
+  was `protocol.startsWith('http')`, which accepted both `http:` and `httpz:`. A sandbox
+  sending `GET http://api.anthropic.com/v1/messages` at the proxy port cleared the
+  allowlist, had the host's live OAuth token spliced in, and had it sent unencrypted. The
+  container still never held the token — the token was simply readable on the wire. The
+  absolute-form path had no end-to-end test at all, which is why.
+- **Cancelled responses leaked the upstream forever.** `pipe` forwards data and nothing
+  else — not errors, not destruction — so an agent cancelling a turn left the upstream
+  socket open and still being written, once per cancelled turn, with the provider still
+  generating and billing. The mirror case was as bad: an upstream dying mid-body left the
+  client waiting on a `content-length` that would never arrive until its own timeout, so
+  the run was filed as a timeout rather than the upstream failure it was. `pipeline`
+  fixes both directions.
+- **Percent-encoding walked around ADR-0005.** GitHub decodes before routing, so
+  `/git-receive-pac%6b` is a push; the matcher compared raw bytes and said it was not.
+- **The CONNECT port was parsed and then ignored**, so `api.anthropic.com:22` was an
+  allowlisted name pointing at somebody else's SSH port. `parseAuthority` had carried a
+  comment claiming exactly this check since the first commit.
+- **An unconditional `rm` of the socket** let a second runner silently steal the path from
+  a first that was still serving containers, with nothing reporting the split brain.
+- **The streaming test was vacuous.** It timed when the *upstream* saw the request, which a
+  fully buffering proxy does exactly as fast. It would have passed against an
+  implementation it was written to distinguish from.
+
+The pattern is worth naming: every bug was in a path with no test, and the one bad test was
+bad in the specific way that made it pass. Coverage now includes the absolute-form door,
+tunnel reuse, HEAD and 304, a non-443 CONNECT, cancellation, upstream death mid-body, and a
+push refused with half a megabyte still uploading.
+
 ### Not verified
 
 The two CLIs' reaction to the stubs, which needs the actual binaries driven end to end:

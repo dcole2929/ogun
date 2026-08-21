@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, test } from 'node:test'
 import { CA_SUBJECT, caState, loadOrCreateCa } from '../src/ca.ts'
-import { namedBits, oid, time, unsignedInteger } from '../src/der.ts'
+import { integer, namedBits, oid, time, unsignedInteger } from '../src/der.ts'
 
 /**
  * The certificates this package mints are hand-encoded ASN.1, so these tests exist to
@@ -180,4 +180,44 @@ test('a validity bound past 2049 switches to GeneralizedTime', () => {
   )
   assert.equal(time(new Date('2036-08-20T00:00:00Z'))[0], 0x17, 'UTCTime')
   assert.equal(time(new Date('2100-01-01T00:00:00Z'))[0], 0x18, 'GeneralizedTime')
+})
+
+/**
+ * `40*first + second` is itself a subidentifier, so it is base-128 like every other one.
+ *
+ * Emitting it as a single byte is correct only while the second arc is under 40. At 40 the
+ * byte reaches 0x80, whose top bit means "this subidentifier continues" — so a conformant
+ * parser swallows the next arc into it and mis-reads the entire OID. Nothing here uses an
+ * OID with a second arc that large, which is precisely why it would have sat undiscovered:
+ * a wrong OID is not a parse failure, it is a certificate that means something else.
+ */
+test('an OID with a large second arc does not collide with the continuation bit', () => {
+  // 2.100.3 — 40*2 + 100 = 180 (0xB4), which must encode as two base-128 bytes.
+  assert.deepEqual([...oid('2.100.3')], [0x06, 0x03, 0x81, 0x34, 0x03])
+  // And the small case is unchanged: 2.5.29.17 is still one byte for the first two arcs.
+  assert.deepEqual([...oid('2.5.29.17')], [0x06, 0x03, 85, 29, 17])
+})
+
+/**
+ * `smallInteger` took the low byte and threw the rest away, so 300 encoded as 44 —
+ * silently. In a certificate that is not a parse error; a wrong version number produces a
+ * v1 certificate whose extensions are all quietly ignored, SAN and basicConstraints
+ * included.
+ */
+test('an integer wider than a byte is encoded, not truncated', () => {
+  assert.deepEqual([...integer(2)], [0x02, 0x01, 0x02])
+  assert.deepEqual([...integer(300)], [0x02, 0x02, 0x01, 0x2c])
+  // Still padded to stay positive, the same as any other unsigned value.
+  assert.deepEqual([...integer(200)], [0x02, 0x02, 0x00, 0xc8])
+  assert.throws(() => integer(-1))
+})
+
+/**
+ * The unreachable inputs, kept unreachable. Each of these produced something worse than an
+ * error — a zero-length INTEGER that is invalid DER, and a TypedArray allocated with a
+ * length of -Infinity — and each is one careless call site away from being reachable.
+ */
+test('the encoder refuses degenerate input rather than emitting nonsense', () => {
+  assert.throws(() => unsignedInteger(new Uint8Array(0)), /at least one byte/)
+  assert.throws(() => namedBits([]), /at least one bit/)
 })

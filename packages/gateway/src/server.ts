@@ -1,16 +1,26 @@
 import { randomBytes } from 'node:crypto'
-import { chmod, rm } from 'node:fs/promises'
-import { createServer as createHttpServer, request as httpRequest } from 'node:http'
+import { chmod, mkdir, rm } from 'node:fs/promises'
+import { createServer as createHttpServer } from 'node:http'
 import type { IncomingHttpHeaders, IncomingMessage, ServerResponse } from 'node:http'
 import { request as httpsRequest } from 'node:https'
 import type { RequestOptions } from 'node:https'
+import { connect as netConnect } from 'node:net'
 import type { Socket } from 'node:net'
+import { dirname } from 'node:path'
+import { pipeline } from 'node:stream'
 import { TLSSocket } from 'node:tls'
 import type { CertificateAuthority } from './ca.ts'
 import { loadOrCreateCa } from './ca.ts'
 import type { CredentialSet } from './credentials.ts'
 import { credentialReader } from './credentials.ts'
-import { DEFAULT_ALLOWED_HOSTS, isAllowedHost, isGitPushRequest, parseAuthority } from './hosts.ts'
+import {
+  ALLOWED_CONNECT_PORT,
+  DEFAULT_ALLOWED_HOSTS,
+  isAllowedHost,
+  isAllowedPort,
+  isGitPushRequest,
+  parseAuthority,
+} from './hosts.ts'
 import {
   applyInjections,
   injectionsFor,
@@ -153,15 +163,37 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
     } catch {
       return refuse(res, 400, 'not_a_proxy_request', 'expected an absolute-form request URI')
     }
-    if (!target.protocol.startsWith('http')) {
-      return refuse(res, 400, 'not_a_proxy_request', `unsupported scheme ${target.protocol}`)
+    /**
+     * `https:` and nothing else, compared exactly.
+     *
+     * This was `protocol.startsWith('http')`, which is two bugs wearing one coat. It
+     * accepted `httpz:` — anything beginning "http" — and, worse, it accepted `http:` and
+     * forwarded it in the clear. A sandbox sending
+     * `GET http://api.anthropic.com/v1/messages` at the proxy port passed the allowlist
+     * (the hostname is allowlisted), had the host's live OAuth token spliced in, and had
+     * it put on plaintext TCP/80. The container still never held the token; the token was
+     * simply on the wire unencrypted, one `curl` away from anyone on the path.
+     *
+     * Every host on the allowlist is an HTTPS API, so cleartext has no legitimate use here
+     * and is refused rather than upgraded — an upgrade would work silently and leave the
+     * next person to discover the rule by reading this file.
+     */
+    if (target.protocol !== 'https:') {
+      return refuse(
+        res,
+        403,
+        'cleartext_refused',
+        `${target.protocol}// is refused — the gateway splices real credentials into ` +
+          'requests and will not put one on an unencrypted connection. Use https.',
+      )
     }
-    const port = Number(target.port) || (target.protocol === 'https:' ? 443 : 80)
+    const port = strictPortOf(target) ?? 443
+    if (!isAllowedPort(port)) return refusePort(res, target.hostname, port)
     if (!isAllowedHost(target.hostname, allowedHosts)) {
       return refuseHost(res, target.hostname)
     }
     req.url = target.pathname + target.search
-    void forward(target.hostname, port, req, res, target.protocol === 'https:')
+    void forward(target.hostname, port, req, res)
   })
 
   proxy.on('connect', (req, socket: Socket, head: Buffer) => {
@@ -191,6 +223,18 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
       socket.end(
         `HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n` +
           `ogun-gateway: ${authority.hostname} is not on the sandbox egress allowlist\r\n`,
+      )
+      return
+    }
+    // The allowlist matches on hostname alone, so the port has to be checked separately or
+    // `api.anthropic.com:22` is an allowlisted name pointing at somebody else's SSH port —
+    // intercepted and credentialed. `parseAuthority` has always returned the port with a
+    // comment saying exactly this; nothing acted on it until now.
+    if (!isAllowedPort(authority.port)) {
+      socket.end(
+        `HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n` +
+          `ogun-gateway: port ${authority.port} is refused — a sandbox reaches ` +
+          `${ALLOWED_CONNECT_PORT} and nothing else\r\n`,
       )
       return
     }
@@ -250,7 +294,6 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
     port: number,
     req: IncomingMessage,
     res: ServerResponse,
-    secure = true,
   ): Promise<void> {
     const path = req.url ?? '/'
     const method = req.method ?? 'GET'
@@ -300,7 +343,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
     // `host` is rewritten to the real target rather than passed through: the client set it
     // from the URL it thinks it is talking to, which is the same name, but a request that
     // was retargeted would otherwise carry the wrong one silently.
-    headers.host = port === (secure ? 443 : 80) ? hostname : `${hostname}:${port}`
+    headers.host = port === 443 ? hostname : `${hostname}:${port}`
 
     const target = dial.rewrite?.(hostname, port) ?? { host: hostname, port }
     const upstreamOptions: RequestOptions = {
@@ -316,8 +359,9 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
       ...(dial.ca ? { ca: dial.ca } : {}),
     }
 
-    const send = secure ? httpsRequest : httpRequest
-    const upstream = send(upstreamOptions)
+    // Always TLS. There is no plaintext leg: the only door that could produce one refuses
+    // `http:` above, and a credential must never ride an unencrypted connection.
+    const upstream = httpsRequest(upstreamOptions)
 
     upstream.on('response', (upstreamRes) => {
       // Hop-by-hop only on the way back: `content-length` is preserved, because it is
@@ -327,11 +371,29 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
         upstreamRes.headers as Record<string, string | string[] | undefined>,
       )
       res.writeHead(upstreamRes.statusCode ?? 502, responseHeaders as IncomingHttpHeaders)
-      // Piped, never buffered. A completion is a Server-Sent Events stream that runs for
-      // minutes; a gateway that collected the body before answering would turn every
-      // streaming run into a single silent block at the end, and would hold the whole
-      // response in memory besides.
-      upstreamRes.pipe(res)
+      /**
+       * Streamed, never buffered — and joined with `pipeline` rather than `pipe`.
+       *
+       * Buffering first is the obvious mistake: a completion is a Server-Sent Events stream
+       * that runs for minutes, and collecting it would turn every streaming run into one
+       * silent block at the end while holding the whole response in memory.
+       *
+       * `pipe` is the subtle one. It forwards data and nothing else — not errors, not
+       * destruction — so both ends of a broken exchange are left open:
+       *
+       *  - the client cancels a turn, and the upstream socket stays open and still being
+       *    written to, forever, once per cancelled turn, with the provider still generating
+       *    and still billing for a response nobody will read;
+       *  - the upstream dies mid-body, and the client sits waiting for the rest of a
+       *    `content-length` that will never arrive until its own timeout fires — so the run
+       *    is filed as a timeout instead of as the upstream failure it was.
+       *
+       * `pipeline` destroys both ends when either one fails, which is the whole fix, in
+       * both directions, in one call.
+       */
+      pipeline(upstreamRes, res, (err) => {
+        if (err && !res.writableEnded) res.destroy()
+      })
     })
 
     upstream.on('error', (err) => {
@@ -339,10 +401,10 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
       refuse(res, 502, 'upstream_unreachable', `${hostname}: ${err.message}`)
     })
 
-    req.pipe(upstream)
-    // A client that hangs up mid-request must not leave the upstream half-open holding a
-    // socket in the pool.
-    req.on('aborted', () => upstream.destroy())
+    // Same reasoning on the way out: a client that hangs up mid-request must not leave the
+    // upstream half-open holding a socket, and an upstream that refuses the body must not
+    // leave the request stream dangling.
+    pipeline(req, upstream, () => undefined)
   }
 
   const host = options.host ?? '127.0.0.1'
@@ -352,7 +414,22 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
     // A socket left behind by a killed runner is not a running gateway, and `listen`
     // answers EADDRINUSE either way. Removing a stale one is the difference between a
     // machine that comes back after a kill -9 and one that needs a manual `rm`.
+    //
+    // But only a stale one. An unconditional unlink lets a second runner silently steal
+    // the path from a first that is still serving containers: the first keeps working
+    // against an unlinked inode, every new sandbox reaches the second, and nothing anywhere
+    // reports the split brain. So: knock first, and unlink only if nobody answers.
+    if (await socketIsLive(socketPath)) {
+      throw new Error(
+        `${socketPath} is already being served — another ogun-runner is running on this host`,
+      )
+    }
     await rm(socketPath, { force: true })
+    // The directory, before the socket exists in it. A unix socket cannot be chmod'd until
+    // `listen` has created it, so for a moment it sits at the process umask; a 0700 parent
+    // is what covers that window.
+    await mkdir(dirname(socketPath), { recursive: true, mode: 0o700 })
+    await chmod(dirname(socketPath), 0o700).catch(() => undefined)
   }
 
   await new Promise<void>((resolve, reject) => {
@@ -438,6 +515,31 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
 }
 
 /**
+ * Is something already answering on this socket path?
+ *
+ * `ENOENT` is no file at all, and `ECONNREFUSED` is a file whose server is gone — the two
+ * shapes of "nothing is behind this". Anything else, including a connection that opens, is
+ * treated as live: the cost of being wrong that way is a refusal to start, and the cost of
+ * being wrong the other way is two runners quietly disagreeing about which one the
+ * containers are talking to.
+ */
+const DEAD_SOCKET_CODES = new Set(['ENOENT', 'ECONNREFUSED'])
+
+function socketIsLive(path: string): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    const probe = netConnect(path)
+    const settle = (live: boolean): void => {
+      probe.destroy()
+      resolve(live)
+    }
+    probe.once('connect', () => settle(true))
+    probe.once('error', (err: NodeJS.ErrnoException) =>
+      settle(!DEAD_SOCKET_CODES.has(err.code ?? '')),
+    )
+  })
+}
+
+/**
  * Which proxy token the caller presented, if any.
  *
  * Three shapes are accepted because three clients produce three shapes from the same
@@ -474,6 +576,18 @@ const challenge = (res: ServerResponse): void => {
 const refuseHost = (res: ServerResponse, hostname: string): void =>
   refuse(res, 403, 'host_not_allowed', `${hostname} is not on the sandbox egress allowlist`)
 
+const refusePort = (res: ServerResponse, hostname: string, port: number): void =>
+  refuse(
+    res,
+    403,
+    'port_not_allowed',
+    `${hostname}:${port} is refused — a sandbox reaches ${ALLOWED_CONNECT_PORT} and nothing else`,
+  )
+
+/** The URL's port, digits only — `new URL` keeps whatever the client wrote. */
+const strictPortOf = (target: URL): number | null =>
+  target.port === '' ? null : /^\d{1,5}$/.test(target.port) ? Number(target.port) : 0
+
 /**
  * Every refusal the gateway generates itself, in one shape.
  *
@@ -484,7 +598,17 @@ const refuseHost = (res: ServerResponse, hostname: string): void =>
  */
 function refuse(res: ServerResponse, status: number, error: string, message: string): void {
   if (res.headersSent) {
-    res.end()
+    /**
+     * Destroyed, not ended.
+     *
+     * The status line is already gone, and with it a `content-length` promising bytes that
+     * will now never arrive. `res.end()` closes the message cleanly and leaves the
+     * connection advertised as reusable — so the client waits for the rest of a body that
+     * does not exist until its own timeout fires, and the run is filed as a timeout rather
+     * than as the upstream failure it was. Tearing the socket down is what tells the client
+     * the message is truncated.
+     */
+    res.destroy()
     return
   }
   const body = JSON.stringify({ error, message })

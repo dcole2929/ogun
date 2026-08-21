@@ -1,5 +1,5 @@
 import { mkdtempSync, rmSync } from 'node:fs'
-import { createServer, request } from 'node:https'
+import { Agent, createServer, request } from 'node:https'
 import type { IncomingHttpHeaders, IncomingMessage, ServerResponse } from 'node:http'
 import { connect } from 'node:net'
 import type { AddressInfo } from 'node:net'
@@ -207,6 +207,22 @@ export type ProxyResponse = {
   status?: number
   headers?: IncomingHttpHeaders
   body?: string
+  /**
+   * When each response chunk reached the *client*, as a `Date.now()`.
+   *
+   * Recorded because "did the bytes arrive" and "did the bytes arrive as they were
+   * produced" are different questions, and only the second one distinguishes a relaying
+   * proxy from a buffering one.
+   */
+  chunkTimes?: number[]
+}
+
+/** A tunnel held open, so a test can put more than one request down it. */
+export type Tunnel = {
+  socket: TLSSocket
+  send: (options: { path?: string; method?: string; headers?: Record<string, string> }) =>
+    Promise<{ status?: number; headers: IncomingHttpHeaders; body: string }>
+  close: () => void
 }
 
 /**
@@ -270,7 +286,11 @@ export function requestThroughProxy(
       req.on('error', reject)
       req.on('response', (res) => {
         const chunks: Buffer[] = []
-        res.on('data', (c: Buffer) => chunks.push(c))
+        const chunkTimes: number[] = []
+        res.on('data', (c: Buffer) => {
+          chunks.push(c)
+          chunkTimes.push(Date.now())
+        })
         res.on('end', () => {
           tls.destroy()
           resolve({
@@ -278,6 +298,7 @@ export function requestThroughProxy(
             status: res.statusCode,
             headers: res.headers,
             body: Buffer.concat(chunks).toString('utf8'),
+            chunkTimes,
           })
         })
       })
@@ -300,6 +321,94 @@ export function requestThroughProxy(
       const rest = preamble.subarray(end + 4)
       if (rest.length > 0) socket.unshift(rest)
       tunnel(status)
+    }
+    socket.on('data', onData)
+  })
+}
+
+/**
+ * One tunnel, several requests.
+ *
+ * `requestThroughProxy` opens a tunnel, sends one request and tears it down, so it can
+ * never observe what happens to the *second* request on a connection — which is where
+ * framing bugs live. A proxy that gets `content-length` or chunking subtly wrong still
+ * answers the first request perfectly and then desynchronises on the next one.
+ */
+export function openTunnel(
+  harness: Harness,
+  options: { token: string; hostname: string; port?: number },
+): Promise<Tunnel> {
+  const { host, port } = harness.address
+  const authority = `${options.hostname}:${options.port ?? 443}`
+
+  return new Promise<Tunnel>((resolve, reject) => {
+    const socket = connect(port, host, () => {
+      socket.write(
+        `CONNECT ${authority} HTTP/1.1\r\nHost: ${authority}\r\n` +
+          `Proxy-Authorization: Basic ${Buffer.from(`x:${options.token}`).toString('base64')}\r\n\r\n`,
+      )
+    })
+    socket.on('error', reject)
+
+    let preamble = Buffer.alloc(0)
+    const onData = (chunk: Buffer): void => {
+      preamble = Buffer.concat([preamble, chunk])
+      const end = preamble.indexOf('\r\n\r\n')
+      if (end === -1) return
+      socket.off('data', onData)
+      const status = Number(preamble.subarray(0, end).toString('utf8').split(' ')[1])
+      if (status !== 200) {
+        socket.destroy()
+        reject(new Error(`CONNECT answered ${status}`))
+        return
+      }
+      const rest = preamble.subarray(end + 4)
+      if (rest.length > 0) socket.unshift(rest)
+
+      const tls = connectTls({
+        socket,
+        ca: harness.sandboxCa,
+        servername: options.hostname,
+        ALPNProtocols: ['http/1.1'],
+      })
+      tls.on('error', reject)
+      // `keepAlive`, and one socket: without it the second request quietly opens a second
+      // connection and the test proves nothing about reuse.
+      const agent = new Agent({ keepAlive: true, maxSockets: 1 })
+      ;(agent as unknown as { createConnection: () => TLSSocket }).createConnection = () => tls
+
+      tls.once('secureConnect', () =>
+        resolve({
+          socket: tls,
+          send: (spec) =>
+            new Promise((ok, fail) => {
+              const req = request({
+                agent,
+                host: options.hostname,
+                method: spec.method ?? 'GET',
+                path: spec.path ?? '/',
+                headers: { host: options.hostname, ...spec.headers },
+              })
+              req.on('error', fail)
+              req.on('response', (res) => {
+                const chunks: Buffer[] = []
+                res.on('data', (c: Buffer) => chunks.push(c))
+                res.on('end', () =>
+                  ok({
+                    status: res.statusCode,
+                    headers: res.headers,
+                    body: Buffer.concat(chunks).toString('utf8'),
+                  }),
+                )
+              })
+              req.end()
+            }),
+          close: () => {
+            agent.destroy()
+            tls.destroy()
+          },
+        }),
+      )
     }
     socket.on('data', onData)
   })

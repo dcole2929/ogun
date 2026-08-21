@@ -2,6 +2,7 @@ import { strict as assert } from 'node:assert'
 import { mkdtempSync, rmSync, statSync } from 'node:fs'
 import { request } from 'node:https'
 import { connect as netConnect } from 'node:net'
+import type { Socket } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, test } from 'node:test'
@@ -9,7 +10,13 @@ import { connect as tlsConnect } from 'node:tls'
 import { loadOrCreateCa } from '../src/ca.ts'
 import { startGateway } from '../src/server.ts'
 import { PLACEHOLDER } from '../src/stubs.ts'
-import { pipelinedTunnel, requestThroughProxy, startHarness, startUpstream } from './harness.ts'
+import {
+  openTunnel,
+  pipelinedTunnel,
+  requestThroughProxy,
+  startHarness,
+  startUpstream,
+} from './harness.ts'
 import type { Harness } from './harness.ts'
 
 /**
@@ -28,6 +35,81 @@ const harnesses: Harness[] = []
 after(async () => {
   for (const harness of harnesses) await harness.cleanup()
 })
+
+/** A raw CONNECT, for the tests that need the socket rather than a finished response. */
+const rawTunnel = (
+  harness: Harness,
+  token: string,
+  onError: (err: Error) => void,
+  authority = 'api.anthropic.com:443',
+) => {
+  const socket = netConnect(harness.address.port, harness.address.host, () => {
+    socket.write(
+      `CONNECT ${authority} HTTP/1.1\r\nHost: ${authority}\r\n` +
+        `Proxy-Authorization: Basic ${Buffer.from(`x:${token}`).toString('base64')}\r\n\r\n`,
+    )
+  })
+  socket.on('error', onError)
+  return socket
+}
+
+const secureTunnel = (harness: Harness, socket: Socket, hostname = 'api.anthropic.com') => {
+  const tls = tlsConnect({
+    socket,
+    ca: harness.sandboxCa,
+    servername: hostname,
+    ALPNProtocols: ['http/1.1'],
+  })
+  tls.on('error', () => undefined)
+  return tls
+}
+
+/**
+ * Poll for a condition rather than sleeping a guessed interval.
+ *
+ * A fixed sleep is either flaky on a loaded machine or slow on an idle one, and the
+ * conditions here — a socket closing, a handle being released — settle in milliseconds
+ * when they settle at all.
+ */
+const waitFor = async (condition: () => boolean, message: string, timeoutMs = 5_000) => {
+  const deadline = Date.now() + timeoutMs
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error(message)
+    await new Promise((r) => setTimeout(r, 10))
+  }
+}
+
+/**
+ * The proxy's other door: an absolute-form request URI sent straight at the proxy port,
+ * with no CONNECT and no tunnel.
+ *
+ * Written on the raw socket because that is the only way to send a request line the HTTP
+ * client libraries will not produce — `http.request` always writes origin form unless it
+ * is going through its own proxy support, and the point here is to send exactly what a
+ * misbehaving client would.
+ */
+const absoluteForm = (
+  harness: Harness,
+  token: string,
+  url: string,
+): Promise<{ status: number; body: string }> =>
+  new Promise((resolve, reject) => {
+    const socket = netConnect(harness.address.port, harness.address.host, () => {
+      socket.write(
+        `GET ${url} HTTP/1.1\r\nHost: ${new URL(url).host}\r\n` +
+          `Proxy-Authorization: Basic ${Buffer.from(`x:${token}`).toString('base64')}\r\n` +
+          'Connection: close\r\n\r\n',
+      )
+    })
+    socket.on('error', reject)
+    const chunks: Buffer[] = []
+    socket.on('data', (c: Buffer) => chunks.push(c))
+    socket.on('close', () => {
+      const raw = Buffer.concat(chunks).toString('utf8')
+      const status = Number(raw.split(' ')[1])
+      resolve({ status, body: raw.slice(raw.indexOf('\r\n\r\n') + 4) })
+    })
+  })
 
 const anthropic = async (): Promise<Harness> => {
   const harness = await startHarness({
@@ -117,49 +199,146 @@ test('provider headers the client set are passed through untouched', async () =>
 /**
  * A response that arrives in pieces over time must leave in pieces over time.
  *
- * Every agent run is a streaming completion. A gateway that collected the response before
- * answering would still pass a naive "did the body arrive" assertion — the bytes are all
- * there at the end — while turning an interactive run into a minutes-long silence and
- * holding the whole completion in memory. The assertion is therefore about *arrival
- * order*, not content.
+ * Every agent run is a streaming completion. A gateway that collected the whole response
+ * before answering still delivers every byte, so "did the body arrive" proves nothing —
+ * the assertion has to be about *when the client saw each chunk*.
+ *
+ * This test was written the wrong way first, and it is worth saying how: it timed when the
+ * *upstream* received the request, which a buffering proxy does exactly as fast. It passed
+ * against an implementation it could not have distinguished from a broken one.
  */
-test('a streamed response is relayed as it arrives, not collected first', async () => {
+test('a streamed response reaches the client in pieces, not in one block at the end', async () => {
+  const harness = await anthropic()
+  const session = harness.gateway.open()
+
+  const HOLD_MS = 200
+  harness.upstream.respond((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' })
+    res.write('event: start\n\n')
+    // Held open well past the point a buffering proxy would have had to answer.
+    setTimeout(() => {
+      res.write('event: done\n\n')
+      res.end()
+    }, HOLD_MS)
+  })
+
+  const started = Date.now()
+  const response = await requestThroughProxy(harness, {
+    token: session.token,
+    hostname: 'api.anthropic.com',
+    path: '/v1/messages?stream=true',
+  })
+
+  assert.equal(response.status, 200)
+  assert.match(response.body ?? '', /event: start/)
+  assert.match(response.body ?? '', /event: done/)
+
+  const times = response.chunkTimes ?? []
+  assert.ok(times.length >= 2, `expected the body in pieces, got ${times.length} chunk(s)`)
+  // The first chunk lands roughly immediately; the last only after the upstream releases
+  // it. A buffering proxy delivers both at the same moment, at the end.
+  assert.ok(
+    times[0]! - started < HOLD_MS / 2,
+    `first chunk reached the client after ${times[0]! - started}ms`,
+  )
+  assert.ok(times.at(-1)! - times[0]! > HOLD_MS / 2, 'the chunks arrived at the same moment')
+})
+
+/**
+ * A client that cancels a turn takes the upstream with it.
+ *
+ * `req.on('aborted')` covers only a client that vanishes while its *request body* is still
+ * arriving, which is never the case once a response is streaming — and streaming is what
+ * an agent does. Without a teardown on the response side, every cancelled turn leaks a
+ * socket on a long-lived runner and leaves the provider generating, and billing for, a
+ * completion nobody will read.
+ */
+test('a client that hangs up mid-stream tears the upstream down with it', async () => {
+  const harness = await anthropic()
+  const session = harness.gateway.open()
+
+  let upstreamClosed = false
+  harness.upstream.respond((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' })
+    res.write('event: start\n\n')
+    // Never ends on its own: the only thing that can close it is the client going away.
+    const keepalive = setInterval(() => res.write(': ping\n\n'), 20)
+    res.on('close', () => {
+      upstreamClosed = true
+      clearInterval(keepalive)
+    })
+  })
+
+  await new Promise<void>((resolve, reject) => {
+    const socket = rawTunnel(harness, session.token, reject)
+    socket.once('data', () => {
+      const tls = secureTunnel(harness, socket)
+      const req = request({
+        createConnection: () => tls,
+        host: 'api.anthropic.com',
+        path: '/v1/messages?stream=true',
+        headers: { host: 'api.anthropic.com' },
+      })
+      req.on('error', () => undefined)
+      req.on('response', (res) => {
+        res.once('data', () => {
+          // The agent pressing stop.
+          tls.destroy()
+          socket.destroy()
+          resolve()
+        })
+      })
+      req.end()
+    })
+  })
+
+  await waitFor(() => upstreamClosed, 'the upstream connection was still open')
+})
+
+/**
+ * The client has to be told when an upstream dies with a promise outstanding.
+ *
+ * The response headers are already gone, and with them a `content-length` announcing bytes
+ * that will never arrive. Ending the response cleanly leaves the message unterminated *and*
+ * the connection advertised as reusable, so the client waits for the rest of a body that
+ * does not exist until its own timeout fires — and the run is filed as a timeout rather
+ * than as the upstream failure it was. Only destroying the socket says "truncated".
+ */
+test('an upstream that dies mid-body closes the client connection instead of hanging it', async () => {
   const harness = await anthropic()
   const session = harness.gateway.open()
 
   harness.upstream.respond((_req, res) => {
-    res.writeHead(200, { 'content-type': 'text/event-stream' })
-    res.write('event: start\n\n')
-    // Held open past the point a buffering proxy would have had to answer.
-    setTimeout(() => {
-      res.write('event: done\n\n')
-      res.end()
-    }, 150)
+    res.writeHead(200, { 'content-type': 'application/json', 'content-length': '100' })
+    res.write('abc')
+    setTimeout(() => res.socket?.destroy(), 30)
   })
 
-  const started = Date.now()
-  let firstByteAt = 0
-  await new Promise<void>((resolve, reject) => {
-    void requestThroughProxy(harness, {
-      token: session.token,
-      hostname: 'api.anthropic.com',
-      path: '/v1/messages?stream=true',
-    }).then(() => resolve(), reject)
-    // The harness resolves on `end`, so first-byte timing is observed on the upstream
-    // side: the request must have reached it well before the response completed.
-    const poll = setInterval(() => {
-      if (harness.upstream.received.length > 0 && firstByteAt === 0) {
-        firstByteAt = Date.now()
-        clearInterval(poll)
-      }
-    }, 5)
-    poll.unref()
+  const closed = await new Promise<boolean>((resolve, reject) => {
+    const socket = rawTunnel(harness, session.token, reject)
+    const timer = setTimeout(() => resolve(false), 5_000)
+    timer.unref()
+    socket.once('data', () => {
+      const tls = secureTunnel(harness, socket)
+      // The client's own connection ending is the signal. Without the fix this never fires
+      // and the test times out — which is exactly what the agent would do.
+      tls.on('close', () => {
+        clearTimeout(timer)
+        resolve(true)
+      })
+      const req = request({
+        createConnection: () => tls,
+        host: 'api.anthropic.com',
+        path: '/v1/messages',
+        headers: { host: 'api.anthropic.com' },
+      })
+      req.on('error', () => undefined)
+      req.on('response', (res) => res.on('error', () => undefined))
+      req.end()
+    })
   })
 
-  assert.ok(
-    firstByteAt > 0 && firstByteAt - started < 140,
-    'the upstream saw the request before the response finished',
-  )
+  assert.equal(closed, true, 'the client was left waiting for a body that will never come')
 })
 
 /**
@@ -403,4 +582,251 @@ test('a missing host credential is reported by the gateway, not by the provider'
   assert.match(response.body ?? '', /no_credential/)
   assert.equal(response.headers?.['x-should-retry'], 'false')
   assert.equal(harness.upstream.received.length, 0, 'nothing was forwarded')
+})
+
+// ── The other door ─────────────────────────────────────────────────────────
+//
+// A proxy is reachable two ways. Everything above goes through CONNECT; these go through
+// absolute-form (`GET https://host/path` sent straight at the proxy port), which some
+// clients use and which had no test at all. Two live security bugs were found here.
+
+/**
+ * Absolute-form `http://` used to inject a real credential onto plaintext TCP/80.
+ *
+ * The scheme test was `protocol.startsWith('http')`, so `http:` passed it. A sandbox
+ * sending `GET http://api.anthropic.com/v1/messages` at the proxy port cleared the
+ * allowlist — the hostname is allowlisted — had the host's live OAuth token spliced in,
+ * and had it put on the wire unencrypted. The container still never held the token; the
+ * token was simply readable by anyone on the path, one `curl` from a prompt-injected
+ * agent.
+ *
+ * Every host on the allowlist is an HTTPS API, so cleartext is refused rather than
+ * upgraded: an upgrade would work silently and leave the rule undiscoverable.
+ */
+test('an absolute-form cleartext request is refused, credential and all', async () => {
+  const harness = await anthropic()
+  const session = harness.gateway.open()
+
+  const response = await absoluteForm(harness, session.token, 'http://api.anthropic.com/v1/messages')
+
+  assert.equal(response.status, 403)
+  assert.match(response.body, /cleartext_refused/)
+  assert.equal(harness.upstream.received.length, 0, 'nothing was forwarded, encrypted or not')
+})
+
+/**
+ * …and the same check accepted any scheme *beginning* "http".
+ *
+ * `httpz://api.anthropic.com/x` parsed, matched `startsWith('http')`, and was forwarded
+ * with a real credential over a plaintext socket. An exact comparison is the fix, and the
+ * reason a prefix test is never the right shape for a scheme.
+ */
+test('a scheme that merely starts with "http" is not https', async () => {
+  const harness = await anthropic()
+  const session = harness.gateway.open()
+
+  const response = await absoluteForm(harness, session.token, 'httpz://api.anthropic.com/x')
+
+  assert.equal(response.status, 403)
+  assert.equal(harness.upstream.received.length, 0)
+})
+
+/**
+ * The second door runs the same checks as the first, or it is a governed proxy sitting
+ * next to an ungoverned one.
+ */
+test('absolute-form enforces the token and the allowlist exactly as CONNECT does', async () => {
+  const harness = await anthropic()
+  const session = harness.gateway.open()
+
+  const noToken = await absoluteForm(harness, 'not-a-token', 'https://api.anthropic.com/v1/messages')
+  assert.equal(noToken.status, 407)
+
+  const offList = await absoluteForm(harness, session.token, 'https://evil.example.com/x')
+  assert.equal(offList.status, 403)
+  assert.match(offList.body, /host_not_allowed/)
+
+  assert.equal(harness.upstream.received.length, 0)
+})
+
+test('an absolute-form https request is forwarded, with the credential spliced in', async () => {
+  const harness = await anthropic()
+  const session = harness.gateway.open()
+
+  const response = await absoluteForm(
+    harness,
+    session.token,
+    'https://api.anthropic.com/v1/models?limit=1',
+  )
+
+  assert.equal(response.status, 200)
+  const upstream = harness.upstream.received.at(-1)
+  assert.equal(upstream?.headers.authorization, 'Bearer sk-ant-oat01-REAL')
+  // The query string survives, and the proxy token does not.
+  assert.equal(upstream?.url, '/v1/models?limit=1')
+  assert.equal(upstream?.headers['proxy-authorization'], undefined)
+})
+
+// ── Ports ──────────────────────────────────────────────────────────────────
+
+/**
+ * The allowlist matches on hostname alone, so without a separate port check
+ * `api.anthropic.com:22` is an allowlisted name pointing at somebody else's SSH port —
+ * intercepted, credentialed, and tunnelled. `parseAuthority` had always returned the port
+ * with a comment saying exactly this; nothing acted on it.
+ */
+test('an allowlisted host on an unexpected port is still refused', async () => {
+  const harness = await anthropic()
+  const session = harness.gateway.open()
+
+  const response = await requestThroughProxy(harness, {
+    token: session.token,
+    hostname: 'api.anthropic.com',
+    port: 8443,
+  })
+
+  assert.equal(response.connect, 403, 'refused at CONNECT, before any TLS')
+  assert.equal(harness.upstream.received.length, 0)
+})
+
+// ── Framing ────────────────────────────────────────────────────────────────
+
+/**
+ * The second request on a connection is where framing bugs surface.
+ *
+ * A proxy that mishandles `content-length` or chunking still answers the first request
+ * perfectly and then desynchronises — the next response is read as a continuation of the
+ * last body, or the parser never finds a status line. Every other test in this file opens
+ * a fresh tunnel per request and would never see it.
+ */
+test('a tunnel carries more than one request without desynchronising', async () => {
+  const harness = await anthropic()
+  const session = harness.gateway.open()
+  const tunnel = await openTunnel(harness, { token: session.token, hostname: 'api.anthropic.com' })
+
+  harness.upstream.respond((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ n: harness.upstream.received.length }))
+  })
+
+  const first = await tunnel.send({ path: '/v1/models' })
+  const second = await tunnel.send({ path: '/v1/messages' })
+  tunnel.close()
+
+  assert.equal(first.status, 200)
+  assert.equal(second.status, 200)
+  assert.notEqual(first.body, second.body, 'the second response is its own, not an echo')
+  assert.deepEqual(
+    harness.upstream.received.map((r) => r.url),
+    ['/v1/models', '/v1/messages'],
+  )
+  // Both carried the real credential: injection is per-request, not per-connection.
+  assert.ok(
+    harness.upstream.received.every((r) => r.headers.authorization === 'Bearer sk-ant-oat01-REAL'),
+  )
+})
+
+/**
+ * A HEAD response announces a `content-length` and carries no body, and a 304 carries
+ * neither. A proxy that strips the length, or that waits for a body that is not coming,
+ * turns both into a hang or an apparent truncation.
+ */
+test('a bodyless response keeps its framing and does not stall the connection', async () => {
+  const harness = await anthropic()
+  const session = harness.gateway.open()
+  const tunnel = await openTunnel(harness, { token: session.token, hostname: 'api.anthropic.com' })
+
+  harness.upstream.respond((req, res) => {
+    if (req.method === 'HEAD') {
+      res.writeHead(200, { 'content-type': 'application/json', 'content-length': '1234' })
+      res.end()
+      return
+    }
+    res.writeHead(304, { etag: 'W/"abc"' })
+    res.end()
+  })
+
+  const head = await tunnel.send({ method: 'HEAD', path: '/v1/models' })
+  assert.equal(head.status, 200)
+  assert.equal(head.headers['content-length'], '1234', 'the announced length survives')
+  assert.equal(head.body, '', 'and no body is invented')
+
+  // The connection is still usable, which is the half a stalled HEAD would break.
+  const notModified = await tunnel.send({ path: '/v1/models' })
+  tunnel.close()
+  assert.equal(notModified.status, 304)
+  assert.equal(notModified.body, '')
+})
+
+// ── ADR-0005, the awkward cases ────────────────────────────────────────────
+
+/**
+ * A push refused while the packfile is still uploading.
+ *
+ * The existing push test posts an empty body, so it never exercises the case that actually
+ * happens: git has megabytes in flight when the refusal is written. A proxy that answers
+ * without draining, or that waits for the whole body before deciding, either resets the
+ * connection before the client can read the status or holds the upload to completion first.
+ */
+test('a push is refused while its packfile is still being uploaded', async () => {
+  const harness = await startHarness({
+    hostname: 'github.com',
+    credentials: { github: { provider: 'github', token: 'ghp_REAL' } },
+  })
+  harnesses.push(harness)
+  const session = harness.gateway.open()
+
+  const response = await requestThroughProxy(harness, {
+    token: session.token,
+    hostname: 'github.com',
+    method: 'POST',
+    path: '/owner/repo.git/git-receive-pack',
+    // Not megabytes — enough that the body is still arriving when the refusal is written.
+    body: 'x'.repeat(512 * 1024),
+  })
+
+  assert.equal(response.status, 403)
+  assert.match(response.body ?? '', /push_refused/)
+  assert.equal(harness.upstream.received.length, 0)
+})
+
+/**
+ * GitHub percent-decodes a path before routing, so `/git-receive-pac%6b` is a push. A
+ * matcher that compares the raw bytes says it is not — a one-`curl` walk around ADR-0005,
+ * live in exactly the configuration the rule exists for.
+ */
+test('a percent-encoded push is still a push', async () => {
+  const harness = await startHarness({
+    hostname: 'github.com',
+    credentials: { github: { provider: 'github', token: 'ghp_REAL' } },
+  })
+  harnesses.push(harness)
+  const session = harness.gateway.open()
+
+  // Each in the method git actually uses for it: the pack goes by POST, the discovery
+  // that precedes it by GET.
+  for (const [method, path] of [
+    ['POST', '/owner/repo.git/git-receive-pac%6b'],
+    ['POST', '/owner/repo.git/GIT-RECEIVE-PACK'],
+    ['POST', '/owner/repo.git/git-receive-pac%256b'],
+    ['GET', '/owner/repo.git/info/refs?service=git-receive-pac%6b'],
+  ] as const) {
+    const response = await requestThroughProxy(harness, {
+      token: session.token,
+      hostname: 'github.com',
+      method,
+      path,
+    })
+    assert.equal(response.status, 403, `${method} ${path}`)
+  }
+  assert.equal(harness.upstream.received.length, 0)
+
+  // And a fetch is still a fetch, encoded or not — the decoding must not turn the rule
+  // into "refuse anything that mentions git".
+  const fetch = await requestThroughProxy(harness, {
+    token: session.token,
+    hostname: 'github.com',
+    path: '/owner/repo.git/info/refs?service=git-upload-pac%6b',
+  })
+  assert.equal(fetch.status, 200)
 })

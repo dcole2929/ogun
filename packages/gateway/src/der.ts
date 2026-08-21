@@ -71,6 +71,9 @@ export const boolean = (v: boolean): Uint8Array => tlv(BOOLEAN, Uint8Array.from(
  * others, which is the worst possible outcome — it works until it does not.
  */
 export function unsignedInteger(bytes: Uint8Array): Uint8Array {
+  // A zero-length INTEGER is not valid DER — zero is `02 01 00`. Unreachable from the one
+  // caller today, and a throw rather than a silent `02 00` so it stays that way.
+  if (bytes.length === 0) throw new Error('an INTEGER needs at least one byte')
   let at = 0
   while (at < bytes.length - 1 && bytes[at] === 0) at++
   const trimmed = bytes.subarray(at)
@@ -78,7 +81,23 @@ export function unsignedInteger(bytes: Uint8Array): Uint8Array {
   return tlv(INTEGER, body)
 }
 
-export const smallInteger = (n: number): Uint8Array => unsignedInteger(Uint8Array.from([n]))
+/**
+ * A non-negative INTEGER from a JS number.
+ *
+ * Previously this took the low byte and threw the rest away, so `300` encoded as `44` —
+ * silently, and only for values the single call site never passes. A wrong version number
+ * in a certificate is not a parse error anywhere; it is a v1 certificate whose extensions
+ * are all quietly ignored.
+ */
+export function integer(n: number): Uint8Array {
+  if (!Number.isSafeInteger(n) || n < 0) throw new Error(`not a non-negative integer: ${n}`)
+  const bytes: number[] = []
+  for (let v = n; ; v = Math.floor(v / 256)) {
+    bytes.unshift(v % 256)
+    if (v < 256) break
+  }
+  return unsignedInteger(Uint8Array.from(bytes))
+}
 
 /** A BIT STRING carrying whole bytes — the leading 0 is the "no unused bits" count. */
 export const bitString = (bytes: Uint8Array): Uint8Array =>
@@ -94,6 +113,10 @@ export const bitString = (bytes: Uint8Array): Uint8Array =>
  * byte-for-byte — and byte-for-byte is what a signature covers.
  */
 export function namedBits(bits: number[]): Uint8Array {
+  // `Math.max()` of nothing is `-Infinity`, which then allocates an array of length
+  // `-Infinity`. An empty KeyUsage is meaningless anyway — say so here rather than
+  // surfacing as a TypedArray range error from three frames down.
+  if (bits.length === 0) throw new Error('a named-bit BIT STRING needs at least one bit')
   const highest = Math.max(...bits)
   const bytes = new Uint8Array(Math.floor(highest / 8) + 1)
   for (const bit of bits) bytes[Math.floor(bit / 8)]! |= 0x80 >> bit % 8
@@ -108,17 +131,26 @@ export function oid(dotted: string): Uint8Array {
   const arcs = dotted.split('.').map(Number)
   const [first, second, ...rest] = arcs
   if (first === undefined || second === undefined) throw new Error(`not an OID: ${dotted}`)
-  const body: number[] = [first * 40 + second]
-  for (const arc of rest) {
-    const chunks: number[] = []
-    for (let n = arc; ; n = Math.floor(n / 128)) {
-      chunks.unshift(n % 128)
-      if (n < 128) break
-    }
-    for (let i = 0; i < chunks.length - 1; i++) chunks[i]! |= 0x80
-    body.push(...chunks)
-  }
+  // `40*first + second` is itself a subidentifier, so it is base-128 like every other one.
+  // Emitting it as a single byte is correct only while the second arc is under 40: at 40
+  // the byte reaches 0x80, whose top bit means "continues", and a conformant parser then
+  // swallows the next arc into it and mis-reads the whole OID. No OID here has a second
+  // arc that large, which is exactly why it would have gone unnoticed.
+  const body = [...base128(first * 40 + second)]
+  for (const arc of rest) body.push(...base128(arc))
   return tlv(OBJECT_IDENTIFIER, Uint8Array.from(body))
+}
+
+/** One OID subidentifier: base-128, big-endian, continuation bit on all but the last. */
+function base128(value: number): number[] {
+  if (!Number.isSafeInteger(value) || value < 0) throw new Error(`not an OID arc: ${value}`)
+  const chunks: number[] = []
+  for (let n = value; ; n = Math.floor(n / 128)) {
+    chunks.unshift(n % 128)
+    if (n < 128) break
+  }
+  for (let i = 0; i < chunks.length - 1; i++) chunks[i]! |= 0x80
+  return chunks
 }
 
 /**

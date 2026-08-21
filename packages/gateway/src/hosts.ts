@@ -87,14 +87,44 @@ export const isAllowedHost = (hostname: string, allowed: readonly string[]): boo
  */
 export function parseAuthority(authority: string): { hostname: string; port: number } | null {
   const bracketed = /^\[([^\]]+)\]:(\d+)$/.exec(authority)
-  if (bracketed) return { hostname: bracketed[1]!.toLowerCase(), port: Number(bracketed[2]) }
-  const at = authority.lastIndexOf(':')
-  if (at <= 0) return null
-  const hostname = authority.slice(0, at).toLowerCase()
-  const port = Number(authority.slice(at + 1))
-  if (!hostname || !Number.isInteger(port) || port < 1 || port > 65535) return null
-  return { hostname, port }
+  const [rawHost, rawPort] = bracketed
+    ? [bracketed[1]!, bracketed[2]!]
+    : splitOnLastColon(authority)
+  if (!rawHost || rawPort === undefined) return null
+  const port = strictPort(rawPort)
+  return port === null ? null : { hostname: rawHost.toLowerCase(), port }
 }
+
+const splitOnLastColon = (authority: string): [string | undefined, string | undefined] => {
+  const at = authority.lastIndexOf(':')
+  return at <= 0 ? [undefined, undefined] : [authority.slice(0, at), authority.slice(at + 1)]
+}
+
+/**
+ * A port, or nothing.
+ *
+ * `Number()` is not a port parser: it accepts `0x1bb`, `1e3`, `+443`, and `" 443"`, all of
+ * which come back as plausible numbers from a string the *client* wrote. Digits only, and
+ * the range check applies to every branch — the IPv6 arm used to return before reaching it,
+ * so `[::1]:99999` parsed.
+ */
+function strictPort(value: string): number | null {
+  if (!/^\d{1,5}$/.test(value)) return null
+  const port = Number(value)
+  return port >= 1 && port <= 65535 ? port : null
+}
+
+/**
+ * The only port a sandbox has business reaching.
+ *
+ * Every entry on the allowlist is an HTTPS API, and the allowlist matches on hostname
+ * alone — so without this, `CONNECT api.anthropic.com:22` is an allowlisted name pointing
+ * at somebody else's SSH port, and the gateway would happily intercept and credential it.
+ * The check was described in a comment here and enforced nowhere.
+ */
+export const ALLOWED_CONNECT_PORT = 443
+
+export const isAllowedPort = (port: number): boolean => port === ALLOWED_CONNECT_PORT
 
 /**
  * A push, in either of the two shapes it arrives in.
@@ -114,6 +144,39 @@ export function parseAuthority(authority: string): { hostname: string; port: num
  * the reason.
  */
 export function isGitPushRequest(method: string, path: string): boolean {
+  // Every spelling of the path the origin server would accept, not just the one on the
+  // wire. GitHub percent-decodes before routing, so `/git-receive-pac%6b` is a push — and
+  // a matcher that compares the raw bytes says it is not. That is a one-curl walk around
+  // ADR-0005, live in exactly the configuration the rule exists for (a GitHub token
+  // configured). Case-insensitive for the same reason: it costs nothing and removes the
+  // next variant of the same trick.
+  return spellings(path).some((candidate) => matchesPush(method, candidate))
+}
+
+function spellings(path: string): string[] {
+  const lower = path.toLowerCase()
+  const out = [lower]
+  try {
+    // Repeated, because `%2569` decodes to `%69` decodes to `i`. Bounded at three passes:
+    // a fixed point is normal, and a path that is still changing after three rounds is not
+    // a path anyone legitimately sent.
+    let decoded = lower
+    for (let i = 0; i < 3; i++) {
+      const next = decodeURIComponent(decoded)
+      if (next === decoded) break
+      decoded = next
+      out.push(decoded)
+    }
+  } catch {
+    // A malformed escape cannot be decoded, so it cannot be reasoned about. Treated as a
+    // push if it looks anything like one, on the principle that this rule refuses rather
+    // than permits when it cannot tell.
+    out.push(lower.replaceAll('%', ''))
+  }
+  return out
+}
+
+function matchesPush(method: string, path: string): boolean {
   const [base = '', query = ''] = path.split('?', 2)
   if (base.endsWith('/git-receive-pack')) return true
   return (
