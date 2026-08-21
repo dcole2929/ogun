@@ -17,8 +17,10 @@ designed, the divergence is recorded here rather than quietly dropped.
    constraint, not a v0 shortcut — it's the entire cost model.
 2. **Skills are durable, jobs are ephemeral.** A skill is committed to git. A job is a
    disposable execution of a skill by a worker.
-3. **The sandbox never pushes.** It produces a patch. The host publishes. Git
-   credentials never enter an agent's reach.
+3. **The sandbox never pushes, and holds no credential at all.** It produces a patch;
+   the host publishes. Git credentials never enter an agent's reach (ADR-0005), and
+   neither do the model providers' — a container gets placeholders and reaches the
+   network through a gateway that splices the real values in at the wire (ADR-0010).
 4. **Deterministic code before AI.** Ticket filtering, scheduling, git plumbing,
    dedupe — ordinary code. LLMs only where judgment is required.
 5. **Structured output, validated.** Findings are records with schemas, not prose.
@@ -65,9 +67,12 @@ WSL2 host — always-on-ish, systemd
 │     └── web UI (vite/react build, served by hono)
 │
 ├── ogun-runner ──── HTTP ────→ localhost:7777/api/jobs/claim
+│     ├── gateway (in-process, on a unix socket the sandbox mounts)
+│     │     local CA → per-host leaf → CONNECT + TLS interception
+│     │     host allowlist; real credentials spliced in at the wire
 │     ├── sandbox: container (default) | worktree (opt-in)
-│     │     mounts: ~/.claude:ro  ~/.codex:ro  cache volumes
-│     │     NO ssh key, NO gh token, NO network to GitHub
+│     │     mounts: placeholder credentials, gateway CA, cache volumes
+│     │     NO ssh key, NO gh token, NO live credential of any kind
 │     └── runtime: claude | codex  (presets over a cli spec)
 │
 └── publisher (in the runner process, host-side)
@@ -302,6 +307,33 @@ Base carries `claude`, `codex`, `git`, node. The project layer adds its toolchai
 - Mount a persistent package-manager cache volume, or every nightly run re-downloads
   the world.
 
+**Credentials.** [corrected — ADR-0010] **Nothing live enters a sandbox.** The container
+gets *placeholder* credential files — real enough in shape for the CLI to decide it is
+logged in, worth nothing to whoever steals them — plus `HTTPS_PROXY` pointing at the
+runner's in-process egress gateway and a CA to trust. The gateway terminates the TLS on
+the host and splices the real credential into the request headers.
+
+What this replaced, kept because it is what the design believed: *`~/.claude` and
+`~/.codex` mounted read-only. Worst case for a misbehaving agent is burning rate limit.*
+That was wrong on both counts. An `adversarial-review` worker is pointed on purpose at
+material that carries prompt injection, and an injected agent's first move is to read its
+own credential file — which on a working machine also holds live OAuth access and refresh
+tokens for every connected MCP server, under `mcpOAuth`. The worst case was handing an
+unattended agent a set of third-party credentials from unrelated products.
+
+**No git credential ever enters a sandbox**, which was true before and is now true at a
+second boundary: the gateway refuses `git-receive-pack` in both of its phases, whatever
+the allowlist or credentials say (ADR-0005).
+
+**The gateway is not optional, and that is the decision.** [built — ADR-0010] It runs
+*in the runner process* rather than beside it, so there is no "runner up, gateway down"
+state to design for: if it cannot bind its socket, the runner exits. There is deliberately
+no fallback to mounting the real credentials — that would trade a loud failure for a
+silent one, and the silent one hands an unattended agent a live token at 3am. A container
+sandbox whose runner has no gateway, or whose gateway is on TCP (which a `--network none`
+container has no interface to reach), refuses to provision rather than starting a container
+that would reach nothing. See `docs/gateway.md` for the reasoning and the wiring.
+
 **The sandbox never pushes.** [settled — ADR-0005]
 
 ```
@@ -356,7 +388,10 @@ from its `base/Dockerfile` plus codex. Reuse directly:
 - Cross-platform credential resolution — `~/.claude` → `/home/dev/.claude`,
   `CLAUDE_CONFIG_DIR` set, three-way fallback for `.claude.json` (explicit → inside
   the data dir on Linux/WSL → legacy sibling on macOS), plus macOS Keychain
-  extraction into a chmod-600 tempfile.
+  extraction into a chmod-600 tempfile. [superseded — ADR-0010] The *resolution* is
+  still what it was; what it resolves to no longer enters the container. The runner
+  reads the host's credential on the host and the container gets a placeholder.
+  claude-sandbox has a human watching the session; this one does not.
 - Copying `.gitconfig` rather than bind-mounting it, so git can rewrite it.
 - The layered config precedence (defaults → user dir → project dir → flags), which is
   already the hierarchy specced in §4.8.
@@ -409,15 +444,15 @@ credential and no remote to push to.
 cannot be an airgap.
 
 **Egress is a host allowlist.** [built] A worker declares the hosts its sandbox may
-reach; anything else is refused. Four spellings, of which `open` and `none` are what
-already shipped and keep working unchanged:
+reach; anything else is refused, by the gateway, per session. Four spellings, of which
+`open` and `none` are what already shipped and keep working unchanged:
 
 | `egress:` | Means |
 |---|---|
 | *absent* | The default allowlist for the worker's runtime. **The default.** |
 | a list of hosts | Those hosts *in addition to* the defaults. `*.example.com` allowed. |
-| `open` | Unrestricted internet. An explicit opt-out; the runner logs it every run. |
-| `none` | No network at all. Structural, and correct for a tool-only pass. |
+| `open` | Unrestricted internet, no gateway, and therefore a real mounted credential. An explicit opt-out; the runner logs both halves every run. |
+| `none` | No network at all, and no credential either — not even a placeholder. Structural, and correct for a tool-only pass. |
 
 The default set is the model API for whichever runtime will run — `*.anthropic.com` or
 `*.openai.com` plus `*.chatgpt.com` and `*.oaiusercontent.com` — plus
@@ -431,14 +466,29 @@ the API host, the OAuth refresh host, the feature-flag host a CLI stalls on — 
 wrong produces a hang that reads as anything but a firewall rule, and it buys nothing:
 the attacker in the prompt-injection story does not control a host under `anthropic.com`.
 
-**How it is enforced: `--network none`, plus one unix socket.** The container has no
-network interface but `lo`. Its only route out is a unix socket the runner bind-mounts in,
-on the far side of which is a forward proxy in the runner process that allows `CONNECT`
-to allowlisted hosts and refuses everything else with a 403 naming the host. Inside the
-container a ~40-line forwarder bridges `127.0.0.1:8118` to that socket, because
-`HTTPS_PROXY` cannot name a socket file; `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` are set in
-**both** letter cases, since curl, Go and reqwest deliberately ignore uppercase
-`HTTP_PROXY` (the CGI `Proxy:` header hole) while other clients read only uppercase.
+**How it is enforced: `--network none`, plus one unix socket.** [built — ADR-0010] The
+container has no network interface but `lo`. Its only route out is a unix socket the
+runner bind-mounts in at `/run/ogun/egress.sock`, on the far side of which is the egress
+**gateway** — one per runner, in the runner process, at `~/.ogun/gateway/proxy.sock`. It
+allows `CONNECT` to the hosts *that job's session* declared, refuses everything else with a
+403 naming the host, and splices the host's real credential into every request on the way
+out. Inside the container a ~40-line forwarder bridges `127.0.0.1:8118` to that socket,
+because `HTTPS_PROXY` cannot name a socket file;
+`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` are set in **both** letter cases, since curl, Go and
+reqwest deliberately ignore uppercase `HTTP_PROXY` (the CGI `Proxy:` header hole) while
+other clients read only uppercase.
+
+The socket is mounted as a *file*, never as its directory: `~/.ogun/gateway/` also holds
+`ca.key`, the signing key that can impersonate every host every Ogun container trusts.
+
+There was briefly a second, smaller proxy at `packages/runner/src/sandbox/egress-proxy.ts`
+— allowlist only, no interception, one per sandbox — landed alongside the gateway while
+the gateway was still inert. Two implementations of one enforcement point is one place for
+a rule to be true and one place for it to quietly stop being; the smaller one was deleted,
+and every property it protected is asserted in `packages/runner/test/egress.test.ts`
+against the survivor. Its host matcher went the same way: `@ogun/core` carried an
+`isHostAllowed` that kept every one of its tests when its only caller was deleted, which is
+the worst state for a security rule to be in — green, and deciding nothing.
 
 The ordering is the point and it is the opposite of how a proxy is usually deployed. On a
 normal bridge network `HTTPS_PROXY` is *advice*, and a prompt-injected agent declines it
@@ -461,11 +511,23 @@ What was rejected, and why:
   gave for the allowlist having no cheap implementation. A unix socket sidesteps it
   entirely: the proxy is the runner, which was already running.
 
-Deliberately not built here: no TLS interception, no credential injection, no policy
-engine. `CONNECT` is allowlisted by hostname and the bytes are piped through untouched.
-The credential-injecting gateway being built alongside this subsumes this enforcement
-point — same socket, same env, same `--network none` container — and when it lands, the
-credential mounts stop existing.
+**One gateway per runner, one session per job.** The gateway is not per sandbox, and that
+is a decision. It owns a CA private key capable of impersonating every host every container
+trusts, and it is the only process that reads the host's real credentials, so a second copy
+per job would multiply exactly the surface it exists to shrink. What separates one job from
+another is not the listener: `gateway.open(authority, allow)` mints a 256-bit session token
+carrying *that worker's* allowlist, and `dispose()` revokes it. A global list would quietly
+widen every worker to the union of all of them — a reviewer that declared
+`egress: [docs.example.com]` inheriting a modifier's reach — and that regression never fails
+a test, it just stops refusing things. A per-job token also survives what a per-job socket
+would not: a container that outlives its `docker run` stops being able to spend the host's
+credentials at the moment the job ends, rather than whenever somebody notices.
+
+The agent container and the verification container that follows it share one session —
+one allowlist, one token, one denial log. The gate needs egress (a suite that begins
+`pnpm install` with no route out fails as a red suite and gets blamed on the modifier whose
+patch it was gating) and needs no credential at all, so it gets the socket, the CA and the
+proxy environment, and nothing under `/host-credentials`.
 
 **Images must be rebuilt for this.** The forwarder is baked into `ogun/base`, so an image
 built before it cannot bridge to the socket — and the silent failure is backwards: the
@@ -479,15 +541,37 @@ marker through `FROM ogun/base` and pick it up on their next `ogun image build .
 writing a secret into a completion request, is unaffected by any allowlist. That is a
 different and harder problem and it is open.
 
-**Credentials.** `~/.claude` and `~/.codex` credential files are mounted read-only into a
-staging path and copied to a writable home. This spec used to say the worst case for a
-misbehaving agent was burning rate limit. That was false, and the correction is the whole
-reason the allowlist above got built: what lands in that home is a live OAuth token, and
-under `egress: open` anything running in the container could read it and POST it
-anywhere. Not a hypothetical agent that turns malicious — an `adversarial-review` worker
-is aimed at untrusted repository content by design, so a crafted README, a test fixture or
-a dependency's source is the delivery mechanism. **No git credential ever enters a
-sandbox**, which remains true and was always the stronger half of the claim.
+**Credentials.** [corrected — ADR-0010] What is mounted at `/host-credentials/...` is a
+*placeholder* written per job, at exactly the paths the real files used to occupy, so
+`entrypoint.sh` and the image need no change at all — what changed is only what is at those
+paths. Verified in a live container: an agent asked to read its own
+`~/.claude/.credentials.json` finds a 274-byte file whose `accessToken` is the literal
+string `ogun-gateway-placeholder`, and `grep -r sk-ant-oat` across its home and
+`/host-credentials` matches nothing, while the same container completes a real
+`api.anthropic.com` call.
+
+This spec used to say the worst case for a misbehaving agent was burning rate limit. That
+was false, and the correction is the whole reason the allowlist and then the gateway got
+built: what used to land in that home was a live OAuth token — and on a working machine
+that file also carries `mcpOAuth`, with live access *and refresh* tokens for every MCP
+server the user has connected. Not a hypothetical agent that turns malicious: an
+`adversarial-review` worker is aimed at untrusted repository content by design, so a crafted
+README, a test fixture or a dependency's source is the delivery mechanism.
+
+**`egress: open` is the one path that still mounts a real credential**, and it is the
+reason the opt-out is loud. It has no gateway to splice one in at, so the choice there is a
+mounted token or an agent that cannot authenticate; the runner warns on every run that says
+it, naming both halves. `credentialMounts()` in `container.ts` is deliberately the single
+place to look for the question "does a sandbox ever see a real token".
+
+`settings.json` and `config.toml` are still mounted for the agent container — configuration
+the CLIs need, and neither a credential by construction, though `settings.json` supports an
+`env` block and is therefore a residual exposure ADR-0010 records rather than hides. The
+verification container gets neither.
+
+**No git credential ever enters a sandbox**, which remains true and was always the stronger
+half of the claim — and is now true at a second boundary, since the gateway refuses
+`git-receive-pack` in both of its phases whatever the allowlist says (ADR-0005).
 
 ### 4.7 Runtimes
 
@@ -973,7 +1057,8 @@ graph without touching either end.
      │       ensure project image is current (content-hash check)
      │       inject only skills NOT already in the workspace
      ▼
-  SANDBOX    workspace mounted rw; no socket, no remote, allowlist egress
+  SANDBOX    workspace mounted rw; no socket, no remote, no credential;
+     │       --network none + the gateway's unix socket as the only route out
      │       agent runs the job's prompt
      │       └──► RunEvents stream out continuously, batched
      ▼
@@ -1243,6 +1328,7 @@ comparison possible later.
 ogun/
   packages/
     core/         types, drizzle schema, fingerprinting, config resolution
+    gateway/      the egress gateway: local CA, TLS interception, credential injection
     runner/       job pipeline, sandbox impls, runtime presets
     server/       hono api, foreman, integrations, serves web build
     cli/          peer to the UI, same application layer
@@ -1254,6 +1340,7 @@ ogun/
   .agents/skills/ the skills ogun runs
 
 ~/.ogun/          machine-local: config.json, skills, workspaces, cache volumes
+  gateway/        the local CA — ca.key (0600) and ca.pem, generated on first start
 ```
 
 Stack: Node 24+, Hono, Vite + React (no Next), Postgres + Drizzle, croner, Zod for all
@@ -1340,6 +1427,22 @@ Also done: **triage fan-in** (§4.12) — the first genuinely multi-node cycle a
 use of `on_dep_failure: degrade`. Reviewers stage, triage publishes, and which of those a
 run does is read off the graph rather than declared on the worker.
 
+Also done: the **egress gateway** (`packages/gateway`, ADR-0010) — a local CA, CONNECT
+with TLS interception, a host allowlist, and credential injection for the three providers,
+running in the runner process — **and the sandbox is wired to it**. `container.ts` mounts
+placeholder credentials at the paths the real files used to occupy and points every
+container at the gateway's socket; the real ones are mounted nowhere except on the
+`egress: open` opt-out. Verified in a live container rather than asserted: an agent asked
+to read its own `~/.claude/.credentials.json` finds `ogun-gateway-placeholder`, and the
+same container completes a real `api.anthropic.com` turn.
+
+That change also deleted the *second* proxy. A smaller allowlist-only one had landed
+alongside the gateway while the gateway was still inert, so for a while one enforcement
+point had two implementations — which is one place for a rule to be true and one place for
+it to quietly stop being. `@ogun/core`'s `isHostAllowed` went with it: when its only caller
+was deleted it kept every one of its tests and lost every bit of its authority, and the two
+matchers had already drifted over the DNS root's trailing dot.
+
 Remaining: re-adjudication, which is what stops a reviewer re-flagging what you already
 dismissed.
 
@@ -1389,7 +1492,16 @@ canvas, auto-merge, agent memory, model auto-selection, remote runner mesh.
 4. **Triage prompt and calibration.** What the severity scale actually is, and how
    triage is itself evaluated. It is the one node that can silently lose real
    findings, so it needs its own quality measure — currently undefined.
-5. **Workspace materialization cost on large repos.** `--no-hardlinks` copies the
+5. **Refreshing an OAuth token host-side.** The gateway re-reads the credential files
+   rather than refreshing them, so the host's own `claude` is what keeps a token alive.
+   Nothing does that on a machine that only runs Ogun, and the token lapses. Whether the
+   gateway should perform the refresh — and therefore write back to the user's real
+   credential file, which is a much larger claim on it — is undecided (ADR-0010).
+6. **Extending the egress allowlist per project.** A project whose test suite reaches a
+   host outside the default list fails its verification gate. The list is a constant; the
+   extension point is designed and unbuilt, and where it should live — project config,
+   machine config, or the worker — is not settled.
+7. **Workspace materialization cost on large repos.** `--no-hardlinks` copies the
    object store per job. Fine for these repos; if one gets big the escape hatch is
    dropping the flag, at the cost of a container being able to corrupt the source.
    No policy yet for when to switch.

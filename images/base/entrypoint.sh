@@ -7,11 +7,17 @@
 # writable would let a container corrupt the credentials it was lent. Copying gives the
 # agent a working home it cannot use to damage the host's own (§4.6).
 #
-# It does not make the credential safe. This line used to say "whose worst-case damage is
-# burning rate limit", which was false: what lands in that home is a live OAuth token, and
-# an agent that can read it and reach the internet can send it anywhere. That is why the
-# container now runs --network none with a host-side allowlist proxy — see the forwarder
-# below, and the Dockerfile header.
+# What arrives at /host-credentials is a *placeholder* (ADR-0010) — real enough in shape
+# for the CLI to decide it is logged in, worth nothing to whoever steals it. The real token
+# never leaves the host; the egress gateway splices it in at the wire. Nothing in this file
+# had to change for that, which was the deciding factor between several bootstrap shapes:
+# the stubs land at exactly the paths the real files used to, so `seed` below copies
+# whatever is there without knowing or caring which it got.
+#
+# This block used to say the credential's "worst-case damage is burning rate limit", which
+# was false — what landed in that home was a live OAuth token, and an agent that can read it
+# and reach the internet can send it anywhere. The --network none plus host-side proxy
+# below bounded where it could go; the gateway removed the thing worth sending.
 set -eu
 
 seed() {
@@ -34,8 +40,9 @@ seed() {
 # than on a missing directory.
 mkdir -p /home/dev/.claude /home/dev/.codex
 
-# The runner mounts individual credential files, never a whole config directory — see
-# credentialMounts() for why. This copies whatever arrived.
+# The runner mounts individual files, never a whole config directory — see
+# credentialMounts() in container.ts for why. This copies whatever arrived, which under
+# every policy but `egress: open` is a placeholder plus the CLI's own settings.
 seed /host-credentials/claude /home/dev/.claude
 seed /host-credentials/codex  /home/dev/.codex
 

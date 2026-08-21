@@ -14,6 +14,7 @@ import {
   type RunOutcome,
   type RunReport,
 } from '@ogun/core'
+import type { Gateway } from '@ogun/gateway'
 import { ControlPlane, EventFlusher, type FindingsHistory } from './client.ts'
 import {
   containedTarget,
@@ -67,6 +68,28 @@ export const HISTORY_INDEX_PATH = '.ogun-in/history.json'
 export const HISTORY_DIR = '.ogun-in/history'
 
 /**
+ * What every job on this runner shares: where the repos are, somewhere to work, and the
+ * one gateway the sandboxes authenticate through.
+ *
+ * The gateway is per *runner*, not per job, and that is the decision (ADR-0010). It owns
+ * a CA private key capable of impersonating every host every Ogun container trusts, and
+ * it is the only process that reads the host's real credentials — so a second copy per
+ * job would multiply exactly the surface this component exists to shrink, for no
+ * isolation gain: what separates one job from another is the session token and the
+ * per-session allowlist that `gateway.open()` mints, not which listener answered.
+ *
+ * Optional only so that a caller with no container sandboxes to run — the tests, and
+ * anything driving `executeJob` directly — is not forced to stand one up. A container
+ * sandbox that reaches `provision()` without one refuses to run rather than falling back
+ * to mounting a credential.
+ */
+export type RunnerContext = {
+  projects: Record<string, string>
+  scratch: string
+  gateway?: Gateway
+}
+
+/**
  * The runner's loop, once per job (§5.2):
  *
  *   prepare   -> materialize workspace, check the image
@@ -78,7 +101,7 @@ export const HISTORY_DIR = '.ogun-in/history'
  */
 export async function executeJob(
   cp: ControlPlane,
-  config: { projects: Record<string, string>; scratch: string },
+  config: RunnerContext,
   job: ClaimedJob,
 ): Promise<RunOutcome> {
   const startedAt = Date.now()
@@ -307,6 +330,13 @@ export async function executeJob(
       // Absent is not "unrestricted" — it resolves to the default allowlist for the
       // runtime, inside the sandbox (§4.6).
       ...(job.egress === undefined ? {} : { egress: job.egress }),
+      /**
+       * One gateway, owned by the runner process, handed to every job (ADR-0010). The
+       * sandbox mints its own session from it and revokes it in `dispose()`, so what a
+       * container gets is a token and an allowlist of its own rather than a share of
+       * something global.
+       */
+      ...(config.gateway ? { gateway: config.gateway } : {}),
     })
     await sandbox.provision()
 
@@ -866,7 +896,7 @@ async function countLines(workspace: string, relPath: string): Promise<number | 
 
 /** Transcripts are large and rarely read: to disk with a pointer, never into postgres. */
 async function writeTranscript(
-  config: { projects: Record<string, string>; scratch: string },
+  config: RunnerContext,
   job: ClaimedJob,
   workspace: string,
 ): Promise<string | undefined> {

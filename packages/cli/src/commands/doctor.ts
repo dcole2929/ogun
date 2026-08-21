@@ -5,6 +5,7 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { imageState, loadLocalConfig, localConfigPath } from '@ogun/core'
+import { caState, credentialStatuses, readCredentials } from '@ogun/gateway'
 import { bold, cyan, dim, green, red, yellow } from '../output.ts'
 import { authHeaders } from '../auth.ts'
 
@@ -81,6 +82,61 @@ export async function sandboxImage(): Promise<Check> {
 }
 
 /**
+ * Whether the egress gateway's CA exists, and who else on this box can sign with it.
+ *
+ * The mode is the check that matters. Anything holding `ca.key` can mint a certificate
+ * for any host that every Ogun container is configured to trust, which turns the thing
+ * that protects the credentials into the way to take them. `configPermissions` above
+ * exists for the same reason and this file is strictly worse to leak.
+ *
+ * A missing CA is a warning rather than a failure: it is generated on first use, and a
+ * machine that has never started a runner has never needed one.
+ */
+export function gatewayCa(): Check {
+  const state = caState()
+  if (state.state === 'missing') {
+    return {
+      name: 'gateway CA',
+      ok: true,
+      detail: `${state.directory} — generated on the runner's first start`,
+      fatal: false,
+    }
+  }
+  const shared = (state.keyMode & 0o077) !== 0
+  return {
+    name: 'gateway CA',
+    ok: !shared,
+    detail: shared
+      ? `${state.keyPath} is 0${state.keyMode.toString(8)} — anything reading it can ` +
+        `impersonate every host a sandbox trusts. \`chmod 600 ${state.keyPath}\``
+      : `${state.keyPath} is 0${state.keyMode.toString(8)}`,
+    fatal: false,
+  }
+}
+
+/**
+ * Which credentials the gateway could actually splice in, and how long they last.
+ *
+ * This is the preflight the gateway design needs and mounting did not. When credentials
+ * were bind-mounted, an expired token was the CLI's problem and the CLI said so in its own
+ * words. Behind a gateway the container holds a placeholder that never expires, so an
+ * expired *host* token surfaces only as a 401 inside an agent transcript — and the gateway
+ * does not refresh, it re-reads the file the host's own `claude` refreshes. Saying
+ * "expired 6h ago" here is the difference between a two-minute fix and an evening.
+ *
+ * Warnings, never fatal. A machine with no OpenAI credential simply cannot run codex
+ * workers, which is a normal way to be configured rather than a broken one.
+ */
+export function gatewayCredentials(): Check[] {
+  return credentialStatuses(readCredentials()).map((status) => ({
+    name: `gateway ${status.provider}`,
+    ok: status.present,
+    detail: status.detail,
+    fatal: false,
+  }))
+}
+
+/**
  * `ogun runner doctor` — which runtimes and tools are present on *this* machine.
  * The repo registry and the toolchain are per-runner, so this is the only honest place
  * to answer "can this box actually run a job" (§4.5).
@@ -145,6 +201,11 @@ export async function doctor(serverUrl: string): Promise<void> {
   const permissions = await configPermissions()
   if (permissions) checks.push(permissions)
   checks.push(await sandboxImage())
+
+  // The gateway is what a sandbox authenticates through, so "can this box run a job" now
+  // includes "can the gateway sign for it, and does it have anything to inject".
+  checks.push(gatewayCa())
+  checks.push(...gatewayCredentials())
 
   const dockerOk = checks.find((c) => c.name === 'docker')?.ok === true
   if (dockerOk) {

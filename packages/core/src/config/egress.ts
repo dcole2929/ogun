@@ -142,25 +142,16 @@ export function resolveEgressAllow(
 export const normalizeHost = (host: string): string => host.trim().toLowerCase().replace(/\.$/, '')
 
 /**
- * Whether one host is covered by an allowlist entry.
+ * There used to be an `isHostAllowed` here, and its absence is the point.
  *
- * The subtlety a naive implementation gets wrong is what `*.example.com` means. Matching
- * it as "ends with example.com" also matches `notexample.com` and `example.com.evil.io`,
- * either of which hands an attacker the whole allowlist for the price of registering a
- * domain. The suffix must begin at a label boundary, and the wildcard covers exactly one
- * level of subdomain hierarchy or more — but never the parent itself, which is why
- * `defaultEgressAllow` lists `anthropic.com` alongside `*.anthropic.com` rather than
- * assuming one implies the other.
+ * It was the matcher for the per-sandbox forward proxy that `@ogun/gateway` replaced.
+ * When that proxy was deleted this function kept every one of its tests and lost every
+ * one of its callers — a security rule in the worst possible state, passing loudly while
+ * deciding nothing. Two matchers for one question is also how they drift: this one
+ * dropped the DNS root's trailing dot and the gateway's did not, so `api.anthropic.com.`
+ * was allowed by the tested implementation and refused by the running one.
+ *
+ * The matcher now lives exactly where the decision is made: `hostMatches` /
+ * `isAllowedHost` in `packages/gateway/src/hosts.ts`. This module still *builds* the
+ * list — that is a config concern and belongs here — and no longer claims to apply it.
  */
-export function isHostAllowed(host: string, allow: readonly string[]): boolean {
-  const target = normalizeHost(host)
-  if (!target) return false
-  return allow.some((entry) => {
-    const rule = normalizeHost(entry)
-    if (rule.startsWith('*.')) {
-      const parent = rule.slice(2)
-      return parent.length > 0 && target.endsWith(`.${parent}`)
-    }
-    return target === rule
-  })
-}

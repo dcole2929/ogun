@@ -44,6 +44,22 @@ that they live host-side, and they do.
   diff under N lines, PR cap not exceeded. Those belong in ordinary host-side code, and
   once they live there the profile has nothing left to grant. The profile collapses into a
   pipeline step.
+- **Let the sandbox push through the egress gateway, which holds the token host-side.**
+  [added] Rejected, and evaluated properly rather than assumed. The gateway (ADR-0009)
+  removes the objection this ADR was built on — the container would hold no credential,
+  because `Authorization: Basic base64("x-access-token:<token>")` would be spliced in at
+  the wire — so it is a fair question whether the rule can be relaxed. It cannot, for a
+  reason that is a property of proxies rather than of this one: **a proxy's git
+  granularity is the repository, not the ref.** What it sees is
+  `POST /owner/repo/git-receive-pack`; the refs being written are inside a pkt-line body,
+  and parsing that to decide "this push targets `main`" means implementing enough of the
+  git wire protocol to be wrong about it. So allowing the repo allows a force-push to
+  `main`, subject only to whatever branch protection GitHub happens to have — which is
+  strictly weaker than what this ADR guarantees today, where there is no remote and
+  nothing to push with. Extraction on the host loses nothing and keeps the guarantee. The
+  gateway therefore refuses `git-receive-pack` unconditionally, in both of its phases,
+  regardless of allowlist or credential: this ADR is **strengthened, not repealed**, and
+  now holds at a second boundary.
 
 ## Consequences
 
@@ -90,9 +106,11 @@ that they live host-side, and they do.
 - **The per-host egress allowlist is built.** [updated] A worker declares the hosts its
   sandbox may reach and anything else is refused; absent a declaration it gets the model
   API for its runtime plus the npm registry, and `open` survives as an explicit, logged
-  opt-out. Enforcement is `--network none` plus a forward proxy in the *runner process*
-  reached over a bind-mounted unix socket, so there is no sibling container and no
-  `NET_ADMIN` — see §4.6 for the mechanism and the rejected alternatives.
+  opt-out. Enforcement is `--network none` plus the egress gateway in the *runner process*
+  (ADR-0010) reached over a bind-mounted unix socket, so there is no sibling container and
+  no `NET_ADMIN` — see §4.6 for the mechanism and the rejected alternatives. The gateway
+  is also where this ADR's own rule got a second enforcement point: `git-receive-pack` is
+  refused in both of its phases, whatever the allowlist or the credentials say.
 
   What this replaced, kept because it is why the ADR said what it said: "The per-host
   egress allowlist is not built, and this ADR does not say it should not be. What ships is
@@ -108,3 +126,9 @@ that they live host-side, and they do.
 - The structural protections above are what stop a container reaching GitHub, and they
   hold regardless of egress. Exfiltration through the model API itself is a different and
   harder problem, no allowlist closes it, and it is open.
+- **The claim that no credential enters a container was true of git and false of the model
+  providers.** [added] `~/.claude/.credentials.json` and `~/.codex/auth.json` were
+  bind-mounted into every sandbox, and the first of those also carries live OAuth tokens
+  for every connected MCP server. ADR-0010 replaces both with placeholders. This ADR's
+  scope was always the *git* credential; the sentence above about "no credential to
+  misuse" should be read that narrowly for anything before ADR-0010 landed.
