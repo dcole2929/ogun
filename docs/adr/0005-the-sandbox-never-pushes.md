@@ -44,6 +44,22 @@ that they live host-side, and they do.
   diff under N lines, PR cap not exceeded. Those belong in ordinary host-side code, and
   once they live there the profile has nothing left to grant. The profile collapses into a
   pipeline step.
+- **Let the sandbox push through the egress gateway, which holds the token host-side.**
+  [added] Rejected, and evaluated properly rather than assumed. The gateway (ADR-0009)
+  removes the objection this ADR was built on — the container would hold no credential,
+  because `Authorization: Basic base64("x-access-token:<token>")` would be spliced in at
+  the wire — so it is a fair question whether the rule can be relaxed. It cannot, for a
+  reason that is a property of proxies rather than of this one: **a proxy's git
+  granularity is the repository, not the ref.** What it sees is
+  `POST /owner/repo/git-receive-pack`; the refs being written are inside a pkt-line body,
+  and parsing that to decide "this push targets `main`" means implementing enough of the
+  git wire protocol to be wrong about it. So allowing the repo allows a force-push to
+  `main`, subject only to whatever branch protection GitHub happens to have — which is
+  strictly weaker than what this ADR guarantees today, where there is no remote and
+  nothing to push with. Extraction on the host loses nothing and keeps the guarantee. The
+  gateway therefore refuses `git-receive-pack` unconditionally, in both of its phases,
+  regardless of allowlist or credential: this ADR is **strengthened, not repealed**, and
+  now holds at a second boundary.
 
 ## Consequences
 
@@ -108,3 +124,9 @@ that they live host-side, and they do.
 - The structural protections above are what stop a container reaching GitHub, and they
   hold regardless of egress. Exfiltration through the model API itself is a different and
   harder problem, no allowlist closes it, and it is open.
+- **The claim that no credential enters a container was true of git and false of the model
+  providers.** [added] `~/.claude/.credentials.json` and `~/.codex/auth.json` were
+  bind-mounted into every sandbox, and the first of those also carries live OAuth tokens
+  for every connected MCP server. ADR-0010 replaces both with placeholders. This ADR's
+  scope was always the *git* credential; the sentence above about "no credential to
+  misuse" should be read that narrowly for anything before ADR-0010 landed.

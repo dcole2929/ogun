@@ -1,5 +1,6 @@
 import { parseArgs } from 'node:util'
 import { imageState, loadLocalConfig, LocalConfigError } from '@ogun/core'
+import { dockerBridgeAddress, startGateway } from '@ogun/gateway'
 import { ControlPlane } from './client.ts'
 import { executeJob } from './pipeline.ts'
 
@@ -77,6 +78,47 @@ if (image.state !== 'current') {
   )
 }
 
+/**
+ * The egress gateway, in this process rather than beside it.
+ *
+ * It could have been a service of its own — systemd unit, health endpoint, restart
+ * policy. It is not, and the reason is that a separate service creates a state that does
+ * not otherwise exist: the runner up and the gateway down. That state has to be detected,
+ * reported, and decided about, and every one of those is a thing to get wrong at 3am. In
+ * one process there is nothing to detect. If the runner is claiming jobs, the gateway is
+ * listening, because they are the same object.
+ *
+ * Fail-closed, and deliberately so. The tempting alternative is to fall back to mounting
+ * the host's credentials when the gateway cannot start — a job runs rather than fails.
+ * That trades a loud failure for a silent one: the run completes, nothing looks wrong, and
+ * the container is holding a live OAuth token exactly as it did before. A failed nightly
+ * review costs a night. A leaked credential costs whatever the credential can reach.
+ *
+ * Restarts are §8's business: "run the server and runner under whatever supervises
+ * services on that host". Ogun does not supervise itself.
+ */
+const gateway = await startGateway({
+  // The docker bridge address, because a container cannot reach the host's loopback and
+  // must not be handed a proxy published to every interface. Loopback is the fallback for
+  // a machine with no docker, where the only sandbox available is `worktree` anyway.
+  host: process.env.OGUN_GATEWAY_HOST ?? (await dockerBridgeAddress()) ?? '127.0.0.1',
+  ...(process.env.OGUN_GATEWAY_PORT ? { port: Number(process.env.OGUN_GATEWAY_PORT) } : {}),
+}).catch((err: Error) => {
+  console.error(
+    `\nogun-runner: the egress gateway could not start: ${err.message}\n` +
+      '  Every sandbox authenticates through it, so jobs cannot run without it.\n' +
+      '  Set OGUN_GATEWAY_HOST / OGUN_GATEWAY_PORT if the address it chose is wrong,\n' +
+      '  then `ogun runner doctor`.\n',
+  )
+  process.exit(1)
+})
+
+console.log(`  gateway on ${gateway.address.host}:${gateway.address.port}`)
+// Said out loud, because the line above otherwise implies a protection that is not in
+// force yet: the sandbox still mounts the host's real credential files. Delete this line
+// in the same change that wires container.ts (docs/gateway.md §3).
+console.log('  sandboxes are NOT routed through it yet — they still mount live credentials')
+
 if (!(await cp.authorized())) {
   console.error(
     `\nogun-runner: ${serverUrl} rejected this runner's token.\n` +
@@ -116,7 +158,11 @@ const shutdown = () => {
   const wait = setInterval(() => {
     if (inFlight.size === 0) {
       clearInterval(wait)
-      process.exit(0)
+      // After the last job, not before: a container still finishing its run is still
+      // making requests, and closing the gateway underneath it would fail the job we just
+      // waited for.
+      void gateway.close().finally(() => process.exit(0))
+      return
     }
     console.log(`[runner] waiting on ${inFlight.size} in-flight job(s)`)
   }, 1000)

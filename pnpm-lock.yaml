@@ -57,6 +57,9 @@ importers:
       '@ogun/core':
         specifier: workspace:*
         version: link:../core
+      '@ogun/gateway':
+        specifier: workspace:*
+        version: link:../gateway
       drizzle-orm:
         specifier: ^0.44.0
         version: 0.44.7(postgres@3.4.9)
@@ -83,11 +86,16 @@ importers:
         specifier: ^0.31.0
         version: 0.31.10
 
+  packages/gateway: {}
+
   packages/runner:
     dependencies:
       '@ogun/core':
         specifier: workspace:*
         version: link:../core
+      '@ogun/gateway':
+        specifier: workspace:*
+        version: link:../gateway
       zod:
         specifier: ^4.0.0
         version: 4.4.3

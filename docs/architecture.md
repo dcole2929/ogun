@@ -17,8 +17,10 @@ designed, the divergence is recorded here rather than quietly dropped.
    constraint, not a v0 shortcut — it's the entire cost model.
 2. **Skills are durable, jobs are ephemeral.** A skill is committed to git. A job is a
    disposable execution of a skill by a worker.
-3. **The sandbox never pushes.** It produces a patch. The host publishes. Git
-   credentials never enter an agent's reach.
+3. **The sandbox never pushes, and holds no credential at all.** It produces a patch;
+   the host publishes. Git credentials never enter an agent's reach (ADR-0005), and
+   neither do the model providers' — a container gets placeholders and reaches the
+   network through a gateway that splices the real values in at the wire (ADR-0010).
 4. **Deterministic code before AI.** Ticket filtering, scheduling, git plumbing,
    dedupe — ordinary code. LLMs only where judgment is required.
 5. **Structured output, validated.** Findings are records with schemas, not prose.
@@ -65,9 +67,12 @@ WSL2 host — always-on-ish, systemd
 │     └── web UI (vite/react build, served by hono)
 │
 ├── ogun-runner ──── HTTP ────→ localhost:7777/api/jobs/claim
+│     ├── gateway (in-process, on the docker bridge address)
+│     │     local CA → per-host leaf → CONNECT + TLS interception
+│     │     host allowlist; real credentials spliced in at the wire
 │     ├── sandbox: container (default) | worktree (opt-in)
-│     │     mounts: ~/.claude:ro  ~/.codex:ro  cache volumes
-│     │     NO ssh key, NO gh token, NO network to GitHub
+│     │     mounts: placeholder credentials, gateway CA, cache volumes
+│     │     NO ssh key, NO gh token, NO live credential of any kind
 │     └── runtime: claude | codex  (presets over a cli spec)
 │
 └── publisher (in the runner process, host-side)
@@ -302,6 +307,24 @@ Base carries `claude`, `codex`, `git`, node. The project layer adds its toolchai
 - Mount a persistent package-manager cache volume, or every nightly run re-downloads
   the world.
 
+**Credentials.** [corrected — ADR-0010] **Nothing live enters a sandbox.** The container
+gets *placeholder* credential files — real enough in shape for the CLI to decide it is
+logged in, worth nothing to whoever steals them — plus `HTTPS_PROXY` pointing at the
+runner's in-process egress gateway and a CA to trust. The gateway terminates the TLS on
+the host and splices the real credential into the request headers.
+
+What this replaced, kept because it is what the design believed: *`~/.claude` and
+`~/.codex` mounted read-only. Worst case for a misbehaving agent is burning rate limit.*
+That was wrong on both counts. An `adversarial-review` worker is pointed on purpose at
+material that carries prompt injection, and an injected agent's first move is to read its
+own credential file — which on a working machine also holds live OAuth access and refresh
+tokens for every connected MCP server, under `mcpOAuth`. The worst case was handing an
+unattended agent a set of third-party credentials from unrelated products.
+
+**No git credential ever enters a sandbox**, which was true before and is now true at a
+second boundary: the gateway refuses `git-receive-pack` in both of its phases, whatever
+the allowlist or credentials say (ADR-0005).
+
 **The sandbox never pushes.** [settled — ADR-0005]
 
 ```
@@ -356,7 +379,10 @@ from its `base/Dockerfile` plus codex. Reuse directly:
 - Cross-platform credential resolution — `~/.claude` → `/home/dev/.claude`,
   `CLAUDE_CONFIG_DIR` set, three-way fallback for `.claude.json` (explicit → inside
   the data dir on Linux/WSL → legacy sibling on macOS), plus macOS Keychain
-  extraction into a chmod-600 tempfile.
+  extraction into a chmod-600 tempfile. [superseded — ADR-0010] The *resolution* is
+  still what it was; what it resolves to no longer enters the container. The runner
+  reads the host's credential on the host and the container gets a placeholder.
+  claude-sandbox has a human watching the session; this one does not.
 - Copying `.gitconfig` rather than bind-mounting it, so git can rewrite it.
 - The layered config precedence (defaults → user dir → project dir → flags), which is
   already the hierarchy specced in §4.8.
@@ -1243,6 +1269,7 @@ comparison possible later.
 ogun/
   packages/
     core/         types, drizzle schema, fingerprinting, config resolution
+    gateway/      the egress gateway: local CA, TLS interception, credential injection
     runner/       job pipeline, sandbox impls, runtime presets
     server/       hono api, foreman, integrations, serves web build
     cli/          peer to the UI, same application layer
@@ -1254,6 +1281,7 @@ ogun/
   .agents/skills/ the skills ogun runs
 
 ~/.ogun/          machine-local: config.json, skills, workspaces, cache volumes
+  gateway/        the local CA — ca.key (0600) and ca.pem, generated on first start
 ```
 
 Stack: Node 24+, Hono, Vite + React (no Next), Postgres + Drizzle, croner, Zod for all
@@ -1340,8 +1368,14 @@ Also done: **triage fan-in** (§4.12) — the first genuinely multi-node cycle a
 use of `on_dep_failure: degrade`. Reviewers stage, triage publishes, and which of those a
 run does is read off the graph rather than declared on the worker.
 
+Also done: the **egress gateway** (`packages/gateway`, ADR-0010) — a local CA, CONNECT
+with TLS interception, a host allowlist, and credential injection for the three providers,
+running in the runner process. It listens; the sandbox is not yet wired to it, and
+`container.ts` still mounts the real credential files. `docs/gateway.md` §3 is the
+remaining step.
+
 Remaining: re-adjudication, which is what stops a reviewer re-flagging what you already
-dismissed.
+dismissed; and wiring the sandbox to the gateway.
 
 **Phase 3 — the write path.** In progress.
 
@@ -1389,7 +1423,16 @@ canvas, auto-merge, agent memory, model auto-selection, remote runner mesh.
 4. **Triage prompt and calibration.** What the severity scale actually is, and how
    triage is itself evaluated. It is the one node that can silently lose real
    findings, so it needs its own quality measure — currently undefined.
-5. **Workspace materialization cost on large repos.** `--no-hardlinks` copies the
+5. **Refreshing an OAuth token host-side.** The gateway re-reads the credential files
+   rather than refreshing them, so the host's own `claude` is what keeps a token alive.
+   Nothing does that on a machine that only runs Ogun, and the token lapses. Whether the
+   gateway should perform the refresh — and therefore write back to the user's real
+   credential file, which is a much larger claim on it — is undecided (ADR-0010).
+6. **Extending the egress allowlist per project.** A project whose test suite reaches a
+   host outside the default list fails its verification gate. The list is a constant; the
+   extension point is designed and unbuilt, and where it should live — project config,
+   machine config, or the worker — is not settled.
+7. **Workspace materialization cost on large repos.** `--no-hardlinks` copies the
    object store per job. Fine for these repos; if one gets big the escape hatch is
    dropping the flag, at the cost of a container being able to corrupt the source.
    No policy yet for when to switch.

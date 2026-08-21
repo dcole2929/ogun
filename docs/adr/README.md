@@ -101,3 +101,4 @@ wrong is a proposed ADR that supersedes it, not a finding.
 - [ADR-0007 — A single job is a one-node cycle](0007-a-single-job-is-a-one-node-cycle.md)
 - [ADR-0008 — No build step: Node runs the TypeScript](0008-no-build-step-node-runs-the-typescript.md)
 - [ADR-0009 — The runner publishes, and reports before it does](0009-the-runner-publishes-and-reports-before-it-does.md)
+- [ADR-0010 — The sandbox never holds a credential](0010-the-sandbox-never-holds-a-credential.md)
