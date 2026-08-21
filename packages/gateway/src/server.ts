@@ -1,4 +1,5 @@
 import { randomBytes } from 'node:crypto'
+import { chmod, rm } from 'node:fs/promises'
 import { createServer as createHttpServer, request as httpRequest } from 'node:http'
 import type { IncomingHttpHeaders, IncomingMessage, ServerResponse } from 'node:http'
 import { request as httpsRequest } from 'node:https'
@@ -57,12 +58,35 @@ export type GatewaySession = {
   revoke: () => void
 }
 
+/**
+ * Where the gateway listens.
+ *
+ * A unix socket is the transport that makes the proxy unavoidable rather than advisory.
+ * On any network — bridge, host, a dedicated one — `HTTPS_PROXY` is *advice*, and a
+ * prompt-injected agent declines it with `curl --noproxy '*'` and talks to the internet
+ * directly. A container run `--network none` has no interface to decline with: the socket
+ * is a file crossing the same boundary docker already crosses for the workspace, and it is
+ * the container's only route out.
+ *
+ * TCP stays for the case the socket cannot serve — a `worktree` sandbox, and the tests.
+ */
+export type Listening =
+  | { kind: 'tcp'; host: string; port: number }
+  | { kind: 'socket'; path: string }
+
 export type Gateway = {
-  address: { host: string; port: number }
+  listening: Listening
   caCertificatePath: string
   caCertificatePem: string
-  /** Mint a token for one job. */
-  open: () => GatewaySession
+  /**
+   * Mint a token for one job.
+   *
+   * `containerAuthority` is the `host:port` the *container* reaches the proxy at, which is
+   * not always where the gateway listens: over a unix socket it is the in-image forwarder's
+   * loopback address, because `HTTPS_PROXY` has no syntax for a socket path. Omitted, the
+   * bound TCP address is used.
+   */
+  open: (containerAuthority?: string) => GatewaySession
   close: () => Promise<void>
 }
 
@@ -78,6 +102,8 @@ export type GatewayOptions = {
   allowedHosts?: readonly string[]
   host?: string
   port?: number
+  /** Listen here instead of on TCP. Takes precedence over `host`/`port`. */
+  socketPath?: string
   dial?: Dial
   onWarning?: (message: string) => void
 }
@@ -320,24 +346,50 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
   }
 
   const host = options.host ?? '127.0.0.1'
+  const socketPath = options.socketPath
+
+  if (socketPath) {
+    // A socket left behind by a killed runner is not a running gateway, and `listen`
+    // answers EADDRINUSE either way. Removing a stale one is the difference between a
+    // machine that comes back after a kill -9 and one that needs a manual `rm`.
+    await rm(socketPath, { force: true })
+  }
+
   await new Promise<void>((resolve, reject) => {
     proxy.once('error', reject)
-    proxy.listen(options.port ?? 0, host, () => {
+    const done = (): void => {
       proxy.off('error', reject)
       resolve()
-    })
+    }
+    if (socketPath) proxy.listen(socketPath, done)
+    else proxy.listen(options.port ?? 0, host, done)
   })
+
+  if (socketPath) {
+    // 0600. The socket is the container's route to every credential the host holds, and
+    // its mode is the only thing between that and any other user on the box. Docker's bind
+    // mount preserves it, and the container runs as uid 1000 — the same uid the runner
+    // does on this host, which is why the mount works at all.
+    await chmod(socketPath, 0o600)
+  }
 
   // What was actually bound, not what was asked for: with port 0 the kernel picks, and
   // reporting the request would leave `:0` in every container's HTTPS_PROXY.
   const bound = proxy.address()
-  if (bound === null || typeof bound === 'string') throw new Error('gateway did not bind a port')
+  if (!socketPath && (bound === null || typeof bound === 'string')) {
+    throw new Error('gateway did not bind a port')
+  }
+  const port = typeof bound === 'object' && bound !== null ? bound.port : 0
+
+  const listening: Listening = socketPath
+    ? { kind: 'socket', path: socketPath }
+    : { kind: 'tcp', host, port }
 
   return {
-    address: { host, port: bound.port },
+    listening,
     caCertificatePath: ca.certificatePath,
     caCertificatePem: ca.certificatePem,
-    open: () => {
+    open: (containerAuthority?: string) => {
       /**
        * A token per job, not one per gateway.
        *
@@ -352,9 +404,22 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
        */
       const token = randomBytes(32).toString('base64url')
       tokens.add(token)
+      const authority =
+        containerAuthority ??
+        (listening.kind === 'tcp'
+          ? `${listening.host}:${listening.port}`
+          : // A socket has no authority to put in a URL. A caller listening on one and not
+            // saying where the container reaches it has not finished wiring the sandbox,
+            // and a silently wrong `HTTPS_PROXY` is a container that talks to nothing.
+            (() => {
+              throw new Error(
+                'the gateway listens on a unix socket — open() needs the authority the ' +
+                  "container's proxy forwarder listens on",
+              )
+            })())
       return {
         token,
-        proxyUrl: `http://x:${token}@${host}:${bound.port}`,
+        proxyUrl: `http://x:${token}@${authority}`,
         revoke: () => tokens.delete(token),
       }
     },
@@ -362,6 +427,8 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
       new Promise<void>((resolve) => {
         tokens.clear()
         intercepted.close()
+        // The socket file goes with it. `server.close()` unlinks it, but only on a clean
+        // close — the `rm` at startup is what covers the other path.
         proxy.close(() => resolve())
         proxy.closeAllConnections()
       }),

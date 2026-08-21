@@ -14,7 +14,8 @@ claude / codex
   reads ~/.claude/.credentials.json
     → { accessToken: "ogun-gateway-placeholder", expiresAt: 2100 }
   sends Authorization: Bearer ogun-gateway-placeholder
-  via HTTPS_PROXY ──── CONNECT api.anthropic.com:443 ──→ gateway
+  via HTTPS_PROXY -> the image's forwarder -> a bind-mounted unix socket
+                  ──── CONNECT api.anthropic.com:443 ──→ gateway
                                                           │ token ok?
                                                           │ host allowlisted?
                                                           │ 200, then TLS with a
@@ -39,17 +40,31 @@ The container never holds a credential. It holds a placeholder and a CA certific
 | `src/inject.ts` | Which header carries which provider's credential, and what to strip. |
 | `src/stubs.ts` | The placeholder credential files and the container's environment. |
 | `src/server.ts` | CONNECT, TLS interception, forwarding, refusals. |
-| `src/bridge.ts` | The docker bridge address; the CA's state for `doctor`. |
 
-### Where it runs
+### Where it runs, and why on a unix socket
 
-In the runner process (`packages/runner/src/main.ts`), started before the claim loop. It
-binds the docker bridge gateway address — usually `172.17.0.1`, resolved from
-`docker network inspect bridge` — on an ephemeral port, and falls back to loopback on a
-machine without docker. `OGUN_GATEWAY_HOST` and `OGUN_GATEWAY_PORT` override both.
+In the runner process (`packages/runner/src/main.ts`), started before the claim loop,
+listening on `~/.ogun/gateway/proxy.sock` at mode 0600. `OGUN_GATEWAY_HOST` /
+`OGUN_GATEWAY_PORT` switch it to TCP, which is what a `worktree` sandbox and the tests use.
 
-Not `127.0.0.1`, because a container's loopback is its own. Not `0.0.0.0`, because that
-publishes a credential-injecting proxy to the LAN.
+The socket is the part that matters, and it is not a detail of packaging.
+
+**On any network, `HTTPS_PROXY` is advice.** A container on a bridge network has an
+interface, and a prompt-injected agent declines the proxy with `curl --noproxy '*'` and
+talks to the internet directly — taking the allowlist, the injection, and every guarantee
+above them with it. A container run `--network none` has no interface to decline with. The
+socket is a file, so it crosses the same boundary docker already crosses for the workspace,
+and it is the container's only route out. Enforcement stops being a variable the agent can
+unset and becomes the shape of the network.
+
+That also means the gateway's own address is not what the container puts in `HTTPS_PROXY`:
+that variable has no syntax for a socket path. A small forwarder inside the image bridges a
+loopback address to the socket, and `open(containerAuthority)` is told what that address is.
+`open()` throws rather than guessing one, because a container handed a plausible-but-wrong
+proxy address talks to nothing at all and says nothing about why.
+
+The socket transport and the `--network none` sandbox are the parallel workstream's
+(`feat/a-sandbox-reaches-only-what-it-is-allowed-to`); this package listens where it points.
 
 ---
 
@@ -102,10 +117,14 @@ still mounts the real credential files. This is the change, precisely.
 Before `docker run`, for each job:
 
 ```ts
-const session = gateway.open()                    // { proxyUrl, token, revoke }
+const session = gateway.open(IN_CONTAINER_PROXY)  // { proxyUrl, token, revoke }
 const stubs   = credentialStubs(opts.runtime)     // [{ containerPath, content, mode }]
 const env     = sandboxProxyEnv(session.proxyUrl) // the whole environment block
 ```
+
+`IN_CONTAINER_PROXY` is the loopback address the image's forwarder listens on — the
+container's view of the proxy, not the gateway's own. Over TCP, `open()` with no argument
+uses the bound address instead.
 
 Write each stub to a per-job directory on the host (mode `0o600`, inside the job's scratch
 space, removed with it), and call `session.revoke()` in `dispose()` — the same place the
@@ -131,7 +150,12 @@ with secrets; that is a residual exposure, recorded in ADR-0010 and reportable.
 <job scratch>/claude-credentials.json : /host-credentials/claude/.credentials.json : ro
 <job scratch>/codex-auth.json         : /host-credentials/codex/auth.json          : ro
 <gateway.caCertificatePath>           : /etc/ogun/gateway-ca.pem                    : ro
+~/.ogun/gateway/proxy.sock            : <wherever the image's forwarder dials>      : rw
 ```
+
+The socket mount is read-**write**: a unix socket that cannot be written to cannot be
+connected to. It is the one mount that has to be, and its 0600 mode on the host is what
+keeps it to this user; the container runs as uid 1000, the same uid the runner does.
 
 The stubs land at exactly the paths the deleted mounts used, so `images/base/entrypoint.sh`
 and `images/base/Dockerfile` need **no change at all** — the entrypoint's `seed` already
@@ -167,8 +191,9 @@ too instead of failing verification.
 ### 3.5 The `egress` option
 
 `egress: 'open' | 'none'` becomes `'gateway' | 'none'`, with `'gateway'` the default and
-`'open'` removed. `'none'` (`--network none`) stays exactly as it is: a tool-only
-verification pass needs no network and should have none.
+`'open'` removed. Note that `'gateway'` *also* means `--network none` — the container gets
+no interface at all, and the socket is its only route out. `'none'` then means no socket
+either: a genuine airgap for a tool-only verification pass.
 
 The comment on the `egress` option in `container.ts` currently says a host allowlist
 "needs a filtering proxy, which conflicts with the no-sibling-containers rule" and is
@@ -178,9 +203,9 @@ host process inside the runner, not a sibling container — and the comment shou
 ### 3.6 The verification container
 
 `verificationOptions()` builds a second container for the test gate. It should get the
-same proxy environment and the same CA: a project's suite installs dependencies, and
-without the proxy it has no egress at all once `open` is gone. It does **not** need the
-credential stubs — no agent runs in it.
+same proxy environment, the same CA, and the same socket: a project's suite installs
+dependencies, and without them it has no egress at all. It does **not** need the credential
+stubs — no agent runs in it, and a test suite has no business holding even a placeholder.
 
 ### 3.7 Order of operations
 

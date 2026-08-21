@@ -1,6 +1,6 @@
 import { parseArgs } from 'node:util'
 import { imageState, loadLocalConfig, LocalConfigError } from '@ogun/core'
-import { dockerBridgeAddress, startGateway } from '@ogun/gateway'
+import { defaultSocketPath, startGateway } from '@ogun/gateway'
 import { ControlPlane } from './client.ts'
 import { executeJob } from './pipeline.ts'
 
@@ -97,23 +97,44 @@ if (image.state !== 'current') {
  * Restarts are §8's business: "run the server and runner under whatever supervises
  * services on that host". Ogun does not supervise itself.
  */
-const gateway = await startGateway({
-  // The docker bridge address, because a container cannot reach the host's loopback and
-  // must not be handed a proxy published to every interface. Loopback is the fallback for
-  // a machine with no docker, where the only sandbox available is `worktree` anyway.
-  host: process.env.OGUN_GATEWAY_HOST ?? (await dockerBridgeAddress()) ?? '127.0.0.1',
-  ...(process.env.OGUN_GATEWAY_PORT ? { port: Number(process.env.OGUN_GATEWAY_PORT) } : {}),
-}).catch((err: Error) => {
+const tcp = process.env.OGUN_GATEWAY_HOST ?? process.env.OGUN_GATEWAY_PORT
+const gateway = await startGateway(
+  /**
+   * A unix socket by default, because that is what makes the proxy unavoidable.
+   *
+   * On any network — bridge, host, a dedicated one — `HTTPS_PROXY` is *advice*: a
+   * prompt-injected agent declines it with `curl --noproxy '*'` and reaches the internet
+   * directly, and every credential-injection guarantee above it evaporates. A container run
+   * `--network none` has no interface to decline with. The socket is a file, so it crosses
+   * the boundary docker already crosses for the workspace, and it is the container's only
+   * route out.
+   *
+   * TCP remains for the cases a socket cannot serve — a `worktree` sandbox, and anyone
+   * pointing something at this by hand.
+   */
+  tcp
+    ? {
+        host: process.env.OGUN_GATEWAY_HOST ?? '127.0.0.1',
+        ...(process.env.OGUN_GATEWAY_PORT ? { port: Number(process.env.OGUN_GATEWAY_PORT) } : {}),
+      }
+    : { socketPath: defaultSocketPath() },
+).catch((err: Error) => {
   console.error(
     `\nogun-runner: the egress gateway could not start: ${err.message}\n` +
       '  Every sandbox authenticates through it, so jobs cannot run without it.\n' +
-      '  Set OGUN_GATEWAY_HOST / OGUN_GATEWAY_PORT if the address it chose is wrong,\n' +
+      '  Set OGUN_GATEWAY_HOST / OGUN_GATEWAY_PORT to listen on TCP instead,\n' +
       '  then `ogun runner doctor`.\n',
   )
   process.exit(1)
 })
 
-console.log(`  gateway on ${gateway.address.host}:${gateway.address.port}`)
+console.log(
+  `  gateway on ${
+    gateway.listening.kind === 'tcp'
+      ? `${gateway.listening.host}:${gateway.listening.port}`
+      : gateway.listening.path
+  }`,
+)
 // Said out loud, because the line above otherwise implies a protection that is not in
 // force yet: the sandbox still mounts the host's real credential files. Delete this line
 // in the same change that wires container.ts (docs/gateway.md §3).

@@ -37,6 +37,8 @@ export type Upstream = {
 
 export type Harness = {
   gateway: Gateway
+  /** Where the tests dial. Always TCP here — the socket transport is the sandbox's. */
+  address: { host: string; port: number }
   upstream: Upstream
   /** The CA the *sandbox* would trust — the only certificate a container gets. */
   sandboxCa: string
@@ -106,8 +108,11 @@ export async function startHarness(options: {
     onWarning: () => undefined,
   })
 
+  if (gateway.listening.kind !== 'tcp') throw new Error('the harness listens on TCP')
+
   return {
     gateway,
+    address: { host: gateway.listening.host, port: gateway.listening.port },
     upstream,
     sandboxCa: ca.certificatePem,
     cleanup: async () => {
@@ -134,7 +139,7 @@ export function pipelinedTunnel(
   harness: Harness,
   options: { token: string; hostname: string },
 ): Promise<TLSSocket> {
-  const { host, port } = harness.gateway.address
+  const { host, port } = harness.address
   const authority = `${options.hostname}:443`
   const connectRequest =
     `CONNECT ${authority} HTTP/1.1\r\n` +
@@ -224,7 +229,7 @@ export function requestThroughProxy(
     port?: number
   },
 ): Promise<ProxyResponse> {
-  const { host, port } = harness.gateway.address
+  const { host, port } = harness.address
   const authority = `${options.hostname}:${options.port ?? 443}`
 
   return new Promise<ProxyResponse>((resolve, reject) => {

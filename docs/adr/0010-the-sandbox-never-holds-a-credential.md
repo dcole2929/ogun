@@ -25,7 +25,8 @@ exfiltrate a token that was never in the container.
 
 `packages/gateway` is the whole of it: a local CA minting a leaf per hostname, CONNECT
 with TLS interception, a host allowlist, and injection for three providers (`anthropic`,
-`openai`, `github`). It runs **in the runner process**, not beside it.
+`openai`, `github`). It runs **in the runner process**, not beside it, and listens on a
+**unix socket** bind-mounted into a container that has no network interface at all.
 
 ## Considered Options
 
@@ -51,6 +52,14 @@ with TLS interception, a host allowlist, and injection for three providers (`ant
   gateway is a *host process inside the runner*, which is not a sibling container and
   needs no daemon reach — so ADR-0006 is not being re-litigated, its premise simply does
   not apply to this shape. ADR-0005's paragraph on the allowlist is amended accordingly.
+- **Listening on TCP, on the docker bridge address.** Rejected once the alternative was
+  clear. It works, and it is what the first version did — but on any network `HTTPS_PROXY`
+  is *advice*, and a prompt-injected agent declines it with `curl --noproxy '*'` and
+  reaches the internet directly, taking the allowlist and the injection with it. A unix
+  socket bind-mounted into a `--network none` container leaves nothing to decline: the
+  socket is a file, crossing the boundary docker already crosses for the workspace, and it
+  is the container's only route out. Enforcement stops being a variable an agent can unset.
+  TCP remains for a `worktree` sandbox and for the tests.
 - **`iptables` inside the container.** Rejected — it needs `NET_ADMIN` plus a privilege
   drop, which hands back capability the profile exists to remove, and it still fails
   against endpoints whose IPs rotate. It also does nothing at all about the actual
@@ -80,10 +89,12 @@ with TLS interception, a host allowlist, and injection for three providers (`ant
   credential is answered `502 no_credential` by the gateway itself rather than forwarded
   to collect somebody else's 401; and `ogun runner doctor` reports the CA's presence and
   mode plus what each provider would actually be handed, before a job is ever claimed.
-- **A per-job token, revoked when the job ends.** The listener is on the docker bridge
-  address, reachable from every container on the host — so "can you connect" and "may you
-  use it" are different questions. Without the token the gateway would be an open
-  credential oracle for anything else on the box.
+- **A per-job token, revoked when the job ends.** The socket is 0600 and the containers
+  that get it are the ones the runner mounted it into, so "can you reach it" is already
+  narrow — but it is not per-job, and a container that outlives its run (a leaked
+  `docker run`, a `--rm` that did not fire) would otherwise keep spending the host's
+  credentials with nothing noticing. The token is what ends that at the same moment the
+  job does.
 - **The gateway does not refresh an OAuth token; it re-reads the file the host refreshes.**
   This is a real gap and it is named rather than hidden. Before, a container refreshed the
   copy it was given; now the container has a placeholder that never expires and the *host*

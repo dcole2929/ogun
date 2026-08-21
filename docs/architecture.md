@@ -67,7 +67,7 @@ WSL2 host — always-on-ish, systemd
 │     └── web UI (vite/react build, served by hono)
 │
 ├── ogun-runner ──── HTTP ────→ localhost:7777/api/jobs/claim
-│     ├── gateway (in-process, on the docker bridge address)
+│     ├── gateway (in-process, on a unix socket the sandbox mounts)
 │     │     local CA → per-host leaf → CONNECT + TLS interception
 │     │     host allowlist; real credentials spliced in at the wire
 │     ├── sandbox: container (default) | worktree (opt-in)
@@ -324,6 +324,13 @@ unattended agent a set of third-party credentials from unrelated products.
 **No git credential ever enters a sandbox**, which was true before and is now true at a
 second boundary: the gateway refuses `git-receive-pack` in both of its phases, whatever
 the allowlist or credentials say (ADR-0005).
+
+**The gateway is not optional, and that is the decision.** [settled — ADR-0010] It runs
+*in the runner process* rather than beside it, so there is no "runner up, gateway down"
+state to design for: if it cannot bind its socket, the runner exits. There is deliberately
+no fallback to mounting the real credentials — that would trade a loud failure for a
+silent one, and the silent one hands an unattended agent a live token at 3am. See
+`docs/gateway.md` for the reasoning and the wiring.
 
 **The sandbox never pushes.** [settled — ADR-0005]
 

@@ -7,7 +7,7 @@ import {
   sign,
 } from 'node:crypto'
 import type { KeyObject } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import {
@@ -86,6 +86,34 @@ export type CertificateAuthority = {
 }
 
 export const defaultCaDirectory = (): string => join(homedir(), '.ogun', 'gateway')
+
+/**
+ * Where the runner listens for sandboxes, by default.
+ *
+ * A fixed, predictable path rather than a per-run temporary one: `container.ts` has to
+ * bind-mount it, `ogun runner doctor` has to look at it, and a path that moved every start
+ * would make both of those a lookup instead of a constant.
+ */
+export const defaultSocketPath = (): string => join(defaultCaDirectory(), 'proxy.sock')
+
+export type CaState =
+  | { state: 'missing'; directory: string }
+  | { state: 'present'; keyPath: string; keyMode: number }
+
+/**
+ * What `ogun runner doctor` can say about the CA without creating one.
+ *
+ * Deliberately not `loadOrCreateCa`. Doctor reports on a machine, it does not change it,
+ * and a diagnostic that silently generates a signing key the first time you run it makes
+ * "is the CA present?" a question you can never get a false answer to.
+ */
+export function caState(directory = defaultCaDirectory()): CaState {
+  const keyPath = join(directory, 'ca.key')
+  if (!existsSync(keyPath) || !existsSync(join(directory, 'ca.pem'))) {
+    return { state: 'missing', directory }
+  }
+  return { state: 'present', keyPath, keyMode: statSync(keyPath).mode & 0o777 }
+}
 
 /**
  * Load the CA from disk, or create one on first use.

@@ -18,11 +18,14 @@
  * gateway does not reopen the question of pushing from a sandbox (ADR-0005).
  */
 
-export { CA_SUBJECT, defaultCaDirectory, loadOrCreateCa } from './ca.ts'
-export type { CertificateAuthority, Leaf } from './ca.ts'
-
-export { caState, dockerBridgeAddress } from './bridge.ts'
-export type { CaState } from './bridge.ts'
+export {
+  CA_SUBJECT,
+  caState,
+  defaultCaDirectory,
+  defaultSocketPath,
+  loadOrCreateCa,
+} from './ca.ts'
+export type { CaState, CertificateAuthority, Leaf } from './ca.ts'
 
 export {
   credentialReader,
@@ -71,4 +74,4 @@ export {
 export type { CredentialStub } from './stubs.ts'
 
 export { proxyToken, startGateway } from './server.ts'
-export type { Dial, Gateway, GatewayOptions, GatewaySession } from './server.ts'
+export type { Dial, Gateway, GatewayOptions, GatewaySession, Listening } from './server.ts'

@@ -1,8 +1,15 @@
 import { strict as assert } from 'node:assert'
-import { after, test } from 'node:test'
-import { PLACEHOLDER } from '../src/stubs.ts'
+import { mkdtempSync, rmSync, statSync } from 'node:fs'
 import { request } from 'node:https'
-import { pipelinedTunnel, requestThroughProxy, startHarness } from './harness.ts'
+import { connect as netConnect } from 'node:net'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { after, test } from 'node:test'
+import { connect as tlsConnect } from 'node:tls'
+import { loadOrCreateCa } from '../src/ca.ts'
+import { startGateway } from '../src/server.ts'
+import { PLACEHOLDER } from '../src/stubs.ts'
+import { pipelinedTunnel, requestThroughProxy, startHarness, startUpstream } from './harness.ts'
 import type { Harness } from './harness.ts'
 
 /**
@@ -195,6 +202,82 @@ test('a client that pipelines its ClientHello behind the CONNECT still connects'
 
   assert.equal(status, 200)
   assert.equal(harness.upstream.received.at(-1)?.headers.authorization, 'Bearer sk-ant-oat01-REAL')
+})
+
+/**
+ * The transport that makes the proxy unavoidable instead of advisory.
+ *
+ * On any network, `HTTPS_PROXY` is a suggestion — `curl --noproxy '*'` declines it and the
+ * agent reaches the internet directly, taking every guarantee above it with it. A container
+ * run `--network none` has no interface to decline with, and a bind-mounted unix socket is
+ * its only route out. So the gateway has to be able to listen on one.
+ *
+ * `open()` refuses to invent a proxy URL in that mode rather than composing a plausible
+ * one: a socket has no authority, `HTTPS_PROXY` has no syntax for a path, and a container
+ * handed a silently wrong proxy address talks to nothing at all.
+ */
+test('the gateway serves over a unix socket, and will not guess the URL for one', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ogun-sock-'))
+  const socketPath = join(directory, 'proxy.sock')
+  const upstream = await startUpstream('api.anthropic.com')
+  const ca = loadOrCreateCa(mkdtempSync(join(tmpdir(), 'ogun-sock-ca-')))
+
+  const gateway = await startGateway({
+    ca,
+    socketPath,
+    credentials: () => ({
+      anthropic: { provider: 'anthropic', mode: 'oauth', accessToken: 'sk-ant-oat01-REAL' },
+    }),
+    allowedHosts: ['api.anthropic.com'],
+    dial: { rewrite: () => upstream.origin, ca: upstream.ca },
+    onWarning: () => undefined,
+  })
+
+  assert.deepEqual(gateway.listening, { kind: 'socket', path: socketPath })
+  // Anything else on the box that can open this file can spend the host's credentials.
+  assert.equal(statSync(socketPath).mode & 0o777, 0o600)
+  assert.throws(() => gateway.open(), /needs the authority/)
+
+  const session = gateway.open('127.0.0.1:8118')
+  assert.equal(session.proxyUrl, `http://x:${session.token}@127.0.0.1:8118`)
+
+  // And it really serves: CONNECT over the socket, then TLS, then the splice.
+  const status = await new Promise<number | undefined>((resolve, reject) => {
+    const wire = netConnect(socketPath, () => {
+      wire.write(
+        'CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com:443\r\n' +
+          `Proxy-Authorization: Basic ${Buffer.from(`x:${session.token}`).toString('base64')}\r\n\r\n`,
+      )
+    })
+    wire.on('error', reject)
+    wire.once('data', (chunk: Buffer) => {
+      assert.match(chunk.toString('utf8'), /^HTTP\/1\.1 200/)
+      const tls = tlsConnect({ socket: wire, ca: ca.certificatePem, servername: 'api.anthropic.com' })
+      tls.on('error', reject)
+      const req = request({
+        createConnection: () => tls,
+        host: 'api.anthropic.com',
+        path: '/v1/messages',
+        headers: { host: 'api.anthropic.com', authorization: `Bearer ${PLACEHOLDER}` },
+      })
+      req.on('error', reject)
+      req.on('response', (res) => {
+        res.resume()
+        res.on('end', () => {
+          tls.destroy()
+          resolve(res.statusCode)
+        })
+      })
+      req.end()
+    })
+  })
+
+  assert.equal(status, 200)
+  assert.equal(upstream.received.at(-1)?.headers.authorization, 'Bearer sk-ant-oat01-REAL')
+
+  await gateway.close()
+  await upstream.close()
+  rmSync(directory, { recursive: true, force: true })
 })
 
 test('a host that is not on the allowlist never gets a tunnel', async () => {

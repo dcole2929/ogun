@@ -4,8 +4,7 @@ import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, test } from 'node:test'
-import { CA_SUBJECT, loadOrCreateCa } from '../src/ca.ts'
-import { caState } from '../src/bridge.ts'
+import { CA_SUBJECT, caState, loadOrCreateCa } from '../src/ca.ts'
 import { namedBits, oid, time, unsignedInteger } from '../src/der.ts'
 
 /**
