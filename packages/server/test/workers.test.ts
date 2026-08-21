@@ -202,6 +202,45 @@ describe('worker api', () => {
     assert.match(await readFile(configPath, 'utf8'), /prompt: Look at the auth boundary\./)
   })
 
+  /**
+   * The UI edits ten fields; a worker has more than ten. The PATCH handler rebuilds the
+   * worker and then deletes every stored key the rebuilt node does not mention, so any
+   * field the UI does not know about was erased from `.ogun/config.yaml` by an unrelated
+   * edit — toggling `enabled` deleted a worker's `verify:` block, and nothing failed.
+   *
+   * `egress:` is the one where the silence is worst. A hand-written allowlist vanishing
+   * because someone flipped a switch leaves a container reaching further than the file it
+   * is configured by says it can, and the diff that did it mentions only `enabled` (§4.6).
+   */
+  test('a ui edit does not delete the fields the ui does not manage', async () => {
+    const guarded: WorkerConfig = {
+      ...defaults,
+      egress: ['proxy.golang.org'],
+      timezone: 'Europe/London',
+      verify: { expectations: [], skipDefaultLenses: [], lensProfile: 'none' },
+    }
+    await reindexProject(db, slug, {
+      hash: 'h-guarded',
+      workers: { nightly: defaults, guarded },
+    })
+
+    const { worker } = await state('guarded')
+    const res = await send(`/api/workers/${worker!.id}`, { enabled: false }, 'PATCH')
+    assert.equal(res.status, 200)
+
+    const text = await readFile(configPath, 'utf8')
+    assert.match(text, /proxy\.golang\.org/, 'the egress allowlist was deleted by an unrelated edit')
+    assert.match(text, /timezone: Europe\/London/, 'the timezone was deleted')
+    assert.match(text, /verify:/, 'the verify block was deleted')
+
+    const after = await db.query.workers.findFirst({ where: eq(schema.workers.id, worker!.id) })
+    assert.deepEqual(
+      (after?.config as { egress?: unknown }).egress,
+      ['proxy.golang.org'],
+      'and the index agrees with the file',
+    )
+  })
+
   test('a stale hash from the client is refused', async () => {
     const { worker } = await state('from-ui')
     const res = await send(

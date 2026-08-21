@@ -302,9 +302,6 @@ Base carries `claude`, `codex`, `git`, node. The project layer adds its toolchai
 - Mount a persistent package-manager cache volume, or every nightly run re-downloads
   the world.
 
-**Credentials.** `~/.claude` and `~/.codex` mounted read-only. Worst case for a
-misbehaving agent is burning rate limit. **No git credential ever enters a sandbox.**
-
 **The sandbox never pushes.** [settled — ADR-0005]
 
 ```
@@ -411,16 +408,86 @@ credential and no remote to push to.
 `api.anthropic.com` for claude, OpenAI's endpoint for codex — so a reviewer container
 cannot be an airgap.
 
-**The host allowlist is not built.** [open] What ships is `egress: open | none`, and
-reviewers run `open`. A real per-host allowlist needs either a filtering proxy, which is
-a sibling container and therefore ruled out above, or `iptables` inside the container,
-which needs `NET_ADMIN` plus a privilege drop after the rules are installed and fails
-anyway against endpoints whose IPs rotate. Both are real options; neither is cheap.
+**Egress is a host allowlist.** [built] A worker declares the hosts its sandbox may
+reach; anything else is refused. Four spellings, of which `open` and `none` are what
+already shipped and keep working unchanged:
 
-Recording this as a gap rather than describing it as done. The structural protections —
-no socket, no `gh`, no credential, no remote — are what actually stop a container
-reaching GitHub, and they hold regardless. An allowlist would add defence against
-exfiltration through the model API itself, which is a harder and different problem.
+| `egress:` | Means |
+|---|---|
+| *absent* | The default allowlist for the worker's runtime. **The default.** |
+| a list of hosts | Those hosts *in addition to* the defaults. `*.example.com` allowed. |
+| `open` | Unrestricted internet. An explicit opt-out; the runner logs it every run. |
+| `none` | No network at all. Structural, and correct for a tool-only pass. |
+
+The default set is the model API for whichever runtime will run — `*.anthropic.com` or
+`*.openai.com` plus `*.chatgpt.com` and `*.oaiusercontent.com` — plus
+`registry.npmjs.org`, because §9's tests-must-pass gate runs the project's suite in this
+same sandbox and a blocked registry turns `pnpm install` into a red suite rather than an
+egress error. A declared list *adds* to that: replacing it would let a worker lock its own
+runtime out of the model API, which is not a stricter worker but one that cannot start.
+
+Vendor domains are wildcarded rather than enumerated. Guessing today's endpoint names —
+the API host, the OAuth refresh host, the feature-flag host a CLI stalls on — and being
+wrong produces a hang that reads as anything but a firewall rule, and it buys nothing:
+the attacker in the prompt-injection story does not control a host under `anthropic.com`.
+
+**How it is enforced: `--network none`, plus one unix socket.** The container has no
+network interface but `lo`. Its only route out is a unix socket the runner bind-mounts in,
+on the far side of which is a forward proxy in the runner process that allows `CONNECT`
+to allowlisted hosts and refuses everything else with a 403 naming the host. Inside the
+container a ~40-line forwarder bridges `127.0.0.1:8118` to that socket, because
+`HTTPS_PROXY` cannot name a socket file; `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` are set in
+**both** letter cases, since curl, Go and reqwest deliberately ignore uppercase
+`HTTP_PROXY` (the CGI `Proxy:` header hole) while other clients read only uppercase.
+
+The ordering is the point and it is the opposite of how a proxy is usually deployed. On a
+normal bridge network `HTTPS_PROXY` is *advice*, and a prompt-injected agent declines it
+with `curl --noproxy '*'`. Here there is no interface to decline with.
+
+What was rejected, and why:
+
+- **`iptables` on resolved IPs.** Needs `NET_ADMIN`, which `--cap-drop ALL` plus
+  `no-new-privileges` exists to deny — and rules written at container start are stale
+  immediately against a rotating CDN, so they are simultaneously too narrow (the job
+  fails) and far too wide (the whole CDN is allowed).
+- **DNS filtering.** Only stops a client that asks DNS. `curl https://1.2.3.4/ -H 'Host:'`
+  never asks. It filters the honest.
+- **A dedicated docker network with masquerade disabled.** The runner-up, and it fails on
+  reachability rather than filtering: the host end must bind an address the container can
+  see, and under Docker Desktop on WSL2 the bridge gateway lives in the engine's VM, not
+  in the distro the runner runs in. Making it portable means an unauthenticated forward
+  proxy bound to `0.0.0.0`.
+- **A sibling proxy container.** Ruled out by ADR-0006 — which is the reason ADR-0005
+  gave for the allowlist having no cheap implementation. A unix socket sidesteps it
+  entirely: the proxy is the runner, which was already running.
+
+Deliberately not built here: no TLS interception, no credential injection, no policy
+engine. `CONNECT` is allowlisted by hostname and the bytes are piped through untouched.
+The credential-injecting gateway being built alongside this subsumes this enforcement
+point — same socket, same env, same `--network none` container — and when it lands, the
+credential mounts stop existing.
+
+**Images must be rebuilt for this.** The forwarder is baked into `ogun/base`, so an image
+built before it cannot bridge to the socket — and the silent failure is backwards: the
+container still gets `--network none` and a mounted socket nothing knows to use, so a
+*tightened* egress policy presents as a total airgap and the agent reports it as an auth
+failure. The base image therefore declares `OGUN_EGRESS_FORWARDER=1` and the runner
+refuses to enforce an allowlist without it, naming the rebuild. Project images inherit the
+marker through `FROM ogun/base` and pick it up on their next `ogun image build .`.
+
+**What this does not close.** Exfiltration *through* the model API itself, by an agent
+writing a secret into a completion request, is unaffected by any allowlist. That is a
+different and harder problem and it is open.
+
+**Credentials.** `~/.claude` and `~/.codex` credential files are mounted read-only into a
+staging path and copied to a writable home. This spec used to say the worst case for a
+misbehaving agent was burning rate limit. That was false, and the correction is the whole
+reason the allowlist above got built: what lands in that home is a live OAuth token, and
+under `egress: open` anything running in the container could read it and POST it
+anywhere. Not a hypothetical agent that turns malicious — an `adversarial-review` worker
+is aimed at untrusted repository content by design, so a crafted README, a test fixture or
+a dependency's source is the delivery mechanism. **No git credential ever enters a
+sandbox**, which remains true and was always the stronger half of the claim.
 
 ### 4.7 Runtimes
 
@@ -599,6 +666,16 @@ workers:
     runtime: codex
     permissions: reviewer
     sandbox: worktree      # opt out of containers for speed
+
+  go-modules:
+    skill: ./skills/deps
+    permissions: modifier
+    # Added to the defaults (the model API + registry.npmjs.org), not instead of them.
+    # Omit the key entirely to get just the defaults; `open` for unrestricted; `none`
+    # for a genuine airgap (§4.6).
+    egress:
+      - proxy.golang.org
+      - "*.crates.io"
 
 policies:
   directPush: false
@@ -1236,9 +1313,17 @@ Verify gate gating findings persistence. Findings persisted with semantic finger
 Run detail page with a live SSE timeline. Both runtimes normalized onto one event type.
 No cron, no retry, no fan-in, no publishing.
 
-Two things landed differently than specced, both recorded above: agent lenses in the
-verify gate record as skipped rather than running (tool checks are wired, §4.10), and
-egress is `open | none` rather than a host allowlist (§4.6).
+One thing landed differently than specced and is recorded above: agent lenses in the
+verify gate record as skipped rather than running (tool checks are wired, §4.10).
+
+The other — egress shipping as `open | none` rather than the host allowlist §4.6 called
+for — **is closed**. It is worth recording what the gap actually was, because it was
+filed as an open question and it was a live hole: `open` was the default, so every
+container had unrestricted internet *and* a mounted OAuth credential it could read. The
+reason given for not building it, that a filtering proxy is a sibling container and so
+ruled out by ADR-0006, was sound about the proxy's packaging and was then used to justify
+the default. A unix socket bind-mounted into a `--network none` container turns out to
+need no sibling and no `NET_ADMIN` at all (§4.6).
 
 The first real run found a genuine `high` in Ogun's own finalize path — a finding marked
 `fixed` that regressed stayed `fixed` and never reappeared in the inbox. That is the

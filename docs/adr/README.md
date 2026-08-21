@@ -56,8 +56,11 @@ Two habits the records here follow:
 - **Say what the ADR does not settle.** A decision with an open edge — a gap left on
   purpose, a choice marked reversible, a half that is designed but unbuilt — names it, so
   the ADR gags the settled part and only the settled part. ADR-0005 settles that no
-  credential enters the sandbox, and says outright that the egress allowlist is not built
-  and that the in-sandbox permission profiles are barely enforced. Both remain reportable.
+  credential enters the sandbox, and said outright that the egress allowlist was not built
+  and that the in-sandbox permission profiles were barely enforced. Both were reportable,
+  both have since been closed, and both consequences were rewritten in place with the
+  superseded text quoted — an ADR that silently starts claiming it always said the right
+  thing is worse than one with a gap.
 - **Check a consequence against the code before writing it down.** `docs/architecture.md`
   is a design document and its present tense is sometimes an intention. An ADR that
   inherits that uncritically suppresses true findings about the gap between them, which is

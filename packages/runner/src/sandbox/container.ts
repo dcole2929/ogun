@@ -1,7 +1,15 @@
 import { existsSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import { resolveEgressAllow, type EgressPolicy } from '@ogun/core'
 import { spawnJsonl } from './exec.ts'
+import {
+  egressSocketPath,
+  GUEST_EGRESS_SOCKET,
+  GUEST_PROXY_PORT,
+  startEgressProxy,
+  type EgressProxy,
+} from './egress-proxy.ts'
 import { readContained } from './paths.ts'
 import type { Sandbox, SandboxSpec } from './types.ts'
 
@@ -10,15 +18,29 @@ export type ContainerOptions = SandboxSpec & {
   memory?: string
   cpus?: string
   /**
-   * `open`  — the agent runtime can reach the internet. Required today: claude calls
-   *           api.anthropic.com and codex calls OpenAI's endpoint, so an airgap is not
-   *           an option (§4.6).
-   * `none`  — no network at all. Valid for tool-only verification passes.
+   * Which hosts this container may reach (§4.6). See `egressSchema` in core for the
+   * three shapes and why absent means "the defaults for this runtime" rather than
+   * "anywhere".
    *
-   * A real host allowlist needs a filtering proxy, which conflicts with the
-   * no-sibling-containers rule. Tracked as an open question rather than faked.
+   * What this replaced, kept because it is what §9 recorded as landing differently from
+   * the spec: `'open' | 'none'`, defaulting to `open`. `open` is unrestricted internet,
+   * and `credentialMounts()` below puts a live OAuth credential in every sandbox — so
+   * the default was "an agent that can read its own credential and POST it anywhere".
+   * Not because an agent would choose to, but because an `adversarial-review` worker is
+   * aimed at untrusted repository content by design, and a crafted README is the whole
+   * of the attack. Both spellings still parse, and `open` is still available as an
+   * explicit opt-out.
    */
-  egress?: 'open' | 'none'
+  egress?: EgressPolicy
+  /**
+   * Host path of the unix socket this container's egress proxy is listening on.
+   *
+   * Passed in rather than derived from `opts.name`, because the verification container
+   * runs under a *different* name (`…-verify`) and shares the agent container's proxy.
+   * Deriving it here would have given the gate a socket path nothing was listening on,
+   * and `pnpm install` would have failed as a red suite rather than as an egress fault.
+   */
+  egressSocket?: string
 }
 
 export const GUEST_WORKSPACE = '/workspace'
@@ -33,6 +55,15 @@ export const GUEST_WORKSPACE = '/workspace'
  */
 export function createContainerSandbox(opts: ContainerOptions): Sandbox {
   const image = opts.image ?? 'ogun/base:latest'
+  const allow = resolveEgressAllow(opts.egress, opts.runtime)
+  /**
+   * Fixed here rather than at each exec so the agent container and the verification
+   * container that follows it share one proxy, one allowlist and one denial log.
+   */
+  const runOpts: ContainerOptions = allow
+    ? { ...opts, egressSocket: egressSocketPath(opts.name) }
+    : opts
+  let proxy: EgressProxy | undefined
 
   return {
     kind: 'container',
@@ -42,6 +73,47 @@ export function createContainerSandbox(opts: ContainerOptions): Sandbox {
           `image ${image} is not present — build it with \`ogun image build\` before running`,
         )
       }
+      if (opts.egress === 'open') {
+        // Loud, once, in the runner's log. `open` is a real escape hatch and staying
+        // silent about it is how a temporary exception becomes the permanent posture.
+        console.warn(
+          `[runner] ${opts.name}: egress is \`open\` — this container has unrestricted ` +
+            'internet and a mounted credential it can read (§4.6)',
+        )
+      }
+      /**
+       * Started in `provision`, which runs ONCE per job (§5.2), so the socket file exists
+       * before the first `docker run`. Ordering is load-bearing in a way docker will not
+       * warn about: bind-mounting a source path that does not exist makes docker create
+       * an empty *directory* there, and the container would then get a directory where it
+       * expects a socket and fail with something that reads nothing like an egress fault.
+       */
+      if (allow && runOpts.egressSocket) {
+        /**
+         * Refuse an image that predates the forwarder rather than starting one that
+         * cannot use it. The silent version of this is backwards in a way nobody would
+         * guess from the symptom: the container still gets `--network none`, the socket
+         * is still mounted, and nothing in there knows to bridge to it — so a tightened
+         * egress policy presents as a total airgap, reported by the agent as an
+         * authentication failure against its model API.
+         *
+         * Project images inherit the marker from `FROM ogun/base`, so this is telling
+         * you to rebuild, which is the actual fix.
+         */
+        if (!(await imageDeclares(image, 'OGUN_EGRESS_FORWARDER'))) {
+          throw new Error(
+            `image ${image} was built before egress allowlisting and cannot reach the ` +
+              'proxy — rebuild it with `ogun image build` (and `ogun image build .` for a ' +
+              'project image), or set `egress: open` on this worker to opt out (§4.6)',
+          )
+        }
+        proxy = await startEgressProxy({
+          containerName: opts.name,
+          allow,
+          onDenied: (host) =>
+            console.warn(`[runner] ${opts.name}: egress refused ${host} (not on the allowlist)`),
+        })
+      }
     },
     exec: (argv, exec = {}) =>
       // `docker run` per exec rather than a long-lived container + `docker exec`: the
@@ -49,7 +121,7 @@ export function createContainerSandbox(opts: ContainerOptions): Sandbox {
       spawnJsonl(
         'docker',
         [
-          ...buildRunArgs(exec.raw ? verificationOptions(opts) : opts, image),
+          ...buildRunArgs(exec.raw ? verificationOptions(runOpts) : runOpts, image),
           ...(exec.raw ? argv : containerCommand(opts.runtime, argv)),
         ],
         { timeoutMs: exec.timeoutMs ?? opts.timeoutMs },
@@ -66,6 +138,11 @@ export function createContainerSandbox(opts: ContainerOptions): Sandbox {
           () => undefined,
         )
       }
+      // After the containers, not before: a proxy closed first would drop a live tunnel
+      // and the agent's last request would fail on the way out of a job that had already
+      // finished. The runner is long-lived, so an unclosed socket is a real leak — one
+      // per job, plus a file in tmpdir that the next run with the same name trips over.
+      await proxy?.close().catch(() => undefined)
     },
   }
 }
@@ -146,7 +223,7 @@ export function buildRunArgs(opts: ContainerOptions, image: string): string[] {
     `${join(opts.hostWorkspace, '.ogun-out')}:${GUEST_WORKSPACE}/.ogun-out:rw`,
   ]
 
-  if ((opts.egress ?? 'open') === 'none') args.push('--network', 'none')
+  args.push(...egressArgs(opts))
 
   /**
    * Individual credential files, read-only, into a staging path the entrypoint copies
@@ -172,6 +249,81 @@ export function buildRunArgs(opts: ContainerOptions, image: string): string[] {
 
   args.push(image)
   return args
+}
+
+/**
+ * The docker flags that make the allowlist real (§4.6).
+ *
+ * `--network none` is the enforcement, and the proxy is only the exception to it. That
+ * ordering is the point and it is the opposite of how a proxy is usually deployed: on a
+ * normal bridge network `HTTPS_PROXY` is advice, and a prompt-injected agent declines the
+ * advice with `curl --noproxy '*'`. Here the container has no interface but `lo`, so
+ * there is nothing to decline — every route out is the unix socket, and the socket is a
+ * host process holding the allowlist.
+ *
+ * The socket is mounted as a *file*, not by mounting its directory. `tmpdir()/ogun-egress`
+ * holds one socket per concurrent run, and a runner runs several: mounting the directory
+ * would hand every container the other jobs' sockets, so a worker with a narrow allowlist
+ * could borrow a wider one from whatever else happened to be running.
+ */
+function egressArgs(opts: ContainerOptions): string[] {
+  if (opts.egress === 'open') return []
+  if (opts.egress === 'none' || !opts.egressSocket) {
+    /**
+     * `none` is a genuine airgap, and so is a caller that asked for an allowlist without
+     * supplying a socket — which can only happen if `provision()` did not run. Failing
+     * closed is the only safe way to be wrong here: the alternative is a bug in the
+     * runner's own lifecycle silently downgrading a container to unrestricted internet.
+     */
+    return ['--network', 'none']
+  }
+
+  const proxyUrl = `http://127.0.0.1:${GUEST_PROXY_PORT}`
+  return [
+    '--network',
+    'none',
+    '--volume',
+    `${opts.egressSocket}:${GUEST_EGRESS_SOCKET}`,
+    // Read by the entrypoint, which starts the loopback→socket forwarder. Absent, the
+    // entrypoint starts nothing and the container is simply airgapped.
+    '--env',
+    `OGUN_EGRESS_SOCKET=${GUEST_EGRESS_SOCKET}`,
+    '--env',
+    `OGUN_EGRESS_PORT=${GUEST_PROXY_PORT}`,
+    ...proxyEnv(proxyUrl),
+  ]
+}
+
+/**
+ * Both spellings of all four variables, which is tedious and not optional.
+ *
+ * There is no standard here, only a convention with a security hole in it. Because CGI
+ * maps a request's `Proxy:` header into the environment as `HTTP_PROXY`, a long list of
+ * libraries — Go's `net/http`, Rust's `reqwest`, curl among them — deliberately ignore
+ * the uppercase `HTTP_PROXY` and read only lowercase `http_proxy`. Others read only the
+ * uppercase form. `codex` is reqwest and `claude` is undici; setting one spelling would
+ * have silently left one of the two runtimes unproxied inside a `--network none`
+ * container, which does not fail open — it fails as an agent that cannot reach its model
+ * API at 3am, for a reason nothing in the error message mentions.
+ *
+ * `NO_PROXY` has to name loopback, in both spellings and all three ways loopback gets
+ * written. The forwarder *is* on loopback: without an exemption a client resolving the
+ * proxy's own address through the proxy is a request that tries to CONNECT to itself.
+ * `127.0.0.1` and `localhost` and `::1` because which one a client compares against
+ * depends on whether it normalises the host before checking, and the ones that do not
+ * are the ones that would loop.
+ */
+function proxyEnv(proxyUrl: string): string[] {
+  const noProxy = 'localhost,127.0.0.1,::1'
+  const pairs: Array<[string, string]> = [
+    ['HTTP_PROXY', proxyUrl],
+    ['http_proxy', proxyUrl],
+    ['HTTPS_PROXY', proxyUrl],
+    ['https_proxy', proxyUrl],
+    ['NO_PROXY', noProxy],
+    ['no_proxy', noProxy],
+  ]
+  return pairs.flatMap(([k, v]) => ['--env', `${k}=${v}`])
 }
 
 /**
@@ -201,6 +353,27 @@ const containerCommand = (runtime: 'claude' | 'codex', argv: string[]): string[]
   runtime,
   ...argv,
 ]
+
+/**
+ * Whether an image carries a given `ENV` marker.
+ *
+ * Read off the image rather than probed by running a container: this is on the path of
+ * every job, and a `docker run` to ask a yes/no question about a layer is a second
+ * container per job for no reason.
+ */
+async function imageDeclares(image: string, key: string): Promise<boolean> {
+  const { lines, done } = spawnJsonl(
+    'docker',
+    ['image', 'inspect', image, '--format', '{{range .Config.Env}}{{println .}}{{end}}'],
+    { timeoutMs: 15_000 },
+  )
+  // Drained from `lines`, not from `done` — `spawnJsonl` deliberately keeps only stderr
+  // on the result, because its callers stream agent output rather than collect it.
+  let found = false
+  for await (const line of lines) if (line.trim().startsWith(`${key}=`)) found = true
+  const { code } = await done.catch(() => ({ code: 1 }))
+  return code === 0 && found
+}
 
 async function imageExists(image: string): Promise<boolean> {
   const { done } = spawnJsonl('docker', ['image', 'inspect', image], { timeoutMs: 15_000 })

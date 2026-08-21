@@ -6,7 +6,7 @@
 #
 # Derived from ~/dev/claude-sandbox's base image, with a changed posture. That one is a
 # convenience sandbox: it protects the host from Claude's mistakes while a human watches
-# a --dangerously-skip-permissions session. This one runs unattended overnight, so five
+# a --dangerously-skip-permissions session. This one runs unattended overnight, so six
 # things are deliberately different (§4.6):
 #
 #   - no docker CLI and no /var/run/docker.sock. Anything holding the socket can start a
@@ -18,6 +18,21 @@
 #     so a container cannot corrupt the host's credential files.
 #   - no git remote in the workspace. The never-pushes rule is structural rather than
 #     policed: there is nothing to push with.
+#   - no unrestricted egress. The container runs --network none and reaches the world only
+#     through a unix socket the runner mounts in, on the far side of which is a proxy that
+#     allows CONNECT to the worker's allowlisted hosts and nothing else.
+#
+# This header used to claim "worst case for a misbehaving agent is burning rate limit".
+# That was never true and it is worth recording why, because it is the assumption the
+# whole posture rested on: the credentials copied to a writable home above are live OAuth
+# tokens, readable by anything running in here. With unrestricted egress — which is what
+# shipped — the worst case was a prompt-injected agent reading its own credential and
+# POSTing it somewhere. Not a hypothetical agent that turns malicious: an
+# `adversarial-review` worker is pointed at untrusted repository content on purpose, so a
+# crafted README, a test fixture or a dependency's source is the delivery mechanism. The
+# allowlist is what makes the sentence approximately true again; the honest version is
+# that the worst case is now bounded by what an attacker can do through the model API
+# itself, which is a smaller and harder problem, and still open.
 
 # The Node the repo pins, not a version chosen here. `.tool-versions` is the single
 # source of truth and `ogun image build` passes it in; there is deliberately no default,
@@ -60,6 +75,10 @@ COPY --chown=dev:dev cli/ogun.mjs /opt/ogun/ogun.mjs
 RUN printf '#!/bin/sh\nexec node /opt/ogun/ogun.mjs "$@"\n' > /home/dev/.local/bin/ogun \
     && chmod +x /home/dev/.local/bin/ogun
 
+# The container half of the egress allowlist. Bridges loopback to the unix socket the
+# runner mounts in, because HTTPS_PROXY cannot name a socket file (§4.6).
+COPY --chown=dev:dev egress-forwarder.mjs /opt/ogun/egress-forwarder.mjs
+
 COPY --chown=dev:dev entrypoint.sh /usr/local/bin/ogun-entrypoint
 USER root
 RUN chmod +x /usr/local/bin/ogun-entrypoint
@@ -68,6 +87,13 @@ USER dev
 ENV CLAUDE_CONFIG_DIR=/home/dev/.claude \
     CODEX_HOME=/home/dev/.codex \
     OGUN_IN_SANDBOX=1 \
+    # Declares that this image's entrypoint knows how to start the egress forwarder. The
+    # runner refuses to enforce an allowlist against an image without it, because the
+    # failure is otherwise silent and backwards: the container gets --network none and
+    # nothing to bridge to, so it is a total airgap that reports itself as an agent
+    # unable to reach its model API. Project images inherit this from `FROM ogun/base`
+    # and so pick it up on their next rebuild (§4.6).
+    OGUN_EGRESS_FORWARDER=1 \
     # Findings land here; the runner reads them back through the bind-mount.
     OGUN_OUTPUT_PATH=/workspace/.ogun-out/findings.json
 

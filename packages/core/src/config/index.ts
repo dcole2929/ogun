@@ -1,3 +1,4 @@
+export * from './egress.ts'
 export * from './project.ts'
 export * from './skill.ts'
 export * from './cycle.ts'
