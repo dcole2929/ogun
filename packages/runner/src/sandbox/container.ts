@@ -1,17 +1,40 @@
 import { existsSync } from 'node:fs'
-import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { chmod, mkdir, rm, writeFile } from 'node:fs/promises'
+import { homedir, tmpdir } from 'node:os'
+import { basename, join } from 'node:path'
 import { resolveEgressAllow, type EgressPolicy } from '@ogun/core'
-import { spawnJsonl } from './exec.ts'
 import {
-  egressSocketPath,
-  GUEST_EGRESS_SOCKET,
-  GUEST_PROXY_PORT,
-  startEgressProxy,
-  type EgressProxy,
-} from './egress-proxy.ts'
+  CA_CONTAINER_PATH,
+  credentialStubs,
+  sandboxProxyEnv,
+  type Gateway,
+  type GatewaySession,
+} from '@ogun/gateway'
+import { spawnJsonl } from './exec.ts'
+import { GUEST_EGRESS_SOCKET, GUEST_PROXY_AUTHORITY, GUEST_PROXY_PORT } from './egress.ts'
 import { readContained } from './paths.ts'
 import type { Sandbox, SandboxSpec } from './types.ts'
+
+/**
+ * Everything one job's containers need in order to reach the gateway, resolved once in
+ * `provision()` and then pure data.
+ *
+ * Separated from the live `Gateway` handle on purpose: `buildRunArgs` is the function the
+ * mount and environment flags are asserted against without starting anything, and it has
+ * to stay a pure function of its options. A `buildRunArgs` that reached into a running
+ * gateway could only be tested by running one, which is how the docker-argument model —
+ * the part of this that is actually load-bearing — would stop being tested at all.
+ */
+export type SandboxEgress = {
+  /** Host path of the runner's gateway socket. Bind-mounted in as a file, read-write. */
+  socketPath: string
+  /** Host path of the gateway's CA certificate. Everything in the image trusts this. */
+  caCertificatePath: string
+  /** `http://x:<token>@127.0.0.1:8118` — the container's view, carrying its own token. */
+  proxyUrl: string
+  /** Placeholder credential files on the host, and the paths they mount at. */
+  stubs: ReadonlyArray<{ hostPath: string; containerPath: string }>
+}
 
 export type ContainerOptions = SandboxSpec & {
   name: string
@@ -24,26 +47,62 @@ export type ContainerOptions = SandboxSpec & {
    *
    * What this replaced, kept because it is what §9 recorded as landing differently from
    * the spec: `'open' | 'none'`, defaulting to `open`. `open` is unrestricted internet,
-   * and `credentialMounts()` below puts a live OAuth credential in every sandbox — so
-   * the default was "an agent that can read its own credential and POST it anywhere".
-   * Not because an agent would choose to, but because an `adversarial-review` worker is
-   * aimed at untrusted repository content by design, and a crafted README is the whole
-   * of the attack. Both spellings still parse, and `open` is still available as an
-   * explicit opt-out.
+   * and this file used to put a live OAuth credential in every sandbox — so the default
+   * was "an agent that can read its own credential and POST it anywhere". Not because an
+   * agent would choose to, but because an `adversarial-review` worker is aimed at
+   * untrusted repository content by design, and a crafted README is the whole of the
+   * attack. Both spellings still parse, and `open` is still available as an explicit
+   * opt-out — see `credentialMounts`, which is now the *only* path that mounts a real
+   * credential, precisely so that the opt-out is the one place to look.
    */
   egress?: EgressPolicy
   /**
-   * Host path of the unix socket this container's egress proxy is listening on.
+   * The runner's gateway, if there is one. Read in `provision()`, never in
+   * `buildRunArgs`.
+   *
+   * One per runner rather than one per sandbox (ADR-0010). The gateway holds a CA
+   * private key that can impersonate every host every Ogun container trusts, and it
+   * reads the host's real credentials; standing up a second copy of that per job would
+   * multiply the surface without buying isolation, because the isolation between jobs is
+   * the per-session token and the per-session allowlist, not the listener.
+   */
+  gateway?: Gateway
+  /**
+   * This job's resolved gateway wiring.
    *
    * Passed in rather than derived from `opts.name`, because the verification container
-   * runs under a *different* name (`…-verify`) and shares the agent container's proxy.
-   * Deriving it here would have given the gate a socket path nothing was listening on,
-   * and `pnpm install` would have failed as a red suite rather than as an egress fault.
+   * runs under a *different* name (`…-verify`) and shares the agent container's session.
+   * Deriving it here would have given the gate a socket nothing was listening on, and
+   * `pnpm install` would have failed as a red suite rather than as an egress fault.
    */
-  egressSocket?: string
+  egressSession?: SandboxEgress
+  /**
+   * Whether this container gets credential files at all.
+   *
+   * `none` is the verification container. No agent runs in it — it runs the project's
+   * own test suite — and a test suite has no business holding even a placeholder, let
+   * alone the host's `settings.json`, which can carry an `env` block with secrets in it
+   * (ADR-0010's named residual exposure). It still gets the proxy, the CA and the socket,
+   * because a suite that begins `pnpm install` with no egress fails as a red suite and is
+   * then blamed on the modifier whose patch it was gating.
+   */
+  credentials?: 'agent' | 'none'
 }
 
 export const GUEST_WORKSPACE = '/workspace'
+
+/**
+ * Where the placeholder credential files are staged before being mounted.
+ *
+ * Under `tmpdir()` rather than the job's scratch directory for the same reason the old
+ * per-container socket lived there: scratch is user-configurable and can be arbitrarily
+ * deep, and this is a directory only the sandbox writes and only the sandbox deletes.
+ * Routing it through the pipeline would couple the sandbox to a directory layout it has
+ * no other reason to know about, and would leave a stub behind on the day someone runs
+ * with `OGUN_KEEP_WORKSPACES=1`.
+ */
+const stubStagingDir = (containerName: string): string =>
+  join(tmpdir(), 'ogun-credentials', containerName)
 
 /**
  * The default sandbox: real capability isolation, per-project image.
@@ -52,18 +111,29 @@ export const GUEST_WORKSPACE = '/workspace'
  * it can start a privileged container mounting /, which makes the boundary decorative.
  * No gh, no git remote, no ssh key, no GitHub token: the never-pushes rule is
  * structural rather than policed, because there is nothing to push with (§4.6).
+ *
+ * And, since ADR-0010, no credential. The container gets placeholder files at the paths
+ * the real ones used to mount at, plus `HTTPS_PROXY` pointing at the runner's gateway
+ * through a bind-mounted unix socket. You cannot exfiltrate a token that was never here.
  */
 export function createContainerSandbox(opts: ContainerOptions): Sandbox {
   const image = opts.image ?? 'ogun/base:latest'
   const allow = resolveEgressAllow(opts.egress, opts.runtime)
+  let session: GatewaySession | undefined
+  let egressSession: SandboxEgress | undefined
+  let stubDir: string | undefined
+
   /**
+   * Resolved per exec rather than captured once, because `provision()` is what fills
+   * `egressSession` in and `exec` may be called several times after it.
+   *
    * Fixed here rather than at each exec so the agent container and the verification
-   * container that follows it share one proxy, one allowlist and one denial log.
+   * container that follows it share one gateway session — one allowlist, one token, one
+   * denial log. Two sessions would mean a test gate that could reach hosts the agent
+   * could not, or the reverse, with nothing saying which.
    */
-  const runOpts: ContainerOptions = allow
-    ? { ...opts, egressSocket: egressSocketPath(opts.name) }
-    : opts
-  let proxy: EgressProxy | undefined
+  const runOpts = (): ContainerOptions =>
+    egressSession ? { ...opts, egressSession } : { ...opts }
 
   return {
     kind: 'container',
@@ -76,43 +146,104 @@ export function createContainerSandbox(opts: ContainerOptions): Sandbox {
       if (opts.egress === 'open') {
         // Loud, once, in the runner's log. `open` is a real escape hatch and staying
         // silent about it is how a temporary exception becomes the permanent posture.
+        // The second clause is not rhetoric: `open` bypasses the gateway, and bypassing
+        // the gateway is exactly what puts a live credential back in the container.
         console.warn(
           `[runner] ${opts.name}: egress is \`open\` — this container has unrestricted ` +
-            'internet and a mounted credential it can read (§4.6)',
+            'internet and a real mounted credential it can read, because there is no ' +
+            'gateway on that path (§4.6, ADR-0010)',
+        )
+      }
+      if (!allow) return
+
+      /**
+       * Fail closed when the runner's own lifecycle is wrong.
+       *
+       * A container sandbox with an allowlist and no gateway has no route out and no way
+       * to authenticate, and the honest alternatives are "airgap" or "put the credential
+       * back". `egressArgs` picks the airgap so a bug here cannot silently restore the
+       * posture ADR-0010 removed; this is the message that says which bug it was.
+       */
+      if (!opts.gateway) {
+        throw new Error(
+          `${opts.name}: no egress gateway was passed to the sandbox — every container ` +
+            'authenticates through it (ADR-0010), so this is a runner wiring bug rather ' +
+            'than a configuration one',
         )
       }
       /**
-       * Started in `provision`, which runs ONCE per job (§5.2), so the socket file exists
+       * A `--network none` container cannot reach a TCP listener, not even on loopback:
+       * it has its own network namespace and the gateway is in the runner's. So the
+       * socket transport is not a preference here, it is the only one that works, and
+       * `OGUN_GATEWAY_HOST`/`OGUN_GATEWAY_PORT` — which exist for a `worktree` sandbox
+       * and for pointing something at the gateway by hand — are refused rather than
+       * accepted into a container that would then quietly reach nothing.
+       */
+      if (opts.gateway.listening.kind !== 'socket') {
+        throw new Error(
+          `${opts.name}: the gateway is listening on TCP ` +
+            `(${opts.gateway.listening.host}:${opts.gateway.listening.port}), which a ` +
+            '`--network none` container has no interface to reach — unset ' +
+            'OGUN_GATEWAY_HOST / OGUN_GATEWAY_PORT so it listens on its unix socket',
+        )
+      }
+      /**
+       * Refuse an image that predates the forwarder rather than starting one that
+       * cannot use it. The silent version of this is backwards in a way nobody would
+       * guess from the symptom: the container still gets `--network none`, the socket
+       * is still mounted, and nothing in there knows to bridge to it — so a tightened
+       * egress policy presents as a total airgap, reported by the agent as an
+       * authentication failure against its model API.
+       *
+       * Project images inherit the marker from `FROM ogun/base`, so this is telling
+       * you to rebuild, which is the actual fix.
+       */
+      if (!(await imageDeclares(image, 'OGUN_EGRESS_FORWARDER'))) {
+        throw new Error(
+          `image ${image} was built before egress allowlisting and cannot reach the ` +
+            'proxy — rebuild it with `ogun image build` (and `ogun image build .` for a ' +
+            'project image), or set `egress: open` on this worker to opt out (§4.6)',
+        )
+      }
+
+      /**
+       * A session per job, with *this worker's* allowlist rather than the gateway's.
+       *
+       * One gateway serves every job on the machine, so a global list would quietly
+       * widen every worker to the union of all of them — a reviewer that declared
+       * `egress: [docs.example.com]` inheriting a modifier's reach. That regression never
+       * fails a test; it just stops refusing things.
+       */
+      session = opts.gateway.open(GUEST_PROXY_AUTHORITY, allow)
+
+      /**
+       * Written in `provision`, which runs ONCE per job (§5.2), so every file exists
        * before the first `docker run`. Ordering is load-bearing in a way docker will not
        * warn about: bind-mounting a source path that does not exist makes docker create
-       * an empty *directory* there, and the container would then get a directory where it
-       * expects a socket and fail with something that reads nothing like an egress fault.
+       * an empty *directory* there, and a CLI would then find a directory where it
+       * expects its credential file and fail with something that reads nothing like an
+       * egress fault.
        */
-      if (allow && runOpts.egressSocket) {
-        /**
-         * Refuse an image that predates the forwarder rather than starting one that
-         * cannot use it. The silent version of this is backwards in a way nobody would
-         * guess from the symptom: the container still gets `--network none`, the socket
-         * is still mounted, and nothing in there knows to bridge to it — so a tightened
-         * egress policy presents as a total airgap, reported by the agent as an
-         * authentication failure against its model API.
-         *
-         * Project images inherit the marker from `FROM ogun/base`, so this is telling
-         * you to rebuild, which is the actual fix.
-         */
-        if (!(await imageDeclares(image, 'OGUN_EGRESS_FORWARDER'))) {
-          throw new Error(
-            `image ${image} was built before egress allowlisting and cannot reach the ` +
-              'proxy — rebuild it with `ogun image build` (and `ogun image build .` for a ' +
-              'project image), or set `egress: open` on this worker to opt out (§4.6)',
-          )
-        }
-        proxy = await startEgressProxy({
-          containerName: opts.name,
-          allow,
-          onDenied: (host) =>
-            console.warn(`[runner] ${opts.name}: egress refused ${host} (not on the allowlist)`),
-        })
+      stubDir = stubStagingDir(opts.name)
+      await mkdir(stubDir, { recursive: true, mode: 0o700 })
+      const stubs: Array<{ hostPath: string; containerPath: string }> = []
+      for (const stub of credentialStubs(opts.runtime)) {
+        const hostPath = join(stubDir, basename(stub.containerPath))
+        await writeFile(hostPath, stub.content)
+        // chmod separately: `writeFile`'s mode is masked by the process umask on create
+        // and ignored entirely for a file that already exists. Every byte in here is a
+        // placeholder, but the file is credential-*shaped* and sits at the path a real
+        // credential used to occupy, so the mode has to already be right on the day
+        // somebody reaches for this code for something that is not.
+        await chmod(hostPath, stub.mode)
+        stubs.push({ hostPath, containerPath: stub.containerPath })
+      }
+
+      egressSession = {
+        socketPath: opts.gateway.listening.path,
+        caCertificatePath: opts.gateway.caCertificatePath,
+        proxyUrl: session.proxyUrl,
+        stubs,
       }
     },
     exec: (argv, exec = {}) =>
@@ -121,7 +252,7 @@ export function createContainerSandbox(opts: ContainerOptions): Sandbox {
       spawnJsonl(
         'docker',
         [
-          ...buildRunArgs(exec.raw ? verificationOptions(runOpts) : runOpts, image),
+          ...buildRunArgs(exec.raw ? verificationOptions(runOpts()) : runOpts(), image),
           ...(exec.raw ? argv : containerCommand(opts.runtime, argv)),
         ],
         { timeoutMs: exec.timeoutMs ?? opts.timeoutMs },
@@ -130,6 +261,18 @@ export function createContainerSandbox(opts: ContainerOptions): Sandbox {
     // already be gone, and the path check has to happen host-side anyway (§5.3).
     readFile: (relPath) => readContained(opts.hostWorkspace, relPath),
     dispose: async () => {
+      /**
+       * The token dies first, before the containers are torn down.
+       *
+       * That is the opposite of the ordering this used to have, and the reason it
+       * changed is that revoking is not closing. Closing the old per-sandbox proxy first
+       * would drop a live tunnel and fail the agent's last request on the way out of a
+       * job that had already finished. Revoking only affects the *next* CONNECT, and a
+       * container we are about to `docker rm -f` has no legitimate next request — while
+       * `docker rm -f` can hang or fail, and a token that outlived a container we failed
+       * to remove is exactly the leak §3.1 revokes for.
+       */
+      session?.revoke()
       // --rm handles the normal path; this catches a container left behind by a kill —
       // including the verification one, which is exactly the container most likely to
       // have been killed, since the gate is what runs against a deadline.
@@ -138,11 +281,11 @@ export function createContainerSandbox(opts: ContainerOptions): Sandbox {
           () => undefined,
         )
       }
-      // After the containers, not before: a proxy closed first would drop a live tunnel
-      // and the agent's last request would fail on the way out of a job that had already
-      // finished. The runner is long-lived, so an unclosed socket is a real leak — one
-      // per job, plus a file in tmpdir that the next run with the same name trips over.
-      await proxy?.close().catch(() => undefined)
+      // The stubs go after the containers, not before: a container still shutting down
+      // still has them bind-mounted, and removing the source of a live bind mount is a
+      // way to confuse docker for no gain. The runner is long-lived, so a directory left
+      // here is a real leak — one per job.
+      if (stubDir) await rm(stubDir, { recursive: true, force: true }).catch(() => undefined)
     },
   }
 }
@@ -159,10 +302,17 @@ export function createContainerSandbox(opts: ContainerOptions): Sandbox {
  * runners (vitest, jest --watch, cargo-watch) that a project whose `command` is a bare
  * `pnpm test` would otherwise sit there until the job's budget ran out and be reported as
  * a timeout, which points at the wrong thing entirely.
+ *
+ * It keeps the agent's gateway session — the same socket, the same CA, the same
+ * allowlist — and loses every credential file, real or placeholder. A test suite does not
+ * authenticate to a model API, and the residual exposure of `settings.json` is not one
+ * worth carrying into a container that has no use for it (§3.6).
  */
 const verificationOptions = (opts: ContainerOptions): ContainerOptions => ({
   ...opts,
   name: verificationName(opts.name),
+  credentials: 'none',
+  ...(opts.egressSession ? { egressSession: { ...opts.egressSession, stubs: [] } } : {}),
   env: { CI: '1', ...opts.env },
 })
 
@@ -226,18 +376,26 @@ export function buildRunArgs(opts: ContainerOptions, image: string): string[] {
   args.push(...egressArgs(opts))
 
   /**
-   * Individual credential files, read-only, into a staging path the entrypoint copies
-   * from. The CLIs write session state, so a read-only mount at the real path makes
-   * them fail; mounting the real path writable would let a container corrupt the host's
-   * credentials.
+   * The credential files, read-only, into a staging path the entrypoint copies from.
    *
-   * Files, not the directory. `~/.claude` is 36MB on a working machine, of which 22MB is
+   * Two kinds arrive here and it matters which. The *placeholder* files come from
+   * `egressSession.stubs` and are written per job by `provision()`; the *real* ones come
+   * from `credentialMounts()` and only on the `egress: open` path, which has no gateway
+   * to splice a credential in at. Under every other policy the container holds nothing
+   * worth stealing (ADR-0010).
+   *
+   * Copied rather than mounted at the real path because the CLIs write session state, so
+   * a read-only mount at `~/.claude` makes them fail; mounting the real path writable
+   * would let a container corrupt the host's own files.
+   *
+   * Files, not directories. `~/.claude` is 36MB on a working machine, of which 22MB is
    * `projects/` — full transcripts of every session in every repo you have ever opened,
-   * which routinely contain secrets from other projects. Handing that to an autonomous
-   * agent is a much larger exposure than the rate limit §4.6 originally named as the
-   * worst case. Both runtimes were verified to authenticate from these files alone.
+   * which routinely contain secrets from other projects.
    */
-  for (const [hostPath, guestPath] of credentialMounts(opts.runtime)) {
+  for (const stub of opts.egressSession?.stubs ?? []) {
+    args.push('--volume', `${stub.hostPath}:${stub.containerPath}:ro`)
+  }
+  for (const [hostPath, guestPath] of credentialMounts(opts)) {
     if (existsSync(hostPath)) args.push('--volume', `${hostPath}:${guestPath}:ro`)
   }
 
@@ -252,81 +410,78 @@ export function buildRunArgs(opts: ContainerOptions, image: string): string[] {
 }
 
 /**
- * The docker flags that make the allowlist real (§4.6).
+ * The docker flags that make the allowlist real, and that point the container at the
+ * gateway (§4.6, ADR-0010).
  *
- * `--network none` is the enforcement, and the proxy is only the exception to it. That
+ * `--network none` is the enforcement, and the socket is only the exception to it. That
  * ordering is the point and it is the opposite of how a proxy is usually deployed: on a
  * normal bridge network `HTTPS_PROXY` is advice, and a prompt-injected agent declines the
  * advice with `curl --noproxy '*'`. Here the container has no interface but `lo`, so
- * there is nothing to decline — every route out is the unix socket, and the socket is a
- * host process holding the allowlist.
+ * there is nothing to decline — every route out is the unix socket, and on the far side
+ * of it is a host process that holds the allowlist *and* the only real credential.
  *
- * The socket is mounted as a *file*, not by mounting its directory. `tmpdir()/ogun-egress`
- * holds one socket per concurrent run, and a runner runs several: mounting the directory
- * would hand every container the other jobs' sockets, so a worker with a narrow allowlist
- * could borrow a wider one from whatever else happened to be running.
+ * The socket is mounted as a *file*, not by mounting its directory, and that is now much
+ * more than hygiene: the directory is `~/.ogun/gateway/`, which also holds `ca.key` — the
+ * signing key that can impersonate every host every Ogun container trusts. Mounting the
+ * directory would hand that key to every sandbox, which is a strictly worse outcome than
+ * the credential mount this whole change exists to remove.
+ *
+ * The socket mount is read-**write**, deliberately. Connecting to a unix socket needs
+ * write permission on the inode; a `:ro` mount here produces a container that cannot
+ * connect at all, and the symptom is an agent that cannot reach its model API.
  */
 function egressArgs(opts: ContainerOptions): string[] {
   if (opts.egress === 'open') return []
-  if (opts.egress === 'none' || !opts.egressSocket) {
+  const session = opts.egressSession
+  if (opts.egress === 'none' || !session) {
     /**
      * `none` is a genuine airgap, and so is a caller that asked for an allowlist without
-     * supplying a socket — which can only happen if `provision()` did not run. Failing
+     * a resolved session — which can only happen if `provision()` did not run. Failing
      * closed is the only safe way to be wrong here: the alternative is a bug in the
-     * runner's own lifecycle silently downgrading a container to unrestricted internet.
+     * runner's own lifecycle silently downgrading a container to unrestricted internet
+     * with a real credential in it.
      */
     return ['--network', 'none']
   }
 
-  const proxyUrl = `http://127.0.0.1:${GUEST_PROXY_PORT}`
   return [
     '--network',
     'none',
     '--volume',
-    `${opts.egressSocket}:${GUEST_EGRESS_SOCKET}`,
+    `${session.socketPath}:${GUEST_EGRESS_SOCKET}`,
+    // Everything in the image trusts this and nothing else — see `sandboxProxyEnv`,
+    // which points four TLS stacks plus git at it.
+    '--volume',
+    `${session.caCertificatePath}:${CA_CONTAINER_PATH}:ro`,
     // Read by the entrypoint, which starts the loopback→socket forwarder. Absent, the
     // entrypoint starts nothing and the container is simply airgapped.
     '--env',
     `OGUN_EGRESS_SOCKET=${GUEST_EGRESS_SOCKET}`,
     '--env',
     `OGUN_EGRESS_PORT=${GUEST_PROXY_PORT}`,
-    ...proxyEnv(proxyUrl),
+    /**
+     * Both spellings of every proxy variable, the CA for four TLS stacks, and git's
+     * three separate settings — all of it from one place in `@ogun/gateway`, because the
+     * list is long, every entry has a failure mode attached, and a second copy of it here
+     * would drift from the one the gateway's own tests assert against.
+     *
+     * The `proxyUrl` carries this job's session token as HTTP basic credentials, which
+     * puts it in the container's environment and in this process's `docker run` argv. The
+     * socket's 0600 mode is what keeps other accounts on the host out; the token bounds a
+     * *container*, so a host user who could read the argv still has nothing to connect
+     * with.
+     */
+    ...Object.entries(sandboxProxyEnv(session.proxyUrl)).flatMap(([k, v]) => [
+      '--env',
+      `${k}=${v}`,
+    ]),
   ]
 }
 
 /**
- * Both spellings of all four variables, which is tedious and not optional.
+ * The host files that still enter a sandbox, and the one case where a real credential
+ * is among them.
  *
- * There is no standard here, only a convention with a security hole in it. Because CGI
- * maps a request's `Proxy:` header into the environment as `HTTP_PROXY`, a long list of
- * libraries — Go's `net/http`, Rust's `reqwest`, curl among them — deliberately ignore
- * the uppercase `HTTP_PROXY` and read only lowercase `http_proxy`. Others read only the
- * uppercase form. `codex` is reqwest and `claude` is undici; setting one spelling would
- * have silently left one of the two runtimes unproxied inside a `--network none`
- * container, which does not fail open — it fails as an agent that cannot reach its model
- * API at 3am, for a reason nothing in the error message mentions.
- *
- * `NO_PROXY` has to name loopback, in both spellings and all three ways loopback gets
- * written. The forwarder *is* on loopback: without an exemption a client resolving the
- * proxy's own address through the proxy is a request that tries to CONNECT to itself.
- * `127.0.0.1` and `localhost` and `::1` because which one a client compares against
- * depends on whether it normalises the host before checking, and the ones that do not
- * are the ones that would loop.
- */
-function proxyEnv(proxyUrl: string): string[] {
-  const noProxy = 'localhost,127.0.0.1,::1'
-  const pairs: Array<[string, string]> = [
-    ['HTTP_PROXY', proxyUrl],
-    ['http_proxy', proxyUrl],
-    ['HTTPS_PROXY', proxyUrl],
-    ['https_proxy', proxyUrl],
-    ['NO_PROXY', noProxy],
-    ['no_proxy', noProxy],
-  ]
-  return pairs.flatMap(([k, v]) => ['--env', `${k}=${v}`])
-}
-
-/**
  * An allowlist, not the directory. Anything not named here does not enter the sandbox —
  * notably `projects/` (session transcripts), `history.jsonl`, `plugins/` and the codex
  * `memories`/`goals` databases.
@@ -334,18 +489,33 @@ function proxyEnv(proxyUrl: string): string[] {
  * Excluding `plugins/` also fixes a correctness problem: a personal plugin's skill was
  * being invoked in preference to the worker's, so what a nightly run actually did
  * depended on what you happened to have installed on your laptop.
+ *
+ * `settings.json` and `config.toml` are configuration the CLIs need, and neither is a
+ * credential by construction — though `settings.json` *can* carry an `env` block with
+ * secrets in it, which ADR-0010 records as a residual exposure rather than pretending
+ * otherwise.
+ *
+ * The credential files themselves are the `egress: open` case and nothing else. Under any
+ * other policy the container gets `credentialStubs()` at exactly these paths instead, and
+ * the real token never leaves this host. `open` has no gateway to splice one in at, so
+ * the choice there is between a mounted credential and an agent that cannot authenticate;
+ * it mounts, loudly, once per run, from `provision()` above. Keeping the two in one
+ * function is deliberate — the question "does a sandbox ever see a real token" has to
+ * have exactly one place to look.
  */
-function credentialMounts(runtime: 'claude' | 'codex'): Array<[string, string]> {
+function credentialMounts(opts: ContainerOptions): Array<[string, string]> {
+  if (opts.credentials === 'none') return []
   const home = homedir()
-  if (runtime === 'claude') {
-    return [
-      [join(home, '.claude', '.credentials.json'), '/host-credentials/claude/.credentials.json'],
-      [join(home, '.claude', 'settings.json'), '/host-credentials/claude/settings.json'],
-    ]
-  }
+  const mounts: Array<[string, string]> =
+    opts.runtime === 'claude'
+      ? [[join(home, '.claude', 'settings.json'), '/host-credentials/claude/settings.json']]
+      : [[join(home, '.codex', 'config.toml'), '/host-credentials/codex/config.toml']]
+  if (opts.egress !== 'open') return mounts
   return [
-    [join(home, '.codex', 'auth.json'), '/host-credentials/codex/auth.json'],
-    [join(home, '.codex', 'config.toml'), '/host-credentials/codex/config.toml'],
+    ...mounts,
+    opts.runtime === 'claude'
+      ? [join(home, '.claude', '.credentials.json'), '/host-credentials/claude/.credentials.json']
+      : [join(home, '.codex', 'auth.json'), '/host-credentials/codex/auth.json'],
   ]
 }
 

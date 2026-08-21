@@ -62,18 +62,36 @@ export const DEFAULT_ALLOWED_HOSTS: readonly string[] = [
  * against a hostname of `notexample.com` is fine, but `endsWith('example.com')` is not,
  * and the difference is one character in a file nobody re-reads.
  *
- * Comparison is case-insensitive because DNS is, and a CONNECT line is written by the
- * client: `API.GitHub.com` is the same host and must not be a way past the list.
+ * This is the only host matcher in the system. `@ogun/core` carried a second one
+ * (`isHostAllowed`) for the per-sandbox proxy that this gateway replaced; when that proxy
+ * was deleted the matcher kept its tests and lost its callers, which is the worst state
+ * for a security rule to be in — green, and enforcing nothing. The core copy went with
+ * the proxy and its cases were moved here, onto the implementation that decides.
  */
 export function hostMatches(pattern: string, hostname: string): boolean {
-  const host = hostname.toLowerCase()
-  const pat = pattern.toLowerCase()
+  const host = normalize(hostname)
+  const pat = normalize(pattern)
   if (pat.startsWith('*.')) {
     const suffix = pat.slice(1) // ".example.com"
     return host.length > suffix.length && host.endsWith(suffix)
   }
   return host === pat
 }
+
+/**
+ * Lowercased, with the DNS root's trailing dot dropped.
+ *
+ * Case, because DNS is case-insensitive and the CONNECT line is written by the *client*:
+ * `API.GitHub.com` is the same host and must not be a way past the list.
+ *
+ * The trailing dot, because `api.anthropic.com.` is the fully-qualified spelling of the
+ * same name and some clients emit it. Without this the comparison is byte-exact and the
+ * fully-qualified form is refused — which fails closed rather than open, so it is not a
+ * hole, but the symptom is an agent that cannot reach its model API for a reason nothing
+ * in the error mentions. Stripped from the pattern too, so a hand-written `egress:` entry
+ * with a stray dot behaves the same way.
+ */
+const normalize = (host: string): string => host.trim().toLowerCase().replace(/\.$/, '')
 
 export const isAllowedHost = (hostname: string, allowed: readonly string[]): boolean =>
   allowed.some((pattern) => hostMatches(pattern, hostname))

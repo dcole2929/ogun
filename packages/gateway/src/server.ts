@@ -116,6 +116,22 @@ export type GatewayOptions = {
   socketPath?: string
   dial?: Dial
   onWarning?: (message: string) => void
+  /**
+   * Every refusal the gateway makes on policy grounds, for the runner's log.
+   *
+   * The per-sandbox proxy this replaced had an `onDenied` callback, and the runner used
+   * it to print `egress refused <host> (not on the allowlist)` next to the job it
+   * happened in. Losing that would have been the quiet half of a regression: the refusal
+   * still reaches the *container* as a 403 with a body naming the host, but a container's
+   * stderr is an agent transcript, and "the agent could not reach X" is a sentence
+   * somebody has to go looking for. On the host it is one line at the moment it happens.
+   *
+   * Not given the job's identity, because the gateway deliberately does not know about
+   * jobs — it knows sessions, and a session is minted with an allowlist and nothing else.
+   * Naming the host is what makes the line actionable; naming the run is the pipeline's
+   * job and would mean threading a label through `open()` for a log line.
+   */
+  onRefused?: (host: string, reason: string) => void
 }
 
 export async function startGateway(options: GatewayOptions = {}): Promise<Gateway> {
@@ -124,6 +140,9 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
   const allowedHosts = options.allowedHosts ?? DEFAULT_ALLOWED_HOSTS
   const dial = options.dial ?? {}
   const warn = options.onWarning ?? ((message: string) => console.error(`[gateway] ${message}`))
+  const refused =
+    options.onRefused ??
+    ((host: string, reason: string) => console.warn(`[gateway] refused ${host}: ${reason}`))
 
   /**
    * Token → the hosts that token may reach.
@@ -190,6 +209,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
      * next person to discover the rule by reading this file.
      */
     if (target.protocol !== 'https:') {
+      refused(target.hostname, `${target.protocol}// puts a credential in the clear`)
       return refuse(
         res,
         403,
@@ -199,8 +219,12 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
       )
     }
     const port = strictPortOf(target) ?? 443
-    if (!isAllowedPort(port)) return refusePort(res, target.hostname, port)
+    if (!isAllowedPort(port)) {
+      refused(target.hostname, `port ${port} is not ${ALLOWED_CONNECT_PORT}`)
+      return refusePort(res, target.hostname, port)
+    }
     if (!isAllowedHost(target.hostname, allow)) {
+      refused(target.hostname, "not on this worker's allowlist")
       return refuseHost(res, target.hostname)
     }
     req.url = target.pathname + target.search
@@ -232,6 +256,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
       return
     }
     if (!isAllowedHost(authority.hostname, allow)) {
+      refused(authority.hostname, "not on this worker's allowlist")
       socket.end(
         `HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n` +
           `ogun-gateway: ${authority.hostname} is not on the sandbox egress allowlist\r\n`,
@@ -243,6 +268,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
     // intercepted and credentialed. `parseAuthority` has always returned the port with a
     // comment saying exactly this; nothing acted on it until now.
     if (!isAllowedPort(authority.port)) {
+      refused(authority.hostname, `port ${authority.port} is not ${ALLOWED_CONNECT_PORT}`)
       socket.end(
         `HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n` +
           `ogun-gateway: port ${authority.port} is refused — a sandbox reaches ` +
@@ -319,6 +345,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
      * refs are in a pkt-line body nothing here parses.
      */
     if (isGitPushRequest(method, path)) {
+      refused(hostname, 'a git push (ADR-0005)')
       return refuse(
         res,
         403,

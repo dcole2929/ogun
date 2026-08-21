@@ -28,6 +28,15 @@ with TLS interception, a host allowlist, and injection for three providers (`ant
 `openai`, `github`). It runs **in the runner process**, not beside it, and listens on a
 **unix socket** bind-mounted into a container that has no network interface at all.
 
+It is in force. `packages/runner/src/sandbox/container.ts` mounts placeholder credentials
+and points every container at the socket; the real files are mounted nowhere except on the
+`egress: open` opt-out, which has no gateway to splice a credential in at and says so on
+every run. Verified live rather than asserted: a container asked to read its own
+`~/.claude/.credentials.json` finds a 274-byte file whose `accessToken` is the literal
+`ogun-gateway-placeholder`, `grep -r sk-ant-oat` over its home and `/host-credentials`
+matches nothing, and the same container completes a real `api.anthropic.com` call in the
+same session.
+
 ## Considered Options
 
 - **Leave the credentials mounted and rely on the container boundary.** Rejected — the
@@ -119,9 +128,38 @@ with TLS interception, a host allowlist, and injection for three providers (`ant
   contain secrets.** `settings.json` supports an `env` block. Removing them is a separate
   change with its own behaviour risk; carrying them across is a residual exposure and is
   reportable.
-- **This does not settle how the runner passes the session to a container.** The wiring —
-  which mounts to delete, which env to set, where the CA is bind-mounted — is written out
-  step by step in `docs/gateway.md` and is mechanical, but `packages/runner/src/sandbox/
-  container.ts` still mounts the real credential files today. Until that lands, the
-  gateway listens and nothing uses it. **A finding that the sandbox still receives live
-  credentials is a real finding.**
+- **One gateway per runner, not one per sandbox.** The runner-up was a gateway per
+  container, which is the smaller change and preserves the lifecycle the proxy this
+  replaced already had. It was rejected on two counts. The gateway holds a CA private key
+  capable of impersonating every host every Ogun container trusts, and it is the only
+  process that reads the host's real credentials — a copy per job multiplies exactly the
+  surface this ADR exists to shrink. And the isolation it would buy is isolation the
+  session already provides, better: `open(authority, allow)` mints a 256-bit token
+  carrying *that worker's* allowlist, and `dispose()` revokes it — which, unlike a
+  per-job socket, also ends a container that outlived its `docker run`. The costs are
+  named rather than waved at: the socket file is shared by every container on the host, so
+  the boundary between two jobs is the token rather than the filesystem; the "already
+  being served" check is now load-bearing, because two runners on one machine really would
+  disagree about which gateway the containers are talking to; and the socket's directory
+  (`~/.ogun/gateway/`, which also holds `ca.key`) must never be bind-mounted, only the
+  socket file inside it.
+- **The second proxy is gone.** A smaller allowlist-only proxy shipped alongside this
+  while the gateway was still inert (`packages/runner/src/sandbox/egress-proxy.ts`), and
+  for a while both existed. Two implementations of one enforcement point is one place for a
+  rule to be true and one place for it to quietly stop being, so it was deleted rather than
+  kept as a fallback — a fallback is precisely the silent failure this ADR refuses. Its
+  guest-side constants were rehomed to `sandbox/egress.ts`; every behavioural property it
+  had is asserted against the gateway in `packages/runner/test/egress.test.ts`. The same
+  reasoning removed `isHostAllowed` from `@ogun/core`: when its only caller went, it kept
+  all of its tests and lost all of its authority, which is the worst state for a security
+  rule to be in. The two matchers had already drifted — core's dropped the DNS root's
+  trailing dot and the gateway's did not, so `api.anthropic.com.` was allowed by the tested
+  implementation and refused by the running one.
+- **`egress: open` still mounts a real credential, deliberately.** `docs/gateway.md` §3.5
+  proposed removing `open` and renaming the default to `gateway`. That was not done: `open`
+  is an escape hatch a project with a wide test suite genuinely needs, existing configs use
+  it, and on that path there is no gateway to splice a credential in at — so the honest
+  choice is a mounted token or an agent that cannot authenticate. It mounts, and the runner
+  says so on every run naming both halves. **A finding that `egress: open` is an
+  unacceptable escape hatch is a real finding**; the answer would be to remove the option,
+  not to make it quietly stop working.

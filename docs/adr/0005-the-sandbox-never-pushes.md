@@ -106,9 +106,11 @@ that they live host-side, and they do.
 - **The per-host egress allowlist is built.** [updated] A worker declares the hosts its
   sandbox may reach and anything else is refused; absent a declaration it gets the model
   API for its runtime plus the npm registry, and `open` survives as an explicit, logged
-  opt-out. Enforcement is `--network none` plus a forward proxy in the *runner process*
-  reached over a bind-mounted unix socket, so there is no sibling container and no
-  `NET_ADMIN` — see §4.6 for the mechanism and the rejected alternatives.
+  opt-out. Enforcement is `--network none` plus the egress gateway in the *runner process*
+  (ADR-0010) reached over a bind-mounted unix socket, so there is no sibling container and
+  no `NET_ADMIN` — see §4.6 for the mechanism and the rejected alternatives. The gateway
+  is also where this ADR's own rule got a second enforcement point: `git-receive-pack` is
+  refused in both of its phases, whatever the allowlist or the credentials say.
 
   What this replaced, kept because it is why the ADR said what it said: "The per-host
   egress allowlist is not built, and this ADR does not say it should not be. What ships is

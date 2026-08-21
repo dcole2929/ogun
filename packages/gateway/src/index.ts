@@ -13,7 +13,7 @@
  * on the host, terminates the TLS, splices the real credential into the request headers,
  * and forwards. You cannot exfiltrate a token that was never in the container.
  *
- * See `docs/adr/0009-the-sandbox-never-holds-a-credential.md` for what was decided and
+ * See `docs/adr/0010-the-sandbox-never-holds-a-credential.md` for what was decided and
  * what was rejected, including why this is not a sibling container (ADR-0006) and why a
  * gateway does not reopen the question of pushing from a sandbox (ADR-0005).
  */

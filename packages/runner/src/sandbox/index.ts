@@ -1,6 +1,7 @@
 import { createContainerSandbox, GUEST_WORKSPACE } from './container.ts'
 import { createWorktreeSandbox } from './worktree.ts'
 import type { EgressPolicy } from '@ogun/core'
+import type { Gateway } from '@ogun/gateway'
 import type { Sandbox, SandboxSpec } from './types.ts'
 
 export type CreateSandboxInput = SandboxSpec & {
@@ -9,6 +10,11 @@ export type CreateSandboxInput = SandboxSpec & {
   allowSandboxDowngrade: boolean
   /** Container sandboxes only — see `ContainerOptions.egress` (§4.6). */
   egress?: EgressPolicy
+  /**
+   * The runner's egress gateway. Container sandboxes only, and not optional for one:
+   * a container authenticates through it and has no other route out (ADR-0010).
+   */
+  gateway?: Gateway
 }
 
 export function createSandbox(input: CreateSandboxInput): Sandbox {
@@ -26,13 +32,20 @@ export function createSandbox(input: CreateSandboxInput): Sandbox {
      * silently is the honest option only because the downgrade itself is already the
      * loud one: a `modifier` needs `allowSandboxDowngrade` to get here at all, and what
      * that policy is agreeing to is exactly "no capability isolation".
+     *
+     * The gateway goes the same way and for the same reason. A worktree agent runs as the
+     * runner, on the runner's network, reading the runner's home — so pointing it at a
+     * gateway would inject a credential into a process that can already read the file the
+     * gateway reads it from. It would be theatre, and theatre is worse than nothing here
+     * because it reads like a protection.
      */
     return createWorktreeSandbox(input)
   }
   return createContainerSandbox({ ...input, guestWorkspace: GUEST_WORKSPACE })
 }
 
-export { GUEST_WORKSPACE }
+export { buildRunArgs, GUEST_WORKSPACE } from './container.ts'
+export type { ContainerOptions, SandboxEgress } from './container.ts'
 export * from './types.ts'
-export { egressSocketPath, GUEST_EGRESS_SOCKET, GUEST_PROXY_PORT } from './egress-proxy.ts'
+export { GUEST_EGRESS_SOCKET, GUEST_PROXY_AUTHORITY, GUEST_PROXY_PORT } from './egress.ts'
 export { containedTarget, readContained, safeJoin, UnsafeReadback, UnsafeWrite } from './paths.ts'

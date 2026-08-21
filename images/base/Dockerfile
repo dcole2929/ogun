@@ -14,8 +14,11 @@
 #   - no gh, and no GitHub token. The container never talks to GitHub; every outbound
 #     git operation happens host-side after it exits.
 #   - no sudo. There is nothing in here the agent needs root for.
-#   - credentials arrive read-only at a staging path and are copied to a writable home,
-#     so a container cannot corrupt the host's credential files.
+#   - no credentials at all. Placeholder files arrive read-only at the staging path the
+#     real ones used to occupy, and are copied to a writable home; the real token stays on
+#     the host and is spliced into requests by the egress gateway (ADR-0010). `egress:
+#     open` is the one opt-out that still mounts a real credential, and the runner says so
+#     on every run that uses it.
 #   - no git remote in the workspace. The never-pushes rule is structural rather than
 #     policed: there is nothing to push with.
 #   - no unrestricted egress. The container runs --network none and reaches the world only
@@ -24,15 +27,15 @@
 #
 # This header used to claim "worst case for a misbehaving agent is burning rate limit".
 # That was never true and it is worth recording why, because it is the assumption the
-# whole posture rested on: the credentials copied to a writable home above are live OAuth
+# whole posture rested on: the credentials copied to a writable home used to be live OAuth
 # tokens, readable by anything running in here. With unrestricted egress — which is what
 # shipped — the worst case was a prompt-injected agent reading its own credential and
 # POSTing it somewhere. Not a hypothetical agent that turns malicious: an
 # `adversarial-review` worker is pointed at untrusted repository content on purpose, so a
 # crafted README, a test fixture or a dependency's source is the delivery mechanism. The
-# allowlist is what makes the sentence approximately true again; the honest version is
-# that the worst case is now bounded by what an attacker can do through the model API
-# itself, which is a smaller and harder problem, and still open.
+# allowlist bounded where it could go; the gateway removed the thing worth sending. The
+# honest version now is that the worst case is bounded by what an attacker can do through
+# the model API itself, which is a smaller and harder problem, and still open.
 
 # The Node the repo pins, not a version chosen here. `.tool-versions` is the single
 # source of truth and `ogun image build` passes it in; there is deliberately no default,

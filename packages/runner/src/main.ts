@@ -40,9 +40,6 @@ const serverUrl = process.env.OGUN_SERVER_URL ?? runner.serverUrl
 // whole reason runner tokens cannot define workers.
 const cp = new ControlPlane(serverUrl, process.env.OGUN_RUNNER_TOKEN?.trim() || runner.token)
 
-// What the job pipeline needs: where repos are on this disk, and somewhere to work.
-const context = { projects: local.projects, scratch: runner.scratch }
-
 /**
  * Deliberately terse. Labels and capacity are defaults nobody asked about, and printing
  * them on every start trains you to skim past the line that does matter.
@@ -135,10 +132,29 @@ console.log(
       : gateway.listening.path
   }`,
 )
-// Said out loud, because the line above otherwise implies a protection that is not in
-// force yet: the sandbox still mounts the host's real credential files. Delete this line
-// in the same change that wires container.ts (docs/gateway.md §3).
-console.log('  sandboxes are NOT routed through it yet — they still mount live credentials')
+if (gateway.listening.kind === 'tcp') {
+  /**
+   * Worth saying, because TCP is not a smaller version of the socket — it is a mode in
+   * which container sandboxes do not work at all. A `--network none` container has its
+   * own network namespace and no interface, so it cannot reach a loopback listener in the
+   * runner's. `provision()` refuses rather than starting a container that would reach
+   * nothing, and this is the line that says why before a job is ever claimed.
+   */
+  console.log('  container sandboxes need the unix socket — unset OGUN_GATEWAY_HOST/PORT')
+}
+
+/**
+ * What the job pipeline needs: where repos are on this disk, somewhere to work, and the
+ * gateway every sandbox authenticates through.
+ *
+ * One gateway for the whole runner rather than one per job. It is the only process that
+ * reads the host's real credentials and it holds a CA key that can impersonate every host
+ * every container trusts, so a second copy per job would multiply that surface for
+ * nothing: jobs are separated by the per-session token and per-session allowlist that
+ * `open()` mints, which is a stronger boundary than a separate listener anyway — it
+ * survives a container that outlives its `docker run`.
+ */
+const context = { projects: local.projects, scratch: runner.scratch, gateway }
 
 if (!(await cp.authorized())) {
   console.error(

@@ -1,7 +1,7 @@
 # The egress gateway
 
-What it is, and how a sandbox gets wired to it. The decision and its rejected
-alternatives are ADR-0010; this is the operating manual and the remaining wiring.
+What it is, and how a sandbox is wired to it. The decision and its rejected
+alternatives are ADR-0010; this is the operating manual.
 
 ---
 
@@ -63,8 +63,9 @@ loopback address to the socket, and `open(containerAuthority)` is told what that
 `open()` throws rather than guessing one, because a container handed a plausible-but-wrong
 proxy address talks to nothing at all and says nothing about why.
 
-The socket transport and the `--network none` sandbox are the parallel workstream's
-(`feat/a-sandbox-reaches-only-what-it-is-allowed-to`); this package listens where it points.
+The socket transport and the `--network none` sandbox came from a parallel workstream that
+also shipped a second, smaller proxy of its own — allowlist only, one per sandbox. Both are
+gone into this one; §3 is what replaced them.
 
 ---
 
@@ -107,65 +108,97 @@ and it is paid deliberately.
 
 ---
 
-## 3. Wiring `container.ts` — the remaining step
+## 3. How a sandbox is wired to it
 
-The gateway listens today and nothing uses it: `packages/runner/src/sandbox/container.ts`
-still mounts the real credential files. This is the change, precisely.
+`packages/runner/src/sandbox/container.ts` mounts placeholder credentials and points every
+container at the socket. This is what it does, and why each part of it is the way it is.
 
-### 3.1 What the runner needs per job
+### 3.1 Per job
 
-Before `docker run`, for each job:
+`provision()` runs once per job (§5.2), before the first `docker run`, and does this:
 
 ```ts
-const session = gateway.open(IN_CONTAINER_PROXY)  // { proxyUrl, token, revoke }
-const stubs   = credentialStubs(opts.runtime)     // [{ containerPath, content, mode }]
-const env     = sandboxProxyEnv(session.proxyUrl) // the whole environment block
+session = gateway.open(GUEST_PROXY_AUTHORITY, allow)  // { proxyUrl, token, revoke }
+stubDir = tmpdir()/ogun-credentials/<container name>
+for (stub of credentialStubs(opts.runtime)) write it there, then chmod 0600
+egressSession = { socketPath, caCertificatePath, proxyUrl, stubs }
 ```
 
-`IN_CONTAINER_PROXY` is the loopback address the image's forwarder listens on — the
-container's view of the proxy, not the gateway's own. Over TCP, `open()` with no argument
-uses the bound address instead.
+`GUEST_PROXY_AUTHORITY` is `127.0.0.1:8118` — the loopback address the image's forwarder
+listens on, which is the *container's* view of the proxy and not where the gateway listens.
+`open()` throws rather than guessing one, because a container handed a
+plausible-but-wrong proxy address talks to nothing at all and says nothing about why.
 
-Write each stub to a per-job directory on the host (mode `0o600`, inside the job's scratch
-space, removed with it), and call `session.revoke()` in `dispose()` — the same place the
-container is force-removed. A revoked token stops working immediately, so a container that
-outlives its job cannot keep spending the host's credentials.
+`allow` is this worker's resolved list, not the gateway's. One gateway serves every job on
+the machine, so passing the global list would quietly widen every worker to the union of
+all of them — the kind of regression that never fails a test, it just stops refusing
+things.
 
-### 3.2 Mounts to delete
+Ordering is load-bearing in a way docker will not warn about: bind-mounting a source path
+that does not exist makes docker create an empty *directory* there, and a CLI would then
+find a directory where it expects its credential file and fail with something that reads
+nothing like an egress fault.
 
-In `credentialMounts()`, delete these two:
+`dispose()` reverses it: `session.revoke()` **first**, then `docker rm -f` on both
+containers, then the stub directory. Revoking first is the opposite of the ordering the
+per-sandbox proxy had, and the difference is that revoking is not closing — closing a proxy
+first drops a live tunnel and fails the agent's last request, while revoking only affects
+the *next* CONNECT, and a container about to be force-removed has no legitimate next
+request. `docker rm -f` can hang; a token that outlived a container we failed to remove is
+exactly the leak the revoke exists for.
+
+### 3.2 One gateway, or one per sandbox
+
+One per **runner**, owned by `main.ts`, which already starts it before the claim loop and
+closes it after the last in-flight job. The alternative — a gateway per sandbox, matching
+the lifecycle the deleted proxy had — was the smaller change and was rejected:
+
+- The gateway holds a CA private key that can impersonate every host every Ogun container
+  trusts, and it is the only process that reads the host's real credentials. A copy per job
+  multiplies exactly the surface this component exists to shrink.
+- The isolation it would buy, the session already provides and better. A per-job socket
+  bounds *which container can connect*; a per-job token bounds *which container can still
+  spend the host's credentials*, and it keeps bounding it after a `--rm` that did not fire.
+
+What that costs, named rather than waved at: the socket file is shared by every container
+on the host, so the boundary between two jobs is the token and not the filesystem; the
+"already being served" check in `startGateway` becomes load-bearing rather than defensive,
+because two runners on one machine really would disagree about which gateway the containers
+are talking to; and `~/.ogun/gateway/` must never be bind-mounted as a directory, because
+`ca.key` lives in it.
+
+### 3.3 Mounts
 
 ```
-~/.claude/.credentials.json  →  /host-credentials/claude/.credentials.json
-~/.codex/auth.json           →  /host-credentials/codex/auth.json
+<stub dir>/.credentials.json  : /host-credentials/claude/.credentials.json : ro
+<stub dir>/auth.json          : /host-credentials/codex/auth.json          : ro
+<gateway.caCertificatePath>   : /etc/ogun/gateway-ca.pem                   : ro
+~/.ogun/gateway/proxy.sock    : /run/ogun/egress.sock                      : rw
+~/.claude/settings.json       : /host-credentials/claude/settings.json     : ro
+~/.codex/config.toml          : /host-credentials/codex/config.toml        : ro
 ```
 
-Keep the other two (`settings.json`, `config.toml`) — they are configuration the CLIs need
-and neither is a credential by construction. `settings.json` *can* contain an `env` block
-with secrets; that is a residual exposure, recorded in ADR-0010 and reportable.
-
-### 3.3 Mounts to add
-
-```
-<job scratch>/claude-credentials.json : /host-credentials/claude/.credentials.json : ro
-<job scratch>/codex-auth.json         : /host-credentials/codex/auth.json          : ro
-<gateway.caCertificatePath>           : /etc/ogun/gateway-ca.pem                    : ro
-~/.ogun/gateway/proxy.sock            : <wherever the image's forwarder dials>      : rw
-```
+The stubs land at exactly the paths the deleted credential mounts used, so
+`images/base/entrypoint.sh` and `images/base/Dockerfile` needed **no change at all** — the
+entrypoint's `seed` already copies whatever is at `/host-credentials/...` into the writable
+home. What changed is only what is at those paths. `CA_CONTAINER_PATH` in `stubs.ts` is the
+constant for the third path; it is not spelled twice.
 
 The socket mount is read-**write**: a unix socket that cannot be written to cannot be
 connected to. It is the one mount that has to be, and its 0600 mode on the host is what
-keeps it to this user; the container runs as uid 1000, the same uid the runner does.
+keeps it to this user; the container runs as uid 1000, the same uid the runner does. It is
+mounted as a *file* — never its directory, which holds `ca.key`.
 
-The stubs land at exactly the paths the deleted mounts used, so `images/base/entrypoint.sh`
-and `images/base/Dockerfile` need **no change at all** — the entrypoint's `seed` already
-copies whatever is at `/host-credentials/...` into the writable home. What changes is only
-what is at those paths. `CA_CONTAINER_PATH` in `stubs.ts` is the constant for the third
-path; do not spell it twice.
+`settings.json` and `config.toml` are kept: configuration the CLIs need, neither a
+credential by construction. `settings.json` *can* contain an `env` block with secrets; that
+is a residual exposure, recorded in ADR-0010 and reportable.
 
 ### 3.4 Environment
 
-Merge `sandboxProxyEnv(session.proxyUrl)` into the `--env` list. It is all of:
+`sandboxProxyEnv(session.proxyUrl)` is merged into the `--env` list whole, from
+`@ogun/gateway`, rather than rebuilt in the runner — the list is long, every entry has a
+failure mode attached, and a second copy would drift from the one the gateway's own tests
+assert against. It is all of:
 
 - `HTTPS_PROXY`, `HTTP_PROXY`, `https_proxy`, `http_proxy` — **both spellings**, because
   curl reads lowercase and some Node libraries read uppercase only. One spelling is a
@@ -184,37 +217,72 @@ Merge `sandboxProxyEnv(session.proxyUrl)` into the `--env` list. It is all of:
 - `GIT_TERMINAL_PROMPT=0` — an unattended run that stops to ask for a password hangs until
   the job's budget runs out and is then reported as a timeout.
 
+Plus `OGUN_EGRESS_SOCKET` and `OGUN_EGRESS_PORT`, which the entrypoint reads to start the
+forwarder. Absent, the entrypoint starts nothing and the container is simply airgapped.
+
 Set as container environment rather than exported from the entrypoint, so a tool started
 outside the entrypoint's process tree — or a `docker exec` session — trusts the gateway
 too instead of failing verification.
 
+The `proxyUrl` carries the session token as basic credentials, which puts it in the
+container's environment and in the runner's `docker run` argv. The socket's 0600 mode is
+what keeps other host accounts out; the token bounds a *container*, so a host user who
+could read the argv still has nothing to connect with.
+
 ### 3.5 The `egress` option
 
-`egress: 'open' | 'none'` becomes `'gateway' | 'none'`, with `'gateway'` the default and
-`'open'` removed. Note that `'gateway'` *also* means `--network none` — the container gets
-no interface at all, and the socket is its only route out. `'none'` then means no socket
-either: a genuine airgap for a tool-only verification pass.
+All four spellings kept, and this diverges from what this section originally proposed —
+which was to remove `open` and rename the default to `gateway`. That was not done: `open`
+is an escape hatch a project with a wide test suite genuinely needs, existing configs use
+it, and the rename buys a word.
 
-The comment on the `egress` option in `container.ts` currently says a host allowlist
-"needs a filtering proxy, which conflicts with the no-sibling-containers rule" and is
-"tracked as an open question rather than faked". That is now answered — the proxy is a
-host process inside the runner, not a sibling container — and the comment should say so.
+| `egress:` | Network | Credential |
+|---|---|---|
+| *absent* | `--network none` + socket | placeholder |
+| a list | `--network none` + socket | placeholder |
+| `open` | default bridge, no socket | **the real one** |
+| `none` | `--network none`, nothing mounted | none at all — not even a placeholder |
 
-### 3.6 The verification container
+`open` is the one path with no gateway to splice a credential in at, so the choice there is
+a mounted token or an agent that cannot authenticate. It mounts, and `provision()` warns
+every run naming both halves. `credentialMounts()` is deliberately the single place to look
+for "does a sandbox ever see a real token".
 
-`verificationOptions()` builds a second container for the test gate. It should get the
-same proxy environment, the same CA, and the same socket: a project's suite installs
-dependencies, and without them it has no egress at all. It does **not** need the credential
-stubs — no agent runs in it, and a test suite has no business holding even a placeholder.
+An allowlist with no resolved session — which can only happen if `provision()` did not run
+— falls to `--network none`, because the alternative is a bug in the runner's own lifecycle
+silently restoring unrestricted internet with a real credential in it.
 
-### 3.7 Order of operations
+The comment on the `egress` option in `container.ts` used to say a host allowlist "needs a
+filtering proxy, which conflicts with the no-sibling-containers rule" and was "tracked as an
+open question rather than faked". That is answered: the proxy is a host process inside the
+runner, not a sibling container.
 
-1. `session = gateway.open()`
-2. write stubs to the job's scratch directory
-3. `docker run` with the mounts and environment above
-4. on `dispose()`: `session.revoke()`, then remove the containers and the scratch stubs
+### 3.6 Refusals the runner makes before starting a container
 
----
+Three, all fail-closed, all naming the fix:
+
+- **No gateway passed to a container sandbox.** A runner wiring bug rather than a
+  configuration one, and the honest alternatives are "airgap" or "put the credential back".
+- **The gateway is listening on TCP.** A `--network none` container has its own network
+  namespace and no interface, so it cannot reach a loopback listener in the runner's.
+  `OGUN_GATEWAY_HOST`/`OGUN_GATEWAY_PORT` exist for a `worktree` sandbox and for pointing
+  something at the gateway by hand; a container gets the socket or nothing. `main.ts` says
+  so at startup too, before a job is claimed.
+- **An image that does not declare `OGUN_EGRESS_FORWARDER`.** An image built before the
+  forwarder gets `--network none` and nothing to bridge with, so a *tightened* policy
+  presents as a total airgap and is reported by the agent as an authentication failure.
+  Project images inherit the marker from `FROM ogun/base`, so this is telling you to
+  rebuild, which is the actual fix.
+
+### 3.7 The verification container
+
+`verificationOptions()` builds a second container for the test gate, and it shares the
+agent's session — the same socket, the same CA, the same allowlist, one denial log. It
+needs egress: a project's suite installs dependencies, and a gate with no route out fails as
+a red suite that gets blamed on the modifier whose patch it was gating.
+
+It gets **no credential file at all** — not the placeholder, and not `settings.json`. No
+agent runs in it, and a test suite has no business holding either.
 
 ## 4. What is verified, and what is not
 
@@ -269,21 +337,39 @@ bad in the specific way that made it pass. Coverage now includes the absolute-fo
 tunnel reuse, HEAD and 304, a non-443 CONNECT, cancellation, upstream death mid-body, and a
 push refused with half a megabyte still uploading.
 
-### Not verified
+### Verified through the wired path
 
-The two CLIs' reaction to the stubs, which needs the actual binaries driven end to end:
+Run by hand against a real container on this host, once `container.ts` was wired:
 
-- that `claude` accepts a `.credentials.json` with an empty `refreshToken` and a
-  far-future `expiresAt`, sends `Authorization: Bearer <placeholder>`, and does not try to
-  refresh. The fields are shaped from the real file on this host, and the shape is the one
-  the reference implementation live-verified for its own harness — but "verified by
-  analogy" is not verified.
+- **`claude` accepts its stub and authenticates.** A `--network none` container on
+  `ogun/base` and on a project image both completed a real `api.anthropic.com` turn with
+  only the placeholder mounted. The CLI did not try to refresh — the empty `refreshToken`
+  and far-future `expiresAt` do what they were shaped to do.
+- **The container holds nothing.** The agent in that container, asked to read its own
+  credential, found a 274-byte file whose `accessToken` is the literal
+  `ogun-gateway-placeholder`, byte-identical to what is at `/host-credentials`, and
+  `grep -rIl 'sk-ant-oat'` over its home and `/host-credentials` matched nothing but the
+  transcript of the prompt that asked.
+- **A non-allowlisted host is refused, and cannot be walked around.** `example.com`
+  gives `curl: (56) CONNECT tunnel failed, response 403`, logged host-side as
+  `refused example.com: not on this worker's allowlist`. The same container running
+  `curl --noproxy '*' https://example.com` gets `Could not resolve host` — there is no
+  interface to decline the proxy with.
+- **`egress: none` is a genuine airgap**, and now holds no credential file either: the CLI
+  reports `Not logged in` and the run exits non-zero.
+- **The `OGUN_EGRESS_FORWARDER` refusal still fires** against an image built without it.
+- **The verification container holds nothing.** `/host-credentials` does not exist in it.
+- **`egress: open` still works**, on a bridge network, with the real credential mounted and
+  the warning printed.
+
+### Still not verified
+
 - that `codex` accepts the stub `auth.json` and its hand-built `id_token`, and that the
   OpenAI arm's `chatgpt-account-id` is what a subscription Codex needs. Nothing on the
-  OpenAI side was exercised live.
+  OpenAI side has been exercised live, at any point.
 - that a long-running streaming completion survives the tunnel for its full duration.
-  Streaming is tested for arrival *order*, over 150ms, not for minutes.
+  Streaming is tested for arrival *order*, over 150ms, not for minutes. The longest live
+  run through the gateway so far was a three-turn tool-using session of about 35s.
 
-The first real job through the gateway is the test for those. If a CLI refuses its stub
-the symptom will be an auth error *before* any request reaches the gateway — check that
-the gateway logged nothing at all before suspecting injection.
+If a CLI refuses its stub the symptom will be an auth error *before* any request reaches
+the gateway — check that the gateway logged nothing at all before suspecting injection.
