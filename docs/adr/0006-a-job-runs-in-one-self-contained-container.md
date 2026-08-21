@@ -48,5 +48,16 @@ In the order these bite:
   scope for autonomous runs**, until there is a better answer. That is a recorded
   limitation rather than a solved problem, and reaching for the socket is not the answer
   to it.
-- A filtering egress proxy would be a sibling container, so this decision is also why the
-  per-host allowlist named in ADR-0005 has no cheap implementation.
+- **A filtering egress proxy is not a sibling container, and this consequence used to say
+  it was.** [corrected] The original line read: "A filtering egress proxy would be a
+  sibling container, so this decision is also why the per-host allowlist named in ADR-0005
+  has no cheap implementation." That reasoning assumed the proxy had to be reachable over
+  IP, and therefore had to be *something on a network*. It does not: the proxy runs in the
+  runner process and the container reaches it over a unix socket bind-mounted in like any
+  other file, under `--network none`. No daemon reach, no lifecycle to orchestrate, and
+  the job is still one container (§4.6).
+
+  Worth keeping as a caution about this ADR's blast radius. "No sibling containers" is a
+  rule about *orchestration*, and it was quietly read as "no out-of-container helpers at
+  all" — which suppressed a security control for two phases on grounds that never applied
+  to it.

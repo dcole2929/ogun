@@ -87,10 +87,24 @@ that they live host-side, and they do.
   repo-scoped installation token, and it is not built.
 - Egress cannot be `none` for an agent run — the runtime itself calls `api.anthropic.com`
   or OpenAI's endpoint, so a reviewer container cannot be an airgap.
-- **The per-host egress allowlist is not built, and this ADR does not say it should not
-  be.** What ships is `egress: open | none`, and reviewers run `open`. A filtering proxy
-  is a sibling container and therefore ruled out by ADR-0006; `iptables` inside the
-  container needs `NET_ADMIN` plus a privilege drop, and still fails against endpoints
-  whose IPs rotate. The structural protections above are what stop a container reaching
-  GitHub, and they hold regardless. Exfiltration through the model API itself is a
-  different and harder problem, and it is open.
+- **The per-host egress allowlist is built.** [updated] A worker declares the hosts its
+  sandbox may reach and anything else is refused; absent a declaration it gets the model
+  API for its runtime plus the npm registry, and `open` survives as an explicit, logged
+  opt-out. Enforcement is `--network none` plus a forward proxy in the *runner process*
+  reached over a bind-mounted unix socket, so there is no sibling container and no
+  `NET_ADMIN` — see §4.6 for the mechanism and the rejected alternatives.
+
+  What this replaced, kept because it is why the ADR said what it said: "The per-host
+  egress allowlist is not built, and this ADR does not say it should not be. What ships is
+  `egress: open | none`, and reviewers run `open`. A filtering proxy is a sibling
+  container and therefore ruled out by ADR-0006; `iptables` inside the container needs
+  `NET_ADMIN` plus a privilege drop, and still fails against endpoints whose IPs rotate."
+  Every clause of that was true about the options considered, and the conclusion still did
+  not follow — a unix socket is not a container and not a network interface, and it was
+  not on the list. The cost of the error was not the missing feature but the *default*:
+  `open` meant every sandbox had unrestricted internet and a mounted OAuth credential it
+  could read, which is a much larger exposure than the rate limit §4.6 named as the worst
+  case.
+- The structural protections above are what stop a container reaching GitHub, and they
+  hold regardless of egress. Exfiltration through the model API itself is a different and
+  harder problem, no allowlist closes it, and it is open.

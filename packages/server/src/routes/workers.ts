@@ -344,8 +344,46 @@ const describe = (file: { path: string; text: string; hash: string }) => ({
   text: file.text,
 })
 
-const toWorkerConfig = (input: z.infer<typeof workerFields>): WorkerConfig =>
+/**
+ * The fields this UI actually edits. Everything else in a worker is hand-written yaml.
+ *
+ * Named as a list because `toWorkerConfig` below has to be able to say "not one of
+ * these", and the PATCH handler deletes stored keys that the rebuilt node does not
+ * mention. Those two facts together were a silent data-loss bug: `toWorkerConfig` built a
+ * worker from this whitelist, so `verify:`, `requires:` and `timezone:` vanished from
+ * `.ogun/config.yaml` the first time anyone toggled `enabled` in the UI. A worker's test
+ * expectations disappearing because someone clicked a switch is not a thing that
+ * announces itself — the run just stops checking what it used to check.
+ *
+ * `egress:` would have been the next one, and it is the one where the silent loss is a
+ * container quietly returning to a wider allowlist than the file says (§4.6).
+ */
+const UI_MANAGED_FIELDS = [
+  'skill',
+  'runtime',
+  'model',
+  'permissions',
+  'sandbox',
+  'prompt',
+  'schedule',
+  'onMissed',
+  'timeoutMs',
+  'enabled',
+] as const
+
+const toWorkerConfig = (input: z.infer<typeof workerFields> & Record<string, unknown>): WorkerConfig =>
   workerSchema.parse({
+    /**
+     * Carried through untouched: anything in the stored config that this UI does not
+     * edit. `workerSchema.parse` strips whatever it does not recognise, so a stray
+     * `projectSlug` from the create body cannot ride along — only real worker fields
+     * survive, which is exactly the set that should.
+     */
+    ...Object.fromEntries(
+      Object.entries(input).filter(
+        ([key]) => !(UI_MANAGED_FIELDS as readonly string[]).includes(key),
+      ),
+    ),
     skill: input.skill,
     runtime: input.runtime,
     model: input.model,

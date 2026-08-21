@@ -169,6 +169,10 @@ jobsRoutes.post('/claim', async (c) => {
         model: found.worker.modelRole,
         permissions: found.worker.permissions,
         sandbox: found.worker.sandbox,
+        // Out of the stored worker config rather than a column: `workers.config` is the
+        // whole parsed worker, so a new field needs no migration and a worker indexed
+        // before this existed simply has none.
+        ...(config.egress === undefined ? {} : { egress: config.egress }),
         timeoutMs: Number(config.timeoutMs ?? 30 * 60_000),
         skillRef: found.worker.skillRef,
         verify: config.verify,

@@ -49,6 +49,10 @@ export async function stampSources(): Promise<string[]> {
   return [
     join(base, 'Dockerfile'),
     join(base, 'entrypoint.sh'),
+    // The egress forwarder is baked in and never rebuilt from source at run time, so an
+    // image built before a change to it enforces the old behaviour while the runner
+    // assumes the new. Same failure this stamp exists for, one file later (§4.6).
+    join(base, 'egress-forwarder.mjs'),
     // The Dockerfile no longer names a Node version — it takes one as a build arg, read
     // from here. Without this the file that decides what Node the image runs would sit
     // outside the hash, and bumping the pin would leave the image looking current while

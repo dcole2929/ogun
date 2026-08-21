@@ -1,6 +1,7 @@
 import { parse as parseYaml } from 'yaml'
 import { z } from 'zod'
 import { cycleConfigSchema } from './cycle.ts'
+import { egressSchema } from './egress.ts'
 
 export const RUNTIMES = ['claude', 'codex'] as const
 export type Runtime = (typeof RUNTIMES)[number]
@@ -53,6 +54,14 @@ export const workerSchema = z.object({
   /** Capability labels a runner must advertise. Derived when omitted. */
   requires: z.array(z.string()).optional(),
   timeoutMs: z.number().int().positive().default(30 * 60_000),
+  /**
+   * Which hosts this worker's sandbox may reach (§4.6). Absent means the default
+   * allowlist for its runtime — see `egressSchema`, which is also why absent is not
+   * spelled `.default(...)` here: "the worker said nothing" and "the worker asked for
+   * exactly the defaults" are the same policy, but only the first can be told apart from
+   * `egress: []` when this config is round-tripped back into yaml by the UI.
+   */
+  egress: egressSchema.optional(),
   verify: verifySchema.optional(),
 })
 export type WorkerConfig = z.infer<typeof workerSchema>

@@ -5,7 +5,13 @@
 # Why copy rather than mount the real path writable: both CLIs write session state, so a
 # bare read-only mount at ~/.claude makes them fail. Mounting the host's directory
 # writable would let a container corrupt the credentials it was lent. Copying gives the
-# agent a working home whose worst-case damage is burning rate limit (§4.6).
+# agent a working home it cannot use to damage the host's own (§4.6).
+#
+# It does not make the credential safe. This line used to say "whose worst-case damage is
+# burning rate limit", which was false: what lands in that home is a live OAuth token, and
+# an agent that can read it and reach the internet can send it anywhere. That is why the
+# container now runs --network none with a host-side allowlist proxy — see the forwarder
+# below, and the Dockerfile header.
 set -eu
 
 seed() {
@@ -41,5 +47,31 @@ git config --global --add safe.directory /workspace 2>/dev/null || true
 # Belt and braces: the runner already removes the remote when materializing the
 # workspace, but a project could commit one into .git/config.
 git -C /workspace remote remove origin 2>/dev/null || true
+
+# The container half of the egress allowlist (§4.6). Only when the runner mounted a
+# socket: `egress: none` mounts nothing and this container is a genuine airgap, and
+# `egress: open` runs on a normal bridge where there is nothing to forward to.
+if [ -n "${OGUN_EGRESS_SOCKET:-}" ]; then
+  OGUN_EGRESS_READY=/tmp/.ogun-egress-ready
+  export OGUN_EGRESS_READY
+  rm -f "$OGUN_EGRESS_READY"
+  node /opt/ogun/egress-forwarder.mjs &
+
+  # Block until it is actually listening. The agent's first act is an API call, and
+  # starting it against a port nothing has bound yet produces an authentication failure
+  # rather than a connection error — a race that hides on a laptop and shows up on a
+  # loaded runner. 100 x 0.05s = 5s, which is two orders of magnitude more than node
+  # needs to bind a socket and still short enough that a genuinely broken forwarder fails
+  # the job rather than eating its budget.
+  i=0
+  while [ ! -e "$OGUN_EGRESS_READY" ]; do
+    i=$((i + 1))
+    if [ "$i" -gt 100 ]; then
+      echo "ogun-entrypoint: egress forwarder did not start; this container has no route out" >&2
+      exit 1
+    fi
+    sleep 0.05
+  done
+fi
 
 exec "$@"

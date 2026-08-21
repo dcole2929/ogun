@@ -304,6 +304,9 @@ export async function executeJob(
       timeoutMs: job.timeoutMs,
       image: process.env.OGUN_IMAGE_OVERRIDE ?? imageFor(job),
       allowSandboxDowngrade: false,
+      // Absent is not "unrestricted" — it resolves to the default allowlist for the
+      // runtime, inside the sandbox (§4.6).
+      ...(job.egress === undefined ? {} : { egress: job.egress }),
     })
     await sandbox.provision()
 

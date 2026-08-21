@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { egressSchema } from './config/egress.ts'
 import { runEventSchema } from './events.ts'
 import { findingsDocumentSchema } from './findings.ts'
 import { RUN_OUTCOMES } from './outcomes.ts'
@@ -43,6 +44,18 @@ export const claimedJobSchema = z.object({
   model: z.string(),
   permissions: z.string(),
   sandbox: z.string(),
+  /**
+   * Which hosts this job's sandbox may reach (§4.6). Absent means the default allowlist
+   * for its runtime, which is what every job claimed by a runner older than this field
+   * gets — the wire stays backward compatible in both directions.
+   *
+   * Validated with the real schema rather than a loose `z.string()` like its neighbours,
+   * because those degrade safely and this does not: an unparseable `permissions` string
+   * lands as a profile nothing matches, whereas an unparseable egress value would have to
+   * be interpreted, and every interpretation of a malformed allowlist is a guess about
+   * what a container may reach.
+   */
+  egress: egressSchema.optional(),
   timeoutMs: z.number().int().positive(),
   skillRef: z.string(),
   verify: z.unknown().optional(),
