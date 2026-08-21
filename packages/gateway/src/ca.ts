@@ -158,7 +158,19 @@ function generateCa(keyPath: string, certPath: string): void {
     subject: caName(),
     issuer: caName(),
     subjectPublicKey: publicKey,
-    notBefore: now,
+    /**
+     * Backdated for the same reason `mintLeaf` backdates, which this did not do and
+     * should have. A CA minted with `notBefore: now` is not-yet-valid to any verifier
+     * whose clock sits even slightly behind the minting one, and WSL2 clocks step
+     * backwards on resume. It surfaced as `CERT_NOT_YET_VALID` in roughly one full test
+     * run in three — and because the leaf is backdated an hour, the CA was the only
+     * certificate in the chain that could have produced it.
+     *
+     * Worse in production than in the suite: the CA is generated once and cached, so a
+     * bad minute is not retried, it is persisted for ten years and every handshake
+     * afterwards fails on a date nobody thinks to check.
+     */
+    notBefore: new Date(now.getTime() - 60 * 60 * 1000),
     notAfter: new Date(now.getTime() + CA_VALIDITY_DAYS * 24 * 60 * 60 * 1000),
     extensions: [
       // `critical` on basicConstraints and keyUsage: a verifier that does not understand

@@ -76,6 +76,37 @@ test('a leaf is already valid when it is minted', () => {
 })
 
 /**
+ * The same property for the root, which is where it was actually missing.
+ *
+ * The leaf was backdated and the CA was not, and the asymmetry cost roughly one full
+ * test run in three to `CERT_NOT_YET_VALID`. The suite was the lucky place to find it:
+ * a leaf is minted per connection, so a bad one is retried seconds later, while the CA
+ * is generated once and cached for ten years — a single unlucky minute at
+ * `ogun runner init` would have made every handshake afterwards fail on a date that
+ * looks entirely reasonable to whoever reads the error.
+ */
+test('the CA is backdated far enough to absorb a clock step', () => {
+  const ca = loadOrCreateCa(scratch())
+  const root = new X509Certificate(ca.certificatePem)
+
+  /**
+   * A margin, not merely a non-future date — and the first version of this test asserted
+   * the latter and passed against the bug it was written to catch. `time()` truncates to
+   * whole seconds, so a `notBefore` of exactly now encodes as up to a second in the
+   * *past* and clears `validFrom < Date.now()` every time. What fails a handshake is a
+   * verifier whose clock is behind the minting one, which no comparison against this
+   * process's own clock can express.
+   */
+  const backdatedBy = Date.now() - new Date(root.validFrom).getTime()
+  assert.ok(
+    backdatedBy >= 30 * 60 * 1000,
+    `the root is backdated ${Math.round(backdatedBy / 1000)}s; a verifier running behind ` +
+      'this clock rejects it as not-yet-valid, and the CA is cached for years',
+  )
+  assert.ok(new Date(root.validTo).getTime() > Date.now())
+})
+
+/**
  * The CA private key is the most valuable thing this package produces: anything holding
  * it can impersonate every host any Ogun container trusts. `ogun runner doctor` already
  * reports a config file left group-readable; this file is strictly worse to leak.
