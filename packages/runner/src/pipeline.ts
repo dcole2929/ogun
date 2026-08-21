@@ -3,11 +3,13 @@ import { mkdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import {
   parseFingerprint,
+  readPolicies,
   readTestCommand,
   verifySchema,
   writeSecretFile,
   type ClaimedJob,
   type GateResult,
+  type Policies,
   type RunEvent,
   type RunOutcome,
   type RunReport,
@@ -22,6 +24,7 @@ import {
 } from './sandbox/index.ts'
 import { nextSeq, newParserState, resolveModel, resolveRuntime } from './runtimes/index.ts'
 import { extractPatch, type PatchExtraction } from './patch.ts'
+import { githubCli, publishPatch } from './publish.ts'
 import { gitIn, materializeWorkspace, resolveHeadSha, stageAll } from './workspace.ts'
 import { runVerifyGate, type VerifyOutcome } from './verify.ts'
 import {
@@ -211,8 +214,26 @@ export async function executeJob(
      * modifier's whole round spent producing a patch nothing can check.
      */
     let testCommand: string | undefined
+    /**
+     * Read here rather than at publish time, from the same blob and for the same reason.
+     *
+     * The publisher runs after the report, by which point this function is on its way into
+     * the `finally` that deletes the workspace — so the only place the pinned
+     * `config.yaml` is still reachable is up here. That is a happy accident; the reason it
+     * *should* be read here is that `policies.maxOpenPullRequests` is the modifier's own
+     * cap, the workspace is a tree the modifier can write, and a gate read after the agent
+     * has run is a gate the agent could have edited.
+     *
+     * `undefined` when the file at the pinned base does not parse, which the publisher
+     * treats as "this project's policy could not be established" and refuses on. It does
+     * not refuse the *run*, unlike `tests.command` — a broken policies block should not
+     * stop a modifier producing a patch a person can still read.
+     */
+    let policies: Policies | undefined
     if (job.permissions === 'modifier') {
-      testCommand = await projectTestCommand(workspace.path, workspace.sha)
+      const pinned = await pinnedProjectConfig(workspace.path, workspace.sha)
+      testCommand = pinned === undefined ? undefined : readTestCommand(pinned)
+      policies = pinned === undefined ? undefined : readPolicies(pinned)
       if (!testCommand) {
         return await refuse(
           `${PROJECT_CONFIG_PATH} at ${workspace.sha.slice(0, 12)} declares no tests.command, ` +
@@ -492,7 +513,47 @@ export async function executeJob(
       ],
     }
     const result = (await cp.report(report)) as { outcome?: RunOutcome }
-    return result.outcome ?? 'approved'
+    const recorded = result.outcome ?? 'approved'
+
+    /**
+     * Report first, then publish. Never the other way round, and this is the ordering the
+     * whole step hangs on.
+     *
+     * Publish-then-report fails in the one direction nothing can recover from: the push
+     * and the pull request are on GitHub, and if the report call then fails — the control
+     * plane is restarting, the token expired, the box lost its network — there is a live
+     * pull request with no `changes` row, no run outcome, and nothing in the database that
+     * knows either exists. The next thing to look at that project sees a modifier that
+     * never finished, and a person finds the branch by accident.
+     *
+     * This order fails to a `changes` row with a null `branch`, which is a state the
+     * schema already has a name for and the run detail page already shows: work that
+     * exists and is not published. It is visible, it is inspectable — the patch is still
+     * on disk — and it is the state a retry would start from anyway.
+     *
+     * It also puts the gate in the right place. `result.outcome` is what the control plane
+     * *recorded*, not what this runner proposed, and the two differ exactly when a gate
+     * failed: `finalizeRun` derives a `dispatched` with a failed gate down to
+     * `changes-requested`. Publishing before reporting would mean deciding on the runner's
+     * own claim, which is the claim the gate exists to overrule.
+     */
+    if (change?.patch) {
+      await publishIfReady({
+        cp,
+        flusher,
+        parser,
+        job,
+        outcome: recorded,
+        ...(localPath ? { localPath } : {}),
+        scratch: config.scratch,
+        patchRef: change.patch.ref,
+        baseSha: change.baseSha,
+        ...(policies ? { policies } : {}),
+        tests: { run: verdict.tests?.ran, passed: verdict.tests?.passed },
+      })
+    }
+
+    return recorded
   } catch (err) {
     return await fail(err instanceof Error ? err.message : String(err))
   } finally {
@@ -598,6 +659,105 @@ const changeRecord = (
   ...(tests ? { testsRun: tests.ran, testsPassed: tests.passed } : {}),
 })
 
+/**
+ * The publisher, and everything it takes to keep a failure here from becoming a failure
+ * of the run.
+ *
+ * Wrapped so that nothing this does can change what the run reported. The report is
+ * already written and terminal; a `gh` that is not installed, a remote that rejected the
+ * push, or a bug in this module must end as a note on the timeline and a `changes` row
+ * with a null `branch` — not as a thrown error unwinding into the outer `catch`, which
+ * would send a second report that `finalizeRun` correctly refuses and log a crash for a
+ * run that succeeded.
+ *
+ * Every path says something. A modifier that produced a patch and no pull request is the
+ * single most confusing thing this system can do, and silence is what makes it confusing
+ * rather than merely disappointing.
+ */
+async function publishIfReady(input: {
+  cp: ControlPlane
+  flusher: EventFlusher
+  parser: ReturnType<typeof newParserState>
+  job: ClaimedJob
+  outcome: RunOutcome
+  /** Absent when this runner has no checkout of the project — see below. */
+  localPath?: string
+  scratch: string
+  patchRef: string
+  baseSha: string
+  policies?: Policies
+  tests: { run?: boolean; passed?: boolean }
+}): Promise<void> {
+  const note = (text: string, fields: Record<string, unknown> = {}): void => {
+    input.flusher.push([
+      {
+        type: 'runner.note',
+        ts: new Date().toISOString(),
+        seq: nextSeq(input.parser),
+        payload: { note: text, ...fields },
+      },
+    ])
+  }
+
+  /**
+   * No local checkout, so nothing to make a worktree from.
+   *
+   * A runner that cloned this project from its remote could clone it again and push from
+   * that — but it is a second materialization path, exercised by nobody, and the thing it
+   * would be doing for the first time is pushing to somebody's default remote. The patch
+   * survives on disk and the `changes` row records the work, so what is lost is
+   * automation rather than the work itself. `ogun project add` on this machine fixes it.
+   */
+  if (!input.localPath) {
+    note(
+      `not published: this runner has no local checkout of "${input.job.projectSlug}", and a ` +
+        'branch is pushed from a worktree of one. The patch is kept at ' +
+        `${input.patchRef}.`,
+    )
+    return
+  }
+
+  try {
+    const published = await publishPatch({
+      repo: input.localPath,
+      scratch: input.scratch,
+      runId: input.job.runId,
+      workerName: input.job.workerName,
+      defaultBranch: input.job.projectDefaultBranch,
+      baseSha: input.baseSha,
+      patchRef: input.patchRef,
+      outcome: input.outcome,
+      tests: input.tests,
+      ...(input.policies ? { policies: input.policies } : {}),
+      // The only place a credential enters this pipeline. `publishPatch` takes it as a
+      // parameter so every gate above it can be tested without one (ADR-0009).
+      remote: githubCli(),
+    })
+
+    if (!published.pr) {
+      note(`not published: ${published.refused ?? 'no reason recorded'}`)
+      return
+    }
+
+    note(`published: ${published.pr.url} on ${published.pr.branch}`, {
+      branch: published.pr.branch,
+      prUrl: published.pr.url,
+    })
+
+    /**
+     * Told to the control plane last, because it is the only part that can be caught up
+     * afterwards. The pull request exists whatever happens here; a `changes` row that
+     * still says null is wrong but recoverable from GitHub, where the branch name carries
+     * the run id.
+     */
+    await input.cp.published(input.job.runId, published.pr.branch, published.pr.url)
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err)
+    note(`publishing failed: ${detail}. The patch is kept at ${input.patchRef}.`)
+    console.error(`[runner] run=${input.job.runId} publish failed`, err)
+  }
+}
+
 /** Where a project says how it is built and how it is tested (§4.6, §9). */
 const PROJECT_CONFIG_PATH = '.ogun/config.yaml'
 
@@ -619,12 +779,26 @@ export async function projectTestCommand(
   workspace: string,
   baseSha: string,
 ): Promise<string | undefined> {
+  const pinned = await pinnedProjectConfig(workspace, baseSha)
+  return pinned === undefined ? undefined : readTestCommand(pinned)
+}
+
+/**
+ * The raw text of that blob, which two gates now read: the test command before the agent
+ * runs, and the publisher's policies after it has. One read rather than two, and more
+ * importantly one definition of *which* copy of the file counts — two call sites each
+ * doing their own is how they end up disagreeing about it.
+ */
+async function pinnedProjectConfig(
+  workspace: string,
+  baseSha: string,
+): Promise<string | undefined> {
   // Missing file, unreadable object, a repository without that path at that commit —
   // all of them mean the same thing to the caller, which refuses rather than guessing.
   const shown = await gitIn(workspace, ['show', `${baseSha}:${PROJECT_CONFIG_PATH}`]).catch(
     () => null,
   )
-  return shown === null ? undefined : readTestCommand(shown.stdout)
+  return shown === null ? undefined : shown.stdout
 }
 
 /**

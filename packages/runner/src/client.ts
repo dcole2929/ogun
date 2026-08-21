@@ -92,6 +92,23 @@ export class ControlPlane {
     return this.post(`/api/runs/${report.runId}/report`, report)
   }
 
+  /**
+   * The branch and the draft pull request the publisher produced, filled into the
+   * `changes` row the report already wrote (ADR-0005).
+   *
+   * Deliberately not folded into `report`: the pull request does not exist yet when the
+   * report is sent, and it is sent first on purpose — a publish that fails halfway leaves
+   * a `changes` row with a null branch, which is a state you can see and retry, where the
+   * other order leaves a live pull request the database has never heard of.
+   *
+   * Throws like every other write. The caller catches it and says so on the timeline: by
+   * the time this runs the pull request is already open, so a failure here is a record
+   * that is behind rather than work that was lost.
+   */
+  async published(runId: string, branch: string, prUrl: string): Promise<void> {
+    await this.post(`/api/runs/${runId}/published`, { branch, prUrl })
+  }
+
   async health(): Promise<boolean> {
     return fetch(`${this.#baseUrl}/api/health`).then(
       (r) => r.ok,

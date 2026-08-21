@@ -2,7 +2,7 @@ import { createWriteStream } from 'node:fs'
 import { mkdir, rm } from 'node:fs/promises'
 import { spawn } from 'node:child_process'
 import { join } from 'node:path'
-import { GIT_ENV, GIT_HARDENING, gitIn } from './workspace.ts'
+import { GIT_ENV, GIT_HARDENING, RUNNER_IDENTITY, gitIn } from './workspace.ts'
 
 /**
  * Getting a modifier's work out of a workspace the container has just had write access to.
@@ -60,14 +60,6 @@ export type PatchExtraction = {
    */
   unextractable?: string
 }
-
-/**
- * Identity for commits the runner makes on the agent's behalf. Constant rather than the
- * host user's git identity: the artefact must not differ depending on whose machine the
- * runner happens to be, and a person reading `git log` on the branch should be able to
- * tell at a glance which commits an agent wrote and which one the harness swept up.
- */
-const RUNNER_IDENTITY = ['-c', 'user.name=ogun', '-c', 'user.email=ogun@localhost']
 
 export async function extractPatch(input: {
   workspace: string

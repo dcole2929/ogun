@@ -1,6 +1,6 @@
 import { strict as assert } from 'node:assert'
 import { test } from 'node:test'
-import { readTestCommand } from '../src/config/project.ts'
+import { readPolicies, readTestCommand } from '../src/config/project.ts'
 
 /**
  * `readTestCommand` is read by two callers that cannot afford the strict schema:
@@ -41,4 +41,43 @@ test('no tests block, an empty command, and unparseable yaml are all "none"', ()
   assert.equal(readTestCommand('tests:\n  command: ""\n'), undefined)
   assert.equal(readTestCommand('tests:\n  command: [a, b\n'), undefined)
   assert.equal(readTestCommand(''), undefined)
+})
+
+/**
+ * `readPolicies` is the publisher's half of the same idea, and the asymmetry with
+ * `readTestCommand` is the thing worth pinning down.
+ *
+ * An absent `policies:` block is not a failure — it means the defaults, which is what
+ * most repositories have. Anything the reader cannot make sense of *is* a failure, and
+ * comes back `undefined` so the publisher refuses rather than publishing on a guess. Those
+ * two must not converge: a project that carefully set `maxOpenPullRequests: 0` and then
+ * broke its YAML would otherwise get three pull requests the next morning.
+ */
+
+test('an absent policies block means the defaults, not an unreadable one', () => {
+  const defaults = readPolicies('project:\n  name: demo\n')
+  assert.equal(defaults?.maxOpenPullRequests, 3)
+  assert.equal(defaults?.directPush, false)
+})
+
+test('a policies block this build cannot parse is "unknown", not "the defaults"', () => {
+  assert.equal(readPolicies('policies:\n  maxOpenPullRequests: nope\n'), undefined)
+  assert.equal(readPolicies('policies:\n  maxOpenPullRequests: -1\n'), undefined)
+  assert.equal(readPolicies('policies: [a, b\n'), undefined)
+  assert.equal(readPolicies('policies: "off"\n'), undefined)
+})
+
+test('a broken workers block does not stop the policies being read', () => {
+  const config = `project:
+  name: demo
+workers:
+  fixer:
+    skill: ./skills/fix
+    permissions: chaotic-neutral
+policies:
+  maxOpenPullRequests: 0
+`
+  // Same reason as the test command above: an unrelated worker this build cannot parse
+  // must not be able to change what the publisher believes the project's cap is.
+  assert.equal(readPolicies(config)?.maxOpenPullRequests, 0)
 })

@@ -52,3 +52,8 @@ policies:
   allowSandboxDowngrade: false
   maxConcurrentModifiers: 1
   failureBreakerThreshold: 3
+  # The publisher's cap on *unreviewed* work, counted live against open pull requests
+  # under the `ogun/` branch prefix — merging or closing one makes room immediately.
+  # Written out rather than left to the default because it is the number you reach for
+  # when the drafts start piling up, and a key you cannot see is a key you do not edit.
+  maxOpenPullRequests: 3

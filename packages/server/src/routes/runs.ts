@@ -1,9 +1,10 @@
 import { Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
-import { and, asc, count, desc, eq, gt, inArray, isNotNull, or, sql } from 'drizzle-orm'
+import { and, asc, count, desc, eq, gt, inArray, isNotNull, isNull, or, sql } from 'drizzle-orm'
 import { schema } from '@ogun/core/db'
 import {
   eventBatchSchema,
+  runPublishedSchema,
   runReportSchema,
   runStartedSchema,
   type RunEvent,
@@ -103,6 +104,63 @@ runsRoutes.post('/:id/report', async (c) => {
   // 200, not a conflict: a slow machine reporting after the sweep gave up on it did
   // nothing wrong, and a runner that throws here would only report again.
   return c.json(result)
+})
+
+/**
+ * The publisher's write: the branch and draft pull request that now exist for a run whose
+ * patch was published (ADR-0005, §4.4).
+ *
+ * A second call rather than two more fields on the report, because the pull request does
+ * not exist when the report is sent and the report is sent first on purpose. The two
+ * columns have been on this table since it was created with nothing writing them (§9);
+ * this is what writes them.
+ *
+ * Three things are checked, and each of them is a claim a runner should not be able to
+ * make on its own:
+ *
+ *   - the run is recorded as `dispatched`. That is the only outcome that means "there was
+ *     a patch to publish" (§5.2), and it is the control plane that decides it — a gate
+ *     failure derives `dispatched` down to `changes-requested` in `finalizeRun`. A runner
+ *     announcing a pull request for a run this database calls failed is either confused
+ *     or lying, and either way the row must not say the work was published.
+ *   - a `changes` row exists. Nothing to fill in otherwise.
+ *   - that row has no branch yet. Two publishes of one run means something has gone
+ *     wrong upstream, and the first pull request is the one already linked from the run
+ *     page; overwriting it would strand it with nothing pointing at it.
+ *
+ * Not part of `finalizeRun`'s transaction and not claimed the way an outcome is: this
+ * writes two columns of one row that the transaction already created, so there is no
+ * partial state to protect and nothing else racing for it.
+ */
+runsRoutes.post('/:id/published', async (c) => {
+  const { db } = c.var.ctx
+  const body = runPublishedSchema.parse({ ...(await c.req.json()), runId: c.req.param('id') })
+
+  const run = await db.query.runs.findFirst({ where: eq(runs.id, body.runId) })
+  if (!run) return c.json({ error: 'no such run' }, 404)
+  if (run.outcome !== 'dispatched') {
+    return c.json(
+      {
+        error: `run ${body.runId} is recorded as "${run.outcome ?? 'not finished'}", not ` +
+          '"dispatched" — only a run that ended with a publishable patch can have one',
+      },
+      409,
+    )
+  }
+
+  const [updated] = await db
+    .update(changes)
+    .set({ branch: body.branch, prUrl: body.prUrl })
+    .where(and(eq(changes.runId, body.runId), isNull(changes.branch)))
+    .returning()
+
+  if (!updated) {
+    const [existing] = await db.select().from(changes).where(eq(changes.runId, body.runId))
+    return existing
+      ? c.json({ error: `run ${body.runId} is already published as ${existing.branch}` }, 409)
+      : c.json({ error: `run ${body.runId} recorded no change to publish` }, 404)
+  }
+  return c.json({ ok: true, change: updated })
 })
 
 runsRoutes.get('/', async (c) => {
@@ -270,9 +328,10 @@ runsRoutes.get('/:id', async (c) => {
       })),
       /**
        * What a modifier did to the tree: base sha, files changed, and a pointer to the
-       * patch when there is one. `branch` and `prUrl` stay null until the host-side
-       * publisher exists — the runner cannot know either, and a row here is a record of
-       * work done, not a claim that it was published (§4.4).
+       * patch when there is one. `branch` and `prUrl` are filled in by the host-side
+       * publisher afterwards, and stay null when it refused — a row here is a record of
+       * work done, not a claim that it was published (§4.4). Which of the two you are
+       * looking at is exactly whether `branch` is set.
        */
       changes: change,
     },

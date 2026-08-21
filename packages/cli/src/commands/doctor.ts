@@ -92,6 +92,7 @@ export async function doctor(serverUrl: string): Promise<void> {
   checks.push(await binary('docker', ['--version'], false))
   checks.push(await binary(process.env.OGUN_CLAUDE_BIN ?? 'claude', ['--version'], false))
   checks.push(await binary('codex', ['--version'], false))
+  checks.push(await publishing())
 
   const home = homedir()
   checks.push({
@@ -207,6 +208,43 @@ const derivedLabels = (checks: Check[]): Set<string> => {
     if (checks.find((c) => c.name === name)?.ok) out.add(label)
   }
   return out
+}
+
+/**
+ * Whether this machine could open a pull request, which is a separate question from
+ * whether it can run a job.
+ *
+ * Not fatal on purpose: a runner that only ever runs reviewers has no use for `gh`, and
+ * making it fatal would stop such a machine claiming anything. But the alternative to
+ * saying it here is finding out at the end of a modifier run — the container has exited,
+ * the suite has passed, the patch is extracted and proved, and the last step of the whole
+ * pipeline fails on a missing binary (ADR-0009). That is the most expensive possible
+ * moment to learn it.
+ *
+ * Presence is checked separately from authorization because they are different problems
+ * with different fixes, and `gh --version` succeeds happily for a `gh` that has never been
+ * logged in.
+ */
+async function publishing(): Promise<Check> {
+  const present = await tryRun('gh', ['--version'])
+  if (present.code !== 0) {
+    return {
+      name: 'gh',
+      ok: false,
+      detail: 'not found on PATH — a modifier could produce a patch but not publish it',
+      fatal: false,
+    }
+  }
+  const auth = await tryRun('gh', ['auth', 'status'])
+  return {
+    name: 'gh',
+    ok: auth.code === 0,
+    detail:
+      auth.code === 0
+        ? present.out.split('\n')[0]!.trim()
+        : 'installed but not logged in — `gh auth login`',
+    fatal: false,
+  }
 }
 
 async function binary(name: string, args: string[], fatal: boolean): Promise<Check> {

@@ -142,6 +142,27 @@ export const runReportSchema = z.object({
 })
 export type RunReport = z.infer<typeof runReportSchema>
 
+/**
+ * The second write about a modifier run, and the only one the runner makes after its
+ * report: the branch that now exists on the remote and the draft pull request opened for
+ * it (ADR-0005).
+ *
+ * Separate from `runReportSchema` rather than folded into it, because the two facts are
+ * established at different times and one of them can fail on its own. The report is what
+ * the run did; publishing is what the host managed to do with it afterwards, and a report
+ * that carried an empty `branch` would be indistinguishable from a report sent before the
+ * publisher existed. Filling the columns in a second call means a run whose publish was
+ * refused, or whose push failed, keeps a `changes` row with a null `branch` — which reads
+ * as "this work exists and is not published", and is exactly the state a retry starts from.
+ */
+export const runPublishedSchema = z.object({
+  runId: z.string(),
+  /** Fully qualified is not wanted here; this is the short name, e.g. `ogun/fixer/3f2a`. */
+  branch: z.string().min(1),
+  prUrl: z.string().min(1),
+})
+export type RunPublished = z.infer<typeof runPublishedSchema>
+
 export const triggerRunSchema = z.object({
   projectSlug: z.string().min(1),
   worker: z.string().min(1),

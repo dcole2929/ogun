@@ -25,11 +25,13 @@ That makes the rule structural rather than policed. There is no credential to mi
 no remote to push to, so an agent that decides to publish cannot, and no prompt has to ask
 it not to.
 
-The two halves are not equally built. The container half is: workspace materialization
+Both halves are built now. [updated] The container half is: workspace materialization
 strips the remote, the image carries no `gh` and no token, and the entrypoint drops
-`origin` again in case a repository committed one. The runner and host halves — patch
-extraction, branch, draft PR — are phase 3 and do not exist yet. What this ADR settles is
-that when they are built they live host-side.
+`origin` again in case a repository committed one. The host half is: extraction writes a
+`git format-patch` mbox to the runner's disk, and the publisher applies it to a scratch
+worktree, pushes a branch and opens a draft pull request — in the runner process, with the
+credential behind one interface (ADR-0009). What this ADR settled before either existed is
+that they live host-side, and they do.
 
 ## Considered Options
 
@@ -70,12 +72,19 @@ that when they are built they live host-side.
   practical"; that sentence is marked `[corrected]` there now. A finding that the profiles
   are not enforced is a real finding and must not be discarded against this ADR.
 - The publisher becomes a host-side pipeline step, which is where the PR cap and the
-  diff-size limit go. [updated] The *extraction* half is built: a modifier's work leaves
-  the container as a `git format-patch` mbox on the runner's disk, with an `artifacts` row
-  and a `changes` row. The publishing half — apply, push, open a draft PR — is not, and it
-  runs **on the runner**, which is the only machine that has both a checkout and a GitHub
-  credential. That places a credential on the runner *host*; this ADR's rule is about the
-  *container*, and the container still has neither credential nor remote.
+  diff-size limit go. [updated] Both halves are built. A modifier's work leaves the
+  container as a `git format-patch` mbox on the runner's disk with an `artifacts` row and a
+  `changes` row; the publisher then applies it, pushes, and opens a draft pull request, and
+  it runs **on the runner** — the only machine with both a checkout and a GitHub credential
+  (ADR-0009). The diff-size limit landed at extraction as `MAX_PATCH_BYTES` rather than at
+  publish: a patch over it never becomes an artefact, so there is nothing for a later gate
+  to reject. The PR cap is `policies.maxOpenPullRequests`, applied at publish.
+
+  That places a credential on the runner *host*; this ADR's rule is about the *container*,
+  and the container still has neither credential nor remote. It is also a person's `gh`
+  credential today, which is the right posture for a runner that is your own machine and
+  the wrong one for a runner that is not — ADR-0009 names that as the condition for a
+  repo-scoped installation token, and it is not built.
 - Egress cannot be `none` for an agent run — the runtime itself calls `api.anthropic.com`
   or OpenAI's endpoint, so a reviewer container cannot be an airgap.
 - **The per-host egress allowlist is not built, and this ADR does not say it should not

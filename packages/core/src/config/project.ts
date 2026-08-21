@@ -81,6 +81,25 @@ export const policiesSchema = z.object({
   maxConcurrentModifiers: z.number().int().nonnegative().default(1),
   /** Consecutive failures before the breaker opens for a worker (§4.3). */
   failureBreakerThreshold: z.number().int().positive().default(3),
+  /**
+   * The PR cap §4.6 has named as a publisher gate since before there was a publisher.
+   *
+   * It bounds *unreviewed* work, not throughput. A nightly modifier opens pull requests
+   * on a schedule and a person merges them when they get to it, so the two rates are
+   * unrelated and the queue only ever grows in one direction. The failure it prevents is
+   * not a runaway loop — `maxConcurrentModifiers` already stops that — it is waking up to
+   * eleven draft branches nobody has read, at which point the honest thing to do with all
+   * of them is close them, and a night's work is thrown away because it arrived in a pile.
+   *
+   * Three, because the number wants to be small enough that exceeding it is a fact you
+   * notice rather than a limit you eventually raise. Counted against what is open on the
+   * remote right now (ADR-0004), so merging or closing one immediately makes room.
+   *
+   * Zero is a valid and useful value: it stops publishing without stopping modifiers, so
+   * a run still produces a patch, a `changes` row, and a diff to read — which is what you
+   * want while you are still deciding whether to trust this worker at all.
+   */
+  maxOpenPullRequests: z.number().int().nonnegative().default(3),
 })
 export type Policies = z.infer<typeof policiesSchema>
 
@@ -123,4 +142,31 @@ export function readTestCommand(yamlText: string): string | undefined {
   }
   const parsed = z.object({ tests: testsSchema.optional() }).safeParse(raw)
   return parsed.success ? parsed.data.tests?.command : undefined
+}
+
+/**
+ * The policies out of a `config.yaml`, from text, on the same terms as `readTestCommand`
+ * and for the same reason.
+ *
+ * The publisher reads this from the blob at the commit the workspace was pinned to, not
+ * from the file on disk: the modifier had write access to that tree, and a line raising
+ * `maxOpenPullRequests` to 999 is one edit away. A gate a patch can set is not a gate. The
+ * blob at the pinned base is the copy a person reviewed and merged, and it is the only one
+ * the agent could not reach.
+ *
+ * Absent `policies:` is not a failure — it means the defaults, which is what most repos
+ * want and what `ogun init` writes. Every other failure returns `undefined`, and the one
+ * caller treats `undefined` as "this project's policy could not be established" and
+ * refuses to publish. So the tolerance can only ever withhold a pull request; it can
+ * never produce one that a readable config would have refused.
+ */
+export function readPolicies(yamlText: string): Policies | undefined {
+  let raw: unknown
+  try {
+    raw = parseYaml(yamlText)
+  } catch {
+    return undefined
+  }
+  const parsed = z.object({ policies: policiesSchema.prefault({}) }).safeParse(raw)
+  return parsed.success ? parsed.data.policies : undefined
 }
