@@ -5,7 +5,9 @@ import { connect } from 'node:net'
 import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { Duplex } from 'node:stream'
 import { connect as connectTls } from 'node:tls'
+import type { TLSSocket } from 'node:tls'
 import { loadOrCreateCa } from '../src/ca.ts'
 import type { CredentialSet } from '../src/credentials.ts'
 import { startGateway } from '../src/server.ts'
@@ -114,6 +116,84 @@ export async function startHarness(options: {
       for (const dir of temporaryDirectories.splice(0)) rmSync(dir, { recursive: true, force: true })
     },
   }
+}
+
+/**
+ * A client that does not wait for `200 Connection Established` before starting TLS.
+ *
+ * The ordinary client above sends CONNECT, reads the status line, and only then begins the
+ * handshake — which means Node's `'connect'` event hands the gateway an empty `head`, and
+ * every mistake in how `head` is replayed is invisible. This one puts the CONNECT request
+ * and the ClientHello in a single write, so `head` carries real ciphertext.
+ *
+ * Built out of a `Duplex` that fronts the socket, because there is no way to make
+ * `tls.connect` hold its ClientHello: the bridge is what lets the first chunk it writes be
+ * concatenated onto the CONNECT line rather than following it.
+ */
+export function pipelinedTunnel(
+  harness: Harness,
+  options: { token: string; hostname: string },
+): Promise<TLSSocket> {
+  const { host, port } = harness.gateway.address
+  const authority = `${options.hostname}:443`
+  const connectRequest =
+    `CONNECT ${authority} HTTP/1.1\r\n` +
+    `Host: ${authority}\r\n` +
+    `Proxy-Authorization: Basic ${Buffer.from(`x:${options.token}`).toString('base64')}\r\n` +
+    '\r\n'
+
+  return new Promise<TLSSocket>((resolve, reject) => {
+    const wire = connect(port, host)
+    wire.on('error', reject)
+
+    let sentConnect = false
+    let statusSeen = false
+    let preamble = Buffer.alloc(0)
+
+    const bridge = new Duplex({
+      read() {},
+      write(chunk: Buffer, _encoding, callback) {
+        if (!sentConnect) {
+          sentConnect = true
+          // The one line this helper exists for: one TCP write, so the gateway's HTTP
+          // parser finds the ClientHello sitting behind the CONNECT request.
+          wire.write(Buffer.concat([Buffer.from(connectRequest, 'ascii'), chunk]))
+        } else {
+          wire.write(chunk)
+        }
+        callback()
+      },
+    })
+
+    wire.on('data', (chunk: Buffer) => {
+      if (statusSeen) {
+        bridge.push(chunk)
+        return
+      }
+      preamble = Buffer.concat([preamble, chunk])
+      const end = preamble.indexOf('\r\n\r\n')
+      if (end === -1) return
+      statusSeen = true
+      const status = Number(preamble.subarray(0, end).toString('utf8').split(' ')[1])
+      if (status !== 200) {
+        wire.destroy()
+        reject(new Error(`CONNECT answered ${status}`))
+        return
+      }
+      const rest = preamble.subarray(end + 4)
+      if (rest.length > 0) bridge.push(rest)
+    })
+
+    const tls = connectTls({
+      socket: bridge,
+      ca: harness.sandboxCa,
+      servername: options.hostname,
+      ALPNProtocols: ['http/1.1'],
+      rejectUnauthorized: true,
+    })
+    tls.on('error', reject)
+    tls.once('secureConnect', () => resolve(tls))
+  })
 }
 
 export type ProxyResponse = {

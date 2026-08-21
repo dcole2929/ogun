@@ -1,7 +1,8 @@
 import { strict as assert } from 'node:assert'
 import { after, test } from 'node:test'
 import { PLACEHOLDER } from '../src/stubs.ts'
-import { requestThroughProxy, startHarness } from './harness.ts'
+import { request } from 'node:https'
+import { pipelinedTunnel, requestThroughProxy, startHarness } from './harness.ts'
 import type { Harness } from './harness.ts'
 
 /**
@@ -152,6 +153,48 @@ test('a streamed response is relayed as it arrives, not collected first', async 
     firstByteAt > 0 && firstByteAt - started < 140,
     'the upstream saw the request before the response finished',
   )
+})
+
+/**
+ * A client that starts its TLS handshake without waiting for `200 Connection Established`.
+ *
+ * Node's `'connect'` event hands the proxy a `head` buffer holding whatever arrived after
+ * the CONNECT request line — for such a client, the first bytes of the ClientHello, still
+ * encrypted. They have to be replayed onto the *raw socket*, before TLS wraps it. Putting
+ * them back with `tlsSocket.unshift()` instead injects ciphertext into the decrypted side,
+ * where it reads as a mangled HTTP request or as nothing at all.
+ *
+ * This was written the wrong way here first, and every other test in this file passed:
+ * a client that waits for the 200 leaves `head` empty, so the whole class of mistake is
+ * invisible unless a test deliberately pipelines.
+ */
+test('a client that pipelines its ClientHello behind the CONNECT still connects', async () => {
+  const harness = await anthropic()
+  const session = harness.gateway.open()
+
+  const tls = await pipelinedTunnel(harness, {
+    token: session.token,
+    hostname: 'api.anthropic.com',
+  })
+
+  const status = await new Promise<number | undefined>((resolve, reject) => {
+    const req = request({
+      createConnection: () => tls,
+      host: 'api.anthropic.com',
+      path: '/v1/messages',
+      headers: { host: 'api.anthropic.com' },
+    })
+    req.on('error', reject)
+    req.on('response', (res) => {
+      res.resume()
+      res.on('end', () => resolve(res.statusCode))
+    })
+    req.end()
+  })
+  tls.destroy()
+
+  assert.equal(status, 200)
+  assert.equal(harness.upstream.received.at(-1)?.headers.authorization, 'Bearer sk-ant-oat01-REAL')
 })
 
 test('a host that is not on the allowlist never gets a tunnel', async () => {

@@ -183,6 +183,19 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
      * server falls back to a default certificate with the wrong name. The CONNECT
      * authority is always present and is the name the client is going to verify against.
      */
+    /**
+     * Bytes the client sent immediately after the CONNECT line, back onto the socket
+     * *before* TLS wraps it.
+     *
+     * `head` is the start of the ClientHello from a client that did not wait for the 200 —
+     * still encrypted, still the TLS layer's input. Replaying it into the `TLSSocket`
+     * instead injects ciphertext into the plaintext side, where it is read as a mangled
+     * HTTP request or as nothing at all. The bug hides completely in testing, because most
+     * clients do wait for the 200 and `head` is then empty: it only appears against a
+     * pipelining client, as a handshake that stalls or a first request that is garbage.
+     */
+    if (head.length > 0) socket.unshift(head)
+
     const leaf = ca.leafFor(authority.hostname)
     const tls = new TLSSocket(socket, {
       isServer: true,
@@ -197,7 +210,6 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
     tls.once('secure', () => clearTimeout(handshakeTimer))
     handshakeTimer.unref()
 
-    if (head.length > 0) tls.unshift(head)
     intercepted.emit('connection', tls)
   })
 
