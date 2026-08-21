@@ -70,8 +70,9 @@ WSL2 host — always-on-ish, systemd
 │     │     NO ssh key, NO gh token, NO network to GitHub
 │     └── runtime: claude | codex  (presets over a cli spec)
 │
-└── publisher (host-side)
-      patch → scratch worktree → branch → gh pr create --draft
+└── publisher (in the runner process, host-side)
+      patch → scratch worktree → git am → push → gh pr create --draft
+      credential behind one interface; `gh` today (ADR-0009)
 ```
 
 **Why HTTP on one host.** The runner speaks HTTP to the server even though they're
@@ -315,6 +316,18 @@ host:       apply to scratch worktree → push branch → gh pr create --draft
 This collapses the "Publisher" permission profile — publishing becomes a host-side
 pipeline step with its own gates (tests green, diff under N lines, PR cap not
 exceeded) rather than an agent capability.
+
+**Built, and it runs in the runner process.** [settled — ADR-0009] The step is
+`packages/runner/src/publish.ts`, the mirror of `patch.ts`, triggered automatically once a
+job finalizes — and *after* the report, so a publish that fails halfway leaves a `changes`
+row with a null `branch` rather than a live pull request the database has never heard of.
+Its gates are the run's recorded outcome being `dispatched`, `changes.tests_passed` being
+true rather than merely not-false, and `policies.maxOpenPullRequests` counted live against
+open pull requests under the `ogun/` branch prefix. The credential reaches it through one
+two-method interface with one implementation (`git` + `gh`); a repo-scoped GitHub App
+installation token is the second, and its condition is a runner that is not your own
+machine. The diff-size limit named above is applied at *extraction* as `MAX_PATCH_BYTES`
+rather than at publish, since a patch over it never becomes an artefact at all.
 
 Permission profiles still exist for what the agent may do *inside* the sandbox:
 `observer` (read), `reviewer` (read + run tests/scanners, emit findings), `modifier`
@@ -591,6 +604,7 @@ policies:
   directPush: false
   allowSandboxDowngrade: false
   maxConcurrentModifiers: 1
+  maxOpenPullRequests: 3   # the publisher's cap, counted live on the remote
 ```
 
 ### 4.10 Verification
@@ -785,7 +799,9 @@ picture, and "three of four reviewers ran" is not derivable from findings alone.
 
 ### 4.13 Integrations
 
-- **GitHub** — clone, branch, push, draft PR. Host-side only.
+- **GitHub** — clone, branch, push, draft PR. Host-side only, in the runner process,
+  behind one interface that is the only thing holding a credential (ADR-0009). `gh` is the
+  one implementation; the PR cap is a live `gh pr list` and is written down nowhere.
 - **Linear** — poll every N minutes with a *deterministic* filter (status, label,
   not-blocked) before any AI sees a ticket. Sources emit jobs; they are not workers.
 
@@ -1058,6 +1074,21 @@ text, survives binaries and renames, and `git am` applies it.
 2. **Stage it** — `git apply` leaves changes unstaged, with the same consequence as above.
 3. Write any extra files.
 
+The publisher does neither 2 nor 3, and that is not an omission. [added] It applies with
+`git am` rather than `git apply`, into a **detached scratch worktree of the project's own
+checkout** rather than into a workspace — so the commits, their messages and their
+authorship arrive intact and there is nothing left unstaged to stage. The list above is the
+retry loop's shape; the publisher's is:
+
+1. `git worktree add --detach <scratch> <base>` — never the live working tree, so a
+   publish landing mid-edit stages, stashes and checks out nothing under you.
+2. `git am` the mbox, under the same hardening every other git call in agent-touched
+   content gets, with a fixed committer identity so the branch does not look like you
+   wrote it.
+3. Push `HEAD:refs/heads/<branch>` — fully qualified, no local branch created, no rebase
+   onto a moved default branch.
+4. Open the pull request as a draft, then remove the worktree whatever happened.
+
 There is deliberately no "reset the workspace to base ref" step. [corrected] It used to
 lead this list, and it contradicts §5.2's settled rule that the workspace is provisioned
 once and every retry reuses it, with the previous attempt's changes still present. Both
@@ -1110,6 +1141,8 @@ findings            id, project_id, worker_id, fingerprint, path, snippet,
 changes             id, run_id, branch, base_sha, patch_ref, files_changed,
                     tests_run, tests_passed, pr_url
                     -- artifact record only; PR lifecycle state lives in GitHub
+                    -- branch/pr_url are the publisher's, written after the report
+                    -- and null when it refused: work that exists, unpublished
 coverage            id, cycle_run_id, worker_id, selected, ran, outcome, reason
 artifacts           id, run_id, kind, ref
                     -- kind=transcript|patch|adr-draft; large blobs on disk, never inlined
@@ -1225,9 +1258,25 @@ run does is read off the graph rather than declared on the worker.
 Remaining: re-adjudication, which is what stops a reviewer re-flagging what you already
 dismissed.
 
-**Phase 3 — the write path.** Modifier workers, retry loop on the existing verify
-gate, modifier-profile lenses, patch → branch → draft PR pipeline, tests-must-pass
-gate, PR cap. Arbitrary user-defined graphs if they turn out to be wanted.
+**Phase 3 — the write path.** In progress.
+
+Done: modifier workers with a project image that can run the project's own suite; the
+tests-must-pass gate, read from the blob at the pinned base so a modifier cannot set its
+own; patch extraction as a `git format-patch` mbox, with the `changes` and `artifacts`
+rows to point at it; and the publisher — patch → scratch worktree → branch → draft PR —
+running in the runner process, after the report, behind a one-interface credential seam,
+with the PR cap as `policies.maxOpenPullRequests` (ADR-0009). Modifiers can also report
+what they noticed, as ordinary findings.
+
+Remaining: the retry loop on the existing verify gate, and modifier-profile lenses. The
+`for round` shape in the runner still runs exactly once, which is what makes the first of
+those an unwrapping rather than a rewrite. Arbitrary user-defined graphs if they turn out
+to be wanted.
+
+Two limits worth knowing rather than discovering: a runner with no local checkout of a
+project produces a patch it cannot publish, and nothing prunes `scratch/patches/` — the
+patch is also an artefact the run page serves, so the publisher deliberately does not
+delete what it consumed.
 
 **Phase 4 — Linear.** Deterministic ticket filtering, scope evaluator, ticket →
 plan → implement → review → draft PR.

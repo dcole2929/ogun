@@ -196,6 +196,11 @@ What this machine can actually run: git, Docker, the two agent runtimes and thei
 credential directories, whether the control plane answers, whether this machine has
 joined, whether `ogun/base` is built, and which registered checkouts are still there.
 
+`gh` is checked too — present *and* logged in, which are different problems with different
+fixes. It is a warning rather than a failure, because a machine that only runs reviewers
+never needs it; but without it a modifier gets all the way to a proved patch and then
+cannot open the pull request, which is the most expensive moment to find out.
+
 Run it on the machine in question — the toolchain and the map of local checkouts are
 per-machine, so this is the only honest place to ask. It exits non-zero when something
 blocking is wrong, so it works as a check in a script.

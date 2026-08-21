@@ -135,6 +135,22 @@ export const GIT_ENV = {
 }
 
 /**
+ * Identity for commits the runner makes on an agent's behalf, on both halves of the
+ * crossing: the sweep-up commit extraction writes for work the agent left uncommitted,
+ * and the committer `git am` stamps when the publisher replays that patch.
+ *
+ * Constant rather than the host user's git identity, and the reason is sharper on the
+ * publishing side: a branch whose commits are committed by *you* is a branch that looks
+ * like you wrote it. A person reading `git log` on a draft PR should be able to tell at a
+ * glance which commits an agent authored and which the harness stamped, and that must not
+ * depend on whose machine the runner happens to be.
+ *
+ * It also has to be spelled out because `GIT_ENV` blanks the global config: with no
+ * `user.email` anywhere, `git am` refuses to run at all.
+ */
+export const RUNNER_IDENTITY = ['-c', 'user.name=ogun', '-c', 'user.email=ogun@localhost']
+
+/**
  * Every git call the runner makes inside a workspace goes through this.
  *
  * `tolerateExit` is for the predicates — `diff --quiet` and `merge-base --is-ancestor`

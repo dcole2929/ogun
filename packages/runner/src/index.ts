@@ -1,5 +1,6 @@
 export { ControlPlane, EventFlusher } from './client.ts'
 export { executeJob, OUTPUT_PATH } from './pipeline.ts'
+export * from './publish.ts'
 export * from './runtimes/index.ts'
 export * from './sandbox/index.ts'
 export * from './skills.ts'
