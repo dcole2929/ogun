@@ -25,22 +25,55 @@ export const STAMP_LABEL = 'dev.ogun.sandbox-stamp'
  */
 export async function sandboxStamp(): Promise<string> {
   const root = await ogunRoot()
-  const base = join(root, 'images', 'base')
-  const sources = [
-    join(base, 'Dockerfile'),
-    join(base, 'entrypoint.sh'),
-    ...(await tsFilesUnder(join(root, 'packages', 'cli', 'src'))),
-    ...(await tsFilesUnder(join(root, 'packages', 'core', 'src'))),
-  ].sort()
-
   const hash = createHash('sha256')
-  for (const file of sources) {
+  for (const file of await stampSources()) {
     // The path as well as the body: a file moved without being edited still changes what
     // the bundle resolves.
     hash.update(file.slice(root.length))
     hash.update(await readFile(file).catch(() => Buffer.alloc(0)))
   }
   return hash.digest('hex').slice(0, 16)
+}
+
+/**
+ * Every file whose contents decide what ends up in the image.
+ *
+ * Separate from `sandboxStamp` so the list itself can be asserted on: what is *missing*
+ * from it is invisible in the digest, and a file dropped from here silently stops the
+ * staleness check noticing that file's changes — which is the failure the stamp exists to
+ * prevent, one level up.
+ */
+export async function stampSources(): Promise<string[]> {
+  const root = await ogunRoot()
+  const base = join(root, 'images', 'base')
+  return [
+    join(base, 'Dockerfile'),
+    join(base, 'entrypoint.sh'),
+    // The Dockerfile no longer names a Node version — it takes one as a build arg, read
+    // from here. Without this the file that decides what Node the image runs would sit
+    // outside the hash, and bumping the pin would leave the image looking current while
+    // running the version before it.
+    join(root, '.tool-versions'),
+    ...(await tsFilesUnder(join(root, 'packages', 'cli', 'src'))),
+    ...(await tsFilesUnder(join(root, 'packages', 'core', 'src'))),
+  ].sort()
+}
+
+/**
+ * The Node version this checkout pins, as `.tool-versions` states it.
+ *
+ * The sandbox image used to hardcode `node:24`, inherited from the sandbox it was derived
+ * from, while the host ran the pinned 26.4.0. Nothing was broken by it — type stripping
+ * works on both — but "the suite passes on the version the agent will actually run" was
+ * being asserted about a different Node than the one under test. One source of truth
+ * removes the question rather than answering it again each time the pin moves.
+ */
+export async function pinnedNodeVersion(): Promise<string> {
+  const root = await ogunRoot()
+  const body = await readFile(join(root, '.tool-versions'), 'utf8').catch(() => '')
+  const version = /^nodejs[ \t]+(\S+)/m.exec(body)?.[1]
+  if (!version) throw new Error(`no nodejs line in ${join(root, '.tool-versions')}`)
+  return version
 }
 
 async function tsFilesUnder(dir: string): Promise<string[]> {

@@ -3,7 +3,7 @@ import { fileURLToPath } from 'node:url'
 import { mkdir } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { existsSync } from 'node:fs'
-import { sandboxStamp, STAMP_LABEL } from '@ogun/core'
+import { pinnedNodeVersion, sandboxStamp, STAMP_LABEL } from '@ogun/core'
 import { bold, dim, fail, green } from '../output.ts'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -39,11 +39,19 @@ export async function imageBuild(args: string[]): Promise<void> {
    * toolchain, and the base is where the CLI lives.
    */
   const stamp = project ? undefined : await sandboxStamp()
+  /**
+   * The base image's Node comes from `.tool-versions`, passed in rather than written into
+   * the Dockerfile, so the container runs the version the suite is tested against. A
+   * project image inherits it by being `FROM ogun/base` and neither needs nor accepts the
+   * arg — docker warns about build args a Dockerfile never declares.
+   */
+  const node = project ? undefined : await pinnedNodeVersion()
   const code = await runDocker([
     'build',
     '-t',
     tag,
     ...(stamp ? ['--label', `${STAMP_LABEL}=${stamp}`] : []),
+    ...(node ? ['--build-arg', `NODE_VERSION=${node}`] : []),
     '-f',
     dockerfile,
     context,
@@ -65,7 +73,9 @@ async function bundleCli(): Promise<void> {
     entryPoints: [join(repoRoot, 'packages', 'cli', 'src', 'main.ts')],
     bundle: true,
     platform: 'node',
-    target: 'node24',
+    // The runtime the bundle will actually meet, which is the image's Node, which is the
+    // pin. Hardcoding a target here was the other half of the same drift.
+    target: `node${(await pinnedNodeVersion()).split('.')[0]}`,
     format: 'esm',
     outfile: out,
     /**

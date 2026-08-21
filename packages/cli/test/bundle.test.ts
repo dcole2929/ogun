@@ -29,11 +29,14 @@ const EXTERNAL = ['drizzle-orm', 'postgres', '@ogun/core/db']
  */
 test('the sandbox bundle imports nothing it will not find in the image', async () => {
   const { build } = await import('esbuild')
+  const { pinnedNodeVersion } = await import('@ogun/core')
   const result = await build({
     entryPoints: [resolve(repoRoot, 'packages/cli/src/main.ts')],
     bundle: true,
     platform: 'node',
-    target: 'node24',
+    // Derived from the pin for the same reason `bundleCli` derives it: the target is the
+    // Node in the image, and the image's Node is `.tool-versions`.
+    target: `node${(await pinnedNodeVersion()).split('.')[0]}`,
     format: 'esm',
     write: false,
     external: EXTERNAL,

@@ -46,3 +46,51 @@ test('a file that moves changes the stamp even with identical contents', async (
     'moving a file must change the stamp — the bundle resolves it differently',
   )
 })
+
+/**
+ * The image used to say `FROM node:24-bookworm-slim` while `.tool-versions` pinned 26.4.0
+ * for the host. Nothing failed — type stripping works on both — but every "the suite
+ * passes" claim about a modifier's patch was made about a different Node than the one the
+ * agent would run under. The version now lives in one file and reaches the image as a
+ * build arg, and these are the two ways that can quietly come apart again.
+ */
+test('the base Dockerfile names no Node version of its own', async () => {
+  const { readFile } = await import('node:fs/promises')
+  const { fileURLToPath } = await import('node:url')
+  const { dirname, resolve } = await import('node:path')
+  const root = resolve(dirname(fileURLToPath(import.meta.url)), '../../..')
+  const dockerfile = await readFile(join(root, 'images', 'base', 'Dockerfile'), 'utf8')
+
+  const from = /^FROM\s+(\S+)/m.exec(dockerfile)?.[1]
+  assert.equal(
+    from,
+    'node:${NODE_VERSION}-bookworm-slim',
+    'a literal version here is a second place to write the pin down',
+  )
+  assert.match(dockerfile, /^ARG NODE_VERSION$/m, 'and it must be declared to be usable in FROM')
+  assert.doesNotMatch(
+    dockerfile,
+    /^ARG NODE_VERSION=/m,
+    'a default is that second place wearing a disguise — it applies silently when the arg is not passed',
+  )
+})
+
+test('the pinned version is read from .tool-versions', async () => {
+  const { pinnedNodeVersion } = await import('../src/image.ts')
+  assert.match(await pinnedNodeVersion(), /^\d+\.\d+\.\d+$/)
+})
+
+/**
+ * A file dropped from the source list is invisible in the digest: the stamp keeps
+ * matching while the thing it describes has changed. `.tool-versions` is the one most
+ * easily forgotten, because it does not live under images/.
+ */
+test('the stamp covers the file that decides the image Node', async () => {
+  const { stampSources } = await import('../src/image.ts')
+  const sources = await stampSources()
+  assert.ok(
+    sources.some((f) => f.endsWith('/.tool-versions')),
+    'bumping the pin must make the installed image read as stale',
+  )
+  assert.ok(sources.some((f) => f.endsWith('/images/base/Dockerfile')))
+})

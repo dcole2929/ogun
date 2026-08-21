@@ -1,3 +1,7 @@
+# check=skip=InvalidDefaultArgInFrom
+# ^ that check wants `ARG NODE_VERSION=<something>`. Giving it one is exactly the second
+#   place to write the pin that the arg exists to avoid — see the comment above FROM.
+
 # ogun/base — the substrate every reviewer runs in.
 #
 # Derived from ~/dev/claude-sandbox's base image, with a changed posture. That one is a
@@ -14,7 +18,14 @@
 #     so a container cannot corrupt the host's credential files.
 #   - no git remote in the workspace. The never-pushes rule is structural rather than
 #     policed: there is nothing to push with.
-FROM node:24-bookworm-slim
+
+# The Node the repo pins, not a version chosen here. `.tool-versions` is the single
+# source of truth and `ogun image build` passes it in; there is deliberately no default,
+# because a default is a second place to write the version down and the two drift. A bare
+# `docker build` without the arg fails on an unparseable tag rather than quietly building
+# a Node the suite was never run against.
+ARG NODE_VERSION
+FROM node:${NODE_VERSION}-bookworm-slim
 
 # Tools an agent actually reaches for while reading a codebase. Deliberately not a
 # full build-essential toolchain — a *project* image adds what its own suite needs.
