@@ -142,6 +142,10 @@ test('a codex chatgpt session is read with its account id', () => {
  * own `claude` refreshes. That makes an expired token a real, recoverable state whose only
  * other symptom is a 401 buried in a 3am transcript, so `doctor` has to name it and say
  * what fixes it.
+ *
+ * The shape of the answer — the five states a caller may not collapse, and the boundaries
+ * between them — is in `expiry.test.ts`. This one stays on the prose, which is what a
+ * person at 3am actually reads.
  */
 test('doctor is told how long a token has left, and what to do when it has none', () => {
   const now = Date.UTC(2026, 0, 1)
@@ -150,7 +154,7 @@ test('doctor is told how long a token has left, and what to do when it has none'
     now,
   )
   assert.match(expired[0]!.detail, /EXPIRED 6h ago/)
-  assert.match(expired[0]!.detail, /run `claude` once on this host/)
+  assert.match(expired[0]!.detail, /run `claude` on this host/)
 
   const fresh = credentialStatuses(
     { anthropic: { provider: 'anthropic', mode: 'oauth', accessToken: 'x', expiresAt: now + 2 * 36e5 } },

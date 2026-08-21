@@ -201,6 +201,14 @@ fixes. It is a warning rather than a failure, because a machine that only runs r
 never needs it; but without it a modifier gets all the way to a proved patch and then
 cannot open the pull request, which is the most expensive moment to find out.
 
+The gateway's credentials are checked the same way, and **presence is not the question**:
+an expired OAuth token is present, parses, and has a token in it. A credential is `ok`
+only while it outlives the next hour — the longest job this machine is likely to be handed
+plus the queue wait — so "expires in 42 minutes" is a warning, and expired is a warning
+that says how long ago and what to type. Never fatal: a dead Anthropic token does not stop
+this box running its codex workers. On a runner nobody logs into, the fix that lasts is an
+API key, which does not expire (`docs/setup.md`).
+
 Run it on the machine in question — the toolchain and the map of local checkouts are
 per-machine, so this is the only honest place to ask. It exits non-zero when something
 blocking is wrong, so it works as a check in a script.
@@ -218,6 +226,8 @@ claims the job.
 
 Admission can still refuse a job, in which case it is reported here as `skipped` and
 recorded in the coverage ledger rather than silently dropped — `ogun coverage` says why.
+A lapsed credential is one of those refusals, and it comes back within the second with the
+fix in it, rather than after a container has started and 401'd three minutes later.
 
 ---
 

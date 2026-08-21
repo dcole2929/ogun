@@ -28,13 +28,21 @@ export {
 export type { CaState, CertificateAuthority, Leaf } from './ca.ts'
 
 export {
+  credentialExpiry,
+  credentialHealth,
+  credentialOutlook,
   credentialReader,
   credentialStatuses,
   defaultCredentialPaths,
+  DOCTOR_EXPIRY_HORIZON_MS,
+  humanDuration,
   readCredentials,
 } from './credentials.ts'
 export type {
   Credential,
+  CredentialExpiry,
+  CredentialHealth,
+  CredentialOutlook,
   CredentialPaths,
   CredentialSet,
   CredentialStatus,

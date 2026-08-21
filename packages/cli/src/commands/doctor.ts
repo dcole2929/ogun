@@ -124,13 +124,22 @@ export function gatewayCa(): Check {
  * does not refresh, it re-reads the file the host's own `claude` refreshes. Saying
  * "expired 6h ago" here is the difference between a two-minute fix and an evening.
  *
+ * `present` is not the question. A token that is on disk and dead is *present*, and the
+ * first version of this check reported it `ok` — the exact machine this preflight exists
+ * for, an unattended runner whose token lapsed weeks ago, got a green line. So the check
+ * degrades on the classification rather than on presence, and a token inside the next
+ * hour is a warning too: `doctor` is run before the night, and a token with forty minutes
+ * left will not survive the job it is being checked for.
+ *
  * Warnings, never fatal. A machine with no OpenAI credential simply cannot run codex
- * workers, which is a normal way to be configured rather than a broken one.
+ * workers, which is a normal way to be configured rather than a broken one — and an
+ * expired Anthropic token does not stop this box running the codex ones, so exiting 1
+ * with "this runner cannot claim jobs" would be false.
  */
-export function gatewayCredentials(): Check[] {
-  return credentialStatuses(readCredentials()).map((status) => ({
+export function gatewayCredentials(statuses = credentialStatuses(readCredentials())): Check[] {
+  return statuses.map((status) => ({
     name: `gateway ${status.provider}`,
-    ok: status.present,
+    ok: status.present && status.health.state !== 'expired' && status.health.state !== 'expiring',
     detail: status.detail,
     fatal: false,
   }))
