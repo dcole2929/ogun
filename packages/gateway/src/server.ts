@@ -96,7 +96,7 @@ export type Gateway = {
    * loopback address, because `HTTPS_PROXY` has no syntax for a socket path. Omitted, the
    * bound TCP address is used.
    */
-  open: (containerAuthority?: string) => GatewaySession
+  open: (containerAuthority?: string, allow?: readonly string[]) => GatewaySession
   close: () => Promise<void>
 }
 
@@ -125,7 +125,17 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
   const dial = options.dial ?? {}
   const warn = options.onWarning ?? ((message: string) => console.error(`[gateway] ${message}`))
 
-  const tokens = new Set<string>()
+  /**
+   * Token → the hosts that token may reach.
+   *
+   * A map rather than a set because the allowlist is a property of the *worker*, not of
+   * the gateway (§4.6): one runner serves every job on the machine, and a reviewer that
+   * declared `egress: [docs.example.com]` must not inherit the reach of a modifier
+   * running beside it. Holding one global list would have quietly widened every worker to
+   * the union of all of them, which is the kind of regression that never fails a test —
+   * it just stops refusing things.
+   */
+  const sessions = new Map<string, readonly string[]>()
 
   /**
    * The intercepted-request handler. One instance, fed sockets from every tunnel.
@@ -156,7 +166,8 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
    * injection, or it is an unauthenticated open relay sitting next to a governed one.
    */
   proxy.on('request', (req, res) => {
-    if (!authorized(req.headers, tokens)) return challenge(res)
+    const allow = sessionAllow(req.headers, sessions)
+    if (!allow) return challenge(res)
     let target: URL
     try {
       target = new URL(req.url ?? '')
@@ -189,7 +200,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
     }
     const port = strictPortOf(target) ?? 443
     if (!isAllowedPort(port)) return refusePort(res, target.hostname, port)
-    if (!isAllowedHost(target.hostname, allowedHosts)) {
+    if (!isAllowedHost(target.hostname, allow)) {
       return refuseHost(res, target.hostname)
     }
     req.url = target.pathname + target.search
@@ -199,7 +210,8 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
   proxy.on('connect', (req, socket: Socket, head: Buffer) => {
     socket.on('error', () => undefined)
 
-    if (!authorized(req.headers, tokens)) {
+    const allow = sessionAllow(req.headers, sessions)
+    if (!allow) {
       // A CONNECT with no valid token is refused rather than tunnelled. Serving it would
       // mean copying bytes to any host the client names, with no allowlist and no
       // injection — an open relay reachable by anything that can open the socket, which is
@@ -219,7 +231,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
       socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n')
       return
     }
-    if (!isAllowedHost(authority.hostname, allowedHosts)) {
+    if (!isAllowedHost(authority.hostname, allow)) {
       socket.end(
         `HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n` +
           `ogun-gateway: ${authority.hostname} is not on the sandbox egress allowlist\r\n`,
@@ -466,7 +478,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
     listening,
     caCertificatePath: ca.certificatePath,
     caCertificatePem: ca.certificatePem,
-    open: (containerAuthority?: string) => {
+    open: (containerAuthority?: string, allow?: readonly string[]) => {
       // A socket has no authority to put in a URL. A caller listening on one and not
       // saying where the container reaches it has not finished wiring the sandbox, and a
       // silently wrong `HTTPS_PROXY` is a container that talks to nothing and says nothing
@@ -492,19 +504,19 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
        * worth defending against on a full-entropy secret that is never partially matched.
        */
       const token = randomBytes(32).toString('base64url')
-      tokens.add(token)
+      sessions.set(token, allow ?? allowedHosts)
       const authority =
         containerAuthority ??
         (listening.kind === 'tcp' ? `${listening.host}:${listening.port}` : '')
       return {
         token,
         proxyUrl: `http://x:${token}@${authority}`,
-        revoke: () => tokens.delete(token),
+        revoke: () => sessions.delete(token),
       }
     },
     close: () =>
       new Promise<void>((resolve) => {
-        tokens.clear()
+        sessions.clear()
         intercepted.close()
         // The socket file goes with it. `server.close()` unlinks it, but only on a clean
         // close — the `rm` at startup is what covers the other path.
@@ -560,9 +572,20 @@ export function proxyToken(headers: IncomingHttpHeaders): string | undefined {
   return candidate.length > 0 ? candidate : undefined
 }
 
-const authorized = (headers: IncomingHttpHeaders, tokens: ReadonlySet<string>): boolean => {
+/**
+ * The hosts the presented token is allowed to reach, or `undefined` for no valid token.
+ *
+ * Returning the allowlist rather than a boolean is deliberate: it makes it impossible to
+ * authenticate against one session and then check the host against something else, which
+ * is exactly the bug the previous global `allowedHosts` would have reintroduced the first
+ * time two workers wanted different reach.
+ */
+const sessionAllow = (
+  headers: IncomingHttpHeaders,
+  sessions: ReadonlyMap<string, readonly string[]>,
+): readonly string[] | undefined => {
   const token = proxyToken(headers)
-  return token !== undefined && tokens.has(token)
+  return token === undefined ? undefined : sessions.get(token)
 }
 
 const challenge = (res: ServerResponse): void => {

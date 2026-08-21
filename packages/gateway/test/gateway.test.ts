@@ -473,6 +473,38 @@ test('a host that is not on the allowlist never gets a tunnel', async () => {
 })
 
 /**
+ * One gateway serves every job on the machine, so the allowlist has to belong to the
+ * session and not to the gateway. It did not: `allowedHosts` was a single list closed over
+ * at startup, and every token was checked against it.
+ *
+ * The failure mode is the quiet kind. Nothing errors — a reviewer that declared a narrow
+ * `egress:` simply inherits the reach of whatever else the runner is running, and the
+ * union only widens as more workers are added. A test that opens one session cannot see
+ * it; it takes two, with the second asserting a refusal for a host the first is allowed.
+ */
+test('one session does not inherit another session\'s reach', async () => {
+  const harness = await anthropic()
+  const permitted = harness.gateway.open(undefined, ['api.anthropic.com'])
+  const restricted = harness.gateway.open(undefined, ['docs.example.com'])
+
+  const allowed = await requestThroughProxy(harness, {
+    token: permitted.token,
+    hostname: 'api.anthropic.com',
+  })
+  assert.equal(allowed.connect, 200, 'the session that declared the host reaches it')
+
+  const refused = await requestThroughProxy(harness, {
+    token: restricted.token,
+    hostname: 'api.anthropic.com',
+  })
+  assert.equal(
+    refused.connect,
+    403,
+    'a second session with a narrower list must not reach what the first may',
+  )
+})
+
+/**
  * The listener sits on an address every container on the host's bridge network can reach,
  * so "can you connect to it" and "may you use it" are different questions. Without the
  * token check the gateway is an open credential oracle for anything else on the box.
