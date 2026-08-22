@@ -31,11 +31,19 @@ export const DEFAULT_ALLOWED_HOSTS: readonly string[] = [
   'console.anthropic.com',
 
   // The codex runtime. `chatgpt.com` is where a ChatGPT-subscription Codex actually
-  // sends completions (`/backend-api/codex/responses`); `api.openai.com` is the API-key
-  // path; `auth.openai.com` is token refresh.
+  // sends completions (`/backend-api/codex/responses`, over a websocket); `api.openai.com`
+  // is the API-key path; `auth.openai.com` is token refresh — where the gateway answers a
+  // placeholder refresh itself rather than forwarding it (see synthetic.ts).
+  //
+  // `ab.chatgpt.com` is the codex analogue of `statsig.anthropic.com`: experiment
+  // assignment, asked for on every start. Observed being refused in a live run — the run
+  // survives it, it just pays for the refusal first. Named exactly rather than as
+  // `*.chatgpt.com`, because the allowlist is what decides where the host's real OAuth
+  // token is allowed to go and a wildcard hands it to every subdomain OpenAI ever adds.
   'api.openai.com',
   'auth.openai.com',
   'chatgpt.com',
+  'ab.chatgpt.com',
 
   // Reading a repository the job did not clone: a reviewer following a dependency to its
   // source, an agent checking an upstream issue. Never *writing* one — see
