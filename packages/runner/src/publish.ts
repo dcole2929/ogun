@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
-import type { Policies, RunOutcome } from '@ogun/core'
+import type { PinnedPolicies, RunOutcome } from '@ogun/core'
 import { GIT_HARDENING, RUNNER_IDENTITY, gitIn } from './workspace.ts'
 
 const run = promisify(execFile)
@@ -203,7 +203,7 @@ export async function publishPatch(input: {
   /** The two test columns as reported, absent and false kept apart on purpose. */
   tests: { run?: boolean; passed?: boolean }
   /** From the blob at `baseSha`. `undefined` means it could not be read, and refuses. */
-  policies?: Policies
+  policies?: PinnedPolicies
   remote: PublishRemote
 }): Promise<Publication> {
   const gate = refuseBefore(input)
@@ -360,7 +360,7 @@ export async function publishPatch(input: {
 function refuseBefore(input: {
   outcome: RunOutcome
   tests: { run?: boolean; passed?: boolean }
-  policies?: Policies
+  policies?: PinnedPolicies
   patchRef: string
   baseSha: string
 }): string | undefined {

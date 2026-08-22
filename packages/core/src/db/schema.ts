@@ -10,6 +10,9 @@ import {
   uuid,
 } from 'drizzle-orm/pg-core'
 import { sql } from 'drizzle-orm'
+// Type-only: this file is loaded by drizzle-kit and by every server query path, and it
+// has no business pulling a yaml parser in behind it.
+import type { ControlPlanePolicies } from '../config/project.ts'
 
 /**
  * Postgres owns exactly what GitHub and Linear cannot represent (§4.4): runs, events,
@@ -54,6 +57,33 @@ export const projects = pgTable('projects', {
    * skill?" (§6). Stale skill versions corrupt that answer quietly.
    */
   skillsHash: text('skills_hash'),
+  /**
+   * This project's control-plane policies, as of the config it was last indexed from.
+   *
+   * `policies:` was declared in `config.yaml`, parsed by `policiesSchema`, posted here by
+   * `ogun project sync` — and dropped on arrival. There was no column, and `applySync`
+   * never looked at `body.policies`. `failureBreakerThreshold: 5` meant three, because
+   * the only reader was a constant in `foreman/admission.ts`, and the Workers page
+   * hardcoded a copy of that same constant to tell you how close a worker was to
+   * tripping. Three places, one of them a browser, none of them the file.
+   *
+   * `ControlPlanePolicies` and not `Policies`, and that is the load-bearing part of this
+   * column. `allowSandboxDowngrade` and `maxOpenPullRequests` are gates on what an agent's
+   * own work may become, and the runner reads them from the git blob at the pinned base
+   * precisely because a modifier can write to its checkout (§4.6, ADR-0009). A stored copy
+   * of one of those would be a second answer to a question that must only have one, sat
+   * somewhere a later caller can find it without knowing which copy counted. The type
+   * makes that unreachable rather than merely discouraged: those keys are not in it, so
+   * `project.policies.maxOpenPullRequests` does not compile.
+   *
+   * Null for a project that has not synced since this column existed, which reads as "we
+   * have never been told" and resolves to the defaults. Deliberately distinct from a row
+   * holding the defaults as values: that one is a project whose config we have read and
+   * whose policies happen to be the standard ones. Different facts, different
+   * representations, principle 6 — and `projectPolicies` in the server hands both the
+   * numbers and which of the two it was to any caller that wants to say so.
+   */
+  policies: jsonb('policies').$type<ControlPlanePolicies>(),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 })
 

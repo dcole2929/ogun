@@ -6,9 +6,6 @@ import { Empty, exact, Page, Pill, when } from '../ui.tsx'
 import { describeSchedule } from '../ScheduleField.tsx'
 import { WorkerForm } from './WorkerForm.tsx'
 
-/** Mirrors policies.failureBreakerThreshold, whose default is 3 (§4.3). */
-const BREAKER_THRESHOLD = 3
-
 export function WorkersPage() {
   const { data: projects } = useQuery({ queryKey: ['projects'], queryFn: api.projects })
   const list = projects?.projects ?? []
@@ -45,6 +42,17 @@ function ProjectWorkers({ slug }: { slug: string }) {
   const workers = data?.workers ?? []
   const editable = data?.editable[slug] ?? false
   const hash = data?.hashes[slug]
+  /**
+   * The breaker threshold this project's config actually asks for, from the server.
+   *
+   * There is deliberately no `?? 3` here. This file used to hold `BREAKER_THRESHOLD = 3`
+   * with a comment saying it mirrored `policies.failureBreakerThreshold`, and it was
+   * wrong for every project that had set anything else — a browser recomputing a
+   * server-side rule from a copied constant is the same bug the server had, in a second
+   * place. `undefined` means we have not been told, and the sentence below says less
+   * rather than guessing.
+   */
+  const breakerThreshold = data?.policies[slug]?.policies.failureBreakerThreshold
 
   const { data: projects } = useQuery({ queryKey: ['projects'], queryFn: api.projects })
   const drift = projects?.projects.find((p) => p.slug === slug)?.drift
@@ -149,6 +157,7 @@ function ProjectWorkers({ slug }: { slug: string }) {
             key={row.worker.id}
             row={row}
             editable={editable}
+            breakerThreshold={breakerThreshold}
             onRun={() => run.mutate(row.worker.name)}
             onEdit={() => setEditing(row.worker.id)}
             running={run.isPending}
@@ -170,12 +179,16 @@ function ProjectWorkers({ slug }: { slug: string }) {
 function WorkerCard({
   row,
   editable,
+  breakerThreshold,
   onRun,
   onEdit,
   running,
 }: {
   row: WorkerRow
   editable: boolean
+  /** This project's `policies.failureBreakerThreshold`. Undefined if the server did not
+   *  say — no local default, see `breakerThreshold` above. */
+  breakerThreshold: number | undefined
   onRun: () => void
   onEdit: () => void
   running: boolean
@@ -308,8 +321,13 @@ function WorkerCard({
             <span className="muted" style={{ flex: '1 1 320px' }}>
               {row.breaker?.consecutiveFailures} run
               {row.breaker?.consecutiveFailures === 1 ? '' : 's'} failed in a row.{' '}
-              {BREAKER_THRESHOLD - (row.breaker?.consecutiveFailures ?? 0)} more and admission
-              stops dispatching this worker. A success resets the count.
+              {/* Only counted down when the real threshold is known. A guess here reads
+                  exactly like a fact, and being told "1 more" when five are left is worse
+                  than being told nothing. */}
+              {breakerThreshold === undefined
+                ? 'A success resets the count.'
+                : `${breakerThreshold - (row.breaker?.consecutiveFailures ?? 0)} more and ` +
+                  'admission stops dispatching this worker. A success resets the count.'}
             </span>
           )}
           <button onClick={() => clearBreaker.mutate()} disabled={clearBreaker.isPending}>

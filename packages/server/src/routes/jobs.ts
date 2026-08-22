@@ -1,10 +1,21 @@
 import { Hono } from 'hono'
 import { and, arrayContained, desc, eq, inArray, isNull, notInArray, sql } from 'drizzle-orm'
 import { schema } from '@ogun/core/db'
-import { claimRequestSchema, claimedJobSchema, type ClaimedJob } from '@ogun/core'
+import {
+  claimRequestSchema,
+  claimedJobSchema,
+  defaultControlPlanePolicies,
+  type ClaimedJob,
+} from '@ogun/core'
 import type { Env } from '../context.ts'
 import { runnerForRequest } from '../auth.ts'
-import { DEFAULT_LIMITS, remainingCapacity } from '../foreman/admission.ts'
+import {
+  DEFAULT_LIMITS,
+  modifierJobs,
+  modifiersOverCap,
+  remainingCapacity,
+} from '../foreman/admission.ts'
+import { policiesByProject } from '../foreman/policies.ts'
 import { markCoverage } from '../foreman/cycles.ts'
 
 const { findings, jobs, projects, runners, runs, stagedFindings, workers } = schema
@@ -91,6 +102,34 @@ jobsRoutes.post('/claim', async (c) => {
   if (slots <= 0) return c.json({ jobs: [] })
 
   /**
+   * The other cap, which is a project's rather than the machine's:
+   * `policies.maxConcurrentModifiers`.
+   *
+   * It had no enforcement anywhere — the only limit a modifier ever met was
+   * `maxConcurrentJobs`, so a project asking for one at a time got as many as this box
+   * could carry. Here rather than at admission because admission's refusals are permanent
+   * (a `skipped` job, a `refused` coverage row) and this limit is about *this minute*: the
+   * second modifier of the night is not work to throw away, it is work to hand out once
+   * the first finishes. `modifiersOverCap` explains the split, and `admit` still refuses
+   * outright on a cap of zero, which is the part that cannot change while the queue
+   * drains.
+   *
+   * Held back by id rather than filtered inside the statement below: the count has to be
+   * per project and per project means a window function, which cannot share a query level
+   * with `FOR UPDATE SKIP LOCKED`. Computed here, excluded there.
+   */
+  const modifiers = await modifierJobs(db)
+  const caps = await policiesByProject(db, modifiers.map((m) => m.projectId))
+  // `policiesByProject` answers for every id it was handed, so the fallback is
+  // unreachable — and were it ever reached, that project's policy is unknown and the
+  // schema default is the only honest number to use. Not "unlimited".
+  const fallback = defaultControlPlanePolicies().maxConcurrentModifiers
+  const heldBack = modifiersOverCap(
+    modifiers,
+    (projectId) => caps.get(projectId)?.policies.maxConcurrentModifiers ?? fallback,
+  )
+
+  /**
    * FOR UPDATE SKIP LOCKED is the whole reason postgres is here (§4.4). Two runners
    * polling at the same instant take disjoint sets without a lock table or a lease.
    *
@@ -111,6 +150,7 @@ jobsRoutes.post('/claim', async (c) => {
       where ${jobs.state} = 'queued'
         and ${jobs.availableAt} <= now()
         and ${arrayContained(jobs.requires, body.labels)}
+        ${heldBack.length ? sql`and ${notInArray(jobs.id, heldBack)}` : sql``}
       order by ${jobs.priority} desc, ${jobs.createdAt} asc
       limit ${slots}
       for update skip locked

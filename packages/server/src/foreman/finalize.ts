@@ -3,7 +3,7 @@ import { schema } from '@ogun/core/db'
 import type { Db } from '@ogun/core/db'
 import { cycleDefinitionSchema, nodesWithDependents } from '@ogun/core'
 import type { CoverageOutcome, JobState, RunOutcome, RunReport } from '@ogun/core'
-import { DEFAULT_LIMITS } from './admission.ts'
+import { projectPolicies } from './policies.ts'
 import { finalizeCycleIfDone, markCoverage, releaseDependents } from './cycles.ts'
 
 const {
@@ -59,6 +59,22 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
   if (!run) throw new Error(`no such run: ${report.runId}`)
   const job = await db.query.jobs.findFirst({ where: eq(jobs.id, run.jobId) })
   if (!job) throw new Error(`run ${report.runId} has no job`)
+
+  /**
+   * The project's breaker threshold, read here beside the run and the job rather than
+   * inside the transaction, and read from the project rather than from a constant.
+   *
+   * It used to be `DEFAULT_LIMITS.failureBreakerThreshold` — a machine-scoped constant
+   * standing in for a project policy that `.ogun/config.yaml` declares, sync posts and
+   * nothing stored. `failureBreakerThreshold: 5` latched at three, and the only way to
+   * discover that was to read this line.
+   *
+   * Outside the transaction because it is a fact about the project, not about this run's
+   * writes: the value cannot be made more correct by being read under the same lock, and a
+   * sync landing between here and the upsert would only mean the breaker counted with the
+   * threshold that was current when the run ended, which is the honest answer either way.
+   */
+  const { policies } = await projectPolicies(db, job.projectId)
 
   const gateFailed = report.gates.some((g) => !g.passed)
 
@@ -341,7 +357,7 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
      * keeps its cascade, and there is nothing to record when the worker is already gone.
      * A run can outlive its worker now; a breaker cannot.
      */
-    const threshold = DEFAULT_LIMITS.failureBreakerThreshold
+    const threshold = policies.failureBreakerThreshold
     if (job.workerId === null) {
       // nothing to latch
     } else if (jobState === 'failed') {

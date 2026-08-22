@@ -19,6 +19,7 @@ import {
   workerToYamlNode,
 } from '../config-store.ts'
 import { ConfigInvalid, reindexProject } from '../reindex.ts'
+import { projectPolicies, type ResolvedPolicies } from '../foreman/policies.ts'
 import { parseSchedule } from '../foreman/scheduler.ts'
 
 const { breakers, cycles, projects, schedules, skills, workers } = schema
@@ -164,6 +165,26 @@ workersRoutes.get('/', async (c) => {
     if (editable[s]) hashes[s] = (await config.read(s)).hash
   }
 
+  /**
+   * Each project's control-plane policies, so the page can say how close a worker is to
+   * tripping its breaker without keeping a copy of the number.
+   *
+   * It kept one: `const BREAKER_THRESHOLD = 3` in `Workers.tsx`, commented as mirroring
+   * `policies.failureBreakerThreshold`. A browser recomputing a server-side rule from a
+   * copied constant is the same bug as the server reading it from a constant, in a second
+   * place and one that nobody greps — a project on 5 was told "1 more and admission stops
+   * dispatching" when three more were left. Sent from here so there is one number.
+   *
+   * `source` travels with it because the two facts differ (principle 6): a project whose
+   * config asks for the defaults, and a project that has never synced its policies at all
+   * and is being shown a guess.
+   */
+  const policies: Record<string, ResolvedPolicies> = {}
+  for (const row of rows) {
+    if (policies[row.project.slug]) continue
+    policies[row.project.slug] = await projectPolicies(db, row.worker.projectId)
+  }
+
   return c.json({
     workers: rows.map((r) => ({
       ...r,
@@ -176,6 +197,7 @@ workersRoutes.get('/', async (c) => {
     })),
     editable,
     hashes,
+    policies,
   })
 })
 
