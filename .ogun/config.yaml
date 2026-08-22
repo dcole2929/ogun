@@ -22,6 +22,59 @@ workers:
     permissions: reviewer
     sandbox: container
 
+  # The first worker in this fleet allowed to write, and the thing the whole of phase 3
+  # was built for: it takes one finding out of the inbox the reviewers and triage fill,
+  # fixes it, and the host turns the patch into a draft pull request.
+  #
+  # **No `schedule:`, deliberately.** `ogun trigger ogun fix-a-finding` is the only way
+  # this runs. Every other gate here is a bound on damage — the tests gate, the `ogun/`
+  # branch prefix, `maxOpenPullRequests`, the draft — and not one of them is a substitute
+  # for a person having watched one of these runs end to end. A schedule is the last thing
+  # to add, after that has happened, and adding it is one line.
+  fix-a-finding:
+    skill: fix-a-finding
+    # `claude`, and the difference that decides it is what happens inside the container.
+    # Codex's own sandbox cannot run in ours (§10.2), so a codex job runs with
+    # `--dangerously-bypass-approvals-and-sandbox` and the container is the only thing
+    # between the agent and the host. Claude adds one legible layer on top: the runtime is
+    # told which permission profile it is running under, and withholds the edit tools for
+    # anything that is not a modifier. That layer is not what enforces the profile — the
+    # mount is — but the first worker allowed to write is not where to spend a layer.
+    # The reviewers already prove both runtimes work against this repo; a modifier is not
+    # also the place to be testing the second one.
+    runtime: claude
+    # Not the default `worker`, which the router points at the cheaper model on the
+    # grounds that the worker burns most of the tokens and most of the clock (§4.7). That
+    # argument is about a nightly fleet, and this worker has no schedule: it runs once,
+    # when somebody asks. The expensive mistake here is not a slow round, it is a patch
+    # that looks right — and the hardest thing the skill asks for is declining, which is
+    # judgement rather than throughput. If this later grows a schedule and the cost shows,
+    # `worker` is the one-word change.
+    model: reviewer
+    permissions: modifier
+    # `container`, and `policies.allowSandboxDowngrade: false` means it could not be
+    # anything else — a modifier on `worktree` is an agent editing files directly in the
+    # checkout on this machine. It also needs `ogun/project-ogun:latest` rather than
+    # `ogun/base`, which is what runs postgres and this repo's own suite; admission
+    # refuses a modifier for a project with no `.ogun/Dockerfile` for exactly that reason.
+    sandbox: container
+    # No `egress:`. Checked rather than assumed: the default allowlist for a claude
+    # runtime is the model API plus `registry.npmjs.org`, and the registry is on it
+    # *because* of this gate — `tests.command` starts with `pnpm install`, and a blocked
+    # registry would fail as a red suite and be blamed on the patch. This repo resolves
+    # every dependency from that one host: no `.npmrc`, no git or tarball dependencies,
+    # pnpm baked into the project image rather than fetched by corepack at run time.
+    # Adding hosts here is additive, so it is the right knob when a suite reaches further;
+    # it just has nothing to add today.
+    #
+    # 45 minutes rather than the default 30. The gate's clock is whatever is left of this
+    # number when the agent exits, not a budget of its own (verify.ts) — and a modifier
+    # spends its round reading, editing *and* running the suite, then the runner runs the
+    # suite again. A gate that starts with nothing left records that the suite never ran,
+    # which refuses to publish for a reason that reads like a broken harness rather than
+    # a bad patch.
+    timeoutMs: 2700000
+
 cycles:
   # The reviewers run in parallel and stage what they find; triage is the only thing
   # that writes to the inbox. Listing a worker under `then:` is what makes its inputs

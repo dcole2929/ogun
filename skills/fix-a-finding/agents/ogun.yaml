@@ -1,0 +1,11 @@
+interface:
+  display_name: "Fix a Finding"
+  short_description: "Fix one finding from the inbox and leave a draft pull request"
+  default_prompt: "Use the fix-a-finding skill."
+policy:
+  # Never auto-triggered, and here that is more than the standing rule for a factory skill
+  # (§4.8). This one writes code. An agent that reached for it mid-task would be editing a
+  # repository for reasons nobody asked about, in a session with no patch extraction, no
+  # test gate and no draft pull request behind it — every part of what makes an
+  # unattended change safe lives outside the skill.
+  allow_implicit_invocation: false

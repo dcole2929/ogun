@@ -1456,6 +1456,24 @@ running in the runner process, after the report, behind a one-interface credenti
 with the PR cap as `policies.maxOpenPullRequests` (ADR-0009). Modifiers can also report
 what they noticed, as ordinary findings.
 
+Also done, and it is what all of the above had been missing: **something to drive it.**
+`skills/fix-a-finding` is the first modifier skill — take one finding out of the inbox the
+reviewers and triage fill, fix it, prove it against `tests.command`, commit it with a
+message written for the person who will read the pull request. It closes the loop the
+system is built around: reviewer finds → triage publishes → modifier fixes → draft PR.
+Deliberately not phase 4's ticket-driven flow, which starts from a Linear issue rather
+than from the inbox and is a different node.
+
+The two instructions in it that carry the most weight are both about the gaps the
+machinery has and cannot close. **Never write a closing keyword in a commit message** —
+the PR body fences agent prose so `Closes #14` is inert there, but GitHub scans commit
+messages on merge and nothing can strip one without destroying the artefact (ADR-0009).
+And **declining is a result**: a modifier that changed nothing is `approved`, an ordinary
+outcome, so the skill is written to make "I could not find a safe fix" cheaper to say than
+to guess. Ogun's own `fix-a-finding` worker carries **no schedule**, and will not until a
+person has watched one of these runs end to end — `maxOpenPullRequests` bounds the damage
+of an unattended modifier; it is not a substitute for having seen one work.
+
 Remaining: the retry loop on the existing verify gate, and modifier-profile lenses. The
 `for round` shape in the runner still runs exactly once, which is what makes the first of
 those an unwrapping rather than a rewrite. Arbitrary user-defined graphs if they turn out
