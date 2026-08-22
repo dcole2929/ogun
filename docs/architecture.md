@@ -993,19 +993,46 @@ pinned to a cheap model: give it the review type, current SHA, and candidate the
 and let it grep a derived compact index and open only the full records that matter.
 The index is derived and disposable — the run records are the source of truth.
 
-**Status lifecycle.** `open | triaged | fixed | wontfix | duplicate | gated |
+**Status lifecycle.** `open | triaged | fixed | wontfix | duplicate | obsolete | gated |
 overflow`, plus
 `first_seen_run`, `last_seen_run`, `seen_count`. Without this, night two regenerates
 every finding from night one and "I already dismissed this" is unrepresentable.
+`obsolete` is separate from `fixed` because "we corrected it" and "the question stopped
+existing" are different facts about the code. **`wontfix` is reachable only by a person** —
+nothing running unattended can decide the factory should stay quiet about something, and
+it is the one status that produces silence rather than a row.
 
-**Re-adjudication.** [phase 2] Hashing catches exact repeats. It does not catch the
-same issue phrased differently. The mechanism: show the reviewer its own prior
-unresolved findings for the file (verbatim stored text) and have it classify each as
-`still-applies | resolved-by-this-diff | no-longer-applicable`. This is the antidote
-to the failure mode every automated reviewer eventually exhibits — repeatedly
-re-flagging an issue the developer has already seen and chosen not to act on.
+**Re-adjudication.** [settled — ADR-0011] Two halves, and they run in opposite
+directions. *Adjudication* asks whether a finding nobody re-reported is still true, and is
+triage's verdict on the inbox: `still-applies | fixed | no-longer-applicable |
+duplicate-of`, each with a reason and `fixed` with citations the grounding gate checks.
+*Suppression* is the other direction — what a run reported and is not allowed to say,
+because a person already dismissed it. That is the antidote to the failure mode every
+automated reviewer eventually exhibits, and the inbox is unusable without it.
 
-Design the schema for it now; build it in phase 2.
+The original proposal was to show the reviewer its prior findings verbatim and have it
+classify each. The verbatim showing shipped and is load-bearing (`/api/jobs/:id/history`,
+written into the workspace as an index plus one write-up per finding). **The classifying
+does not decide.** Suppression is deterministic, in `foreman/suppression.ts`, in the
+transaction that ends the run: an agent wrongly calling something new costs one duplicate
+row, and an agent wrongly calling something already-dismissed removes a real finding from
+the only place anyone would see it. Matching is exact fingerprint, or one hop through a
+`duplicate_of` pointer triage filed on purpose — never by prefix, because a dismissal is
+permanent and silent where a cooldown is temporary and loud, and two techniques under one
+invariant are two different bugs.
+
+**A dismissal is not permanent by accident.** It is anchored: dismissing a finding freezes
+the cited code as the runner last read it off disk, plus the severity dismissed. The runner
+searches each later tree for that text — normalized for whitespace, searched for rather
+than read at a line offset, so a rebase or a formatter run is not a rewrite — and reports
+`intact | moved | unreadable`. Moved lapses the dismissal and the finding reopens; so does
+a re-sighting at a higher severity than was dismissed. A dismissal with no anchor, or one
+this run could not check, still suppresses and says which of those it was: all three
+produce silence, and only the ledger can tell them apart.
+
+**Silence is recorded.** `staged_findings.suppressed_by` and `suppression_reason` name the
+dismissal and the evidence, so "suppressed because dismissed in run X" and "not found this
+time" never wear the same value (principle 6). The run detail page serves them.
 
 **Grounding check.** Before findings are persisted, a deterministic check: does every
 cited `file:line` exist in the diff? Cheap, catches hallucinated findings, and runs
@@ -1033,7 +1060,13 @@ Triage does five things:
 3. **Ranking** — severity × confidence × effort, so the top of the inbox is worth
    reading.
 4. **Suppression against history** — the natural home for re-adjudication. One
-   implementation rather than N drifting copies inside each reviewer.
+   implementation rather than N drifting copies inside each reviewer. [built] What
+   triage does here is *nominate*: a `duplicate-of` verdict saying tonight's rephrasing is
+   the same issue as something already dismissed. The suppression itself is enforced by
+   the control plane on the way into the inbox, deterministically, whether triage
+   cooperates or not (§4.11, ADR-0011) — a reviewer that publishes directly gets the same
+   treatment. Triage's verdict is what teaches the machine a *new* fingerprint belongs to
+   an old decision, which is the part no exact match can do.
 5. **Coverage ledger assembly** — marks the batch degraded when a reviewer failed.
 
 Cheap to run well: structured JSON in, no repo reading. A strong model is affordable
@@ -1427,9 +1460,18 @@ runs                id, job_id, runner_id, started_at, ended_at, outcome,
 run_events          id, run_id, seq, ts, type, payload (jsonb)
 
 staged_findings     id, run_id, worker_id, raw (jsonb)   -- pre-triage, queryable
-findings            id, project_id, worker_id, fingerprint, path, snippet,
-                    severity, title, body, status, first_seen_run,
-                    last_seen_run, seen_count
+                    suppressed_by, suppression_reason
+                    -- which dismissal silenced this sighting, and on what evidence.
+                    -- an absence with no record reads as "nobody found anything"
+findings            id, project_id, worker_id, fingerprint, path, line, snippet,
+                    severity, title, body, status, status_reason, status_run,
+                    duplicate_of, revisit_of, revisit_reason,
+                    dismissed_at, dismissed_basis, dismissed_basis_path,
+                    dismissed_severity, first_seen_run, last_seen_run, seen_count
+                    -- snippet is the cited code as the runner read it, host-side
+                    -- the dismissed_* four are frozen when a person sets wontfix and
+                    -- cleared when the status leaves it: what makes a dismissal
+                    -- revocable by evidence rather than permanent by default (§4.11)
 changes             id, run_id, branch, base_sha, patch_ref, files_changed,
                     tests_run, tests_passed, pr_url
                     -- artifact record only; PR lifecycle state lives in GitHub
@@ -1574,8 +1616,26 @@ it to quietly stop being. `@ogun/core`'s `isHostAllowed` went with it: when its 
 was deleted it kept every one of its tests and lost every bit of its authority, and the two
 matchers had already drifted over the DNS root's trailing dot.
 
-Remaining: re-adjudication, which is what stops a reviewer re-flagging what you already
-dismissed.
+Also done: **re-adjudication** (§4.11, ADR-0011), which is what stops a reviewer
+re-flagging what you already dismissed — and phase 2 is therefore complete. Both
+directions are built: triage's verdicts on findings nobody re-reported, and deterministic
+suppression of findings somebody already dismissed, enforced by the control plane at the
+moment of promotion rather than asked for in a skill's prose.
+
+The half worth recording is the one that took the argument. §10.3 proposed showing a
+reviewer its prior findings verbatim and having it classify them, and the classifying is
+not what decides: an agent wrongly calling something *new* costs one duplicate row, and an
+agent wrongly calling something *already dismissed* deletes a real finding from the only
+place anybody would have seen it, silently. So the agent shows and nominates; the control
+plane decides. And a dismissal is anchored to the code it was about — frozen at the moment
+a person dismisses, checked against every later tree by the runner — so that dismissing
+"this retry loop is fine" cannot silence the rewrite of that retry loop into something
+broken. That is the same `high` §9 records above, approached from the other side.
+
+What it does not close: an agent that mints a slightly different fingerprint for the same
+issue still defeats suppression, and the only repair is triage filing `duplicate-of`. A
+night where triage does not adjudicate is a night where the inbox re-fills with
+rephrasings, and nothing yet measures that.
 
 **Phase 3 — the write path.** In progress.
 
@@ -1636,8 +1696,18 @@ canvas, auto-merge, agent memory, model auto-selection, remote runner mesh.
    remove, for a second copy of a boundary we already have.
    `--dangerously-bypass-approvals-and-sandbox` is therefore right, and the profile is
    enforced at the mount instead (§4.6).
-3. **Re-adjudication mechanism.** The approach (show prior unresolved findings
-   verbatim, classify) is a proposal, not a decision. Revisit at implementation.
+3. ~~**Re-adjudication mechanism.**~~ [answered — ADR-0011] The proposal was to show
+   prior unresolved findings verbatim and have the reviewer classify them. Half of it
+   stands: history is written into the workspace verbatim, and triage's verdicts on
+   findings nobody re-reported are how the inbox stays true. The other half was rejected
+   on contact. **A classification must not be what decides silence.** The two errors are
+   not symmetric — "this is new" costs a duplicate row, "this is the one you dismissed"
+   costs the bug — so suppression is deterministic code at the promotion boundary,
+   matching on exact fingerprint or one explicit `duplicate_of` hop, and a dismissal is
+   anchored to the code it cited so that it lapses when that code is rewritten or the same
+   problem returns worse. What remains open is narrower and is recorded in ADR-0011's
+   consequences: nothing measures how often a rephrased finding escapes because triage did
+   not merge it, and there is no UI for a dismissal whose anchor was never recorded.
 4. **Triage prompt and calibration.** What the severity scale actually is, and how
    triage is itself evaluated. It is the one node that can silently lose real
    findings, so it needs its own quality measure — currently undefined.

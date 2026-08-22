@@ -386,5 +386,31 @@ jobsRoutes.get('/:id/history', async (c) => {
       ...(f.statusReason ? { statusReason: f.statusReason } : {}),
     })),
     details: Object.fromEntries(rows.map((f) => [f.fingerprint, f.body])),
+    /**
+     * The anchors of every dismissal standing against this project, for the runner to
+     * check against the tree it materialized (§4.11).
+     *
+     * Not part of `index` or `details`, and deliberately never written into the workspace:
+     * `writeHistory` lays out those two and nothing else. This is not confidentiality —
+     * it is the project's own source, which the agent has in front of it — it is a
+     * separation of duties. The basis is the one input to a dismissal's fate that no
+     * agent may influence, and a copy inside the sandbox is a copy some future skill
+     * starts reading and then arguing with.
+     *
+     * A dismissal with no recorded basis is simply absent here rather than sent with an
+     * empty one. Nothing can be established about it, and a check that always says
+     * `moved` for want of a needle would lapse exactly the dismissals Ogun knows least
+     * about.
+     *
+     * Bounded by the same `limit` as the rest of the payload, so a project past it has
+     * dismissals whose anchors never cross the wire — they keep suppressing and every
+     * suppression says the basis went unchecked, which is the honest failure but not a
+     * harmless one. The ordering makes it the least-bad slice: `updated_at` moves on every
+     * sighting including a suppressed one, so the dismissals reviewers keep re-finding are
+     * the ones that stay in the window.
+     */
+    bases: rows
+      .filter((f) => f.status === 'wontfix' && f.dismissedBasis && f.dismissedBasisPath)
+      .map((f) => ({ fingerprint: f.fingerprint, path: f.dismissedBasisPath, basis: f.dismissedBasis })),
   })
 })

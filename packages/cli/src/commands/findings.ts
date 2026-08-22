@@ -75,6 +75,7 @@ export async function findingsWrite(args: string[]): Promise<void> {
   console.log(green(`recorded ${parts.join(' and ')} to ${target}`))
 
   await remarkOnUnjudgedHistory(verdicts)
+  await remarkOnDismissedRepeats(doc.data)
 }
 
 /**
@@ -101,6 +102,43 @@ async function remarkOnUnjudgedHistory(verdicts: number): Promise<void> {
     dim(
       `note: ${HISTORY_INDEX} lists ${known} finding${known === 1 ? '' : 's'} already in the ` +
         'inbox and this document judges none of them.',
+    ),
+  )
+}
+
+/**
+ * Say when a document re-files something a person already dismissed.
+ *
+ * Not a refusal, for the same reason as above — and because refusing would be pointless:
+ * the control plane suppresses the sighting whether or not this printed anything, so the
+ * row is going nowhere either way (§4.11, ADR-0011). What the agent loses by not knowing
+ * is the chance to spend the finding usefully. Two moves are open to it and neither is
+ * re-filing: if the same problem genuinely returned *worse* than it was dismissed, the
+ * severity it reports is what lapses the dismissal, and if this is one bug the reviewers
+ * keep rephrasing, a `duplicate-of` verdict is the only thing in the system that can
+ * teach a new fingerprint it belongs to an old decision.
+ *
+ * Printed at the one moment the agent can still act on it, and phrased as what is true
+ * rather than as an instruction — the skill says what to do.
+ */
+async function remarkOnDismissedRepeats(doc: {
+  findings: Array<{ fingerprint: string }>
+}): Promise<void> {
+  if (doc.findings.length === 0) return
+  const index = await readFile(join(dirname(OUTPUT_PATH), '..', HISTORY_INDEX), 'utf8').catch(
+    () => null,
+  )
+  if (!index) return
+  const parsed = JSON.parse(index) as { findings?: Array<{ fingerprint?: string; status?: string }> }
+  const dismissed = new Set(
+    (parsed.findings ?? []).filter((f) => f.status === 'wontfix').map((f) => f.fingerprint),
+  )
+  const repeats = doc.findings.filter((f) => dismissed.has(f.fingerprint)).map((f) => f.fingerprint)
+  if (repeats.length === 0) return
+  console.log(
+    dim(
+      `note: ${repeats.length} of these ${repeats.length === 1 ? 'is' : 'are'} already dismissed ` +
+        `(${repeats.join(', ')}) and will be suppressed rather than published.`,
     ),
   )
 }
@@ -221,6 +259,11 @@ export function findingsSchema(): void {
       '  consequential as opening it, and it is the direction with no reviewer after you.',
       '',
       `  ${dim('wontfix is not a verdict. A person decided to accept that risk.')}`,
+      '',
+      '  duplicate-of is also how a dismissal reaches a rephrasing. A sighting of a',
+      '  dismissed finding is suppressed by exact fingerprint, so one bug described four',
+      '  ways stays noisy until you say the four are one. That verdict is the only thing',
+      '  in the system that can say it.',
     ].join('\n'),
   )
 

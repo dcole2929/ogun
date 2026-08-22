@@ -324,6 +324,27 @@ export const stagedFindings = pgTable(
     /** Snapshot, so history stays readable after a rename or a removal. */
     workerName: text('worker_name').notNull(),
     raw: jsonb('raw').notNull().$type<Record<string, unknown>>(),
+    /**
+     * The dismissal that kept this reported finding out of the inbox, and why (§4.11).
+     *
+     * This is the ledger's answer to "what did tonight's review stay silent about, and on
+     * whose authority" (principle 6). Suppression is the one thing this system does whose
+     * whole effect is an absence, and an absence with no record is indistinguishable from
+     * a reviewer that looked and found nothing — the exact collapse principle 6 forbids.
+     *
+     * Null means this run suppressed nothing about this finding. It does *not* mean the
+     * finding reached the inbox: a reviewer feeding triage stages everything and publishes
+     * nothing, and that withholding is the graph's doing rather than a dismissal's. The
+     * two are told apart by the run's node, not by this column.
+     */
+    suppressedBy: text('suppressed_by'),
+    /**
+     * The full account: which dismissal, when it was made, and what state its basis was
+     * found in. Written even when the basis could not be checked, because "suppressed on
+     * a live check" and "suppressed because nobody could look" are different facts and a
+     * reader auditing an empty night needs to be able to separate them.
+     */
+    suppressionReason: text('suppression_reason'),
   },
   (t) => [index('staged_findings_run_idx').on(t.runId)],
 )
@@ -339,6 +360,15 @@ export const findings = pgTable(
     fingerprint: text('fingerprint').notNull(),
     path: text('path'),
     line: integer('line'),
+    /**
+     * The cited code as the runner read it off the disk, normalized (`evidence.ts`).
+     *
+     * On this table since it was created with nothing writing it. It is written now
+     * because it is what a dismissal gets frozen against: the basis has to come from
+     * somewhere, and the somewhere is the last run that actually saw the code. Never
+     * agent-authored — a snippet an agent could write is a snippet an agent could use to
+     * anchor a dismissal to code that does not exist.
+     */
     snippet: text('snippet'),
     severity: text('severity').notNull(),
     confidence: integer('confidence'),
@@ -368,6 +398,32 @@ export const findings = pgTable(
      * re-adjudication changes a status precisely when nothing reported it again.
      */
     statusRun: uuid('status_run').references(() => runs.id, { onDelete: 'set null' }),
+    /**
+     * When a person dismissed this, and what code they dismissed it about (§4.11).
+     *
+     * Only a person reaches `wontfix` — `applyAdjudications` refuses the status outright —
+     * so these four columns are populated by the API call a human makes and by nothing
+     * else. That is deliberate: suppression is a standing instruction to stay quiet, and
+     * the authority for it has to be a person or it is the machine deciding what the
+     * machine reports.
+     *
+     * `dismissedBasis` is the finding's `snippet` copied at the moment of dismissal, and
+     * `dismissedSeverity` the severity it carried then. Together they are what makes the
+     * dismissal revocable by events rather than permanent by default: the code changing
+     * underneath it, or the same issue coming back materially worse, both lapse it. A
+     * dismissal with no basis (one made before this existed, or one whose finding never
+     * carried a usable excerpt) still suppresses — refusing to honour a person's decision
+     * because Ogun failed to record enough is punishing the wrong party — but the ledger
+     * says so on every suppression, so "standing on a live check" and "standing on nobody
+     * having looked" never wear the same value.
+     *
+     * Cleared when the status leaves `wontfix` by any route. A stale basis on an open
+     * finding would resurrect the dismissal the next time somebody set the status back.
+     */
+    dismissedAt: timestamp('dismissed_at', { withTimezone: true }),
+    dismissedBasis: text('dismissed_basis'),
+    dismissedBasisPath: text('dismissed_basis_path'),
+    dismissedSeverity: text('dismissed_severity'),
     firstSeenRun: uuid('first_seen_run').references(() => runs.id, { onDelete: 'set null' }),
     lastSeenRun: uuid('last_seen_run').references(() => runs.id, { onDelete: 'set null' }),
     seenCount: integer('seen_count').notNull().default(1),

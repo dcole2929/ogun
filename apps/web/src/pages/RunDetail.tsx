@@ -96,7 +96,7 @@ export function RunDetailPage() {
  * answerable only by reading fifty tool calls to the end.
  */
 function Produced({ detail }: { detail: RunDetail }) {
-  const { promoted, changes, findings } = detail.produced
+  const { promoted, changes, findings, suppressed } = detail.produced
   const running = !detail.run.endedAt
   const outcome = detail.run.outcome
 
@@ -185,6 +185,26 @@ function Produced({ detail }: { detail: RunDetail }) {
             {findings.length} reported, {promoted.length} persisted — the rest were
             duplicates of findings already open.
           </p>
+        )}
+
+        {/* What this run was not allowed to say, and who decided. Suppression is the one
+            thing here whose entire effect is an absence, and an absence with nothing
+            beside it reads exactly like a reviewer that found nothing (principle 6). */}
+        {suppressed.length > 0 && (
+          <div style={{ marginTop: 14 }}>
+            <p className="muted" style={{ margin: '0 0 6px', fontSize: 12 }}>
+              {suppressed.length} suppressed — reported again after being dismissed, so it
+              did not reach the inbox.
+            </p>
+            {suppressed.map((s, i) => (
+              <div key={i} className="finding" style={{ paddingTop: 8 }}>
+                <div className="fp">{s.dismissal}</div>
+                <p className="muted" style={{ margin: '2px 0 0', fontSize: 12 }}>
+                  {s.reason}
+                </p>
+              </div>
+            ))}
+          </div>
         )}
 
         {changes.map((ch) => (

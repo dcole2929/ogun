@@ -316,6 +316,21 @@ runsRoutes.get('/:id', async (c) => {
     produced: {
       /** Exactly what the agent reported, before triage. */
       findings: reported.map((f) => f.raw),
+      /**
+       * What this run reported and was not allowed to say, and on whose authority (§4.11).
+       *
+       * The page could already answer "what did this run find". It could not answer "what
+       * did it stay silent about", and suppression is the one thing here whose entire
+       * effect is an absence — which without a record is indistinguishable from a
+       * reviewer that looked and found nothing (principle 6).
+       */
+      suppressed: reported
+        .filter((f) => f.suppressedBy)
+        .map((f) => ({
+          finding: f.raw,
+          dismissal: f.suppressedBy,
+          reason: f.suppressionReason,
+        })),
       /** Those the control plane accepted, with their status now. */
       promoted: promoted.map((f) => ({
         id: f.id,

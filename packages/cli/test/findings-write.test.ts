@@ -1,6 +1,6 @@
 import { strict as assert } from 'node:assert'
 import { execFileSync } from 'node:child_process'
-import { chmod, mkdtemp, readFile, stat, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
@@ -57,4 +57,45 @@ test('a findings document the agent already touched is rewritten owner-only', as
 
   assert.equal(await modeOf(out), '600')
   assert.match(await readFile(out, 'utf8'), /cross-account-id-swap/)
+})
+
+/**
+ * A reviewer re-filing something a person dismissed gets nothing for the row — the
+ * control plane suppresses it — so the one useful moment to say so is here, while the
+ * agent can still spend the finding on a `duplicate-of` verdict instead.
+ *
+ * Deliberately a remark and not a refusal. Failing the write would push an agent into
+ * dropping a finding it believes in, and the mechanism does not need the agent's
+ * cooperation to work: the suppression happens either way (ADR-0011).
+ */
+test('re-filing a dismissed finding is remarked on rather than refused', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'ogun-dismissed-'))
+  await mkdir(join(dir, '.ogun-in'), { recursive: true })
+  await writeFile(
+    join(dir, '.ogun-in/history.json'),
+    JSON.stringify({
+      findings: [
+        {
+          fingerprint: 'security/public-orders/account-isolation/cross-account-id-swap',
+          status: 'wontfix',
+          severity: 'high',
+          title: 'already decided',
+          seenCount: 4,
+          lastSeenAt: '2026-08-20T00:00:00.000Z',
+        },
+      ],
+    }),
+  )
+
+  const printed = execFileSync(
+    process.execPath,
+    [cli, 'findings', 'write', '--out', join(dir, '.ogun-out/findings.json')],
+    { input: DOC, encoding: 'utf8', cwd: dir },
+  )
+
+  assert.match(printed, /already dismissed/)
+  assert.match(printed, /cross-account-id-swap/)
+  assert.match(printed, /suppressed rather than published/)
+  // And the document is still written: the remark is information, not a gate.
+  assert.match(await readFile(join(dir, '.ogun-out/findings.json'), 'utf8'), /cross-account/)
 })

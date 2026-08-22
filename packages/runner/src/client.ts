@@ -14,6 +14,16 @@ export type FindingsHistory = {
     statusReason?: string
   }>
   details: Record<string, string>
+  /**
+   * The anchor of every standing dismissal, for the runner to check against the tree
+   * (§4.11). Optional because a control plane that predates re-adjudication sends none,
+   * and because a project with no dismissals has none to send — both mean "check nothing",
+   * and `finalizeRun` treats an unchecked dismissal as a fact about the night rather than
+   * as a pass.
+   *
+   * Held in the runner process and never written into the workspace. See `evidence.ts`.
+   */
+  bases?: Array<{ fingerprint: string; path: string; basis: string }>
 }
 
 /**
