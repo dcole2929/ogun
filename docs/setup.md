@@ -207,6 +207,53 @@ and match it from a worker's `requires:`:
 ogun runner init --labels gpu,staging-db
 ```
 
+### Keeping an unattended runner logged in
+
+A container never holds a credential. The runner's in-process gateway reads
+`~/.claude/.credentials.json` and `~/.codex/auth.json` on the host and splices the real
+value into each request on the wire (ADR-0010). What it does **not** do is refresh
+anything — it re-reads the file that the host's own `claude` rewrites *when a human runs
+it*.
+
+On a workstation that is invisible: you use `claude` most days, so the token is always
+fresh. On a runner you do not personally log into, nothing refreshes it, the OAuth access
+token lapses, and every 3am job fails on auth until somebody notices.
+
+**Use an API key on a machine nobody logs into. An API key does not expire.**
+
+```sh
+# Visible to BOTH the control plane and the runner — see the warning below.
+ANTHROPIC_API_KEY=sk-ant-api03-…
+OPENAI_API_KEY=sk-…
+```
+
+The gateway prefers an explicit key over the subscription token, so setting one takes
+effect immediately and needs nothing else configured. It also points runs at a different
+account than the host's `claude` is logged into, which is the other reason to set one.
+The trade is that an API key is billed per token where a subscription is not — on a
+workstation you use daily, leaving the OAuth token in place is still the cheaper answer.
+
+**Export it where both halves can see it.** Ogun checks the credential *before* a job
+starts, and the check runs on the control plane. A key exported into the runner's service
+unit but not the server's means the control plane sees only a stale OAuth token and
+refuses jobs the runner could have run perfectly well. The repo-root `.env` is read by
+both; a systemd drop-in should cover both units.
+
+**Checking it, ahead of the night rather than after it:**
+
+```
+$ ogun runner doctor
+  warn  gateway anthropic     oauth, only 42m left — a job starting now would 401
+                              partway. run `claude` on this host, or set
+                              ANTHROPIC_API_KEY for an unattended runner
+```
+
+`ok` means the credential outlives the longest job this machine is likely to be handed.
+`warn` means it does not, and the line says which fix applies. If a job is dispatched
+anyway it is refused rather than run, and the run's coverage row carries the same
+sentence — so a night lost to a lapsed token says so in words instead of leaving a
+provider 401 buried in an agent transcript.
+
 ### Names are unique
 
 Two machines answering to one name would share a claim identity and a run history, and

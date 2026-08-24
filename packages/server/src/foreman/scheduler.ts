@@ -2,6 +2,7 @@ import { Cron } from 'croner'
 import { and, eq, isNull } from 'drizzle-orm'
 import { schema } from '@ogun/core/db'
 import type { Db } from '@ogun/core/db'
+import { probeCredentials } from './admission.ts'
 import { startCycleRun } from './cycles.ts'
 
 const { cycles, schedules } = schema
@@ -189,7 +190,20 @@ export async function tick(db: Db, opts: SchedulerOptions = {}): Promise<TickRes
     const shouldRun = !item.missed || item.policy === 'runOnce'
 
     if (shouldRun) {
-      await startCycleRun(db, { cycleId: item.cycleId, trigger: item.missed ? 'cron:missed' : 'cron' })
+      /**
+       * Read here rather than once outside the loop: the fix for a refusal is running
+       * `claude` on the host, and a tick that started before that happened should not go
+       * on refusing cycles it evaluates afterwards. Two small file reads against work
+       * measured in minutes.
+       *
+       * This is the path the whole preflight is for — 3am, nobody watching, and the token
+       * that was refreshed by hand a week ago.
+       */
+      await startCycleRun(db, {
+        cycleId: item.cycleId,
+        trigger: item.missed ? 'cron:missed' : 'cron',
+        credentials: probeCredentials(),
+      })
       result.started.push(cycle.name)
     } else {
       result.skipped.push(cycle.name)

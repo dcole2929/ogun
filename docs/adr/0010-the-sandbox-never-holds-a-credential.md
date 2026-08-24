@@ -74,6 +74,30 @@ same session.
   against endpoints whose IPs rotate. It also does nothing at all about the actual
   problem: an allowlisted `api.anthropic.com` is exactly where a stolen Anthropic token
   would be spent.
+- **Refreshing the OAuth token in the gateway, in memory only.** Rejected, and the reason
+  is a property of the provider rather than of this code. Ogun runs unattended at 3am on a
+  machine whose owner may not have opened a terminal in a week, so the obvious fix for a
+  lapsed token is for the gateway to spend the refresh token itself and keep the new
+  access token in memory — nothing written, nothing to race. It fails if the provider
+  **rotates the refresh token on use**, which is the common design and which Ogun does not
+  get to decide: the moment the gateway spends it, the copy in
+  `~/.claude/.credentials.json` is dead, and the next time the user runs `claude` on their
+  own machine they are logged out by a background process they did not know was touching
+  their credentials. The symptom — "my Claude login keeps dropping" — is nowhere near the
+  cause, and nothing in Ogun's logs connects them. Taking a plausible chance of silently
+  logging someone out of their own CLI, to save them typing `claude` once, is a bad trade.
+- **Refreshing and writing the new tokens back to the credential file.** Rejected — it
+  fixes rotation by buying a race. The host's own `claude` rewrites that file whenever a
+  human uses it, and neither writer holds a lock over it; two processes rewriting a
+  credential file at overlapping moments lose a token between them, and the machine ends
+  up logged out of the account it was working for, at whatever hour the collision
+  happened. It is also a much larger claim on the user's files than reading them: the
+  gateway's whole justification for touching `~/.claude` is that it is the *only* thing
+  that needs to, and it is careful; a writer is a different kind of neighbour.
+  **What is done instead** is to catch the lapse before it costs a night — `ogun runner
+  doctor` and admission both refuse ahead of the job (§4.3) — and to document the
+  configuration that has no lapse to catch: an explicit `ANTHROPIC_API_KEY`, which
+  `credentials.ts` already prefers and which does not expire (§4.6, `docs/setup.md`).
 - **A policy engine — rules, conditions, per-worker grants, approval flows.** Rejected.
   §9 lists multi-tenancy and RBAC as explicit non-goals and Ogun is one user on one host.
   A rule language here would be configuration for a decision that has one right answer:
@@ -108,9 +132,19 @@ same session.
   This is a real gap and it is named rather than hidden. Before, a container refreshed the
   copy it was given; now the container has a placeholder that never expires and the *host*
   file is the only live one. If nothing on the host runs `claude` before the token lapses,
-  jobs 401. `doctor` says "expired 6h ago — run `claude` once on this host", which is the
-  difference between a two-minute fix and an evening. **A finding that the gateway should
-  refresh is a real finding.**
+  jobs 401. **A finding that the gateway should refresh is a real finding** — see the two
+  rejected shapes of it above.
+- **The lapse is caught before a job starts, in two places.** [added] Not a refresh: a
+  preflight. `ogun runner doctor` reports the credential as a warning once it is inside
+  the next hour and louder once it is dead, and admission refuses a job whose runtime's
+  credential will not outlive the worker's own `timeoutMs` (§4.3) — because "is it valid
+  right now" is the wrong question to ask on behalf of a job that runs for half an hour.
+  The refusal is recorded as `refused` with the fix in the reason, never as a failure:
+  nothing about the worker failed, and filing it as a failure would latch the breaker
+  against workers that are fine. Both surfaces keep five states apart — absent, an API key
+  that cannot expire, an expiry nothing recorded, alive, dead — and admit the ones they
+  cannot judge, because "I could not check" is not "I checked, and it is dead"
+  (principle 6).
 - **The allowlist is not the security property.** It bounds what a compromised agent can
   reach through the gateway's connection, which is worth having. It does not stop
   exfiltration: `api.anthropic.com` is on the list, and anything an agent can put in a

@@ -14,6 +14,15 @@ export type PermissionProfile = (typeof PERMISSION_PROFILES)[number]
 export const SANDBOX_KINDS = ['container', 'worktree'] as const
 export type SandboxKind = (typeof SANDBOX_KINDS)[number]
 
+/**
+ * How long a worker may run before it is given up on, when it does not say.
+ *
+ * Named rather than inlined because admission reads it too: a credential preflight has to
+ * know how long the job it is about to admit could still be running, and a second literal
+ * `30 * 60_000` somewhere else would drift from this one the first time either moved.
+ */
+export const DEFAULT_WORKER_TIMEOUT_MS = 30 * 60_000
+
 /** Model names are roles, not tiers — a router maps them to specs (§4.7). */
 export const MODEL_ROLES = ['worker', 'reviewer'] as const
 
@@ -53,7 +62,7 @@ export const workerSchema = z.object({
   enabled: z.boolean().default(true),
   /** Capability labels a runner must advertise. Derived when omitted. */
   requires: z.array(z.string()).optional(),
-  timeoutMs: z.number().int().positive().default(30 * 60_000),
+  timeoutMs: z.number().int().positive().default(DEFAULT_WORKER_TIMEOUT_MS),
   /**
    * Which hosts this worker's sandbox may reach (§4.6). Absent means the default
    * allowlist for its runtime — see `egressSchema`, which is also why absent is not

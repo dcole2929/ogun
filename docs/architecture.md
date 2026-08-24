@@ -189,9 +189,41 @@ Guards, each at the scope where its scarce resource actually lives:
 |---|---|---|
 | Concurrent jobs | global (machine) | **yes** — start at 2; WSL2 will OOM otherwise |
 | Consecutive-failure breaker | worker × project | **yes** — ~30 lines, prevents the real disaster |
+| Modifier verifiability | project | **yes** — no image or no test command, no modifier |
+| Credential preflight | runtime × host | **yes** — a job that cannot log in is refused, not dispatched |
 | Runs per day | worker × project | defer |
 | Token budget per day | global, per runtime | defer |
 | Open agent PRs | project | defer (phase 3) |
+
+**The credential preflight.** [settled] Both agent CLIs authenticate with OAuth access
+tokens that expire, and the gateway does not refresh them — it re-reads the file the
+host's own `claude` rewrites when a human runs it (ADR-0010). Nothing runs it on an
+unattended runner, so the token lapses and every job fails on auth at 3am. Admission
+refuses a job whose runtime has no live credential, and the refusal names the fix.
+
+Three things about it are decisions rather than details:
+
+- **The question is not "is it valid now".** A token with five minutes left passes that
+  test and dies mid-run. The window checked is the worker's own `timeoutMs`, because that
+  is exactly how long the credential has to keep working.
+- **Refused, not dispatched-and-failed.** A job that 401s spends a runner slot, a
+  workspace clone and an agent round to produce a failure that is not the worker's — and
+  a failure latches the breaker, so a token that lapsed on Tuesday disables every worker
+  on the project by Friday, for a reason that outlives the fix. A refusal costs one
+  coverage row that says which credential and what to type (principle 6).
+- **Five states, never collapsed.** No credential; an API key, which does not expire; an
+  OAuth token whose file records no expiry; alive; and dead. Only the first, the last and
+  "will be dead before this job's timeout" refuse. An expiry that cannot be read is
+  admitted — "I could not check" must not be recorded as "I checked, and it is dead".
+
+It refuses only the credential the job's *own runtime* needs, so a dead Anthropic token
+does not stop this machine's codex workers, and never over the GitHub token, whose absence
+is the intended default (ADR-0005). And it is established by the caller rather than read
+inside `admit`: the credentials are a fact about the **runner host**, which the control
+plane can see only while they are the same machine (§3, ADR-0001). A control plane that
+had moved and then failed closed on what it could no longer see would turn a preflight
+into an outage, so not-checked admits, and the gateway's own `502 no_credential` and the
+provider's 401 remain behind it.
 
 Two implementation notes:
 
@@ -320,6 +352,16 @@ material that carries prompt injection, and an injected agent's first move is to
 own credential file — which on a working machine also holds live OAuth access and refresh
 tokens for every connected MCP server, under `mcpOAuth`. The worst case was handing an
 unattended agent a set of third-party credentials from unrelated products.
+
+**An API key is the right credential for a runner nobody logs into.** [settled]
+`credentials.ts` prefers an explicit `ANTHROPIC_API_KEY` (and `OPENAI_API_KEY`) over the
+subscription OAuth token, and **an API key does not expire**. That matters far more than
+it reads: the OAuth token is kept alive only by a human running `claude` on that host, so
+on a machine whose owner does not log in daily it lapses, and every nightly job fails on
+auth until somebody notices. An API key is the one configuration that survives an
+unattended factory unattended. It also points a run at a different account than the host's
+`claude` is logged into, which is the other reason to set it. `docs/setup.md` has the
+how; §4.3 is what happens when neither is live.
 
 **No git credential ever enters a sandbox**, which was true before and is now true at a
 second boundary: the gateway refuses `git-receive-pack` in both of its phases, whatever
@@ -1510,11 +1552,35 @@ canvas, auto-merge, agent memory, model auto-selection, remote runner mesh.
 4. **Triage prompt and calibration.** What the severity scale actually is, and how
    triage is itself evaluated. It is the one node that can silently lose real
    findings, so it needs its own quality measure — currently undefined.
-5. **Refreshing an OAuth token host-side.** The gateway re-reads the credential files
-   rather than refreshing them, so the host's own `claude` is what keeps a token alive.
-   Nothing does that on a machine that only runs Ogun, and the token lapses. Whether the
-   gateway should perform the refresh — and therefore write back to the user's real
-   credential file, which is a much larger claim on it — is undecided (ADR-0010).
+5. **Refreshing an OAuth token host-side.** [open] The gateway re-reads the credential
+   files rather than refreshing them, so the host's own `claude` is what keeps a token
+   alive. Nothing does that on a machine that only runs Ogun, and the token lapses.
+
+   The *symptom* is now handled and the *refresh* is still open, and those are different
+   questions. A lapse used to surface only as a provider 401 inside a 3am transcript,
+   which names the wrong cause; it is now caught before a job starts, by `ogun runner
+   doctor` and by admission (§4.3). What is undecided is whether anything should keep the
+   token alive, and both ways of doing it were considered and rejected for now:
+
+   - **Refresh in memory, never writing to disk.** Rejected — it depends on a property of
+     the provider that Ogun does not control. If the refresh token rotates on use, the
+     gateway spending it invalidates the copy sitting in `~/.claude/.credentials.json`,
+     and the next time the user runs `claude` on their own machine they are logged out of
+     their own CLI by a background process they did not know was touching it. The symptom
+     — "my Claude login keeps dropping" — looks nothing like the cause, and nothing in
+     Ogun's logs would connect them.
+   - **Refresh and write the result back.** Rejected — it fixes rotation and buys a race.
+     The host's own `claude` rewrites that same file whenever a human uses it, and neither
+     writer holds a lock. Two processes rewriting a credential file at overlapping moments
+     lose a token between them, and the machine ends up logged out of the account it was
+     working for, at whatever hour the collision happened to occur.
+
+   What is *not* open: an **API key does not expire**, so a runner nobody logs into should
+   use one (§4.6, `docs/setup.md`). That is the answer for an unattended factory today,
+   and it is why the refusal text names `ANTHROPIC_API_KEY` rather than only `claude`.
+   The other unbuilt half is a runner-side re-check — the runner is the process that
+   actually holds the credentials, and its `refuse` path (§5.2) is the right place for a
+   lapse that happens between admission and the claim.
 6. **Extending the egress allowlist per project.** A project whose test suite reaches a
    host outside the default list fails its verification gate. The list is a constant; the
    extension point is designed and unbuilt, and where it should live — project config,

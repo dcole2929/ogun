@@ -2,6 +2,7 @@ import { and, eq, inArray } from 'drizzle-orm'
 import { schema } from '@ogun/core/db'
 import type { Db } from '@ogun/core/db'
 import { cycleDefinitionSchema, isTerminal, type CycleDefinition, type JobState } from '@ogun/core'
+import type { CredentialOutlook } from '@ogun/gateway'
 import {
   admit,
   DEFAULT_LIMITS,
@@ -25,6 +26,24 @@ export type StartCycleRunInput = {
    * assert an admission rule is a test about filesystems.
    */
   modifierReadiness?: ModifierReadiness
+  /**
+   * What the host's credential files say (§4.3), for the preflight that refuses a job no
+   * credential on this machine could authenticate.
+   *
+   * Established by the caller and — unlike `modifierReadiness` — deliberately *not*
+   * probed here when it is missing. Every trigger passes through this function, including
+   * the twenty-odd tests that call it directly, and a `probeCredentials()` default would
+   * make each of their outcomes depend on whatever `~/.claude/.credentials.json` happened
+   * to hold: green on a laptop somebody used this morning, red on CI, red on the very
+   * machine whose lapsed token this feature exists to catch. A suite that fails when the
+   * host is misconfigured is a suite that gets ignored.
+   *
+   * The two production callers — `scheduler.ts` for cron and `routes/trigger.ts` for a
+   * manual run — pass it. Omitting it means the credential guard does not run, which is
+   * the documented open case: the gateway's `502 no_credential` and the provider's 401
+   * are still there behind it.
+   */
+  credentials?: CredentialOutlook
 }
 
 /**
@@ -89,7 +108,21 @@ export async function startCycleRun(
 
       const dependsOn = definition.edges.filter((e) => e.to === node.key).map((e) => e.from)
       const verdict = worker.enabled
-        ? await admit(tx, { id: worker.id, permissions: worker.permissions }, limits, readiness)
+        ? await admit(
+            tx,
+            {
+              id: worker.id,
+              permissions: worker.permissions,
+              // The runtime decides *which* credential has to be alive, and the timeout
+              // decides for how long — a worker permitted to run for two hours needs more
+              // of a token left than one capped at ten minutes.
+              runtime: worker.runtime,
+              ...timeoutOf(worker.config),
+            },
+            limits,
+            readiness,
+            input.credentials,
+          )
         : ({ allowed: false, reason: 'worker disabled' } as const)
 
       const state: JobState = !verdict.allowed ? 'skipped' : dependsOn.length ? 'blocked' : 'queued'
@@ -268,6 +301,18 @@ async function resolveWorkers(db: Db, projectId: string, definition: CycleDefini
     .from(workers)
     .where(and(eq(workers.projectId, projectId), inArray(workers.name, names)))
   return new Map(rows.map((w) => [w.name, w]))
+}
+
+/**
+ * The worker's own timeout, if its stored config carries one.
+ *
+ * Spread rather than defaulted here so that "this worker did not say" reaches admission
+ * as an absence, and the fallback is applied in the one place that knows what a missing
+ * timeout means. A default written twice is a default that drifts.
+ */
+function timeoutOf(config: Record<string, unknown>): { timeoutMs?: number } {
+  const timeoutMs = config.timeoutMs
+  return typeof timeoutMs === 'number' && Number.isFinite(timeoutMs) ? { timeoutMs } : {}
 }
 
 /** A job's requirements are derived from its worker, not hand-maintained. */

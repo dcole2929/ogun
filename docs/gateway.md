@@ -94,15 +94,30 @@ and it is paid deliberately.
    refusal is retried until the job's budget is gone and is then filed as a timeout.
 5. **`ogun runner doctor` reports it before a job is claimed** — the CA's presence and the
    mode of `ca.key`, and per provider what would actually be injected, including how long
-   an OAuth token has left.
+   an OAuth token has left. A token is `ok` only while it outlives the next hour;
+   `present` is not the question, because an expired token is present.
+6. **Admission refuses a job that cannot log in**, rather than dispatching it to fail
+   (§4.3). The window it checks is the worker's own `timeoutMs`, not the current instant:
+   a token with five minutes left is valid right now and dead halfway through the job.
+   The refusal is recorded as `refused` with the fix in the reason — a failure would be
+   the wrong name for it and would latch the breaker against a worker that is fine.
 
 ### What is deliberately not built
 
 - **No token refresh.** The gateway re-reads the credential files on a five-second memo,
   so a refresh the host's own `claude` performs reaches an in-flight job. It does not
-  perform one itself. Before the gateway, a container refreshed the copy it was given;
-  now the host file is the only live one, and if nothing on the host runs `claude` before
-  it lapses, jobs 401. `doctor` names it and says what fixes it. This is a real gap.
+  perform one itself, and both ways of doing so are rejected in ADR-0010: refreshing in
+  memory risks the provider rotating the refresh token and logging the user out of their
+  own CLI, and writing the result back races the host's `claude` over the same file.
+  What replaces it is a preflight (above) plus the configuration that has nothing to
+  refresh — an explicit `ANTHROPIC_API_KEY` does not expire, `credentials.ts` already
+  prefers it, and `docs/setup.md` says so. The gap is real and narrowed, not closed.
+- **No expiry check for codex.** `~/.codex/auth.json` records no expiry in the fields the
+  gateway reads. The access token's JWT payload could be parsed for one; deliberately not
+  done — it adds an unverified parse of a credential body to the one code path that must
+  not throw, to predict what a 401 answers authoritatively. Codex jobs are therefore never
+  refused on expiry grounds, and `doctor` says the expiry is unrecorded rather than
+  printing a healthy-looking line for something nothing checked.
 - **No approval flow, no rate limits, no per-worker grants, no policy DSL.** §9 lists
   multi-tenancy and RBAC as explicit non-goals.
 
