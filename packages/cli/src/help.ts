@@ -124,7 +124,7 @@ const topics: Record<string, Topic> = {
 
   image: {
     summary: 'build the container image a job runs inside',
-    usage: ['ogun image build [project-dir]'],
+    usage: ['ogun image build [project-dir] [--name <slug>]'],
     where:
       'On every machine that runs container jobs. The image is built locally, never ' +
       'pulled, so it has to exist where the container starts.',
@@ -132,9 +132,13 @@ const topics: Record<string, Topic> = {
       'With no argument: ogun/base:latest from images/base. The CLI is bundled into it ' +
         'first, so the in-sandbox `ogun findings write` cannot drift from the validator ' +
         'that will read its output.',
-      'With a directory: ogun/project-<dir>:latest from <dir>/.ogun/Dockerfile. A ' +
+      'With a directory: ogun/project-<slug>:latest from <dir>/.ogun/Dockerfile. A ' +
         "project image is FROM ogun/base plus that project's toolchain, and a modifier " +
         'worker needs one — the base image is enough to read a repo and not enough to build it.',
+      'The tag comes from `project.name` in the directory\'s .ogun/config.yaml, not from ' +
+        'the directory name, because that is what the runner looks the image up by. A ' +
+        'worktree or a clone under another name would otherwise build an image no job asks ' +
+        'for. --name overrides it, matching `ogun project add --name`.',
     ],
     touches: [['docker', 'writes the image into the local daemon']],
   },

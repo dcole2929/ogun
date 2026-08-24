@@ -2,7 +2,9 @@ import { existsSync } from 'node:fs'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import {
+  baseImage,
   parseFingerprint,
+  projectImage,
   readPolicies,
   readTestCommand,
   verifySchema,
@@ -1022,12 +1024,18 @@ function describeExtraction(change: PatchExtraction): string {
   )
 }
 
-/** Each project has its own image; absent one, `ogun/base` — enough for a reviewer and
- *  not enough for a modifier (§5.1). */
-const imageFor = (job: ClaimedJob): string =>
-  job.permissions === 'modifier'
-    ? `ogun/project-${job.projectSlug}:latest`
-    : (process.env.OGUN_BASE_IMAGE ?? 'ogun/base:latest')
+/**
+ * Each project has its own image; absent one, `ogun/base` — enough for a reviewer and not
+ * enough for a modifier (§5.1).
+ *
+ * The tag is not spelled out here any more. It used to be, and `ogun image build` spelled
+ * it out differently — from the checkout's directory name rather than the project slug —
+ * so a repository whose directory is not named after the project built one image and ran
+ * another. `projectImage` is now the only place the format string exists; exported so a
+ * test can hold the builder and the runner to the same answer.
+ */
+export const imageFor = (job: Pick<ClaimedJob, 'permissions' | 'projectSlug'>): string =>
+  job.permissions === 'modifier' ? projectImage(job.projectSlug) : baseImage()
 
 async function trackedPaths(workspace: string): Promise<Set<string>> {
   // Through `gitIn`, like every git call made after the container has exited: `ls-files`

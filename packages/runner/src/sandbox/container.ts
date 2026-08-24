@@ -399,7 +399,50 @@ export function buildRunArgs(opts: ContainerOptions, image: string): string[] {
     if (existsSync(hostPath)) args.push('--volume', `${hostPath}:${guestPath}:ro`)
   }
 
-  // A package-manager cache volume, or every nightly run re-downloads the world.
+  /**
+   * A package-manager cache volume, or every nightly run re-downloads the world (§4.6).
+   *
+   * One volume per *runtime*, mounted read-write into every concurrent sandbox — so with
+   * `maxConcurrentJobs: 2` there are routinely two containers writing to it at once, and
+   * for Ogun's own project image `tests.command` is `pnpm install` straight into it. That
+   * looks exactly like every other shared mutable global, and it is the one place here
+   * where sharing turns out to be correct. Written down because it is not obvious, and
+   * because the next person to audit this will otherwise re-derive it from scratch:
+   *
+   *  - **Where the store actually is.** `PNPM_HOME=/home/dev/.cache/pnpm` in
+   *    `.ogun/Dockerfile`, and pnpm resolves `store-dir` from `$PNPM_HOME/store` before
+   *    anything else, so the content-addressable store lands at
+   *    `/home/dev/.cache/pnpm/store/v10` — inside this volume, which is the intent. The
+   *    metadata cache follows `$XDG_CACHE_HOME` / `~/.cache` and lands here too, by a
+   *    different rule that happens to agree.
+   *  - **Why concurrent writers do not corrupt it.** pnpm writes each store file to a
+   *    temporary path and renames it over the destination, and — this is the part that
+   *    matters — the temporary name is *derived from the destination*
+   *    (`<dest><pid><threadId>`). The destination name is the content hash. So two
+   *    containers can only collide on a temp path when they are writing the same hash,
+   *    which means they are writing identical bytes, which means interleaving them is
+   *    harmless and either rename produces the right file. pnpm's own source names this
+   *    scenario — "two containers use the same mounted directory for their
+   *    content-addressable store" — and handles a temp file that vanished before its
+   *    rename by assuming the destination is correct. It is, for the same reason.
+   *  - **The backstop.** `verify-store-integrity` defaults to true, so a store file whose
+   *    content stops matching its name is detected when it is linked out rather than
+   *    installed.
+   *
+   * Three things are true and worth knowing before relying on any of this:
+   *
+   *  - The safety claim is a pnpm maintainer's answer in a GitHub discussion, not
+   *    documentation. A pull request to state it on pnpm.io has been open since 2022. The
+   *    project image pins `pnpm@10`, which is what bounds the risk of it changing.
+   *  - The store is on a docker volume and `node_modules` is on the bind-mounted
+   *    workspace, so they are different filesystems and hardlinking fails with EXDEV.
+   *    pnpm warns once and copies. The volume therefore saves the *download*, which is
+   *    what §4.6 asked for, and not the disk or the linking.
+   *  - Keyed by runtime, so every project on this runner shares one store, and a
+   *    `modifier` has write access to it. Content-addressing plus the integrity check is
+   *    the whole of what keeps that honest. A project turning `verify-store-integrity`
+   *    off in its own config would remove the backstop for *itself*, not for others.
+   */
   args.push('--volume', `ogun-cache-${opts.runtime}:/home/dev/.cache`)
 
   args.push('--env', `OGUN_PERMISSIONS=${opts.permissions}`)

@@ -1,8 +1,9 @@
 import { strict as assert } from 'node:assert'
 import { after, before, describe, test } from 'node:test'
-import { mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readdir, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { parse as parseYaml } from 'yaml'
 import { eq } from 'drizzle-orm'
 import { schema } from '@ogun/core/db'
 import { startHarness, type Harness } from './harness.ts'
@@ -102,6 +103,93 @@ describe('config store', () => {
     const yaml = workerToYamlBlock('busy', { ...defaults, runtime: 'codex', model: 'reviewer' })
     assert.match(yaml, /runtime: codex/)
     assert.match(yaml, /model: reviewer/)
+  })
+})
+
+/**
+ * What happens when two edits to one config.yaml are in flight at once.
+ *
+ * Not hypothetical for a control plane: `maxConcurrentJobs` defaults to 2, the UI can
+ * have the same project open in two tabs, and a `fix-a-finding` modifier now writes
+ * through this store as well. Two of the three failures below leave no error anywhere —
+ * the request returns 200 and the edit is simply not in the file — which is the shape
+ * that costs an afternoon.
+ *
+ * A naive implementation gets three things wrong, and each of these tests fails against
+ * one of them:
+ *
+ *  - It stages through a fixed `<path>.ogun-tmp`. Two writers open that one path, both
+ *    truncate it, and their `write(2)`s interleave: what is renamed over config.yaml is a
+ *    splice of two documents, not either of them.
+ *  - It treats "load, check the hash, modify, write" as atomic when every step of it
+ *    yields. Both writers see the same hash, both pass the check, and the second write
+ *    erases the first.
+ *  - It therefore makes `expectedHash` a compare-and-swap that does not swap: the caller
+ *    who lost is told the edit succeeded.
+ */
+describe('concurrent config edits', () => {
+  let root = ''
+  const slug = 'demo'
+  const store = () => createLocalConfigStore(join(root, 'projects.json'))
+  const configPath = () => join(root, 'repo', '.ogun', 'config.yaml')
+
+  before(async () => {
+    root = await mkdtemp(join(tmpdir(), 'ogun-config-race-'))
+    await mkdir(join(root, 'repo', '.ogun'), { recursive: true })
+    await writeFile(configPath(), CONFIG.replace('SLUG', slug))
+    await writeFile(
+      join(root, 'projects.json'),
+      JSON.stringify({ projects: { [slug]: join(root, 'repo') } }),
+    )
+  })
+
+  test('every one of twenty simultaneous edits survives', async () => {
+    // Twenty separate stores, because that is what two requests to one server get: the
+    // store is constructed per call site, so anything guarding this has to be keyed on
+    // the file rather than held by an instance.
+    const names = Array.from({ length: 20 }, (_, i) => `w${i}`)
+    await Promise.all(
+      names.map((name) =>
+        store().mutate(slug, undefined, (doc) => {
+          doc.setIn(['workers', name], { skill: 'review', runtime: 'claude' })
+        }),
+      ),
+    )
+
+    const text = await readFile(configPath(), 'utf8')
+    // Parses at all: the splice failure produces a file that does not.
+    const parsed = parseYaml(text) as { workers: Record<string, unknown> }
+    const missing = names.filter((n) => !(n in parsed.workers))
+    // Against a lost update this is nineteen of twenty, not one or two — every writer
+    // read the same original text, so only the last rename's content survives.
+    assert.deepEqual(missing, [], `edits dropped: ${missing.join(', ')}`)
+    assert.ok('nightly' in parsed.workers, 'the worker that was already there was lost')
+  })
+
+  test('nothing is left behind in the repo', async () => {
+    // A staging file in the repo's own `.ogun/` shows up in `git status` as something the
+    // control plane put there and never took away.
+    const left = (await readdir(join(root, 'repo', '.ogun'))).filter((f) => f !== 'config.yaml')
+    assert.deepEqual(left, [])
+  })
+
+  test('two edits against one hash: one wins, the other is told', async () => {
+    const hash = (await store().read(slug)).hash
+    const edit = (name: string) =>
+      store().mutate(slug, hash, (doc) => {
+        doc.setIn(['workers', name], { skill: 'review', runtime: 'claude' })
+      })
+
+    const results = await Promise.allSettled([edit('first'), edit('second')])
+    const rejected = results.filter((r) => r.status === 'rejected')
+    // The point of the parameter. Silently dropping one is the behaviour it exists to
+    // replace, and a caller told "saved" about an edit that was not is worse than an
+    // error, because there is nothing left to notice.
+    assert.equal(rejected.length, 1, 'both edits claimed to succeed against one base hash')
+    assert.ok(
+      (rejected[0] as PromiseRejectedResult).reason instanceof ConfigConflict,
+      'the loser must get a conflict, not an arbitrary error',
+    )
   })
 })
 

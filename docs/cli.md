@@ -97,9 +97,14 @@ With no argument it builds `ogun/base:latest` from `images/base`, bundling the C
 the image first — the in-sandbox `ogun findings write` has to match the validator that
 will read its output, and a bundle cannot drift from it.
 
-With a directory it builds `ogun/project-<dir>:latest` from `<dir>/.ogun/Dockerfile`. A
+With a directory it builds `ogun/project-<slug>:latest` from `<dir>/.ogun/Dockerfile`. A
 project image is `FROM ogun/base` plus that project's toolchain; a `modifier` worker
 needs one, because the base image is enough to read a repo and not enough to build it.
+
+The slug comes from `project.name` in that directory's `.ogun/config.yaml`, not from the
+directory name — that is the name the runner looks the image up by, so building from a
+git worktree or a clone kept under a different name would otherwise produce an image no
+job ever asks for. `--name <slug>` overrides it, the same way `ogun project add` does.
 
 Touches: Docker.
 
