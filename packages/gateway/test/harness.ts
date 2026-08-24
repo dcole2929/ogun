@@ -1,8 +1,9 @@
+import { createHash, randomBytes } from 'node:crypto'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { Agent, createServer, request } from 'node:https'
 import type { IncomingHttpHeaders, IncomingMessage, ServerResponse } from 'node:http'
 import { connect } from 'node:net'
-import type { AddressInfo } from 'node:net'
+import type { AddressInfo, Socket } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Duplex } from 'node:stream'
@@ -32,6 +33,13 @@ export type Upstream = {
   /** Every request the upstream actually received, headers and all. */
   received: Array<{ method: string; url: string; headers: IncomingHttpHeaders; body: string }>
   respond: (handler: (req: IncomingMessage, res: ServerResponse) => void) => void
+  /**
+   * Every Upgrade request that reached the upstream — the ones `received` cannot hold,
+   * because `node:http` routes them to a different event and never builds a body for them.
+   */
+  upgraded: Array<{ method: string; url: string; headers: IncomingHttpHeaders }>
+  /** Replace the handshake handler. The default completes it and then echoes bytes. */
+  onUpgrade: (handler: (req: IncomingMessage, socket: Socket, head: Buffer) => void) => void
   close: () => Promise<void>
 }
 
@@ -76,6 +84,39 @@ export async function startUpstream(hostname: string): Promise<Upstream> {
     })
   })
 
+  /**
+   * A real WebSocket handshake, not a stub 101.
+   *
+   * `Sec-WebSocket-Accept` is a hash of the key the *client* chose, so an upstream that
+   * returned a canned value would pass a proxy that dropped or rewrote the key — which is
+   * exactly the class of bug worth catching, because the gateway strips hop-by-hop headers
+   * and `sec-websocket-key` sits one line away from the ones it is right to strip.
+   *
+   * After the switch it echoes: whatever arrives comes back. That makes the frames opaque,
+   * which is the point — the gateway relays bytes and must not need to understand them.
+   */
+  const upgrades: Upstream['upgraded'] = []
+  let upgradeHandler = (req: IncomingMessage, socket: Socket, _head: Buffer): void => {
+    const key = req.headers['sec-websocket-key']
+    if (typeof key !== 'string') {
+      socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n')
+      return
+    }
+    socket.write(
+      'HTTP/1.1 101 Switching Protocols\r\n' +
+        'Upgrade: websocket\r\n' +
+        'Connection: Upgrade\r\n' +
+        `Sec-WebSocket-Accept: ${webSocketAccept(key)}\r\n\r\n`,
+    )
+    socket.on('data', (chunk: Buffer) => socket.write(chunk))
+  }
+
+  server.on('upgrade', (req: IncomingMessage, socket: Socket, head: Buffer) => {
+    upgrades.push({ method: req.method ?? '', url: req.url ?? '', headers: req.headers })
+    socket.on('error', () => undefined)
+    upgradeHandler(req, socket, head)
+  })
+
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
   const address = server.address() as AddressInfo
 
@@ -86,9 +127,19 @@ export async function startUpstream(hostname: string): Promise<Upstream> {
     respond: (next) => {
       handler = next
     },
+    upgraded: upgrades,
+    onUpgrade: (next) => {
+      upgradeHandler = next
+    },
     close: () => new Promise<void>((resolve) => server.close(() => resolve())),
   }
 }
+
+/** RFC 6455 §1.3: sha1 of the client's key concatenated with the protocol's fixed GUID. */
+export const webSocketAccept = (key: string): string =>
+  createHash('sha1')
+    .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
+    .digest('base64')
 
 export async function startHarness(options: {
   hostname: string
@@ -198,6 +249,158 @@ export function pipelinedTunnel(
     })
     tls.on('error', reject)
     tls.once('secureConnect', () => resolve(tls))
+  })
+}
+
+/**
+ * A CONNECT tunnel with TLS finished on it, handed back raw.
+ *
+ * `openTunnel` wraps its socket in an `https.Agent` so it can send ordinary requests, and
+ * an Agent will not send an Upgrade. This gives the tunnel back as a socket, which is the
+ * only way to write a handshake onto it.
+ */
+export function openRawTunnel(
+  harness: Harness,
+  options: { token: string; hostname: string; port?: number },
+): Promise<TLSSocket> {
+  const { host, port } = harness.address
+  const authority = `${options.hostname}:${options.port ?? 443}`
+
+  return new Promise<TLSSocket>((resolve, reject) => {
+    const socket = connect(port, host, () => {
+      socket.write(
+        `CONNECT ${authority} HTTP/1.1\r\nHost: ${authority}\r\n` +
+          `Proxy-Authorization: Basic ${Buffer.from(`x:${options.token}`).toString('base64')}\r\n\r\n`,
+      )
+    })
+    socket.on('error', reject)
+
+    let preamble = Buffer.alloc(0)
+    const onData = (chunk: Buffer): void => {
+      preamble = Buffer.concat([preamble, chunk])
+      const end = preamble.indexOf('\r\n\r\n')
+      if (end === -1) return
+      socket.off('data', onData)
+      const status = Number(preamble.subarray(0, end).toString('utf8').split(' ')[1])
+      if (status !== 200) {
+        socket.destroy()
+        reject(new Error(`CONNECT answered ${status}`))
+        return
+      }
+      const rest = preamble.subarray(end + 4)
+      if (rest.length > 0) socket.unshift(rest)
+      const tls = connectTls({
+        socket,
+        ca: harness.sandboxCa,
+        servername: options.hostname,
+        ALPNProtocols: ['http/1.1'],
+      })
+      tls.on('error', reject)
+      tls.once('secureConnect', () => resolve(tls))
+    }
+    socket.on('data', onData)
+  })
+}
+
+/** A bare connection to the proxy port, for the door that has no tunnel in front of it. */
+export const proxySocket = (harness: Harness): Promise<Socket> =>
+  new Promise((resolve, reject) => {
+    const socket = connect(harness.address.port, harness.address.host, () => resolve(socket))
+    socket.on('error', reject)
+  })
+
+export type UpgradeResult = {
+  status: number
+  headers: Record<string, string>
+  /** The `Sec-WebSocket-Key` this client chose, so a test can verify the accept hash. */
+  key: string
+  /** Whatever followed the response head — a refusal's JSON body, or the first frames. */
+  body: string
+  socket: Duplex
+  /** The next chunk to arrive after the head, for asserting a relay in both directions. */
+  next: () => Promise<Buffer>
+}
+
+/**
+ * A WebSocket handshake written by hand onto a socket.
+ *
+ * By hand because no HTTP client will send this: `http.request` refuses to put
+ * `Connection: Upgrade` and an absolute-form request URI on the same line, and a `ws`
+ * library would open its own connection rather than use the tunnel under test. The wire
+ * bytes *are* the thing being tested — this is the request shape that `node:http` routes
+ * to `'upgrade'` instead of `'request'`, and that the gateway used to drop on the floor.
+ */
+export function speakUpgrade(
+  socket: Duplex,
+  target: string,
+  options: { host: string; headers?: Record<string, string>; proxyToken?: string } ,
+): Promise<UpgradeResult> {
+  const key = randomBytes(16).toString('base64')
+  const lines = [
+    `GET ${target} HTTP/1.1`,
+    `Host: ${options.host}`,
+    'Upgrade: websocket',
+    'Connection: Upgrade',
+    'Sec-WebSocket-Version: 13',
+    `Sec-WebSocket-Key: ${key}`,
+    ...(options.proxyToken
+      ? [
+          `Proxy-Authorization: Basic ${Buffer.from(`x:${options.proxyToken}`).toString('base64')}`,
+        ]
+      : []),
+    ...Object.entries(options.headers ?? {}).map(([name, value]) => `${name}: ${value}`),
+  ]
+
+  return new Promise<UpgradeResult>((resolve, reject) => {
+    let preamble = Buffer.alloc(0)
+    let settled = false
+    const queue: Buffer[] = []
+    let waiting: ((chunk: Buffer) => void) | undefined
+
+    const onData = (chunk: Buffer): void => {
+      if (settled) {
+        if (waiting) {
+          const take = waiting
+          waiting = undefined
+          take(chunk)
+        } else queue.push(chunk)
+        return
+      }
+      preamble = Buffer.concat([preamble, chunk])
+      const end = preamble.indexOf('\r\n\r\n')
+      if (end === -1) return
+      settled = true
+      const head = preamble.subarray(0, end).toString('utf8').split('\r\n')
+      const rest = preamble.subarray(end + 4)
+      if (rest.length > 0) queue.push(rest)
+      const headers: Record<string, string> = {}
+      for (const line of head.slice(1)) {
+        const at = line.indexOf(':')
+        if (at > 0) headers[line.slice(0, at).trim().toLowerCase()] = line.slice(at + 1).trim()
+      }
+      resolve({
+        status: Number(head[0]?.split(' ')[1]),
+        headers,
+        key,
+        body: rest.toString('utf8'),
+        socket,
+        next: () =>
+          new Promise<Buffer>((ok) => {
+            const queued = queue.shift()
+            if (queued) ok(queued)
+            else waiting = ok
+          }),
+      })
+    }
+
+    socket.on('data', onData)
+    socket.on('error', reject)
+    // A refusal that closes without a body still has to resolve, or the test hangs and
+    // reports a timeout instead of the status the gateway actually sent.
+    socket.on('close', () => {
+      if (!settled) reject(new Error('the socket closed before a response head arrived'))
+    })
+    socket.write(`${lines.join('\r\n')}\r\n\r\n`)
   })
 }
 

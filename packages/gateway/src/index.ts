@@ -83,5 +83,13 @@ export {
 } from './stubs.ts'
 export type { CredentialStub } from './stubs.ts'
 
+export {
+  bodyIsBufferable,
+  isSyntheticRefreshTarget,
+  MAX_SYNTHETIC_BODY_BYTES,
+  syntheticRefresh,
+} from './synthetic.ts'
+export type { SyntheticResponse } from './synthetic.ts'
+
 export { proxyToken, startGateway } from './server.ts'
 export type { Dial, Gateway, GatewayOptions, GatewaySession, Listening } from './server.ts'

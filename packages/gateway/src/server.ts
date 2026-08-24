@@ -28,6 +28,7 @@ import {
   requiresCredential,
   stripHopByHop,
 } from './inject.ts'
+import { bodyIsBufferable, isSyntheticRefreshTarget, syntheticRefresh } from './synthetic.ts'
 
 /**
  * The proxy: CONNECT, TLS interception, allowlist, credential injection.
@@ -173,6 +174,27 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
   })
   intercepted.on('clientError', (_err, socket) => socket.destroy())
 
+  /**
+   * The same door, inside a tunnel.
+   *
+   * This is where Codex's `wss://chatgpt.com/backend-api/codex/responses` actually lands:
+   * the CONNECT already happened, TLS is already terminated, and the handshake arrives on
+   * the intercepted connection as a `GET` with `Connection: Upgrade`.
+   *
+   * The token, the allowlist and the port were all checked on the CONNECT that built this
+   * socket, and `ogunAuthority` is the evidence of it — exactly as for the `'request'`
+   * handler above. What is left is what `forwardUpgrade` does: the push refusal, the
+   * credential answer, and the injection.
+   */
+  intercepted.on('upgrade', (req, socket: Socket, head: Buffer) => {
+    socket.on('error', () => undefined)
+    const authority = (socket as TLSSocket & { ogunAuthority?: Authority }).ogunAuthority
+    if (!authority) {
+      return refuseSocket(socket, 500, 'internal', 'intercepted socket has no host')
+    }
+    forwardUpgrade(authority.hostname, authority.port, req, socket, head)
+  })
+
   const proxy = createHttpServer()
 
   /**
@@ -229,6 +251,74 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
     }
     req.url = target.pathname + target.search
     void forward(target.hostname, port, req, res)
+  })
+
+  /**
+   * The third door, on the plain side.
+   *
+   * An `Upgrade` request can arrive in absolute form straight at the proxy port, exactly
+   * as a `GET http://host/path` can — and for exactly the same reason it has to run every
+   * check the other doors run. Left unhandled it was closed rather than relayed, so this
+   * is not fixing a hole; it is refusing to open one while adding the upgrade support the
+   * tunnel door needs.
+   *
+   * Written as its own listener rather than folded into `'request'` because `node:http`
+   * will never deliver these to `'request'`: an upgrade is a different event with a raw
+   * socket instead of a `ServerResponse`, which is why every refusal below is written by
+   * hand onto the wire.
+   */
+  proxy.on('upgrade', (req, socket: Socket, head: Buffer) => {
+    socket.on('error', () => undefined)
+
+    const allow = sessionAllow(req.headers, sessions)
+    if (!allow) return challengeSocket(socket)
+
+    let target: URL
+    try {
+      target = new URL(req.url ?? '')
+    } catch {
+      return refuseSocket(
+        socket,
+        400,
+        'not_a_proxy_request',
+        'expected an absolute-form request URI',
+      )
+    }
+    // `https:` exactly, for the reason written out above `proxy.on('request')`: the
+    // gateway splices a real credential into what it forwards and will not put one on an
+    // unencrypted connection. `ws:` lands here too and is refused by the same rule.
+    if (target.protocol !== 'https:') {
+      refused(target.hostname, `${target.protocol}// puts a credential in the clear`)
+      return refuseSocket(
+        socket,
+        403,
+        'cleartext_refused',
+        `${target.protocol}// is refused — the gateway splices real credentials into ` +
+          'requests and will not put one on an unencrypted connection. Use https.',
+      )
+    }
+    const port = strictPortOf(target) ?? 443
+    if (!isAllowedPort(port)) {
+      refused(target.hostname, `port ${port} is not ${ALLOWED_CONNECT_PORT}`)
+      return refuseSocket(
+        socket,
+        403,
+        'port_not_allowed',
+        `${target.hostname}:${port} is refused — a sandbox reaches ${ALLOWED_CONNECT_PORT} ` +
+          'and nothing else',
+      )
+    }
+    if (!isAllowedHost(target.hostname, allow)) {
+      refused(target.hostname, "not on this worker's allowlist")
+      return refuseSocket(
+        socket,
+        403,
+        'host_not_allowed',
+        `${target.hostname} is not on the sandbox egress allowlist`,
+      )
+    }
+    req.url = target.pathname + target.search
+    forwardUpgrade(target.hostname, port, req, socket, head)
   })
 
   proxy.on('connect', (req, socket: Socket, head: Buffer) => {
@@ -327,15 +417,29 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
   proxy.on('error', (err) => warn(`listener error: ${err.message}`))
   proxy.on('clientError', (_err, socket) => socket.destroy())
 
-  async function forward(
+  /**
+   * Everything that happens to a request between "it is allowed through" and "it goes on
+   * the wire", for every door.
+   *
+   * Extracted rather than repeated, and that is the whole point of it existing. This
+   * gateway has already shipped the same bug twice — a second entrance that skipped a
+   * check the first one made (see the long comment above `proxy.on('request')`) — and a
+   * third entrance was then added for HTTP Upgrade. Three copies of "refuse a push, refuse
+   * a missing credential, inject, rewrite Host" is three chances for one of them to drift.
+   * One function is a structural answer instead of a promise: a door that forwards without
+   * calling this has nothing to forward, because this is where the headers come from.
+   */
+  type Prepared =
+    | { ok: true; headers: Record<string, string | string[] | undefined> }
+    | { ok: false; status: number; error: string; message: string }
+
+  function prepare(
     hostname: string,
     port: number,
-    req: IncomingMessage,
-    res: ServerResponse,
-  ): Promise<void> {
-    const path = req.url ?? '/'
-    const method = req.method ?? 'GET'
-
+    method: string,
+    path: string,
+    requestHeaders: IncomingHttpHeaders,
+  ): Prepared {
     /**
      * ADR-0005, enforced here as well as at the workspace.
      *
@@ -346,13 +450,14 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
      */
     if (isGitPushRequest(method, path)) {
       refused(hostname, 'a git push (ADR-0005)')
-      return refuse(
-        res,
-        403,
-        'push_refused',
-        'the sandbox never pushes (ADR-0005) — a modifier commits locally and the runner ' +
+      return {
+        ok: false,
+        status: 403,
+        error: 'push_refused',
+        message:
+          'the sandbox never pushes (ADR-0005) — a modifier commits locally and the runner ' +
           'extracts a patch on the host',
-      )
+      }
     }
 
     const credentials = readCredentials()
@@ -366,23 +471,72 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
        * whoever reads the transcript to re-authenticate a host credential that was fine.
        * The gateway knows the actual cause, so it answers with it.
        */
-      return refuse(
-        res,
-        502,
-        'no_credential',
-        `no ${provider} credential is available on this host — the sandbox holds only a ` +
+      return {
+        ok: false,
+        status: 502,
+        error: 'no_credential',
+        message:
+          `no ${provider} credential is available on this host — the sandbox holds only a ` +
           'placeholder, so the request cannot be completed. Run `ogun runner doctor`.',
-      )
+      }
     }
 
     const headers = applyInjections(
-      stripHopByHop(req.headers as Record<string, string | string[] | undefined>),
+      stripHopByHop(requestHeaders as Record<string, string | string[] | undefined>),
       injectionsFor(hostname, credentials),
     )
     // `host` is rewritten to the real target rather than passed through: the client set it
     // from the URL it thinks it is talking to, which is the same name, but a request that
     // was retargeted would otherwise carry the wrong one silently.
     headers.host = port === 443 ? hostname : `${hostname}:${port}`
+    return { ok: true, headers }
+  }
+
+  async function forward(
+    hostname: string,
+    port: number,
+    req: IncomingMessage,
+    res: ServerResponse,
+  ): Promise<void> {
+    const path = req.url ?? '/'
+    const method = req.method ?? 'GET'
+
+    const prepared = prepare(hostname, port, method, path, req.headers)
+    if (!prepared.ok) {
+      return refuse(res, prepared.status, prepared.error, prepared.message)
+    }
+    const headers = prepared.headers
+
+    /**
+     * The one request answered here instead of upstream — see `synthetic.ts` for why a
+     * placeholder credential cannot be refreshed and what happens to the run when Codex
+     * tries.
+     *
+     * The body is only read when host, method and path already match and the declared
+     * length is small. A request that does not match, or that does not say how big it is,
+     * is never buffered: this check must not become a way to make the runner hold an
+     * arbitrary upload in memory.
+     *
+     * When the body turns out to be a *real* refresh the buffered bytes are forwarded, so
+     * the branch is transparent rather than lossy — hence `bufferedBody` below rather than
+     * an early `return` on the miss.
+     */
+    let bufferedBody: Buffer | undefined
+    if (
+      isSyntheticRefreshTarget(hostname, method, path) &&
+      bodyIsBufferable(req.headers['content-length'])
+    ) {
+      bufferedBody = await collect(req)
+      const answer = syntheticRefresh(bufferedBody.toString('utf8'))
+      if (answer) {
+        res.writeHead(answer.status, {
+          'content-type': 'application/json',
+          'content-length': Buffer.byteLength(answer.body),
+        })
+        res.end(answer.body)
+        return
+      }
+    }
 
     const target = dial.rewrite?.(hostname, port) ?? { host: hostname, port }
     const upstreamOptions: RequestOptions = {
@@ -403,6 +557,24 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
     const upstream = httpsRequest(upstreamOptions)
 
     upstream.on('response', (upstreamRes) => {
+      /**
+       * The client may already be gone, and this is not a hypothetical.
+       *
+       * A container that is killed mid-turn — a job budget expiring, `docker kill`, an
+       * agent that exits while a request is in flight — takes its socket with it, and the
+       * upstream's response then arrives for a `ServerResponse` that is already destroyed.
+       * `pipeline()` *throws* in that case rather than calling back with the error
+       * (`ERR_STREAM_UNABLE_TO_PIPE`), and a throw from a `'response'` handler is an
+       * uncaught exception that takes the whole runner down — every other job on the
+       * machine with it. Found by killing a container mid-run, not by reading the code.
+       *
+       * Destroying the upstream response rather than ignoring it is the other half: the
+       * provider is still generating, and still billing, for something nobody will read.
+       */
+      if (res.destroyed || res.writableEnded) {
+        upstreamRes.destroy()
+        return
+      }
       // Hop-by-hop only on the way back: `content-length` is preserved, because it is
       // required for correct HTTP/1.1 framing and is the only body length a HEAD response
       // has. Stripping it here produces responses that appear truncated at random.
@@ -440,10 +612,159 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
       refuse(res, 502, 'upstream_unreachable', `${hostname}: ${err.message}`)
     })
 
+    if (bufferedBody !== undefined) {
+      // The interception check already drained `req`, so there is nothing left to pipe.
+      // Written back verbatim: `content-length` was never touched and still describes
+      // exactly these bytes, which is what makes the buffering invisible to the upstream.
+      upstream.end(bufferedBody)
+      return
+    }
+
     // Same reasoning on the way out: a client that hangs up mid-request must not leave the
     // upstream half-open holding a socket, and an upstream that refuses the body must not
     // leave the request stream dangling.
     pipeline(req, upstream, () => undefined)
+  }
+
+  /**
+   * The third door: HTTP Upgrade.
+   *
+   * `node:http` routes a request carrying `Connection: Upgrade` to an `'upgrade'` event
+   * rather than to `'request'`, and a server with no `'upgrade'` listener destroys the
+   * socket. That is what this gateway did until now, and the cost was not theoretical:
+   * Codex on a ChatGPT subscription runs its model turn over
+   * `wss://chatgpt.com/backend-api/codex/responses`, so every turn's socket was dropped
+   * mid-handshake. Codex retried five times, fell back to the HTTPS transport, and the run
+   * died — with an error naming the *credential*, which is the wrong place to look.
+   *
+   * This is the same class of hole the absolute-form door was: a second (now third) way in
+   * that does not run the first one's checks. So it runs `prepare()` — the push refusal,
+   * the missing-credential answer, the injection, the `Host` rewrite — and the callers
+   * below do the token, allowlist and port checks before they ever get here.
+   */
+  function forwardUpgrade(
+    hostname: string,
+    port: number,
+    req: IncomingMessage,
+    client: Socket,
+    head: Buffer,
+  ): void {
+    const path = req.url ?? '/'
+    const method = req.method ?? 'GET'
+
+    const prepared = prepare(hostname, port, method, path, req.headers)
+    if (!prepared.ok) {
+      return refuseSocket(client, prepared.status, prepared.error, prepared.message)
+    }
+
+    /**
+     * `connection` and `upgrade` put back after the hop-by-hop strip.
+     *
+     * They are hop-by-hop by definition and `stripHopByHop` is right to remove them — on
+     * every other request. On this one they *are* the request: strip them and what reaches
+     * the upstream is a plain `GET`, which answers 200 with an HTML page and no
+     * `Sec-WebSocket-Accept`. The client then fails its handshake against a response that
+     * looks perfectly valid, which is a considerably harder thing to debug than a dropped
+     * socket. Rebuilt from the client's own values rather than passed through, so a
+     * `Connection: Upgrade, X-Trace` that named a third header still loses the third one.
+     */
+    const headers = prepared.headers
+    headers.connection = 'Upgrade'
+    headers.upgrade = firstHeader(req.headers.upgrade) ?? 'websocket'
+
+    const target = dial.rewrite?.(hostname, port) ?? { host: hostname, port }
+    const upstream = httpsRequest({
+      host: target.host,
+      port: target.port,
+      method,
+      path,
+      headers: headers as IncomingHttpHeaders,
+      servername: hostname,
+      // A dedicated socket, never a pooled one. An upgraded connection stops being HTTP
+      // the moment the 101 lands, and handing a socket in that state back to a keep-alive
+      // pool means the next request on it is parsed as WebSocket frames.
+      agent: false,
+      ...(dial.ca ? { ca: dial.ca } : {}),
+    })
+
+    upstream.on('upgrade', (upstreamRes, upstreamSocket: Socket, upstreamHead: Buffer) => {
+      // The client may have hung up while the handshake was in flight — see the note on
+      // the response path in `forward()`. `pipeline()` throws on a destroyed destination,
+      // and a throw from here is an uncaught exception that ends the runner process.
+      if (client.destroyed || client.writableEnded) {
+        upstreamSocket.destroy()
+        return
+      }
+      /**
+       * The 101 is relayed byte for byte, hop-by-hop headers included.
+       *
+       * This is the one response where stripping them is wrong: `Connection: Upgrade` and
+       * `Upgrade: websocket` are the switch itself, and `Sec-WebSocket-Accept` is a hash
+       * of the key the *client* chose — the gateway cannot recompute or omit it. Written
+       * from `rawHeaders` so casing and repeated fields survive exactly as sent.
+       */
+      client.write(rawResponseHead(upstreamRes.statusCode ?? 101, upstreamRes.statusMessage, upstreamRes.rawHeaders))
+      // Frames the upstream already sent, ahead of the ones that will arrive as data.
+      if (upstreamHead.length > 0) client.write(upstreamHead)
+      // ...and frames the client sent before the 101 came back. Both ends are allowed to
+      // start writing immediately, and a relay that drops either one loses the first
+      // message of the conversation — which for Codex is the whole turn.
+      if (head.length > 0) upstreamSocket.write(head)
+
+      /**
+       * Two pipelines, not two `pipe`s, for the reason spelled out on the response path
+       * above: a WebSocket carries a model turn that runs for minutes, and either end
+       * dying must tear the other one down rather than leave it open and waiting.
+       */
+      pipeline(client, upstreamSocket, () => undefined)
+      pipeline(upstreamSocket, client, () => undefined)
+    })
+
+    /**
+     * The upstream declined to upgrade — a 401, a 403, a redirect.
+     *
+     * There is no `ServerResponse` here to write through, so the status line is built by
+     * hand, and the framing headers are dropped in favour of `Connection: close`. That is
+     * deliberate: `node:http` has already decoded any chunked body, so relaying the
+     * upstream's `Transfer-Encoding` verbatim would advertise an encoding the bytes no
+     * longer carry, and the client would hang waiting for a terminating chunk that never
+     * comes. Ending the body at the close is the one framing rule that stays true no
+     * matter what the upstream used.
+     */
+    upstream.on('response', (upstreamRes) => {
+      if (client.destroyed || client.writableEnded) {
+        upstreamRes.destroy()
+        return
+      }
+      const headersOut = stripHopByHop(
+        upstreamRes.headers as Record<string, string | string[] | undefined>,
+      )
+      delete headersOut['content-length']
+      client.write(
+        rawResponseHead(
+          upstreamRes.statusCode ?? 502,
+          upstreamRes.statusMessage,
+          flatten(headersOut).concat(['connection', 'close']),
+        ),
+      )
+      pipeline(upstreamRes, client, () => undefined)
+    })
+
+    upstream.on('error', (err) => {
+      warn(`${hostname}${path.split('?')[0]} (upgrade): ${err.message}`)
+      refuseSocket(client, 502, 'upstream_unreachable', `${hostname}: ${err.message}`)
+    })
+
+    /**
+     * Ended, not piped.
+     *
+     * A handshake request has no body, and on an `'upgrade'` event `node:http` has already
+     * detached the socket from its parser — so `req` is not a stream that will ever emit
+     * `'end'`, and piping it leaves the upstream request open forever waiting for a body
+     * that cannot arrive. Anything the client did send early is in `head`, which goes to
+     * the upstream socket once the 101 lands.
+     */
+    upstream.end()
   }
 
   const host = options.host ?? '127.0.0.1'
@@ -633,6 +954,98 @@ const refusePort = (res: ServerResponse, hostname: string, port: number): void =
     'port_not_allowed',
     `${hostname}:${port} is refused — a sandbox reaches ${ALLOWED_CONNECT_PORT} and nothing else`,
   )
+
+/**
+ * A refusal written straight onto a socket, for the doors that have no `ServerResponse`.
+ *
+ * Deliberately the same shape as `refuse()` — same JSON body, same `x-should-retry: false`
+ * so a refusal that will never change is not retried until the job's budget runs out. A
+ * door that answered upgrades with a bare `socket.destroy()` would be enforcing the same
+ * rules and reporting none of them, and "the proxy hung up" is the error message this
+ * whole exercise started from.
+ */
+function refuseSocket(socket: Socket, status: number, error: string, message: string): void {
+  if (socket.writableEnded || socket.destroyed) return
+  const body = JSON.stringify({ error, message })
+  socket.end(
+    `HTTP/1.1 ${status} ${STATUS_REASONS[status] ?? 'Error'}\r\n` +
+      'content-type: application/json\r\n' +
+      `content-length: ${Buffer.byteLength(body)}\r\n` +
+      'x-should-retry: false\r\n' +
+      'connection: close\r\n\r\n' +
+      body,
+  )
+}
+
+const challengeSocket = (socket: Socket): void => {
+  if (socket.writableEnded || socket.destroyed) return
+  socket.end(
+    'HTTP/1.1 407 Proxy Authentication Required\r\n' +
+      // Same reason as on the CONNECT door: without the challenge header many clients
+      // never retry with credentials and the failure reads as "the proxy hung up".
+      'Proxy-Authenticate: Basic realm="ogun-gateway"\r\n' +
+      'Connection: close\r\n\r\n',
+  )
+}
+
+/**
+ * Reason phrases for the statuses the raw-socket doors emit.
+ *
+ * A status line needs one, and the phrase is advisory — but an empty one produces
+ * `HTTP/1.1 403 ` with a trailing space, which some clients parse and some reject, and
+ * that difference would show up as a refusal that "works on my machine".
+ */
+const STATUS_REASONS: Record<number, string> = {
+  400: 'Bad Request',
+  403: 'Forbidden',
+  407: 'Proxy Authentication Required',
+  500: 'Internal Server Error',
+  502: 'Bad Gateway',
+}
+
+/** A status line plus headers, as bytes. `rawHeaders` is name/value alternating. */
+function rawResponseHead(
+  status: number,
+  reason: string | undefined,
+  rawHeaders: readonly string[],
+): string {
+  const lines = [`HTTP/1.1 ${status} ${reason ?? STATUS_REASONS[status] ?? 'OK'}`]
+  for (let i = 0; i + 1 < rawHeaders.length; i += 2) {
+    lines.push(`${rawHeaders[i]}: ${rawHeaders[i + 1]}`)
+  }
+  return `${lines.join('\r\n')}\r\n\r\n`
+}
+
+/** A header bag back into the alternating name/value form, repeating multi-valued names. */
+function flatten(headers: Record<string, string | string[] | undefined>): string[] {
+  const out: string[] = []
+  for (const [name, value] of Object.entries(headers)) {
+    if (value === undefined) continue
+    if (Array.isArray(value)) for (const one of value) out.push(name, one)
+    else out.push(name, value)
+  }
+  return out
+}
+
+/**
+ * The first value of a header that `node:http` may have joined.
+ *
+ * A duplicated `Upgrade` is not something a legitimate client sends, and forwarding
+ * `websocket, websocket` would fail the handshake at the upstream with no useful message.
+ */
+const firstHeader = (value: string | string[] | undefined): string | undefined =>
+  Array.isArray(value) ? value[0] : typeof value === 'string' ? value.split(',')[0]?.trim() : undefined
+
+/** A request body, whole. Only ever called on a body whose declared length is bounded. */
+const collect = (req: IncomingMessage): Promise<Buffer> =>
+  new Promise<Buffer>((resolve) => {
+    const chunks: Buffer[] = []
+    req.on('data', (chunk: Buffer) => chunks.push(chunk))
+    req.on('end', () => resolve(Buffer.concat(chunks)))
+    // A client that hangs up mid-body has not sent a refresh request, so there is nothing
+    // to answer; whatever arrived is handed on and the upstream decides it is truncated.
+    req.on('error', () => resolve(Buffer.concat(chunks)))
+  })
 
 /** The URL's port, digits only — `new URL` keeps whatever the client wrote. */
 const strictPortOf = (target: URL): number | null =>
