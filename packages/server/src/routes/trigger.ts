@@ -4,7 +4,7 @@ import { schema } from '@ogun/core/db'
 import { singleWorkerCycle, triggerRunSchema } from '@ogun/core'
 import type { Env } from '../context.ts'
 import { startCycleRun } from '../foreman/cycles.ts'
-import { probeCredentials, resetBreaker } from '../foreman/admission.ts'
+import { fleetCredentials, resetBreaker } from '../foreman/admission.ts'
 import { fleet } from '../foreman/reach.ts'
 
 const { cycles, jobs, projects, workers } = schema
@@ -60,13 +60,14 @@ triggerRoutes.post('/', async (c) => {
   /**
    * The credential preflight applies to a manual run too, and this is where it is most
    * useful to a person: the response carries each node's state, so pressing run against a
-   * lapsed token comes back `skipped` with the reason and the fix in the coverage row,
-   * within the second, instead of a container starting and 401-ing three minutes later.
+   * fleet whose tokens have all lapsed comes back `skipped` with the reason, the machine
+   * that is wrong and the fix in the coverage row, within the second, instead of a
+   * container starting and 401-ing three minutes later.
    */
   const result = await startCycleRun(db, {
     cycleId: cycle.id,
     trigger: 'manual',
-    credentials: probeCredentials(),
+    credentials: await fleetCredentials(db),
     ...(body.prompt ? { promptOverrides: { [body.worker]: body.prompt } } : {}),
   })
 

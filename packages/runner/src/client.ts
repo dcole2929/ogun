@@ -1,4 +1,4 @@
-import type { ClaimedJob, RunEvent, RunReport } from '@ogun/core'
+import type { ClaimedJob, CredentialOutlook, RunEvent, RunReport } from '@ogun/core'
 import { claimResponseSchema } from '@ogun/core'
 
 /** One compact record per known finding, plus its full body keyed by fingerprint. */
@@ -47,8 +47,33 @@ export class ControlPlane {
     }
   }
 
-  async claim(runnerName: string, labels: string[], capacity: number): Promise<ClaimedJob[]> {
-    const res = await this.post('/api/jobs/claim', { runnerName, labels, capacity })
+  /**
+   * Ask for work, and in the same breath say what this machine currently is.
+   *
+   * `credentials` rides here rather than on an endpoint of its own, for the reason the
+   * gateway runs in the runner process rather than beside it: a second channel creates a
+   * state that otherwise cannot exist — claiming but not reporting — which then has to be
+   * detected, decided about, and got wrong at 3am. The claim is already the heartbeat and
+   * already carries `labels`, which is the same kind of fact: what this box can do. A
+   * credential's health is what this box can *authenticate*, and the control plane needs
+   * it for exactly the same purpose, so it travels the same way.
+   *
+   * Optional, so a runner talking to a control plane that predates the field loses
+   * nothing, and so the type says out loud that a caller may have nothing to report.
+   * Expiries only — a token never leaves the host (ADR-0010).
+   */
+  async claim(
+    runnerName: string,
+    labels: string[],
+    capacity: number,
+    credentials?: CredentialOutlook,
+  ): Promise<ClaimedJob[]> {
+    const res = await this.post('/api/jobs/claim', {
+      runnerName,
+      labels,
+      capacity,
+      ...(credentials ? { credentials } : {}),
+    })
     return claimResponseSchema.parse(res).jobs
   }
 

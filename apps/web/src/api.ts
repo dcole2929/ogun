@@ -337,6 +337,24 @@ export const api = {
         pending: boolean
         enrolled: boolean
         online: boolean
+        /**
+         * What this machine last told the control plane it could authenticate.
+         *
+         * Null means it has not said — an older build, or a report that has aged out —
+         * which is deliberately not the same as "no credentials" and must not be rendered
+         * as a failure. Admission admits on it, and so does this page.
+         *
+         * Expiries only ever leave the runner host, so there is nothing secret here to
+         * put in a browser (ADR-0010). The states are `CredentialHealth['state']`, judged
+         * server-side against the default worker timeout — the page does no arithmetic of
+         * its own, which is how the Workers page came to display a breaker threshold no
+         * project had set.
+         */
+        credentials: {
+          reportedAt: string
+          anthropic: string
+          openai: string
+        } | null
       }>
       /** Addresses this control plane believes it is reachable at. */
       addresses: string[]

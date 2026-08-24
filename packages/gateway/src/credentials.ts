@@ -1,6 +1,31 @@
 import { readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+/**
+ * The vocabulary, from `@ogun/core/credentials`.
+ *
+ * The subpath rather than the package root, deliberately: that module imports nothing at
+ * all, where `@ogun/core` drags a yaml parser and a zod runtime in behind it — and this
+ * package is loaded by the gateway, which every job's every request passes through.
+ *
+ * The types and the judgement moved out of this file because three processes have to
+ * agree about them: this one classifies what is on its own host's disk, the control plane
+ * judges the report before it dispatches a job, and the CLI prints it in `doctor`. Two
+ * copies of "expired" is how a preflight and a machine come to disagree about that
+ * machine. Reading stayed here, because reading belongs with the thing that injects.
+ */
+import {
+  credentialHealth,
+  humanDuration,
+  type CredentialExpiry,
+  type CredentialHealth,
+  type CredentialOutlook,
+} from '@ogun/core/credentials'
+
+// Re-exported so `@ogun/gateway`'s own consumers — `doctor`, the runner — keep one import
+// site for the whole subject rather than having to know where each half ended up.
+export { credentialHealth, humanDuration }
+export type { CredentialExpiry, CredentialHealth, CredentialOutlook }
 
 /**
  * Where the real credentials live, and how the gateway gets at them.
@@ -139,44 +164,12 @@ export function credentialReader(
 // transcript, which names the wrong cause and sends whoever reads it to re-authenticate
 // something that was fine.
 //
-// So the expiry is turned into a fact two preflights can act on: `ogun runner doctor`
-// before the night, and admission before a job is dispatched (§4.3). Both ask the same
-// question of the same data and want different answers out of it, which is why the fact
-// and the judgement are separate types below.
-
-/**
- * When a credential stops working, as far as anything on this host can tell.
- *
- * Four values, and the last three are three different things a boolean would collapse
- * into "fine" (principle 6). `never` is an API key, which genuinely does not expire.
- * `unrecorded` is a credential that may well expire and whose file does not say when — a
- * `~/.codex/auth.json` OAuth token, or a `claudeAiOauth` block in a shape we no longer
- * recognise. Refusing on `unrecorded` would refuse a working machine; calling it `never`
- * would promise something nothing here has checked.
- */
-export type CredentialExpiry =
-  | { kind: 'absent' }
-  | { kind: 'never' }
-  | { kind: 'unrecorded' }
-  | { kind: 'at'; expiresAt: number }
-
-/**
- * A `CredentialExpiry` judged against a clock and a horizon.
- *
- * The horizon is what makes this a preflight rather than a status line. "Is it valid
- * right now?" is the wrong question when the thing asking is about to start a job that
- * runs for half an hour: a token with five minutes left passes that test and dies
- * mid-stream, which is the same 3am 401 arriving slightly later. So callers pass the
- * window they actually care about — a worker's `timeoutMs` for admission, an hour for
- * `doctor` — and `expiring` is the answer that separates the two.
- */
-export type CredentialHealth =
-  | { state: 'absent' }
-  | { state: 'no-expiry' }
-  | { state: 'unknown-expiry' }
-  | { state: 'valid'; expiresAt: number; msRemaining: number }
-  | { state: 'expiring'; expiresAt: number; msRemaining: number }
-  | { state: 'expired'; expiresAt: number; msElapsed: number }
+// So the expiry is turned into a fact three readers can act on: `ogun runner doctor`
+// before the night, the runner's own claim — which reports this outlook to the control
+// plane every few seconds — and admission before a job is dispatched (§4.3). All three
+// ask the same question of the same data and want different answers out of it, which is
+// why `CredentialExpiry` (the fact) and `CredentialHealth` (the judgement) are separate
+// types, and why both now live in `@ogun/core`: the fact has to survive a network hop.
 
 /**
  * The lower bound on an `expiresAt` this module will believe: 2001-09-09, the moment
@@ -218,66 +211,17 @@ export function credentialExpiry(credential: Credential | undefined): Credential
 }
 
 /**
- * `expiry` judged at `now`, against a window the caller says it needs.
+ * What this host's two model-provider credentials look like right now.
  *
- * The boundaries are the whole content of this function. A token whose `expiresAt` is
- * exactly `now` is expired rather than expiring — the next request it is spliced into
- * fails. A `horizonMs` of zero asks only "is it alive right now" and can never return
- * `expiring`, which is what a caller with no run to protect should pass.
+ * The type is in `@ogun/core` because it crosses the wire: the runner sends one on every
+ * claim and the control plane stores and judges it. This function is the only thing that
+ * produces one, and it lives here because this is the only module where a real credential
+ * is in scope. What leaves the host is an expiry; a token never does.
  */
-export function credentialHealth(
-  expiry: CredentialExpiry,
-  { now = Date.now(), horizonMs = 0 }: { now?: number; horizonMs?: number } = {},
-): CredentialHealth {
-  switch (expiry.kind) {
-    case 'absent':
-      return { state: 'absent' }
-    case 'never':
-      return { state: 'no-expiry' }
-    case 'unrecorded':
-      return { state: 'unknown-expiry' }
-    default: {
-      const msRemaining = expiry.expiresAt - now
-      if (msRemaining <= 0) {
-        return { state: 'expired', expiresAt: expiry.expiresAt, msElapsed: -msRemaining }
-      }
-      const state = msRemaining <= horizonMs ? 'expiring' : 'valid'
-      return { state, expiresAt: expiry.expiresAt, msRemaining }
-    }
-  }
-}
-
-/**
- * What the two model providers' credentials on this host look like right now.
- *
- * Deliberately the *fact* and not the judgement. A caller establishes this once and then
- * asks about several jobs, each with its own run length; a health baked in here would
- * answer all of them with the first one's window.
- */
-export type CredentialOutlook = {
-  anthropic: CredentialExpiry
-  openai: CredentialExpiry
-}
-
 export const credentialOutlook = (set: CredentialSet): CredentialOutlook => ({
   anthropic: credentialExpiry(set.anthropic),
   openai: credentialExpiry(set.openai),
 })
-
-/**
- * How long, in the terse form `doctor`'s one-line details use.
- *
- * Minutes below ninety, and that is the point of the function rather than a nicety.
- * Rounding to whole hours renders "expires in 42 minutes" as "1h left" and "expired
- * eleven minutes ago" as "EXPIRED 0h ago" — so the one window this preflight exists to
- * warn about was the one window the string could not express.
- */
-export function humanDuration(ms: number): string {
-  const minutes = Math.round(ms / 60_000)
-  if (minutes < 90) return `${minutes}m`
-  const hours = Math.round(ms / 36e5)
-  return hours < 48 ? `${hours}h` : `${Math.round(ms / 864e5)}d`
-}
 
 /**
  * How far ahead `ogun runner doctor` looks.

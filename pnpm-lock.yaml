@@ -86,7 +86,11 @@ importers:
         specifier: ^0.31.0
         version: 0.31.10
 
-  packages/gateway: {}
+  packages/gateway:
+    dependencies:
+      '@ogun/core':
+        specifier: workspace:*
+        version: link:../core
 
   packages/runner:
     dependencies:
@@ -108,9 +112,6 @@ importers:
       '@ogun/core':
         specifier: workspace:*
         version: link:../core
-      '@ogun/gateway':
-        specifier: workspace:*
-        version: link:../gateway
       croner:
         specifier: ^10.0.1
         version: 10.0.1

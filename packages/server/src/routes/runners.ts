@@ -3,9 +3,18 @@ import { readFileSync } from 'node:fs'
 import { networkInterfaces } from 'node:os'
 import { and, desc, eq, isNull } from 'drizzle-orm'
 import { z } from 'zod'
+import {
+  credentialHealth,
+  DEFAULT_WORKER_TIMEOUT_MS,
+  type CredentialOutlook,
+} from '@ogun/core'
 import { schema } from '@ogun/core/db'
 import type { Env } from '../context.ts'
 import { hashToken, mintToken } from '../auth.ts'
+// One constant for "how long since we heard from a machine", shared with the preflight
+// that decides whether that machine's credential report still counts. Two copies is how
+// the Runners page comes to call a runner online that admission has already written off.
+import { RUNNER_STALE_MS } from '../foreman/admission.ts'
 
 const { invites, runners } = schema
 
@@ -25,9 +34,6 @@ const { invites, runners } = schema
  */
 export const runnersRoutes = new Hono<Env>()
 
-/** A runner polls every few seconds, so silence for a minute means it is gone. */
-const STALE_MS = 60_000
-
 runnersRoutes.get('/', async (c) => {
   const rows = await c.var.ctx.db.select().from(runners).orderBy(desc(runners.lastSeenAt))
   const now = Date.now()
@@ -45,7 +51,40 @@ runnersRoutes.get('/', async (c) => {
       pending: r.pending,
       // Never the hash, and certainly never the token — this is a browser-facing route.
       enrolled: r.tokenHash !== null,
-      online: !r.pending && !r.revokedAt && now - r.lastSeenAt.getTime() < STALE_MS,
+      online: !r.pending && !r.revokedAt && now - r.lastSeenAt.getTime() < RUNNER_STALE_MS,
+      /**
+       * What this machine last said it could authenticate, judged for the browser.
+       *
+       * Safe to send: a `CredentialOutlook` carries expiries and nothing else — no access
+       * token, no API key, no refresh token, no account id (ADR-0010) — and this route is
+       * already the one the Runners page reads.
+       *
+       * Worth sending because the control plane's belief about a machine is now a thing
+       * that can be wrong in a way nobody can see from either end: `ogun runner doctor`
+       * shows what the machine thinks, and until this existed nothing showed what the
+       * control plane had been *told*. When a job is refused for a credential, this is the
+       * row that says whether the report is the problem or the credential is.
+       *
+       * Null for a runner that has never reported or whose report has aged out — the same
+       * `silent` that admission admits on, and rendered as "not reported" rather than as a
+       * green tick or a red cross, because it is neither.
+       */
+      credentials:
+        r.credentials !== null &&
+        r.credentialsAt !== null &&
+        now - r.credentialsAt.getTime() < RUNNER_STALE_MS
+          ? {
+              reportedAt: r.credentialsAt,
+              anthropic: credentialHealth((r.credentials as CredentialOutlook).anthropic, {
+                now,
+                horizonMs: DEFAULT_WORKER_TIMEOUT_MS,
+              }).state,
+              openai: credentialHealth((r.credentials as CredentialOutlook).openai, {
+                now,
+                horizonMs: DEFAULT_WORKER_TIMEOUT_MS,
+              }).state,
+            }
+          : null,
     })),
     /** Addresses this control plane believes it is reachable at, for the paste command. */
     addresses: reachableAddresses(),

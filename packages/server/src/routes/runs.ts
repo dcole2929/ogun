@@ -11,6 +11,7 @@ import {
   type RunReport,
 } from '@ogun/core'
 import type { Env } from '../context.ts'
+import { RUNNER_STALE_MS } from '../foreman/admission.ts'
 import { finalizeRun } from '../foreman/finalize.ts'
 import { fleet } from '../foreman/reach.ts'
 

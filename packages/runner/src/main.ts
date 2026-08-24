@@ -1,6 +1,6 @@
 import { parseArgs } from 'node:util'
 import { imageState, loadLocalConfig, LocalConfigError } from '@ogun/core'
-import { defaultSocketPath, startGateway } from '@ogun/gateway'
+import { credentialOutlook, defaultSocketPath, startGateway } from '@ogun/gateway'
 import { ControlPlane } from './client.ts'
 import { executeJob } from './pipeline.ts'
 
@@ -173,7 +173,32 @@ const tick = async (): Promise<void> => {
   const capacity = runner.maxConcurrentJobs - inFlight.size
   if (capacity <= 0 || stopping) return
 
-  const jobs = await cp.claim(runner.name, runner.labels, capacity)
+  /**
+   * What this machine can authenticate, reported with every claim.
+   *
+   * Read through `gateway.credentials()` — the gateway's own memoised reader, the one that
+   * will splice the value onto the request — rather than by opening the files here. That
+   * is the whole point of the change: the control plane used to read `~/` on *its* host
+   * and call the answer this machine's, so an `ANTHROPIC_API_KEY` in this unit and not the
+   * server's had jobs refused with a reason that sounded certain while this process could
+   * have run every one of them. A reporter with a reader of its own would rebuild the same
+   * divergence one process further in — a different `process.env`, a different moment.
+   *
+   * Per claim rather than per process, because a token expires on a clock: a value read at
+   * startup is a promise about a long-lived runner that nobody keeps. Per claim rather than
+   * per job for the opposite reason — the read is memoised for five seconds inside the
+   * gateway, so at a three-second poll this costs at most one pair of small file reads
+   * every other tick, and the control plane's copy is never more than one poll stale.
+   *
+   * Expiries only. `credentialOutlook` maps a credential to when it dies; no token, no key
+   * and no account id crosses the wire (ADR-0010).
+   */
+  const jobs = await cp.claim(
+    runner.name,
+    runner.labels,
+    capacity,
+    credentialOutlook(gateway.credentials()),
+  )
   for (const job of jobs) {
     inFlight.add(job.runId)
     console.log(`[runner] claimed ${job.workerName} (${job.projectSlug}) run=${job.runId}`)

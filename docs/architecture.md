@@ -221,9 +221,10 @@ global counter, since a busy repository throttling a quiet one is a rule neither
 tokens that expire, and the gateway does not refresh them — it re-reads the file the
 host's own `claude` rewrites when a human runs it (ADR-0010). Nothing runs it on an
 unattended runner, so the token lapses and every job fails on auth at 3am. Admission
-refuses a job whose runtime has no live credential, and the refusal names the fix.
+refuses a job whose runtime no live runner can authenticate, and the refusal names the
+machine and the fix.
 
-Three things about it are decisions rather than details:
+Four things about it are decisions rather than details:
 
 - **The question is not "is it valid now".** A token with five minutes left passes that
   test and dies mid-run. The window checked is the worker's own `timeoutMs`, because that
@@ -237,15 +238,42 @@ Three things about it are decisions rather than details:
   OAuth token whose file records no expiry; alive; and dead. Only the first, the last and
   "will be dead before this job's timeout" refuse. An expiry that cannot be read is
   admitted — "I could not check" must not be recorded as "I checked, and it is dead".
+- **The runner is the one who says.** [corrected] The preflight used to read
+  `~/.claude/.credentials.json` on the machine the *control plane* runs on. That is right
+  only while the two are one host (§3, ADR-0001), and it was already wrong on one host: an
+  `ANTHROPIC_API_KEY` in the runner's systemd unit and not the server's had the runner
+  authenticating perfectly while every job was refused with a reason that read as certain.
+  Each runner now reports its own credential outlook on every claim — the same request that
+  already carries its labels and its capacity, because credential health is a capability
+  fact about a machine in exactly the way a label is. Expiries only; no token crosses the
+  wire (ADR-0010).
 
 It refuses only the credential the job's *own runtime* needs, so a dead Anthropic token
-does not stop this machine's codex workers, and never over the GitHub token, whose absence
-is the intended default (ADR-0005). And it is established by the caller rather than read
-inside `admit`: the credentials are a fact about the **runner host**, which the control
-plane can see only while they are the same machine (§3, ADR-0001). A control plane that
-had moved and then failed closed on what it could no longer see would turn a preflight
-into an outage, so not-checked admits, and the gateway's own `502 no_credential` and the
-provider's 401 remain behind it.
+does not stop the fleet's codex workers, and never over the GitHub token, whose absence
+is the intended default (ADR-0005).
+
+**Which machine, and where each half is decided.** Admission runs when a cycle run is
+created, before anybody has claimed, so "the credential state" is one state per machine
+rather than one state. A job only one runner can authenticate is not unadmittable — it is
+admittable *there*. So the question is split the way `maxConcurrentModifiers` is:
+
+- **Admission** answers what cannot change while the queue drains — *no* live runner can
+  authenticate this at all — and its refusal is permanent: a `skipped` job and a `refused`
+  coverage row for the night.
+- **The claim** answers what can: this machine's token is dead *right now*. That job is
+  held back, stays `queued`, is recorded as nothing, and goes to a runner that can run it
+  — or to the same one after somebody logs in there. The claiming runner's own report is
+  used, which is the freshest reading there is: the same `credentialReader` the gateway
+  will inject from, seconds old.
+
+Silence admits, in all three of its forms — no fleet outlook established, no runner live,
+or a live runner that has never reported. Each means "we have not been told", and a control
+plane that failed closed on what it has not been told would refuse every job the day a
+runner is one release behind it: a preflight that becomes an outage. A report is trusted
+for one liveness window (60s, `RUNNER_STALE_MS`); past that the machine reads as silent
+rather than as dead, so a credential fixed by hand takes effect within a poll or two rather
+than needing a restart. The gateway's own `502 no_credential` and the provider's 401 remain
+behind all of it.
 
 Two implementation notes:
 

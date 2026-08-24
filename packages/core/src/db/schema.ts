@@ -512,6 +512,44 @@ export const runners = pgTable('runners', {
   maxConcurrency: integer('max_concurrency').notNull().default(2),
   lastSeenAt: timestamp('last_seen_at', { withTimezone: true }).notNull().defaultNow(),
   /**
+   * What this machine last said about its own model-provider credentials — a
+   * `CredentialOutlook`, expiries only, never a token.
+   *
+   * The control plane used to read `~/.claude/.credentials.json` on *its own* host and
+   * call the answer the runner's. That is right on one box and wrong the moment there are
+   * two, and it was already wrong on one: an `ANTHROPIC_API_KEY` exported into the
+   * runner's systemd unit and not the server's had the runner authenticating perfectly
+   * while admission refused every job with a reason that read as certain. A machine is the
+   * only thing that can answer for its own disk, so it is the thing that answers.
+   *
+   * `jsonb` rather than columns per provider, for the reason `workers.config` is jsonb: a
+   * third runtime is a new key, not a migration, and a runner that predates one simply
+   * does not send it.
+   *
+   * Null means **never reported**, which is not "no credentials". A runner built before
+   * this column existed sends nothing on its claims and must keep being handed work; see
+   * `credentialVerdict`.
+   */
+  credentials: jsonb('credentials'),
+  /**
+   * When that report arrived. Separate from `last_seen_at`, and the separation is the
+   * point rather than duplication.
+   *
+   * A claim always advances `last_seen_at` and only *sometimes* carries a report — an
+   * older runner never does. Folding the two together would mean a machine downgraded, or
+   * a field dropped by a proxy, kept its last report looking eternally current while the
+   * heartbeat ticked on. Admission would then go on refusing jobs over a token that was
+   * refreshed hours ago, which is this feature's own failure mode wearing new clothes.
+   *
+   * So the report has its own clock and admission ignores one older than
+   * `RUNNER_STALE_MS`. Note what does *not* decay: `{ kind: 'at', expiresAt }` is an
+   * absolute instant and stays true about that instant forever. What the window protects
+   * is the assumption that this machine still holds that credential — a person running
+   * `claude` or exporting a key changes the answer, and the fix has to take effect within
+   * a poll or two rather than needing a restart.
+   */
+  credentialsAt: timestamp('credentials_at', { withTimezone: true }),
+  /**
    * sha256 of the enrollment token. Per-runner rather than one shared secret so a lost
    * laptop is one revocation rather than a rotation across every machine.
    *
