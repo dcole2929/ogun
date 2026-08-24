@@ -27,8 +27,18 @@ export type PendingJob = {
   requires: string[]
   worker: { id: string; name: string }
   project: { slug: string }
-  /** False when no online runner advertises everything this job needs. */
-  claimable: boolean
+  /**
+   * Why this job is still queued. `claimable` means a runner that could take it is up
+   * right now; `offline` means one exists and is not; `unmatched` means no runner
+   * registered here has ever advertised what it needs, and it will wait forever.
+   *
+   * This was a boolean, and the two non-claimable cases were the same value. A job whose
+   * only capable machine is rebooting was reported as "nothing can run this", which is
+   * both false and the same sentence shown for the case where it is true.
+   */
+  reach: 'claimable' | 'offline' | 'unmatched'
+  /** The labels nothing here advertises. Non-empty exactly when `reach` is `unmatched`. */
+  missing: string[]
 }
 
 export type RunSummary = {
@@ -285,9 +295,13 @@ export const api = {
   coverage: (slug: string) => json<{ coverage: CoverageRow[] }>(`/api/projects/${slug}/coverage`),
   runNotes: (slug: string) => json<{ notes: RunNote[] }>(`/api/runs/notes?project=${slug}`),
   runs: () =>
-    json<{ runs: RunSummary[]; pending: PendingJob[]; onlineRunners: number }>(
-      '/api/runs?limit=50',
-    ),
+    json<{
+      runs: RunSummary[]
+      pending: PendingJob[]
+      onlineRunners: number
+      /** Registered and not revoked, whether or not they are up. */
+      liveRunners: number
+    }>('/api/runs?limit=50'),
   system: () => json<SystemInfo>('/api/system'),
   adminToken: () =>
     json<{ token: string | null; reason?: string; fromEnvironment?: boolean }>('/api/system/token'),
@@ -350,6 +364,16 @@ export const api = {
       editable: Record<string, boolean>
       hashes: Record<string, string>
       /**
+       * Per project: whether config.yaml's `policies.allowSandboxDowngrade` is true, so
+       * the form can offer `modifier` + `worktree` to a project that opted into it.
+       *
+       * Separate from `policies` below because it is a different copy of a different
+       * half. `policies` is what the control plane stored at sync; this key is
+       * deliberately never stored (§4.9) and is read straight from the file. Absent for a
+       * project this control plane cannot reach.
+       */
+      allowSandboxDowngrade: Record<string, boolean>
+      /**
        * Per project: the control-plane policies actually in force, from the server.
        *
        * The page used to keep `const BREAKER_THRESHOLD = 3` and do the arithmetic itself,
@@ -395,7 +419,17 @@ export const api = {
     json<{ deleted: string; config: ConfigSnapshot }>(`/api/workers/${id}`, { method: 'DELETE' }),
 
   trigger: (projectSlug: string, worker: string) =>
-    json<{ cycleRunId: string; jobs: Array<{ nodeKey: string; state: string }> }>('/api/trigger', {
+    json<{
+      cycleRunId: string
+      jobs: Array<{
+        nodeKey: string
+        state: string
+        /** Whether anything can claim it — see the server's `foreman/reach.ts`. */
+        reach: 'claimable' | 'offline' | 'unmatched'
+        /** Labels no runner here advertises. Non-empty exactly when `reach` is `unmatched`. */
+        missing: string[]
+      }>
+    }>('/api/trigger', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ projectSlug, worker }),

@@ -5,6 +5,7 @@ import { singleWorkerCycle, triggerRunSchema } from '@ogun/core'
 import type { Env } from '../context.ts'
 import { startCycleRun } from '../foreman/cycles.ts'
 import { probeCredentials, resetBreaker } from '../foreman/admission.ts'
+import { fleet } from '../foreman/reach.ts'
 
 const { cycles, jobs, projects, workers } = schema
 
@@ -70,10 +71,29 @@ triggerRoutes.post('/', async (c) => {
   })
 
   const queued = await db
-    .select({ id: jobs.id, state: jobs.state, nodeKey: jobs.nodeKey })
+    .select({ id: jobs.id, state: jobs.state, nodeKey: jobs.nodeKey, requires: jobs.requires })
     .from(jobs)
     .where(eq(jobs.cycleRunId, result.cycleRunId))
-  return c.json({ ...result, jobs: queued })
+
+  /**
+   * Whether anything can actually claim what was just queued.
+   *
+   * The response already explains a node that was *refused* — admission says why, and the
+   * CLI and the UI both print it. The node that was accepted got a bare `queued`, which
+   * is the right word for a job waiting its turn and the wrong one for a job asking for a
+   * label no machine here advertises. Those are indistinguishable from outside and stay
+   * that way forever, because nothing further happens to either.
+   *
+   * This is the interactive surface of the same fact `ogun project sync` reports at
+   * declaration time and the Runs page reports for the standing queue. It matters most
+   * here: pressing run and being told "queued" is the moment a person concludes the
+   * system is working.
+   */
+  const machines = await fleet(db)
+  return c.json({
+    ...result,
+    jobs: queued.map((j) => ({ ...j, ...machines.verdict(j.requires) })),
+  })
 })
 
 /** Clearing a breaker is a deliberate human act — it is the one guard that stays

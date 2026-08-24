@@ -12,6 +12,7 @@ import {
 } from '@ogun/core'
 import type { Env } from '../context.ts'
 import { finalizeRun } from '../foreman/finalize.ts'
+import { fleet } from '../foreman/reach.ts'
 
 const {
   artifacts,
@@ -21,7 +22,6 @@ const {
   projects,
   runEvents,
   runs,
-  runners: runnersTable,
   stagedFindings,
   workers,
 } = schema
@@ -198,12 +198,10 @@ runsRoutes.get('/', async (c) => {
     .orderBy(desc(jobs.createdAt))
     .limit(50)
 
-  // What could pick them up, so "queued" can say whether it is waiting on a machine or
-  // just waiting its turn.
-  const online = await db
-    .select({ id: runnersTable.id, labels: runnersTable.labels })
-    .from(runnersTable)
-    .where(sql`${runnersTable.lastSeenAt} > now() - interval '60 seconds'`)
+  // What could pick them up, so "queued" can say whether it is waiting on a machine, on
+  // a machine that is asleep, or on a machine that does not exist. See `foreman/reach.ts`
+  // for why that is three answers and not a boolean.
+  const machines = await fleet(db)
 
   /**
    * What each run produced, for the list. A run's result is what you are scanning for —
@@ -218,13 +216,10 @@ runsRoutes.get('/', async (c) => {
 
   return c.json({
     runs: rows.map((r) => ({ ...r, produced: { findings: byRun.get(r.run.id) ?? 0 } })),
-    pending: pending.map((p) => ({
-      ...p,
-      // A job whose requirements no runner advertises will never be claimed. Saying so
-      // beats leaving it queued forever with no explanation.
-      claimable: online.some((r) => p.requires.every((label) => r.labels.includes(label))),
-    })),
-    onlineRunners: online.length,
+    pending: pending.map((p) => ({ ...p, ...machines.verdict(p.requires) })),
+    onlineRunners: machines.online,
+    /** Live machines, up or not. Zero is a different problem from "none match". */
+    liveRunners: machines.live,
   })
 })
 

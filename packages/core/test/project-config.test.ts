@@ -4,9 +4,12 @@ import { parse as parseYaml } from 'yaml'
 import {
   controlPlanePoliciesSchema,
   defaultControlPlanePolicies,
+  inertPolicies,
+  policiesSchema,
   projectConfigSchema,
   readPolicies,
   readTestCommand,
+  workerRequirements,
 } from '../src/config/project.ts'
 
 /**
@@ -176,4 +179,86 @@ test('an empty extends key is refused too, since it is still a line to delete', 
 
 test('a config that never mentions extends is unaffected', () => {
   assert.equal(projectConfigSchema.safeParse(parseYaml('project:\n  name: demo\n')).success, true)
+})
+
+/**
+ * `workerRequirements` — the capability labels a runner must advertise before it may
+ * claim a job, and the one function that decides them.
+ *
+ * The property protected is that the two sources are **unioned**. What a naive
+ * implementation does — and what this codebase actually did — is derive the set from the
+ * worker's `runtime` and `sandbox` and stop there, because those are the two labels
+ * anything can work out for itself. `requires:` was declared in the schema, parsed,
+ * stored on `workers.config`, returned by the API and carefully preserved through a UI
+ * PATCH, and read by nothing at all. A worker asking for a GPU was offered to every
+ * machine in the fleet, and the way you learned that was a job failing on a laptop.
+ *
+ * The other naive implementation is the opposite one, and it is worse because it looks
+ * more respectful of the config: let a declared `requires:` *replace* the derivation, on
+ * the grounds that the person spelled out what they wanted. Then a `container` worker
+ * that says `requires: [gpu]` stops requiring `docker`, and its jobs go to a machine with
+ * no Docker at all — the config having silently dropped a requirement nobody waived.
+ * Writing "this also needs a GPU" is not saying "and it no longer needs Docker".
+ */
+test('a declared requirement is added to the derived ones, never substituted for them', () => {
+  assert.deepEqual(
+    workerRequirements({ runtime: 'claude', sandbox: 'container', requires: ['gpu'] }),
+    ['claude', 'docker', 'gpu'],
+    'declaring a label must not waive the ones the worker`s own shape implies',
+  )
+  assert.deepEqual(workerRequirements({ runtime: 'codex', sandbox: 'container' }), [
+    'codex',
+    'docker',
+  ])
+  // A worktree sandbox needs no docker — it is a process on the host.
+  assert.deepEqual(workerRequirements({ runtime: 'claude', sandbox: 'worktree' }), ['claude'])
+})
+
+/**
+ * The array is stamped onto every `jobs.requires` row and rendered in the UI, so it has
+ * to be a stable sequence rather than a set that happens to compare equal: a re-render
+ * that reshuffles the pills, or a diff that shows a change nobody made, teaches people to
+ * ignore the field.
+ */
+test('requirements are deduplicated, trimmed and stably ordered', () => {
+  assert.deepEqual(
+    workerRequirements({
+      runtime: 'claude',
+      sandbox: 'container',
+      // `docker` again, a label with the whitespace a yaml list picks up easily, and one
+      // that is nothing but whitespace.
+      requires: ['docker', ' gpu ', '   ', 'vpn'],
+    }),
+    ['claude', 'docker', 'gpu', 'vpn'],
+  )
+})
+
+/**
+ * `inertPolicies` — settings this build accepts, stores, and does not act on.
+ *
+ * `directPush: true` is the only one today. The publisher builds every branch as
+ * `ogun/<worker>/<run>` and opens a draft pull request; there is no code path anywhere
+ * that pushes to a default branch, so a project setting this gets exactly the behaviour
+ * of a project that never heard of it. That is the same silent shape as `requires:` being
+ * ignored, and the same fix: say so at the moment somebody wrote the line.
+ *
+ * The second assertion is the one that keeps this useful. A warning that also fires on an
+ * ordinary, correct configuration is a warning people learn to scroll past — and then the
+ * one that mattered scrolls past with it. `directPush: false` is not inert; it is the
+ * rule being followed.
+ */
+test('directPush: true is reported as inert, and the default configuration says nothing', () => {
+  const inert = inertPolicies(policiesSchema.parse({ directPush: true }))
+  assert.equal(inert.length, 1)
+  assert.match(inert[0]!, /directPush/)
+  assert.match(inert[0]!, /no implementation/)
+
+  assert.deepEqual(inertPolicies(policiesSchema.parse({})), [])
+  assert.deepEqual(
+    inertPolicies(
+      policiesSchema.parse({ allowSandboxDowngrade: true, maxOpenPullRequests: 0 }),
+    ),
+    [],
+    'settings that are honoured must not be reported, however unusual their value',
+  )
 })

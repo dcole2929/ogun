@@ -207,6 +207,16 @@ and match it from a worker's `requires:`:
 ogun runner init --labels gpu,staging-db
 ```
 
+A worker's `requires:` is **added to** what its shape already implies — `requires: [gpu]`
+on a container worker still needs `docker`. Nothing waives a derived label, because
+writing "this also needs a GPU" is not saying "and it no longer needs Docker".
+
+Asking for a label nothing advertises is not an error, because the machine that has it
+may be joining this afternoon — but it is never silent. `ogun project sync` names the
+worker and the label it cannot satisfy, and the Runs page separates a job whose capable
+machine is *offline* from one nothing here has ever advertised. A job queued forever with
+no explanation is the one outcome that is not allowed.
+
 ### Keeping an unattended runner logged in
 
 A container never holds a credential. The runner's in-process gateway reads

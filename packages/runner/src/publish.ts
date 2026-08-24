@@ -214,17 +214,31 @@ export async function publishPatch(input: {
   const branch = branchFor({ workerName: input.workerName, runId: input.runId })
 
   /**
-   * The prefix already makes this impossible, and it is checked anyway.
+   * The prefix already makes this impossible, and it is checked anyway. **Kept
+   * deliberately** — the question was asked, so here is the answer.
    *
    * `directPush: false` is the rule that Ogun proposes rather than pushes, and the only
    * way this module could break it is a project whose default branch is itself under
-   * `ogun/`. That is a legal branch name. It is also the one case the structural
-   * guarantee does not cover, so it gets the check — and the check is written against
-   * the policy rather than against the prefix, so that if a direct-push path is ever
-   * built it finds the gate already in the right shape.
+   * `ogun/`. That is a legal branch name — `git branch -m ogun/fixer/a1b2c3d4e5f6` costs
+   * nothing and nothing warns — and it is the one case `branchFor`'s structure does not
+   * cover. It is not a hypothetical the check has to be justified by, either: the branch
+   * this publisher would then push to is the branch the pull request would target, so
+   * without this the failure is Ogun writing straight onto a project's default branch
+   * with no review, which is the single thing §4.6 promises it will never do.
    *
-   * There is no `directPush: true` path. The setting exists to be relied on, not turned
-   * on, and nothing in this file can write to a branch it did not construct.
+   * So it is a guard against a narrow case rather than a check that cannot fire, and it
+   * is exercised: `publish.test.ts`'s "a default branch that collides with a published
+   * branch" constructs exactly that project and asserts the refusal. A check nobody can
+   * make run would be the other answer to this question, and it is not this one.
+   *
+   * Written against the policy rather than against the prefix, so that if a direct-push
+   * path is ever built it finds the gate already in the right shape. Which is the other
+   * half of the honesty owed here: **there is no `directPush: true` path**. Nothing in
+   * this file can write to a branch it did not construct, so a project setting the flag
+   * gets the same draft pull request as a project that never heard of it. That is
+   * recorded on the schema, where somebody writing the line will read it, and
+   * `ogun project sync` says it out loud (`inertPolicies`) — a flag that silently does
+   * nothing being the exact failure this file's neighbours were fixed for.
    */
   if (!policies.directPush && branch === input.defaultBranch) {
     return {

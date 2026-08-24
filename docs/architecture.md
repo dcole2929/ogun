@@ -359,6 +359,14 @@ read-only mount, so the permission profile has nothing enforcing it; there is no
 namespace, so a worker's `egress` list cannot be applied and is dropped. Only the file
 state is isolated, and only because the clone is a separate directory.
 
+That paragraph is not left to the docs. A run that actually takes the downgrade says the
+same thing where it will be read: once on the runner's stdout before the agent's first
+turn, and once on the run timeline as a `runner.note` carrying `uncontained: true`, so the
+question "was this agent contained" has an answer next to the run a fortnight later. It is
+said once per run and only for a run that gave something up — a container run and a
+reviewer on a worktree say nothing, because a warning that fires on the ordinary
+configuration is one people stop reading.
+
 The policy is read from `.ogun/config.yaml` **in the blob at the commit the workspace
 was pinned to**, never from the workspace — the same rule `tests.command` follows, and
 for the same reason: that tree is one the modifier can write, and a gate the agent can
@@ -897,6 +905,14 @@ explicit before somebody tidies it up.
 | `maxOpenPullRequests` | git blob at the pinned base | publisher | ditto (ADR-0009) |
 | `maxConcurrentModifiers` | `projects.policies` | foreman, at admission and at claim | a scheduling decision, taken before a sandbox exists |
 | `failureBreakerThreshold` | `projects.policies` | foreman, at finalize | ditto |
+
+`directPush: true` has no implementation and is accepted anyway. Every branch the
+publisher builds is `ogun/<worker>/<run>` and every publication is a draft pull request,
+so a project setting the flag gets exactly the behaviour of one that never heard of it —
+`publishPatch` keeps the check for the one case the prefix does not cover, a default
+branch that is itself under `ogun/`. `ogun project sync` says so out loud rather than
+leaving you to infer it, because a setting that silently does nothing is the same failure
+as `requires:` being ignored, wearing a different key.
 
 The first three are read with `git show <baseSha>:.ogun/config.yaml` because a modifier
 has write access to its own checkout: one line appended to `config.yaml` in the workspace

@@ -162,11 +162,12 @@ async function applySync(db: Db, body: SyncPayload) {
     .set({ skillsHash: hashSkillSet(body.skills) })
     .where(eq(projects.id, project.id))
 
-  const { workers: indexed, removed, overriddenSchedules } = await reindexProject(
-    db,
-    project.slug,
-    { hash: body.configHash, workers: body.workers, cycles: body.cycles },
-  )
+  const { workers: indexed, removed, overriddenSchedules, unmetRequirements, registeredRunners } =
+    await reindexProject(db, project.slug, {
+      hash: body.configHash,
+      workers: body.workers,
+      cycles: body.cycles,
+    })
 
   return {
     project: { id: project.id, slug: project.slug },
@@ -174,6 +175,13 @@ async function applySync(db: Db, body: SyncPayload) {
     skills: [...skillIds.keys()],
     removed,
     overriddenSchedules,
+    /**
+     * Sync is the moment somebody wrote a `requires:` label, so it is the moment to say
+     * that nothing here advertises it. See `ReindexResult.unmetRequirements` for why this
+     * is a warning at the point of writing rather than a refusal at admission.
+     */
+    unmetRequirements,
+    registeredRunners,
   }
 }
 

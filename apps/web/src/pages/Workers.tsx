@@ -53,6 +53,15 @@ function ProjectWorkers({ slug }: { slug: string }) {
    * rather than guessing.
    */
   const breakerThreshold = data?.policies[slug]?.policies.failureBreakerThreshold
+  /**
+   * Whether this project's config.yaml permits a modifier on the `worktree` sandbox.
+   *
+   * From the server, from the file — not from `policies` above, which is the
+   * control-plane half off the `projects` row and does not carry this key by design.
+   * Undefined means the control plane cannot read the file, in which case the form has
+   * nothing to write to anyway.
+   */
+  const allowSandboxDowngrade = data?.allowSandboxDowngrade[slug] ?? false
 
   const { data: projects } = useQuery({ queryKey: ['projects'], queryFn: api.projects })
   const drift = projects?.projects.find((p) => p.slug === slug)?.drift
@@ -130,6 +139,7 @@ function ProjectWorkers({ slug }: { slug: string }) {
       {creating && (
         <WorkerForm
           projectSlug={slug}
+          allowSandboxDowngrade={allowSandboxDowngrade}
           {...(hash ? { configHash: hash } : {})}
           onDone={() => setCreating(false)}
         />
@@ -147,6 +157,7 @@ function ProjectWorkers({ slug }: { slug: string }) {
           <WorkerForm
             key={row.worker.id}
             projectSlug={slug}
+            allowSandboxDowngrade={allowSandboxDowngrade}
             existing={row.worker}
             {...(row.drivenBy ? { drivenBy: row.drivenBy.cycle } : {})}
             {...(hash ? { configHash: hash } : {})}
@@ -170,6 +181,26 @@ function ProjectWorkers({ slug }: { slug: string }) {
           Admission refused that job. If the worker shows{' '}
           <span className="pill red">breaker open</span> above, clear it here;{' '}
           <Link to="/coverage">Coverage</Link> records the reason either way.
+        </p>
+      )}
+      {/*
+        Queued and unclaimable. "Queued" is what a job about to start in four seconds also
+        says, which is exactly what made this invisible — you press run, are told it
+        worked, and nothing ever happens. The labels are named because the fix is on the
+        line that asked for them, not on the Runners page where everything looks fine.
+      */}
+      {run.data?.jobs.some((j) => j.state === 'queued' && j.reach === 'unmatched') && (
+        <p className="error" style={{ fontSize: 13 }}>
+          Queued, but no runner registered here advertises{' '}
+          <span className="mono">
+            {[
+              ...new Set(
+                run.data.jobs.filter((j) => j.state === 'queued').flatMap((j) => j.missing ?? []),
+              ),
+            ].join(', ')}
+          </span>
+          , so nothing will claim it. <Link to="/runners">Runners</Link> — a capability Ogun
+          cannot detect is declared with <span className="mono">ogun runner init --labels</span>.
         </p>
       )}
     </>

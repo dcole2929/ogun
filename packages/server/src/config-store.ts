@@ -8,6 +8,7 @@ import {
   projectConfigSchema,
   workerSchema,
   type CycleDefinition,
+  type Policies,
   type WorkerConfig,
 } from '@ogun/core'
 
@@ -71,6 +72,28 @@ export type ConfigFile = {
    * nothing ran it.
    */
   cycles: Record<string, CycleDefinition>
+  /**
+   * The whole `policies:` block, including the pinned-blob half — because this *is* the
+   * file, not a copy of it.
+   *
+   * The rule those keys live by is that no *second* copy of them may exist: the runner
+   * reads `allowSandboxDowngrade` from the git blob at the pinned base and the control
+   * plane refuses to store them on the `projects` row, so that a gate an agent could
+   * edit is never the gate that counts (§4.9, ADR-0009). Handing them back from a read
+   * of the file does not create a second copy; it hands back what the file says, to the
+   * one component that is about to write to that same file.
+   *
+   * The API needs them for exactly one question: whether to refuse a `modifier` on the
+   * `worktree` sandbox. It was refusing that unconditionally, so a project that had set
+   * `allowSandboxDowngrade: true` could create such a worker by hand and sync it, and the
+   * runner would honour it — but the UI, editing the very file that granted permission,
+   * would not. A policy that half the system honours is a policy nobody can reason about.
+   *
+   * `undefined` when the file could not be read. Callers must not read that as `false`:
+   * the config being unreachable is a different fact from the project saying no, and the
+   * same distinction `sandboxDowngrade` makes on the runner side.
+   */
+  policies: Policies
 }
 
 export class ConfigConflict extends Error {}
@@ -107,7 +130,14 @@ export function createLocalConfigStore(projectMapPath?: string): ConfigStore {
       throw new ConfigUnreachable(`${path} is not readable`)
     })
     const parsed = projectConfigSchema.parse(parseDocument(text).toJS())
-    return { path, text, hash: hashOf(text), workers: parsed.workers, cycles: expand(parsed.cycles) }
+    return {
+      path,
+      text,
+      hash: hashOf(text),
+      workers: parsed.workers,
+      cycles: expand(parsed.cycles),
+      policies: parsed.policies,
+    }
   }
 
   const load = async (slug: string): Promise<ConfigFile> => loadFrom(await configPathFor(slug))
@@ -171,6 +201,7 @@ export function createLocalConfigStore(projectMapPath?: string): ConfigStore {
           hash: hashOf(next),
           workers: parsed.data.workers,
           cycles: expand(parsed.data.cycles),
+          policies: parsed.data.policies,
         }
       }),
   }

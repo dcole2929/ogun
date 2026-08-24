@@ -373,7 +373,13 @@ describe('worker api', () => {
     assert.equal(await readFile(configPath, 'utf8'), before)
   })
 
-  test('a modifier cannot be put on a worktree sandbox', async () => {
+  /**
+   * The refusal survives — but on the project's authority rather than unconditionally,
+   * and the message has to say whose. "Not allowed" and "your config.yaml says not
+   * allowed" send a person to two different places, and only one of them has a line they
+   * can change.
+   */
+  test('a modifier cannot be put on a worktree sandbox by a project that forbids it', async () => {
     const res = await send('/api/workers', {
       projectSlug: slug,
       name: 'risky',
@@ -382,7 +388,133 @@ describe('worker api', () => {
       sandbox: 'worktree',
     })
     assert.equal(res.status, 400)
-    assert.match(await errorOf(res), /directly on the host/)
+    const error = await errorOf(res)
+    assert.match(error, /directly on the host/)
+    assert.match(error, /allowSandboxDowngrade/)
+  })
+})
+
+/**
+ * `policies.allowSandboxDowngrade` reaching the API that names it.
+ *
+ * The route refused `modifier` + `worktree` unconditionally, from before the policy
+ * existed. By the time it did exist and the runner honoured it, that refusal had become a
+ * second, contradictory answer to a settled question: a project that had set the policy
+ * true could create exactly that worker by hand in config.yaml, sync it, and watch it
+ * run — while the UI over that same file insisted it was not permitted. The worst version
+ * of a policy is one that half the system honours, because then neither half can be
+ * reasoned about from the config.
+ *
+ * The value is read from the file rather than from the `projects` row, and that is not an
+ * implementation detail. `allowSandboxDowngrade` is deliberately never stored: it is a
+ * gate on what an agent's own work may become, the runner reads it from the git blob at
+ * the pinned base because a modifier can write to its own checkout, and `syncSchema`
+ * drops it at the door so no second copy exists anywhere a future caller could reach
+ * (§4.9, ADR-0009). A naive fix reaches for `projectPolicies(db, id)` — which compiles,
+ * returns a `ResolvedPolicies` that has no such key, and would send somebody to add one
+ * to the database.
+ *
+ * This gate is not load-bearing on its own and is not meant to be. It decides whether a
+ * form submission is accepted; `sandboxDowngrade` on the runner re-asks the same question
+ * of a copy the agent could not have edited, and that is the one that decides whether a
+ * container is skipped.
+ */
+describe('the api honours the project policy it refuses on behalf of', () => {
+  let h: Awaited<ReturnType<typeof startHarness>>
+  const slug = `dg-${Date.now()}`
+  let root = ''
+  let configPath = ''
+
+  const send = (path: string, body: unknown, method = 'POST') =>
+    h.fetch(path, {
+      method,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+
+  const config = (allow: boolean) => `project:
+  name: ${slug}
+  defaultBranch: main
+
+workers:
+  nightly:
+    skill: review
+
+policies:
+  allowSandboxDowngrade: ${allow}
+`
+
+  before(async () => {
+    root = await mkdtemp(join(tmpdir(), 'ogun-downgrade-api-'))
+    configPath = join(root, '.ogun', 'config.yaml')
+    await mkdir(join(root, '.ogun'), { recursive: true })
+    await writeFile(configPath, config(true))
+    const mapPath = join(root, 'projects.json')
+    await writeFile(mapPath, JSON.stringify({ projects: { [slug]: root } }))
+    h = await startHarness(createLocalConfigStore(mapPath))
+
+    await send('/api/projects/sync', {
+      slug,
+      defaultBranch: 'main',
+      configHash: 'h1',
+      workers: { nightly: defaults },
+      policies: { maxConcurrentModifiers: 1, failureBreakerThreshold: 3 },
+      skills: [{ name: 'review', sourcePath: '.agents/skills/review', versionHash: 'sv1' }],
+    })
+  })
+
+  after(async () => {
+    await h.stop()
+  })
+
+  test('a project that set the policy true can create the worker it permits', async () => {
+    const res = await send('/api/workers', {
+      projectSlug: slug,
+      name: 'on-host',
+      skill: 'review',
+      permissions: 'modifier',
+      sandbox: 'worktree',
+    })
+    assert.equal(res.status, 201, await res.text())
+    assert.match(await readFile(configPath, 'utf8'), /sandbox: worktree/)
+  })
+
+  /**
+   * And the same request against the same route, once the file says no. The policy is
+   * re-read per request rather than captured at boot, because config.yaml is a file
+   * somebody edits in an editor while the control plane is running — a cached answer
+   * would keep granting permission that had been withdrawn minutes ago.
+   */
+  test('withdrawing the policy in the file takes effect on the next request', async () => {
+    await writeFile(configPath, config(false))
+    const res = await send('/api/workers', {
+      projectSlug: slug,
+      name: 'on-host-again',
+      skill: 'review',
+      permissions: 'modifier',
+      sandbox: 'worktree',
+    })
+    assert.equal(res.status, 400)
+    assert.match(((await res.json()) as { error: string }).error, /allowSandboxDowngrade/)
+  })
+
+  /**
+   * The list route carries the same answer to the browser, so the form can offer what the
+   * API will accept. It is sent separately from `policies` — which is the control-plane
+   * half off the `projects` row — precisely because this key is not in there.
+   */
+  test('the worker list tells the ui which projects permit it', async () => {
+    const res = await h.fetch(`/api/workers?project=${slug}`)
+    const body = (await res.json()) as {
+      allowSandboxDowngrade: Record<string, boolean>
+      policies: Record<string, { policies: Record<string, unknown> }>
+    }
+    assert.equal(body.allowSandboxDowngrade[slug], false)
+    assert.equal(
+      Object.hasOwn(body.policies[slug]!.policies, 'allowSandboxDowngrade'),
+      false,
+      'the stored half must not grow a copy of a gate that is deliberately not stored',
+    )
   })
 })
 
