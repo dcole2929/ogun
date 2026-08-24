@@ -280,6 +280,20 @@ export const runs = pgTable(
     runtime: text('runtime'),
     model: text('model'),
     sessionId: text('session_id'),
+    /**
+     * Rounds of deliver-and-grade this run took (§5.2), which only a modifier's retry
+     * loop can push above one.
+     *
+     * Not to be confused with `jobs.attempts`, which counts *claims of the job* by a
+     * runner — a queue concern, decided before a container exists. This counts how many
+     * times the agent inside one run was handed the work, and the two can differ in both
+     * directions.
+     *
+     * Nullable, and no default. A row written by a runner that predates the retry loop
+     * said nothing about rounds, and backfilling it with `1` would be the control plane
+     * inventing evidence about a night nobody measured.
+     */
+    rounds: integer('rounds'),
     inputTokens: integer('input_tokens'),
     outputTokens: integer('output_tokens'),
     /** List-price estimate where a runtime reports one. Never a bill (§4.7). */

@@ -1,13 +1,13 @@
 import { strict as assert } from 'node:assert'
 import { execFile } from 'node:child_process'
 import { existsSync } from 'node:fs'
-import { chmod, mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { test } from 'node:test'
 import { extractPatch } from '../src/patch.ts'
-import { materializeWorkspace } from '../src/workspace.ts'
+import { materializeWorkspace, sweepGateArtifacts } from '../src/workspace.ts'
 
 const run = promisify(execFile)
 
@@ -45,6 +45,20 @@ const git = (repo: string, args: string[]) =>
 
 const commit = (repo: string, message: string) =>
   git(repo, ['-c', 'user.name=agent', '-c', 'user.email=agent@test', 'commit', '-qm', message])
+
+/** A message with a body, which is where a closing keyword actually gets written. */
+const commitBody = (repo: string, message: string) =>
+  git(repo, [
+    '-c',
+    'user.name=agent',
+    '-c',
+    'user.email=agent@test',
+    'commit',
+    '-q',
+    '-m',
+    message,
+    '--cleanup=verbatim',
+  ])
 
 /**
  * What the host will do with the artefact in the publisher slice, run here so the tests
@@ -222,4 +236,123 @@ test('an oversized patch is refused and leaves nothing half-written behind', asy
     [],
     'a partial patch was left on disk, and a partial patch applies',
   )
+})
+
+/**
+ * What the modifier lenses read (§4.10), gathered in the same pass that writes the mbox.
+ *
+ * The gate cannot go and get these itself: every git call against agent-authored content
+ * has to go through `gitIn`'s hardening, and a second place for that rule to be true is a
+ * second place for it to quietly stop being. So extraction reads them and the gate is
+ * handed facts, exactly as it is handed `knownPaths`.
+ */
+test('a patch carries its commit messages, whole and in order', async () => {
+  const { baseSha, workspace, destDir } = await factory()
+  await writeFile(join(workspace.path, 'app.ts'), 'export const answer = 42\n')
+  await git(workspace.path, ['add', '-A'])
+  await commitBody(workspace.path, 'Correct the answer\n\nThe body a reviewer reads.\n')
+  await writeFile(join(workspace.path, 'app.ts'), 'export const answer = 43\n')
+  await git(workspace.path, ['add', '-A'])
+  await commit(workspace.path, 'And again')
+
+  const extracted = await extractPatch({ workspace: workspace.path, baseSha, destDir })
+  /**
+   * The *body*, not just the subject, and that is the whole point: `Fixes #14` is a line a
+   * reviewer's own advice puts three paragraphs down, and a check reading subjects would
+   * be a gate that looks enforced and is not.
+   */
+  assert.deepEqual(extracted.facts?.messages, [
+    'Correct the answer\n\nThe body a reviewer reads.',
+    'And again',
+  ])
+  assert.equal(extracted.facts?.sweptUp, false)
+})
+
+/**
+ * The sweep-up commit is recognisable from any round, not just the one that made it. On a
+ * retry the workspace carries the previous round's history forward, so "did this call
+ * commit leftovers" is not a question a later round can ask — the fact has to be readable
+ * off `base..HEAD`.
+ */
+test('work the agent left uncommitted is recorded as such in the facts', async () => {
+  const { baseSha, workspace, destDir } = await factory()
+  await writeFile(join(workspace.path, 'app.ts'), 'export const answer = 42\n')
+
+  const extracted = await extractPatch({ workspace: workspace.path, baseSha, destDir })
+  assert.equal(extracted.facts?.sweptUp, true)
+  assert.equal(extracted.facts?.messages.length, 1)
+})
+
+/**
+ * A rename arrives as the two paths it touches, because `--no-renames` is what makes a
+ * membership test mean what a lens thinks it means. Git's default renders a rename as
+ * `old => new` in one entry, and `paths.includes('.ogun/config.yaml')` against that is
+ * false for a patch that moved the file away.
+ */
+test('a renamed file is reported as both of its paths', async () => {
+  const { baseSha, workspace, destDir } = await factory()
+  await git(workspace.path, ['mv', 'app.ts', 'renamed.ts'])
+  await commit(workspace.path, 'Move it')
+
+  const extracted = await extractPatch({ workspace: workspace.path, baseSha, destDir })
+  assert.deepEqual(extracted.facts?.paths.sort(), ['app.ts', 'renamed.ts'])
+})
+
+/**
+ * The hazard the retry loop introduces, and the reason `sweepGateArtifacts` exists.
+ *
+ * Extraction takes the patch *before* the gate runs, so a suite writing into the tree has
+ * never mattered: the workspace is deleted moments later. A retry reuses the workspace
+ * (§5.2), so without this the next round's `git add -A` commits `coverage/` under "work
+ * the agent left uncommitted" and publishes it.
+ *
+ * `-fd` and not `-fdx`: an ignored `node_modules` is what the *next* round needs to run
+ * the suite at all, and removing it would turn one red suite into a second one about a
+ * missing dependency.
+ */
+test('the gate\'s own leavings are swept before a retry, and ignored files are not', async () => {
+  const { baseSha, workspace, destDir } = await factory()
+  await writeFile(join(workspace.path, '.gitignore'), 'node_modules/\n')
+  await writeFile(join(workspace.path, 'app.ts'), 'export const answer = 42\n')
+  await git(workspace.path, ['add', '-A'])
+  await commit(workspace.path, 'The agent\'s work')
+  await extractPatch({ workspace: workspace.path, baseSha, destDir })
+
+  // Now the gate runs, and the suite writes into the tree.
+  await mkdir(join(workspace.path, 'coverage'), { recursive: true })
+  await writeFile(join(workspace.path, 'coverage', 'lcov.info'), 'TN:\n')
+  await mkdir(join(workspace.path, 'node_modules'), { recursive: true })
+  await writeFile(join(workspace.path, 'node_modules', 'installed'), 'x')
+
+  const swept = await sweepGateArtifacts(workspace.path)
+  assert.deepEqual(swept.dirty, [])
+  assert.deepEqual(swept.removed, ['coverage/lcov.info'])
+  assert.equal(existsSync(join(workspace.path, 'node_modules', 'installed')), true)
+
+  // And the round after it extracts the agent's work and nothing else.
+  const second = await extractPatch({ workspace: workspace.path, baseSha, destDir })
+  assert.deepEqual(second.facts?.paths.sort(), ['.gitignore', 'app.ts'])
+  assert.equal(second.facts?.sweptUp, false)
+})
+
+/**
+ * A suite that writes into *tracked* content is reported rather than repaired.
+ *
+ * Putting the file back means `git checkout`, which applies `.gitattributes` smudge
+ * filters — arbitrary commands, in content the agent wrote, run on the host as the runner.
+ * That is the `core.fsmonitor` exposure again, and `-c` overrides cannot close it because
+ * a filter is named per attribute. So the caller ends the loop instead, which is a refusal
+ * naming the files rather than a repair nobody would trust.
+ */
+test('a suite that rewrites tracked files is reported, not restored', async () => {
+  const { baseSha, workspace, destDir } = await factory()
+  await writeFile(join(workspace.path, 'app.ts'), 'export const answer = 42\n')
+  await git(workspace.path, ['add', '-A'])
+  await commit(workspace.path, 'The agent\'s work')
+  await extractPatch({ workspace: workspace.path, baseSha, destDir })
+
+  await writeFile(join(workspace.path, 'app.ts'), 'export const answer = 999 // snapshot\n')
+
+  const swept = await sweepGateArtifacts(workspace.path)
+  assert.deepEqual(swept.dirty, ['app.ts'])
 })

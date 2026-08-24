@@ -228,6 +228,14 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
         detail: report.detail ?? gateSummary(report),
         endedAt: new Date(),
         ...(notes ? { notes } : {}),
+        /**
+         * Copied, never derived. `gates` carries the last round's verdict only, so
+         * nothing in this transaction could work out that there was an earlier one — and
+         * a run retried into a pass would be indistinguishable from one that passed
+         * first time (principle 6). Absent stays null: a runner predating the retry loop
+         * reported no count, which is not a claim that it ran once.
+         */
+        ...(report.rounds !== undefined ? { rounds: report.rounds } : {}),
         ...(report.durationMs !== undefined ? { durationMs: report.durationMs } : {}),
         ...(report.usage?.inputTokens !== undefined ? { inputTokens: report.usage.inputTokens } : {}),
         ...(report.usage?.outputTokens !== undefined

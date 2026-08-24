@@ -53,6 +53,12 @@ export type RunSummary = {
     startedAt: string
     endedAt: string | null
     durationMs: number | null
+    /**
+     * Rounds of deliver-and-grade (§5.2). Above one only when a modifier's patch was
+     * refused and it was given another attempt. Null for a run recorded by a runner that
+     * predates the retry loop, which is not the same as one.
+     */
+    rounds: number | null
     repoSha: string | null
     runtime: string | null
     model: string | null

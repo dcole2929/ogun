@@ -185,6 +185,22 @@ export const runReportSchema = z.object({
       costCents: z.number().int().nonnegative().optional(),
     })
     .optional(),
+  /**
+   * How many times the agent was delivered to before this run ended (§5.2's rounds).
+   *
+   * One for everything that is not a modifier, because retry is a modifier concept. For a
+   * modifier it is the whole of the retry loop's ledger: `gates` carries only the last
+   * round's verdict — it has to, or a run that was retried and then passed would derive
+   * down to `changes-requested` — so without this a run that succeeded first time and a
+   * run that succeeded on its second attempt are the same row (principle 6). The rejected
+   * round's own reason, and the reason there was or was not another one, are on the
+   * timeline where they happened.
+   *
+   * Optional rather than defaulted to 1, so `null` in the column keeps meaning "a runner
+   * that predates the retry loop said nothing" rather than claiming a count nobody
+   * reported.
+   */
+  rounds: z.number().int().positive().optional(),
   gates: z.array(gateResultSchema).default([]),
   /** Absent when the gate failed or the run errored before producing output. */
   findings: findingsDocumentSchema.optional(),

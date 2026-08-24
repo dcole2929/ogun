@@ -66,7 +66,8 @@ test('a modifier is graded on the project\'s suite, run as a command in its own 
 
   const gate = verdict.gates.find((g) => g.name === 'tests')
   assert.equal(gate?.passed, true, 'a green suite passes the gate')
-  assert.deepEqual(verdict.tests, { ran: true, passed: true })
+  assert.equal(verdict.tests?.ran, true)
+  assert.equal(verdict.tests?.passed, true)
   /**
    * `raw`, because the sandbox otherwise prefixes the agent runtime binary — every exec
    * before this one was the agent — and `claude sh -c 'pnpm -s test'` runs claude.
@@ -84,7 +85,17 @@ test('a red suite fails the gate and carries what it printed', async () => {
 
   const gate = verdict.gates.find((g) => g.name === 'tests')
   assert.equal(gate?.passed, false)
-  assert.deepEqual(verdict.tests, { ran: true, passed: false })
+  assert.equal(verdict.tests?.ran, true)
+  assert.equal(verdict.tests?.passed, false)
+  /**
+   * A red suite *finished*, and the retry loop's entire budget arithmetic is that
+   * measurement — the reserve it holds back for the gate's next run is what the suite
+   * just cost, not a constant somebody chose. A gate that reported only `ran: false`
+   * here would leave `retryDecision` with nothing to reserve against and no retry would
+   * ever happen; one that reported a duration for a suite killed at the deadline would
+   * be quoting the budget back at itself.
+   */
+  assert.equal(typeof verdict.tests?.durationMs, 'number')
   // Stdout, not stderr. A failing suite reports on stdout and frequently leaves stderr
   // empty, so a gate quoting stderr alone says "tests: failed" and nothing else — which
   // is the sentence nobody can act on at 8am.

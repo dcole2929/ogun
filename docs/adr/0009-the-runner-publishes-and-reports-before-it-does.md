@@ -114,6 +114,18 @@ about the container applied one level out, and has no condition yet.
   close tickets or notify people from the body. GitHub also scans commit messages
   themselves on merge, and rewriting those would destroy the artefact. **That gap is
   real and reportable**; this ADR does not settle it.
+
+  [amended] It is now closed on the only side it can be. Nothing rewrites a commit
+  message — that part stands — but the verify gate's `commit-message` lens (§4.10) refuses
+  the patch outright when one carries a closing keyword, so the pull request is never
+  opened. Refusing rather than warning, because a warning records the harm without
+  preventing it and the harm lands weeks later on somebody who never saw the run; and not
+  retryable, because the only repair is rewriting history, which extraction refuses for
+  the reasons above. `@mentions` are deliberately still not checked: a handle and a scoped
+  package name (`@ogun/core`, which this repository's own commit messages are full of) are
+  indistinguishable without asking GitHub, the stakes are a notification rather than a
+  closed ticket, and a lens that refused real patches over that would be worse than the
+  thing it prevents.
 - **Push and pull-request creation are one interface method but two operations**, so
   there is a window in which the branch is on the remote and the pull request is not. The
   run says so on its timeline and the `changes` row stays null, which reads correctly —

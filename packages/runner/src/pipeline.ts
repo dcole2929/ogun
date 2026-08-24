@@ -23,14 +23,22 @@ import {
   createSandbox,
   GUEST_WORKSPACE,
   readContained,
+  type CreateSandboxInput,
   type Sandbox,
 } from './sandbox/index.ts'
 import { nextSeq, newParserState, resolveModel, resolveRuntime } from './runtimes/index.ts'
 import { checkDismissals, gatherEvidence } from './evidence.ts'
 import { extractPatch, type PatchExtraction } from './patch.ts'
 import { githubCli, publishPatch } from './publish.ts'
-import { gitIn, materializeWorkspace, resolveHeadSha, stageAll } from './workspace.ts'
-import { runVerifyGate, type VerifyOutcome } from './verify.ts'
+import { MAX_MODIFIER_ROUNDS, retryDecision, retryPrompt } from './retry.ts'
+import {
+  gitIn,
+  materializeWorkspace,
+  resolveHeadSha,
+  stageAll,
+  sweepGateArtifacts,
+} from './workspace.ts'
+import { runVerifyGate, TESTS_LENS, type VerifyOutcome } from './verify.ts'
 import {
   defaultSearchPaths,
   ensureSkillAvailable,
@@ -90,6 +98,21 @@ export type RunnerContext = {
   projects: Record<string, string>
   scratch: string
   gateway?: Gateway
+  /**
+   * How a sandbox is made. A seam, not a knob — the same shape `publishPatch` takes its
+   * `PublishRemote` in, and for the same reason: everything above it is decisions, and
+   * decisions that can only be exercised by starting a container are decisions nothing
+   * exercises.
+   *
+   * The loop this seam exists for is the retry one. Whether a rejected patch gets a
+   * second round, what the round is given as a budget, whether the session is resumed or
+   * restarted, and what the ledger says afterwards are all questions answered *between*
+   * two agent invocations — so a test that cannot script the invocations cannot reach any
+   * of them, and the only alternative is running a real model twice per assertion.
+   *
+   * Absent means `createSandbox`, which is what every real caller uses.
+   */
+  sandboxes?: (input: CreateSandboxInput) => Sandbox
 }
 
 /**
@@ -97,10 +120,14 @@ export type RunnerContext = {
  *
  *   prepare   -> materialize workspace, check the image
  *   provision -> sandbox, ONCE per job rather than per round
- *   deliver   -> round 0 only in v1; the `for round` shape stays so phase 3 is an
- *                unwrapping rather than a rewrite
- *   grade     -> verify gate
+ *   deliver   -> the agent; on a retry, resumed into the same session
+ *   extract   -> a modifier's commits, as a patch, before anything else touches the tree
+ *   grade     -> verify gate; a modifier it rejects may go round again (`retry.ts`)
  *   record    -> one report; the control plane writes it in one transaction
+ *
+ * The deliver/extract/grade three are the loop body. Everything above them happens once
+ * per job and everything below them happens once per run, which is why the workspace and
+ * the sandbox are outside it and the report is after it.
  */
 export async function executeJob(
   cp: ControlPlane,
@@ -111,6 +138,17 @@ export async function executeJob(
   const flusher = new EventFlusher(cp, job.runId)
   let sandbox: Sandbox | undefined
   let cleanup: (() => Promise<void>) | undefined
+  /**
+   * How many rounds this run actually took, declared out here so that `fail` can carry
+   * it too: "the runtime crashed" and "the runtime crashed on the retry, after a graded
+   * round that produced a patch" are different nights, and the second one has a patch on
+   * disk to explain.
+   *
+   * Zero until a round starts, and omitted from the report at zero — a run that failed
+   * before the agent ran said nothing about rounds, which is not the same as saying none
+   * (principle 6).
+   */
+  let rounds = 0
 
   /**
    * `extra` carries what the run had already produced when it failed. A modifier whose
@@ -130,6 +168,7 @@ export async function executeJob(
         outcome: 'error',
         detail,
         durationMs: Date.now() - startedAt,
+        ...(rounds > 0 ? { rounds } : {}),
         gates,
         coverage: { outcome: 'errored', reason: detail },
         artifacts: [],
@@ -370,7 +409,7 @@ export async function executeJob(
       ...(model ? { model } : {}),
     })
 
-    sandbox = createSandbox({
+    sandbox = (config.sandboxes ?? createSandbox)({
       kind: job.sandbox === 'worktree' ? 'worktree' : 'container',
       name: `ogun-${job.runId.slice(0, 12)}`,
       hostWorkspace: workspace.path,
@@ -406,8 +445,16 @@ export async function executeJob(
       permissions: job.permissions as 'observer' | 'reviewer' | 'modifier',
     }
 
-    // v1 runs exactly one round. Keeping the loop makes phase 3's retry an unwrapping.
-    const maxRounds = 1
+    /**
+     * §5.2's `for round` shape, unwrapped (§9, phase 3).
+     *
+     * Only a modifier gets more than one. A reviewer's gate decides whether its findings
+     * persist, and re-delivering a rejected findings document is a different feature with
+     * a different failure mode — §5.2 has said "retry is a modifier concept" since it was
+     * written. What bounds a modifier's rounds is `retryDecision`, not this number: the
+     * cap is the backstop for a project whose suite is too cheap for the budget to bite.
+     */
+    const maxRounds = job.permissions === 'modifier' ? MAX_MODIFIER_ROUNDS : 1
     const parser = newParserState()
     let lastEvent: RunEvent | undefined
     /**
@@ -419,6 +466,23 @@ export async function executeJob(
      * gotcha, which is fixed, rather than at the model name, which was wrong.
      */
     let reportedFailure: string | undefined
+
+    /**
+     * The runner's own voice on the timeline. There are now enough of these — extraction,
+     * the suite, each lens with something to say, and the retry decision either way —
+     * that spelling out the event envelope at every call site was the larger half of what
+     * this function had become.
+     */
+    const note = (text: string, fields: Record<string, unknown> = {}): void => {
+      flusher.push([
+        {
+          type: 'runner.note',
+          ts: new Date().toISOString(),
+          seq: nextSeq(parser),
+          payload: { note: text, ...fields },
+        },
+      ])
+    }
 
     /**
      * Recorded on every run, not only when something was copied. Which skill a run
@@ -502,8 +566,42 @@ export async function executeJob(
         : []),
     ])
 
-    for (let round = 0; round < maxRounds; round++) {
-      const handle = sandbox.exec(spec.start(ctx))
+    let output: unknown
+    let change: PatchExtraction | undefined
+    let verdict: VerifyOutcome | undefined
+    let usage: RunReport['usage']
+    /** Set at the end of a round when there is to be another, and consumed by it. */
+    let pending: { prompt: string; budgetMs: number } | undefined
+
+    for (let round = 1; round <= maxRounds; round++) {
+      rounds = round
+      // Per round, not per run. A retry that exits non-zero without reporting a reason of
+      // its own would otherwise be explained by the previous round's, which is a wrong
+      // answer that reads like a right one.
+      reportedFailure = undefined
+      const roundCtx = pending ? { ...ctx, prompt: pending.prompt } : ctx
+      /**
+       * Resumed, not restarted (§5.2). The provider session carries the twenty minutes
+       * this agent already spent reading the repository, and a retry that re-reads it
+       * cold pays for that twice out of a budget it is already short of.
+       *
+       * The fallback is a fresh `start` with the original prompt *and* the feedback
+       * concatenated, for a runtime that never reported a session id. It is worse — the
+       * agent has to rediscover its own work from `git log` — and it is much better than
+       * refusing the round, because the workspace still holds everything it did.
+       */
+      const argv =
+        pending && parser.sessionId
+          ? spec.resume(roundCtx, parser.sessionId)
+          : spec.start(pending ? { ...ctx, prompt: `${ctx.prompt}\n\n${pending.prompt}` } : ctx)
+      /**
+       * A retry round is given an explicit timeout, and that is the whole of what keeps
+       * the gate's share of the budget. `sandbox.exec` otherwise applies the sandbox's
+       * own timeout, which is the *entire* `job.timeoutMs` — so a second round would be a
+       * second full helping of a budget the first round already spent part of, and the
+       * gate after it would find nothing left.
+       */
+      const handle = sandbox.exec(argv, pending ? { timeoutMs: pending.budgetMs } : undefined)
       for await (const line of handle.lines) {
         const events = spec.parseLine(line, parser)
         if (events.length === 0) continue
@@ -516,110 +614,209 @@ export async function executeJob(
       const { code, stderr } = await handle.done
       await flusher.flush()
       if (code !== 0) {
-        return await fail(
-          reportedFailure
-            ? `${job.runtime} exited ${code}: ${reportedFailure}`
-            : `${job.runtime} exited ${code}: ${stderr.slice(-1500)}`,
-        )
+        const why = reportedFailure
+          ? `${job.runtime} exited ${code}: ${reportedFailure}`
+          : `${job.runtime} exited ${code}: ${stderr.slice(-1500)}`
+        /**
+         * The first round crashing is a failed run — nothing has been graded and there is
+         * nothing to report but the crash. A *retry* crashing must not be, and the
+         * difference is the point: the previous round's patch is already on disk and its
+         * verdict is already in hand, and failing here would throw both away to report a
+         * resume that did not start. So the loop ends and the run is reported as the last
+         * round that finished, which is the state the patch file on disk actually
+         * describes.
+         */
+        if (round === 1) return await fail(why)
+        note(`the retry round did not complete: ${why}. Reporting round ${round - 1}.`, {
+          round,
+          retryFailed: true,
+        })
+        rounds = round - 1
+        break
       }
       if (parser.sessionId) await cp.started(job.runId, { sessionId: parser.sessionId })
-    }
+      /**
+       * Accumulated across rounds rather than read off the last one.
+       *
+       * Each round ends with its own `result` event carrying that round's usage, so a
+       * report built from `lastEvent` alone would charge a two-round run at the price of
+       * its retry — and the retry is the cheap one, because the expensive reading
+       * happened in round one. Under-reporting cost is the wrong direction to be wrong in
+       * on a system whose entire premise is a subscription somebody is spending
+       * (principle 1).
+       */
+      usage = addUsage(usage, usageFrom(lastEvent))
 
-    // The agent may have created files; stage them or the grounding check will call a
-    // real new file a hallucination (§5.3).
-    await stageAll(workspace.path).catch(() => undefined)
+      // The agent may have created files; stage them or the grounding check will call a
+      // real new file a hallucination (§5.3).
+      await stageAll(workspace.path).catch(() => undefined)
 
-    let raw: string | null
-    try {
-      raw = await sandbox.readFile(OUTPUT_PATH)
-    } catch (err) {
-      // A symlinked or oversized output is an attempt to make the host read something it
-      // should not. That ends the run; it is not a gate failure to be graded.
-      return await fail(err instanceof Error ? err.message : String(err))
-    }
-    const output = raw === null ? undefined : safeJsonParse(raw)
+      let raw: string | null
+      try {
+        raw = await sandbox.readFile(OUTPUT_PATH)
+      } catch (err) {
+        // A symlinked or oversized output is an attempt to make the host read something
+        // it should not. That ends the run; it is not a gate failure to be graded.
+        return await fail(err instanceof Error ? err.message : String(err))
+      }
+      output = raw === null ? undefined : safeJsonParse(raw)
 
-    /**
-     * The crossing (ADR-0005). A modifier's work exists only as commits in a clone this
-     * function deletes in its `finally`, and the container had no remote to put it
-     * anywhere else — so if it is not extracted here it is gone, and the run reads as an
-     * agent that did nothing.
-     *
-     * **Before the gate, which is the reverse of where this sat.** The gate now runs the
-     * project's suite in the same workspace, and a suite writes: `node_modules/.cache`,
-     * `coverage/`, `.pytest_cache`, a compiled `dist/` — verified by running one against
-     * a modifier's read-write mount, which left `node_modules/.cache/suite-artifact` in
-     * the tree. Extraction begins with `git add -A`, so anything the suite dropped and
-     * the repo does not ignore would be committed under "work the agent left
-     * uncommitted" and published in the pull request. The patch has to be the agent's
-     * work, so it is taken before anything else touches the tree.
-     *
-     * Nothing is lost by the swap: extraction commits what the agent left but does not
-     * change a file in the worktree, so the suite still runs against exactly the tree the
-     * agent produced. A patch written for a run the gate then rejects is not waste
-     * either — the run records the patch and refuses to call it ready, and the person
-     * reading the failure wants to see the diff that failed.
-     *
-     * The patch is written under `scratch/patches`, outside the workspace, because the
-     * workspace is deleted in this function's `finally`. Nothing prunes that directory
-     * yet — the same gap transcripts already have, and the natural place to close it is
-     * the publisher, which is the step that knows a patch has been consumed.
-     */
-    let change: PatchExtraction | undefined
-    if (job.permissions === 'modifier') {
-      change = await extractPatch({
-        workspace: workspace.path,
-        baseSha: workspace.sha,
-        destDir: join(config.scratch, 'patches', job.runId),
+      /**
+       * The crossing (ADR-0005). A modifier's work exists only as commits in a clone this
+       * function deletes in its `finally`, and the container had no remote to put it
+       * anywhere else — so if it is not extracted here it is gone, and the run reads as an
+       * agent that did nothing.
+       *
+       * **Before the gate, which is the reverse of where this sat.** The gate now runs the
+       * project's suite in the same workspace, and a suite writes: `node_modules/.cache`,
+       * `coverage/`, `.pytest_cache`, a compiled `dist/` — verified by running one against
+       * a modifier's read-write mount, which left `node_modules/.cache/suite-artifact` in
+       * the tree. Extraction begins with `git add -A`, so anything the suite dropped and
+       * the repo does not ignore would be committed under "work the agent left
+       * uncommitted" and published in the pull request. The patch has to be the agent's
+       * work, so it is taken before anything else touches the tree.
+       *
+       * Nothing is lost by the swap: extraction commits what the agent left but does not
+       * change a file in the worktree, so the suite still runs against exactly the tree the
+       * agent produced. A patch written for a run the gate then rejects is not waste
+       * either — the run records the patch and refuses to call it ready, and the person
+       * reading the failure wants to see the diff that failed.
+       *
+       * **Once per round, to the same file, on purpose.** The workspace is never reset
+       * between rounds (§5.2), so `base..HEAD` grows: round two's mbox contains round
+       * one's commits and then some. It supersedes rather than competes, which is why
+       * there is one `changes.patch` per run rather than one per round, and why a retry
+       * that crashes before extracting leaves the previous round's artefact intact and
+       * correct.
+       *
+       * The patch is written under `scratch/patches`, outside the workspace, because the
+       * workspace is deleted in this function's `finally`. Nothing prunes that directory
+       * yet — the same gap transcripts already have, and the natural place to close it is
+       * the publisher, which is the step that knows a patch has been consumed.
+       */
+      if (job.permissions === 'modifier') {
+        change = await extractPatch({
+          workspace: workspace.path,
+          baseSha: workspace.sha,
+          destDir: join(config.scratch, 'patches', job.runId),
+        })
+        note(describeExtraction(change), {
+          round,
+          filesChanged: change.filesChanged,
+          commits: change.commits,
+          ...(change.patch ? { patchRef: change.patch.ref, bytes: change.patch.bytes } : {}),
+        })
+        if (change.unextractable) {
+          /**
+           * Loud, and with the file count kept: a modifier whose work cannot be published
+           * is a broken factory, not a quiet night. Running the suite first would spend
+           * the rest of the budget grading work that cannot leave this machine either way.
+           *
+           * No retry, on the same grounds `admission.ts` puts a project's missing test
+           * command ahead of the failure breaker. An agent that rewrote history or
+           * committed a build directory has produced a fact about this run, not a
+           * question — and the second half of that fact is that the workspace it would
+           * retry *in* is the one it just broke.
+           */
+          return await fail(change.unextractable, [], { change: changeRecord(change) })
+        }
+      }
+
+      verdict = await runVerifyGate({
+        config: job.verify ? verifySchema.parse(job.verify) : undefined,
+        permissions: job.permissions as 'observer' | 'reviewer' | 'modifier',
+        output,
+        knownPaths: await trackedPaths(workspace.path),
+        lineCountOf: (path) => countLines(workspace.path, path),
+        sandbox,
+        ...(testCommand ? { testCommand } : {}),
+        ...(change?.facts ? { patch: change.facts } : {}),
+        deadline,
       })
-      flusher.push([
-        {
-          type: 'runner.note',
-          ts: new Date().toISOString(),
-          seq: nextSeq(parser),
-          payload: {
-            note: describeExtraction(change),
-            filesChanged: change.filesChanged,
-            commits: change.commits,
-            ...(change.patch ? { patchRef: change.patch.ref, bytes: change.patch.bytes } : {}),
-          },
-        },
-      ])
-      if (change.unextractable) {
-        // Loud, and with the file count kept: a modifier whose work cannot be published
-        // is a broken factory, not a quiet night. Running the suite first would spend the
-        // rest of the budget grading work that cannot leave this machine either way.
-        return await fail(change.unextractable, [], { change: changeRecord(change) })
+      if (verdict.tests) {
+        note(describeTests(verdict), {
+          round,
+          testsRun: verdict.tests.ran,
+          testsPassed: verdict.tests.passed,
+        })
+      }
+      /**
+       * Every other lens that had something to say, on the timeline, whether it passed or
+       * failed. Gate results are not persisted as rows — a failure reaches the ledger
+       * folded into `runs.detail`, and a *pass* with a detail reaches it nowhere at all.
+       * That is fine for `schema` and `grounded`, which have nothing to say when they
+       * pass, and not fine for the modifier lenses: "this patch edits the file that
+       * decides how it is judged" is a passing verdict whose whole value is that a person
+       * reads it before they read the diff.
+       */
+      for (const gate of verdict.gates) {
+        if (gate.name === TESTS_LENS || !gate.detail) continue
+        note(`${gate.name}: ${gate.detail}`, { round, gate: gate.name, passed: gate.passed })
+      }
+
+      if (job.permissions !== 'modifier') break
+      if (!verdict.gates.some((g) => !g.passed)) break
+
+      const decision = retryDecision({
+        round,
+        maxRounds,
+        permissions: 'modifier',
+        gates: verdict.gates,
+        tests: verdict.tests,
+        remainingMs: deadline - Date.now(),
+      })
+      // Said whichever way it went. "This patch was refused and nobody tried again" is
+      // the sentence a person needs, and it is the one an unrecorded decision loses.
+      note(decision.reason, { round, retrying: decision.retry })
+      if (!decision.retry) break
+
+      /**
+       * The gate just ran the project's suite in this workspace, and a suite writes into
+       * the tree it is run against. Anything it left would be committed by the next
+       * round's extraction as the agent's own work, so it goes before the agent is let
+       * back in — and a suite that modified *tracked* content ends the loop instead,
+       * because the alternative is running the agent's own `.gitattributes` filters on
+       * the host to put them back (see `sweepGateArtifacts`).
+       */
+      const swept = await sweepGateArtifacts(workspace.path)
+      if (swept.dirty.length > 0) {
+        note(
+          `no second attempt after all: running \`${testCommand}\` modified tracked files ` +
+            `(${swept.dirty.slice(0, 5).join(', ')}), so a retry could not tell this ` +
+            "project's suite output from the agent's work",
+          { round, dirty: swept.dirty.length },
+        )
+        break
+      }
+      if (swept.removed.length > 0) {
+        note(`removed ${swept.removed.length} file(s) the suite left in the tree`, {
+          round,
+          removed: swept.removed.slice(0, 20),
+        })
+      }
+
+      pending = {
+        prompt: retryPrompt({
+          round: round + 1,
+          maxRounds,
+          gates: verdict.gates,
+          agentBudgetMs: decision.agentBudgetMs,
+          reserveMs: decision.reserveMs,
+          guestRoot,
+          outputPath: OUTPUT_PATH,
+        }),
+        budgetMs: decision.agentBudgetMs,
       }
     }
 
-    const verdict = await runVerifyGate({
-      config: job.verify ? verifySchema.parse(job.verify) : undefined,
-      permissions: job.permissions as 'observer' | 'reviewer' | 'modifier',
-      output,
-      knownPaths: await trackedPaths(workspace.path),
-      lineCountOf: (path) => countLines(workspace.path, path),
-      sandbox,
-      ...(testCommand ? { testCommand } : {}),
-      deadline,
-    })
-    if (verdict.tests) {
-      flusher.push([
-        {
-          type: 'runner.note',
-          ts: new Date().toISOString(),
-          seq: nextSeq(parser),
-          payload: {
-            note: describeTests(verdict),
-            testsRun: verdict.tests.ran,
-            testsPassed: verdict.tests.passed,
-          },
-        },
-      ])
-    }
+    /**
+     * Unreachable while `maxRounds >= 1` and every early exit above returns rather than
+     * breaks — kept because the alternative to an impossible branch here is a reachable
+     * one where the report is assembled from a verdict nobody produced.
+     */
+    if (!verdict) return await fail('the run finished without the verify gate ever running')
 
     const transcriptRef = await writeTranscript(config, job, workspace.path)
-    const usage = usageFrom(lastEvent)
 
     /**
      * Re-adjudication's host-side half (§4.11), computed here and not by the agent.
@@ -652,20 +849,11 @@ export async function executeJob(
      */
     if ((history?.bases?.length ?? 0) > 0 || dismissalChecks.length > 0) {
       const moved = dismissalChecks.filter((c) => c.basis === 'moved').length
-      flusher.push([
-        {
-          type: 'runner.note',
-          ts: new Date().toISOString(),
-          seq: nextSeq(parser),
-          payload: {
-            note:
-              `dismissals: checked ${dismissalChecks.length} of ${history?.bases?.length ?? 0} ` +
-              `anchored dismissal(s); ${moved} no longer describe code in this tree`,
-            checked: dismissalChecks.length,
-            lapsedBases: moved,
-          },
-        },
-      ])
+      note(
+        `dismissals: checked ${dismissalChecks.length} of ${history?.bases?.length ?? 0} ` +
+          `anchored dismissal(s); ${moved} no longer describe code in this tree`,
+        { checked: dismissalChecks.length, lapsedBases: moved },
+      )
     }
 
     const report: RunReport = {
@@ -678,7 +866,16 @@ export async function executeJob(
        */
       outcome: change?.patch ? 'dispatched' : 'approved',
       durationMs: Date.now() - startedAt,
+      rounds,
       ...(usage ? { usage } : {}),
+      /**
+       * The *final* round's verdict, and only that one. Folding a rejected earlier round
+       * into this array would derive the whole run down to `changes-requested` in
+       * `finalizeRun`, which reads any failed gate as the gate's answer — so a run that
+       * was retried and then passed would report as a run that failed. What the earlier
+       * rounds were is `rounds` above and the timeline below, where the rejection and the
+       * decision to retry are recorded in the order they happened.
+       */
       gates: verdict.gates,
       ...(output !== undefined ? { findings: output as never } : {}),
       evidence,
@@ -1220,6 +1417,29 @@ export function failureMessage(payload: unknown, depth = 0): string | undefined 
     }
   }
   return undefined
+}
+
+/**
+ * Two rounds' usage, added.
+ *
+ * Absent stays absent, and that is the whole care this needs: a runtime that reports no
+ * usage must not have its silence turned into a zero the moment a second round runs, and
+ * a round that reported nothing must not zero out one that did. So each field is summed
+ * only over the rounds that carried it, and stays undefined if none of them did.
+ */
+function addUsage(a: RunReport['usage'], b: RunReport['usage']): RunReport['usage'] {
+  if (!a) return b
+  if (!b) return a
+  const add = (x?: number, y?: number): number | undefined =>
+    x === undefined ? y : y === undefined ? x : x + y
+  const inputTokens = add(a.inputTokens, b.inputTokens)
+  const outputTokens = add(a.outputTokens, b.outputTokens)
+  const costCents = add(a.costCents, b.costCents)
+  return {
+    ...(inputTokens !== undefined ? { inputTokens } : {}),
+    ...(outputTokens !== undefined ? { outputTokens } : {}),
+    ...(costCents !== undefined ? { costCents } : {}),
+  }
 }
 
 function usageFrom(event: RunEvent | undefined): RunReport['usage'] {

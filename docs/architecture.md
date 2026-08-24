@@ -973,9 +973,11 @@ read, the other is a guess, and only `source` can tell them apart.
 Every worker has a verify gate: deterministic tool checks first, then agent lenses.
 Tool checks short-circuit, so a schema-invalid output never spends a grading call.
 
-**In v1 the gate controls persistence, not retry.** [settled] With no retry loop, a
-failed gate means findings are not persisted and the run records why. Same Grader,
-same config shape; phase 3 adds re-delivery on top without changing either.
+**For a reviewer the gate controls persistence; for a modifier it also controls
+retry.** [settled] A reviewer's failed gate means findings are not persisted and the
+run records why, and that is the whole of it. A modifier's failed gate is additionally
+the *input* to another round — see §5.2, which owns the bounds. Same Grader, same
+config shape; the re-delivery sits on top and changed neither.
 
 **Default lens sets differ by permission profile.** A standing rubric of security /
 coupling / deadcode grades *a code change* — meaningless for a reviewer that produced
@@ -984,16 +986,57 @@ no diff. The reviewer analog grades *findings quality*:
 | Profile | Tool checks | Agent lenses |
 |---|---|---|
 | `reviewer` | output matches schema; every cited `file:line` exists in the diff | actionable? grounded in cited evidence? not N restatements of one issue? |
-| `modifier` | build, test, lint, diff size | security, coupling, deadcode |
+| `modifier` | `commit-message`, `self-gating`, then the project's own suite | one change or four? was a test weakened to pass? does the message explain the repair? |
 
 Per-worker overrides: `skipDefaultLenses: [...]`, or `lensProfile: none` for
-non-code work.
+non-code work. Neither reaches a modifier's three, which belong to the project rather
+than to the worker — a gate a worker can switch off in its own stanza is not a gate.
 
-**Only the tool checks are wired.** [open] `schema` and `grounded` run and can fail a
-run; agent lenses are resolved and recorded as skipped with that stated as the reason,
-rather than silently reported as passed. Grading findings quality with a model is a
-prompt-calibration problem, not a plumbing one, and guessing at the rubric before there
-is a week of real reviewer output to calibrate against would bake in the wrong one.
+**A modifier's lenses grade the patch, not the tree.** [added] The row above used to
+read `build, test, lint, diff size`, and three of those four are the project's own
+`tests.command` under different names: a repository that lints in CI lints there, and
+one that does not would not be linted by a lens either. `diff size` is real and already
+recorded — every run notes files, commits and bytes on its timeline — and the only
+thing a lens would add is a threshold nobody can derive. So what is actually built are
+the two questions a suite structurally cannot answer, because they are about the patch
+as a *published artefact*:
+
+- **`commit-message`** — refuses a patch whose commit messages carry a GitHub closing
+  keyword (`Closes #14`, `fixes owner/repo#14`, `Resolves GH-14`, an issue URL). This
+  closes the gap ADR-0009 records: the pull request body fences agent prose, so a
+  keyword there is inert, but GitHub scans commit messages when a branch merges and
+  nothing can strip one without rewriting the artefact a person is reviewing. It
+  *refuses* rather than warns because a warning records the harm without preventing it,
+  and the harm lands weeks later on somebody who never saw the run. The check is
+  narrow on purpose: GitHub only acts when the reference immediately follows the
+  keyword, so "the bug reported in #14" — the phrasing the skill recommends — passes.
+  It also warns, passing, when the patch contains the runner's own sweep-up commit,
+  because a pull request whose content arrived that way has no explanation in it.
+- **`self-gating`** — passes, always, and says so when the patch edits
+  `.ogun/config.yaml`. Refusing was considered and rejected: that file is a file like
+  any other, a reviewer can file a finding about it, and a gate that refused would make
+  one file unfixable by the machinery built to fix files. The gates were read from the
+  blob at the pinned base before the agent started, so the edit changes nothing about
+  how the run was judged — what must not happen is that it is invisible.
+
+Both are deterministic, which is not an economy: neither needs judgment. What genuinely
+does is in the agent-lens column above, and none of it is built.
+
+**Only the tool checks are wired.** [open] `schema`, `grounded`, `commit-message`,
+`self-gating` and the test gate run and can fail a run; agent lenses are resolved and
+recorded as skipped with that stated as the reason, rather than silently reported as
+passed. Grading findings quality with a model is a prompt-calibration problem, not a
+plumbing one, and guessing at the rubric before there is a week of real reviewer output
+to calibrate against would bake in the wrong one. The modifier column is the same
+argument with less evidence behind it — there is one merged modifier patch in
+existence.
+
+**Cheap and fatal runs first.** [settled] `commit-message` costs microseconds and the
+suite costs minutes, so a patch that is unpublishable whatever the suite says never
+spends the budget finding out. The cost is a `changes` row with null test columns,
+which reads as "nobody said" and is true; the publisher refuses on the run's outcome
+long before it reaches its test gate, so the null is never the sentence anyone is
+handed.
 
 ```yaml
 # alongside a skill
@@ -1414,8 +1457,8 @@ admit     re-check with foreman (primary gate was at dispatch)
    ↓
 provision sandbox — ONCE per job, not per round
    ↓
-   ┌─ round 0: deliver(job.prompt) → grade ─┐    ← v1: exactly one round
-   └─ round N: deliver(feedback, resume session) → grade ─┘
+   ┌─ round 1: deliver(job.prompt) → extract → grade ─┐
+   └─ round N: deliver(the rejection, resume session) → extract → grade ─┘
    ↓
 record    outcome + findings + coverage in one transaction;
           transcript to disk, patch extracted
@@ -1432,9 +1475,50 @@ provider session carries forward (`--resume`) so a retry continues the same
 conversation rather than re-reading the repo cold. Provisioning per round instead
 turns three cheap rounds into three full-price ones and invites thrashing.
 
-**v1 has no retry loop.** [settled] Reviewers emit findings; the verify gate decides
-whether they persist; done. Retry is a modifier concept (phase 3). Keep the `for
-round` shape running exactly once so phase 3 is an unwrapping, not a rewrite.
+**Retry is a modifier concept.** [settled] A reviewer emits findings, the verify gate
+decides whether they persist, done — re-delivering a rejected findings document is a
+different feature with a different failure mode and is not this one.
+
+**The retry is bounded by four things, and the budget is the operative one.** [built]
+
+1. **Is the rejection a question?** A red suite is evidence another round can act on. A
+   commit message that closes somebody's issue is not — the only repair is rewriting
+   history, which extraction refuses outright — and neither is a `tests` gate that
+   reports the suite never *ran*, which means no test command or no budget. Those are
+   facts about the run in the sense §4.3's admission means it: no round changes them.
+   The retryable set is an allowlist and fails closed, so a lens added later gets no
+   retry until somebody decides it deserves one.
+2. **Is there budget for the gate afterwards?** The gate's clock is what remains of
+   `job.timeoutMs`, not a fresh one, so a round that runs to the deadline produces "the
+   suite never ran" — which refuses to publish for a reason that reads like a broken
+   harness rather than a bad patch. The reserve is a **measurement, not a constant**:
+   what the gate will need is what the suite just cost. A retry happens only when at
+   least twice that remains — once for the gate, once so the agent can run the suite
+   itself, which is what the skill tells it to do — and the round is given
+   `remaining − suite` as its own `exec` timeout so it cannot eat the reserve.
+3. **The round cap**, at two. The backstop for a project whose suite is too cheap for
+   the budget to bite; a four-second suite would otherwise permit dozens of rounds
+   inside one timeout. Two rather than three because of what a round is worth: the
+   first retry is handed the suite's output, which is new information; the second is
+   handed the same complaint about the same code. Not a worker knob — there is no
+   corpus of retried runs to set one from, and a setting that exists before its
+   evidence is how `failureBreakerThreshold` came to mean nothing.
+4. **Did the gate dirty the workspace?** Extraction takes the patch before the gate
+   runs, so a suite writing `coverage/` into the tree has never mattered — the
+   workspace is deleted moments later. A retry reuses it, so the untracked leavings are
+   swept with `git clean -fd` (never `-fdx`: the ignored `node_modules` is what the next
+   round needs) before the agent is let back in. A suite that modified *tracked* content
+   ends the loop instead, because putting those back means `git checkout`, which applies
+   `.gitattributes` smudge filters — arbitrary commands, written by the agent, run on
+   the host as the runner.
+
+**The ledger keeps the rounds apart.** [built] `runs.rounds` is the count, nullable so a
+row from a runner that predates the loop says nothing rather than claiming one. The
+report's `gates` carries only the **final** round's verdict, because `finalizeRun` reads
+any failed gate as the gate's answer and would derive a run that recovered down to
+`changes-requested` — so without the count, a first-round pass and a second-round pass
+are the same row (principle 6). The rejection itself, and the decision to retry or not
+with its reason, are `runner.note` events in the order they happened.
 
 **Outcome taxonomy** — never conflated:
 `approved | changes-requested | skipped (admission refused) | dispatched | error`
@@ -1526,7 +1610,11 @@ jobs                id, cycle_run_id, worker_id, project_id, prompt,
                     -- prompt is the literal text handed to the agent
 runs                id, job_id, runner_id, started_at, ended_at, outcome,
                     repo_sha, worker_version, skill_version, runtime, model,
-                    input_tokens, output_tokens, cost_cents, duration_ms
+                    rounds, input_tokens, output_tokens, cost_cents, duration_ms
+                    -- rounds is deliver-and-grade passes (§5.2), above one only when a
+                    -- modifier's patch was refused and it got another attempt. Null for
+                    -- a runner predating the retry loop, which is not the same as one.
+                    -- Not jobs.attempts, which counts claims of the job by a runner
 run_events          id, run_id, seq, ts, type, payload (jsonb)
 
 staged_findings     id, run_id, worker_id, raw (jsonb)   -- pre-triage, queryable
@@ -1643,7 +1731,10 @@ Run detail page with a live SSE timeline. Both runtimes normalized onto one even
 No cron, no retry, no fan-in, no publishing.
 
 One thing landed differently than specced and is recorded above: agent lenses in the
-verify gate record as skipped rather than running (tool checks are wired, §4.10).
+verify gate record as skipped rather than running (tool checks are wired, §4.10). Still
+open, and now open on both profiles — phase 3 added a modifier's tool lenses and left its
+agent lenses named and unbuilt for the same reason: a rubric guessed at before there is
+output to calibrate it against is the wrong rubric, permanently.
 
 The other — egress shipping as `open | none` rather than the host allowlist §4.6 called
 for — **is closed**. It is worth recording what the gap actually was, because it was
@@ -1707,7 +1798,7 @@ issue still defeats suppression, and the only repair is triage filing `duplicate
 night where triage does not adjudicate is a night where the inbox re-fills with
 rephrasings, and nothing yet measures that.
 
-**Phase 3 — the write path.** In progress.
+**Phase 3 — the write path.** ✅ Built.
 
 Done: modifier workers with a project image that can run the project's own suite; the
 tests-must-pass gate, read from the blob at the pinned base so a modifier cannot set its
@@ -1725,20 +1816,55 @@ system is built around: reviewer finds → triage publishes → modifier fixes �
 Deliberately not phase 4's ticket-driven flow, which starts from a Linear issue rather
 than from the inbox and is a different node.
 
-The two instructions in it that carry the most weight are both about the gaps the
-machinery has and cannot close. **Never write a closing keyword in a commit message** —
-the PR body fences agent prose so `Closes #14` is inert there, but GitHub scans commit
-messages on merge and nothing can strip one without destroying the artefact (ADR-0009).
-And **declining is a result**: a modifier that changed nothing is `approved`, an ordinary
-outcome, so the skill is written to make "I could not find a safe fix" cheaper to say than
-to guess. Ogun's own `fix-a-finding` worker carries **no schedule**, and will not until a
+The two instructions in it that carry the most weight were both about gaps the machinery
+had and could not close. **Never write a closing keyword in a commit message** — the PR
+body fences agent prose so `Closes #14` is inert there, but GitHub scans commit messages
+on merge and nothing can strip one without destroying the artefact (ADR-0009). That one
+is no longer only an instruction: the `commit-message` lens below refuses the patch, which
+is what §4.10 is for. And **declining is a result**: a modifier that changed nothing is
+`approved`, an ordinary outcome, so the skill is written to make "I could not find a safe
+fix" cheaper to say than to guess. Ogun's own `fix-a-finding` worker carries **no
+schedule**, and will not until a
 person has watched one of these runs end to end — `maxOpenPullRequests` bounds the damage
 of an unattended modifier; it is not a substitute for having seen one work.
 
-Remaining: the retry loop on the existing verify gate, and modifier-profile lenses. The
-`for round` shape in the runner still runs exactly once, which is what makes the first of
-those an unwrapping rather than a rewrite. Arbitrary user-defined graphs if they turn out
-to be wanted.
+Also done, and phase 3's write path is therefore complete: **the retry loop** and
+**modifier-profile lenses**. The `for round` shape was an unwrapping exactly as it was
+meant to be — deliver, extract, grade, decide — and what took the argument was the
+decision rather than the loop.
+
+The retry's bounds are in §5.2 and the one worth repeating is the budget. A modifier
+shares one `timeoutMs` with the gate's own suite run, so a retry that spends the margin
+produces "the suite never ran", which refuses to publish for a reason that reads like a
+broken harness rather than a bad patch. The reserve held back is therefore a
+*measurement* — what the suite just cost — rather than a constant somebody chose, on the
+same grounds `testsCheck` refuses to give the gate a timeout of its own: a second number
+is a number able to disagree with the first. And not every rejection is a question. A
+patch rejected because the suite was red is worth another round; one rejected because the
+agent rewrote history, or wrote a commit message that closes an issue, is not, because
+the only repair for either is the thing extraction refuses. That is `admission.ts`'s
+distinction between a worker that has been failing and a fact about the repository, drawn
+one level down.
+
+The lenses are the smaller half and the one that had a recorded gap to close. §4.10's
+`build, test, lint, diff size` turned out to be three names for `tests.command` and one
+threshold nobody can derive, so a modifier's new checks are the two questions the suite
+structurally cannot answer — both about the patch as a published artefact.
+**`commit-message`** refuses a closing keyword, which closes ADR-0009's open gap on the
+only side it can be closed: the pull request *body* was already fenced, the commit message
+cannot be rewritten without destroying the artefact, and until now the only thing standing
+in that gap was a sentence in a skill. **`self-gating`** never refuses and says out loud
+when a patch edits `.ogun/config.yaml` — refusing would make one file unfixable by the
+machinery built to fix files, and the gates were read from the pinned blob anyway, so the
+hazard was never the edit but the edit going unnoticed.
+
+What is **not** built, and is named rather than left implied: the agent lenses a
+modifier's patch actually wants — is this one change or four, was a test weakened to make
+the suite green, does the message explain the repair or restate the finding. Each needs
+judgment, and the reviewer lenses' calibration argument applies with less evidence behind
+it: there is one merged modifier patch in existence to calibrate against.
+
+Remaining: arbitrary user-defined graphs if they turn out to be wanted.
 
 Two limits worth knowing rather than discovering: a runner with no local checkout of a
 project produces a patch it cannot publish, and nothing prunes `scratch/patches/` — the
