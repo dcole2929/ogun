@@ -7,6 +7,14 @@ import type { Sandbox, SandboxSpec } from './types.ts'
 export type CreateSandboxInput = SandboxSpec & {
   kind: 'container' | 'worktree'
   name: string
+  /**
+   * `policies.allowSandboxDowngrade`, as the *project* set it at the commit the workspace
+   * was pinned to — never a constant, and never anything read out of the workspace, which
+   * is a tree the agent this gate contains can write. `sandboxDowngrade` in pipeline.ts
+   * establishes it and refuses the run with a reason; by the time a value arrives here it
+   * has already been decided, and the throw below is the backstop for a future caller
+   * that skips that step.
+   */
   allowSandboxDowngrade: boolean
   /** Container sandboxes only — see `ContainerOptions.egress` (§4.6). */
   egress?: EgressPolicy
