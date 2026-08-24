@@ -127,7 +127,16 @@ same session.
   narrow — but it is not per-job, and a container that outlives its run (a leaked
   `docker run`, a `--rm` that did not fire) would otherwise keep spending the host's
   credentials with nothing noticing. The token is what ends that at the same moment the
-  job does.
+  job does. **[amended]** For its first several months it did not: `revoke()` deleted the
+  token and stopped there, and the token is checked exactly once — on the CONNECT that
+  builds a tunnel. Every request inside that tunnel afterwards re-read the host's live
+  credential file and spliced in whatever was currently valid, without consulting the
+  session again, so a container that opened a tunnel before the job ended kept spending
+  the host's credentials for as long as it held the socket. That is not an edge case
+  against the adversary this ADR names — an injected agent can hold a socket open on
+  purpose. `revoke()` now closes every connection the token opened, and every request
+  inside one re-checks its grant; `docs/gateway.md` §3.1 has both halves and the reasons
+  for each. The sentence above is now a description rather than an intention.
 - **The gateway does not refresh an OAuth token; it re-reads the file the host refreshes.**
   This is a real gap and it is named rather than hidden. Before, a container refreshed the
   copy it was given; now the container has a placeholder that never expires and the *host*

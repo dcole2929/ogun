@@ -65,7 +65,22 @@ export type GatewaySession = {
   /** What goes in `HTTPS_PROXY`. Carries the token as HTTP basic credentials. */
   proxyUrl: string
   token: string
-  /** Called when the job ends. The token stops working immediately. */
+  /**
+   * Called when the job ends. The token stops working immediately, *and* every connection
+   * it opened goes down with it.
+   *
+   * Both halves, because for most of this component's life it was only the first, and the
+   * first alone does not mean what this comment says or what ADR-0010 §3.1 rests on. The
+   * token is consulted exactly once, on the CONNECT that builds a tunnel; after that TLS is
+   * terminated and the plaintext socket is fed to an HTTP server that reads its target off
+   * the socket and calls `prepare()`, which re-reads the host's live credential file on
+   * every request. So deleting the token closed the front door and left the window open: a
+   * tunnel opened a second before the job ended kept being handed fresh, currently-valid
+   * Anthropic/OpenAI/GitHub credentials for as long as it stayed open, and nothing on that
+   * path ever looked at `sessions` again. The adversary ADR-0010 names is a prompt-injected
+   * agent, which can hold a socket open on purpose with a heartbeat request — so "it will
+   * close eventually" was not a mitigation, it was a hope.
+   */
   revoke: () => void
 }
 
@@ -165,16 +180,95 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
     ((host: string, reason: string) => console.warn(`[gateway] refused ${host}: ${reason}`))
 
   /**
-   * Token → the hosts that token may reach.
+   * One job's grant: what its token may reach, and what that token currently holds open.
    *
-   * A map rather than a set because the allowlist is a property of the *worker*, not of
-   * the gateway (§4.6): one runner serves every job on the machine, and a reviewer that
-   * declared `egress: [docs.example.com]` must not inherit the reach of a modifier
-   * running beside it. Holding one global list would have quietly widened every worker to
-   * the union of all of them, which is the kind of regression that never fails a test —
-   * it just stops refusing things.
+   * `allow` is per *worker*, not per gateway (§4.6): one runner serves every job on the
+   * machine, and a reviewer that declared `egress: [docs.example.com]` must not inherit the
+   * reach of a modifier running beside it. Holding one global list would have quietly
+   * widened every worker to the union of all of them, which is the kind of regression that
+   * never fails a test — it just stops refusing things.
+   *
+   * `sockets` is the other half of revocation, and it exists because a token check that
+   * runs once cannot revoke anything. Every long-lived connection this gateway hands out
+   * is authenticated at the moment it is *opened* and never again — a CONNECT tunnel, an
+   * upgraded WebSocket — so without a way back to those sockets, `revoke()` can only
+   * refuse the next connection while the current one keeps spending the host's
+   * credentials. The set is what makes "the token stops working" true of connections that
+   * already exist.
+   *
+   * `token` is on the record as well as being its key, so a handler holding a session can
+   * ask whether it is still *the* session for that token by identity rather than by
+   * re-deriving it from a header. That is the check the intercepted doors run.
    */
-  const sessions = new Map<string, readonly string[]>()
+  type Session = {
+    token: string
+    allow: readonly string[]
+    sockets: Set<Socket>
+  }
+
+  const sessions = new Map<string, Session>()
+
+  /**
+   * Which session the caller presented, if any.
+   *
+   * Returns the whole grant rather than a boolean for the reason it always has: it makes
+   * it impossible to authenticate against one session and then check the host against
+   * something else, which is exactly the bug a global `allowedHosts` would reintroduce the
+   * first time two workers wanted different reach.
+   *
+   * Three token shapes are accepted because three clients produce three shapes from the
+   * same `http://x:TOKEN@host` URL — see `proxyToken`.
+   */
+  const sessionFor = (headers: IncomingHttpHeaders): Session | undefined => {
+    const token = proxyToken(headers)
+    return token === undefined ? undefined : sessions.get(token)
+  }
+
+  /**
+   * Remember a connection for exactly as long as it is open.
+   *
+   * The bookkeeping is the part of this that can quietly become its own bug: a map of
+   * sockets that only ever grows is a memory leak in a process that is meant to run for
+   * weeks, and the runner is exactly that process. So there is one rule — an entry is
+   * added when the connection is accepted and removed when it closes — and `'close'` is
+   * the event to hang it on rather than `'end'`, because `'close'` fires for every way a
+   * socket can go away, including the destroy that `revoke()` itself performs.
+   *
+   * The guard is not defensive noise: on the absolute-form door a keep-alive socket is
+   * re-authenticated on every request, so `hold` is called once per request for the same
+   * socket, and an unguarded `once('close')` would stack a listener each time and start
+   * printing MaxListenersExceeded warnings at the eleventh.
+   *
+   * The closure keeps the `Session` alive until the socket closes, which is the right
+   * lifetime: a revoked session is unreachable from `sessions` and is collected once the
+   * last connection it opened has gone.
+   */
+  const hold = (session: Session, socket: Socket): void => {
+    if (session.sockets.has(socket)) return
+    session.sockets.add(socket)
+    socket.once('close', () => session.sockets.delete(socket))
+  }
+
+  /**
+   * Is the session this connection was opened under still the session for its token?
+   *
+   * Compared by identity, not by presence. Tokens are 256 bits from the CSPRNG and are
+   * never reissued, so `sessions.has(token)` would answer the same question today — but
+   * identity is the question actually being asked ("is *this grant* still in force"), and
+   * it stays correct if anything ever mints a session for a token twice.
+   */
+  const inForce = (session: Session | undefined): boolean =>
+    session !== undefined && sessions.get(session.token) === session
+
+  /**
+   * What a CONNECT leaves on the socket it built, for the handlers on the far side of it.
+   *
+   * `ogunAuthority` was always here: the intercepted server serves sockets it did not
+   * accept, so the target has to travel on the socket. `ogunSession` rides along for the
+   * same reason and closes the same gap — the token was checked once, at CONNECT, and
+   * every request afterwards had no way to ask which grant it was running under.
+   */
+  type Marked = { ogunAuthority?: Authority; ogunSession?: Session }
 
   /**
    * The intercepted-request handler. One instance, fed sockets from every tunnel.
@@ -184,8 +278,21 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
    * the CONNECT socket, then hand the plaintext duplex to a server as a connection.
    */
   const intercepted = createHttpServer((req, res) => {
-    const authority = (req.socket as TLSSocket & { ogunAuthority?: Authority }).ogunAuthority
+    const marked = req.socket as TLSSocket & Marked
+    const authority = marked.ogunAuthority
     if (!authority) return refuse(res, 500, 'internal', 'intercepted socket has no host')
+    /**
+     * The token, again, on every request rather than once per tunnel.
+     *
+     * `revoke()` tears this socket down, so in the ordinary case this branch never fires —
+     * which is precisely why it is here. It is the structural half of the fix: the two
+     * failures it covers are a request that crossed the revoke in flight, and a socket
+     * that escaped the bookkeeping for any reason at all. Without it, "does this
+     * connection still have a grant" is answered by a `Set` being correct, and the
+     * original bug was exactly what happens when the only answer to that question is
+     * somewhere else. Refused before `prepare()`, so no credential file is read.
+     */
+    if (!inForce(marked.ogunSession)) return refuseRevoked(res)
     // The port from the CONNECT line, not a hardcoded 443. An allowlisted host reached on
     // a non-standard port would otherwise be silently retargeted at 443, which either
     // works against the wrong service or fails as a connection refused nobody can explain.
@@ -200,16 +307,28 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
    * the CONNECT already happened, TLS is already terminated, and the handshake arrives on
    * the intercepted connection as a `GET` with `Connection: Upgrade`.
    *
-   * The token, the allowlist and the port were all checked on the CONNECT that built this
-   * socket, and `ogunAuthority` is the evidence of it — exactly as for the `'request'`
-   * handler above. What is left is what `forwardUpgrade` does: the push refusal, the
-   * credential answer, and the injection.
+   * The allowlist and the port were checked on the CONNECT that built this socket, and
+   * `ogunAuthority` is the evidence of it — exactly as for the `'request'` handler above.
+   * The *token* is checked again here, for the same reason and with more at stake: this is
+   * the door onto the longest-lived connection the gateway holds. Codex runs its whole
+   * model turn over `wss://chatgpt.com/backend-api/codex/responses`, so once the 101 lands
+   * this stops being a sequence of requests and becomes two pipelines relaying opaque
+   * bytes — nothing after this point will ever consult a session again. A revocation that
+   * reached the request path and not this one would leave the connection most likely to
+   * still be spending the host's credential as the one it could not touch.
+   *
+   * What is left is what `forwardUpgrade` does: the push refusal, the credential answer,
+   * and the injection.
    */
   intercepted.on('upgrade', (req, socket: Socket, head: Buffer) => {
     socket.on('error', () => undefined)
-    const authority = (socket as TLSSocket & { ogunAuthority?: Authority }).ogunAuthority
+    const marked = socket as TLSSocket & Marked
+    const authority = marked.ogunAuthority
     if (!authority) {
       return refuseSocket(socket, 500, 'internal', 'intercepted socket has no host')
+    }
+    if (!inForce(marked.ogunSession)) {
+      return refuseSocket(socket, 403, 'session_revoked', REVOKED_MESSAGE)
     }
     forwardUpgrade(authority.hostname, authority.port, req, socket, head)
   })
@@ -226,8 +345,19 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
    * injection, or it is an unauthenticated open relay sitting next to a governed one.
    */
   proxy.on('request', (req, res) => {
-    const allow = sessionAllow(req.headers, sessions)
-    if (!allow) return challenge(res)
+    const session = sessionFor(req.headers)
+    if (!session) return challenge(res)
+    /**
+     * Held even though this door re-authenticates every request anyway.
+     *
+     * The token check makes the *next* request on this keep-alive socket impossible after a
+     * revoke, which is most of it — but not the response already streaming. A completion is
+     * Server-Sent Events that runs for minutes, and a job whose token was revoked mid-stream
+     * would otherwise go on receiving a response the host is still being billed for. Same
+     * rule as every other door: hold on accept, release on close.
+     */
+    hold(session, req.socket)
+    const allow = session.allow
     let target: URL
     try {
       target = new URL(req.url ?? '')
@@ -289,8 +419,14 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
   proxy.on('upgrade', (req, socket: Socket, head: Buffer) => {
     socket.on('error', () => undefined)
 
-    const allow = sessionAllow(req.headers, sessions)
-    if (!allow) return challengeSocket(socket)
+    const session = sessionFor(req.headers)
+    if (!session) return challengeSocket(socket)
+    // This socket is checked once and then relays for as long as it likes, exactly like a
+    // tunnelled upgrade — and it never becomes a `TLSSocket`, so it carries no marks and
+    // the intercepted doors never see it. Holding it here is the only way `revoke()` ever
+    // reaches it.
+    hold(session, socket)
+    const allow = session.allow
 
     let target: URL
     try {
@@ -343,8 +479,8 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
   proxy.on('connect', (req, socket: Socket, head: Buffer) => {
     socket.on('error', () => undefined)
 
-    const allow = sessionAllow(req.headers, sessions)
-    if (!allow) {
+    const session = sessionFor(req.headers)
+    if (!session) {
       // A CONNECT with no valid token is refused rather than tunnelled. Serving it would
       // mean copying bytes to any host the client names, with no allowlist and no
       // injection — an open relay reachable by anything that can open the socket, which is
@@ -358,6 +494,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
       )
       return
     }
+    const allow = session.allow
 
     const authority = parseAuthority(req.url ?? '')
     if (!authority) {
@@ -385,6 +522,17 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
       )
       return
     }
+
+    /**
+     * From here the tunnel exists, so the session has to be able to find it again.
+     *
+     * The *raw* socket, not the `TLSSocket` that is about to wrap it. Destroying the raw
+     * socket is unambiguous — it takes the TLS layer, the intercepted connection and any
+     * upgrade riding on it down together — whereas destroying only the wrapper leaves the
+     * question of what the underlying socket does next, which is not a question worth
+     * having in the teardown path of a security control.
+     */
+    hold(session, socket)
 
     // 200 before the handshake, because that is the order the protocol requires: the
     // client will not start TLS until the tunnel is established. Anything that goes wrong
@@ -420,7 +568,11 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
       cert: leaf.cert,
       ALPNProtocols: CLIENT_ALPN,
     })
-    ;(tls as TLSSocket & { ogunAuthority?: Authority }).ogunAuthority = authority
+    // Both marks, together: where this tunnel is pointed, and under whose grant. The
+    // second is what lets every request and every upgrade inside it ask a question the
+    // CONNECT used to answer once and for all.
+    ;(tls as TLSSocket & Marked).ogunAuthority = authority
+    ;(tls as TLSSocket & Marked).ogunSession = session
     tls.on('error', () => tls.destroy())
 
     const handshakeTimer = setTimeout(() => tls.destroy(), TLS_HANDSHAKE_TIMEOUT_MS)
@@ -872,18 +1024,64 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
        * worth defending against on a full-entropy secret that is never partially matched.
        */
       const token = randomBytes(32).toString('base64url')
-      sessions.set(token, allow ?? allowedHosts)
+      const session: Session = { token, allow: allow ?? allowedHosts, sockets: new Set() }
+      sessions.set(token, session)
       const authority =
         containerAuthority ??
         (listening.kind === 'tcp' ? `${listening.host}:${listening.port}` : '')
       return {
         token,
         proxyUrl: `http://x:${token}@${authority}`,
-        revoke: () => sessions.delete(token),
+        /**
+         * Forget the token, then close what it opened. In that order, so that a connection
+         * racing the teardown finds no grant at the intercepted door either way.
+         *
+         * Read out of the map rather than closed over, because two `revoke()` calls on one
+         * session must be one revocation and one no-op: `dispose()` is best-effort and a
+         * caller that retries it must not walk a stale socket set.
+         *
+         * Destroyed rather than ended. `end()` is a polite FIN that a peer is free to
+         * ignore while it goes on writing, and the peer here is a container that has
+         * already outlived its run — which, under ADR-0010's threat model, may be
+         * deliberately trying to stay connected. There is nothing left to say to it that is
+         * worth the risk of it not listening.
+         *
+         * This is safe on the normal path, and that is not an accident of timing: the
+         * pipeline calls `dispose()` in a `finally`, after every `exec()` has resolved,
+         * which means every `docker run` for this job has already exited. A socket still
+         * open at that moment belongs to a container that outlived its run — the exact
+         * thing §3.1 revokes for — and never to a job that is finishing cleanly. The
+         * verification container is covered by the same fact: it runs as another `exec()`
+         * on this session and has long since exited too.
+         *
+         * `clear()` after the loop is not redundant with the `'close'` handlers: those fire
+         * on a later tick, and leaving the set populated until then would let a second
+         * `revoke()` — or `close()` — walk sockets that are already gone.
+         */
+        revoke: () => {
+          const granted = sessions.get(token)
+          if (!granted) return
+          sessions.delete(token)
+          for (const socket of granted.sockets) socket.destroy()
+          granted.sockets.clear()
+        },
       }
     },
     close: () =>
       new Promise<void>((resolve) => {
+        /**
+         * The same teardown, for every session at once.
+         *
+         * `proxy.closeAllConnections()` below does not reach these: `node:http` hands a
+         * socket to the `'connect'` or `'upgrade'` handler and stops tracking it, so a
+         * tunnel and an upgraded relay both survive it. Observed rather than assumed — the
+         * test suite hung on exit with the event loop held open by exactly these sockets
+         * before this loop existed.
+         */
+        for (const session of sessions.values()) {
+          for (const socket of session.sockets) socket.destroy()
+          session.sockets.clear()
+        }
         sessions.clear()
         intercepted.close()
         // The socket file goes with it. `server.close()` unlinks it, but only on a clean
@@ -941,19 +1139,48 @@ export function proxyToken(headers: IncomingHttpHeaders): string | undefined {
 }
 
 /**
- * The hosts the presented token is allowed to reach, or `undefined` for no valid token.
+ * What a container is told when it speaks on a connection whose grant has been revoked.
  *
- * Returning the allowlist rather than a boolean is deliberate: it makes it impossible to
- * authenticate against one session and then check the host against something else, which
- * is exactly the bug the previous global `allowedHosts` would have reintroduced the first
- * time two workers wanted different reach.
+ * Said rather than swallowed, and said in the gateway's own refusal shape. A bare
+ * `destroy()` would enforce the rule and report nothing, and "the proxy hung up" is the
+ * error message half the comments in this file exist because of. Naming the cause is what
+ * stops a leaked container's transcript sending somebody to re-authenticate a host
+ * credential that is perfectly fine.
  */
-const sessionAllow = (
-  headers: IncomingHttpHeaders,
-  sessions: ReadonlyMap<string, readonly string[]>,
-): readonly string[] | undefined => {
-  const token = proxyToken(headers)
-  return token === undefined ? undefined : sessions.get(token)
+const REVOKED_MESSAGE =
+  'this proxy session has been revoked — the job that opened it has ended, and the gateway ' +
+  'does not splice a host credential into a request from a container that outlived its run ' +
+  '(ADR-0010)'
+
+/**
+ * A request arriving inside a tunnel whose grant is gone.
+ *
+ * `403` rather than `407`. Inside the tunnel the client believes it is talking to
+ * `api.anthropic.com`, and a proxy-authentication challenge from what looks like the
+ * provider is both nonsense and an invitation to retry with credentials that will never
+ * work again. `403` with `x-should-retry: false` is the shape every other in-tunnel
+ * refusal here already uses — `host_not_allowed`, `push_refused` — and the SDKs honour it.
+ *
+ * `connection: close` rather than a `destroy()` after the write: it lets `node:http` finish
+ * the response and then close the socket, so the client reads the reason it was given
+ * instead of a truncated body. In practice `revoke()` has already destroyed this socket and
+ * this path is the race and the belt-and-braces; when it does fire, it should still explain
+ * itself.
+ */
+const refuseRevoked = (res: ServerResponse): void => {
+  if (res.destroyed || res.writableEnded) return
+  if (res.headersSent) {
+    res.destroy()
+    return
+  }
+  const body = JSON.stringify({ error: 'session_revoked', message: REVOKED_MESSAGE })
+  res.writeHead(403, {
+    'content-type': 'application/json',
+    'content-length': Buffer.byteLength(body),
+    'x-should-retry': 'false',
+    connection: 'close',
+  })
+  res.end(body)
 }
 
 const challenge = (res: ServerResponse): void => {
