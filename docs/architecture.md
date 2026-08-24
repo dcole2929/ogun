@@ -1933,14 +1933,49 @@ canvas, auto-merge, agent memory, model auto-selection, remote runner mesh.
    What is *not* open: an **API key does not expire**, so a runner nobody logs into should
    use one (§4.6, `docs/setup.md`). That is the answer for an unattended factory today,
    and it is why the refusal text names `ANTHROPIC_API_KEY` rather than only `claude`.
-   The other unbuilt half is a runner-side re-check — the runner is the process that
-   actually holds the credentials, and its `refuse` path (§5.2) is the right place for a
-   lapse that happens between admission and the claim.
+   The runner-side half of this is now built: a runner reports its own credential health
+   on every claim (§4.3), so the control plane no longer guesses from its own filesystem
+   and a job the claimer cannot authenticate is held back rather than failed. What remains
+   open is only the refresh itself.
 6. **Extending the egress allowlist per project.** A project whose test suite reaches a
    host outside the default list fails its verification gate. The list is a constant; the
    extension point is designed and unbuilt, and where it should live — project config,
    machine config, or the worker — is not settled.
-7. **Workspace materialization cost on large repos.** `--no-hardlinks` copies the
+7. **The retry loop's bounds are reasoned, not measured.** [open] A modifier gets at most
+   two rounds, and a retry needs `2 × suiteMs` of budget left. Both numbers were chosen
+   from first principles — one suite run for the gate, one for the agent, and a backstop
+   so a four-second suite cannot buy dozens of rounds. Nothing has been retried in
+   anger yet, so there is no distribution to fit them to. `runs.rounds` is the column that
+   will answer it; revisit once it has data in it.
+
+8. **The modifier lenses that need judgement are not built.** [open] `commit-message` and
+   `self-gating` are deterministic and shipped. Three that §4.10 implies are not: whether a
+   patch is one change or four, whether a test was weakened rather than fixed, and whether
+   the commit message explains the repair. Each needs an agent lens, and there is exactly
+   one merged modifier patch to calibrate against — a rubric written from one example is a
+   rubric fitted to one example.
+
+9. **What a dismissal should be anchored to, in practice.** [open] ADR-0011 freezes the
+   cited snippet and lapses the dismissal when that text can no longer be found. Whether a
+   normalized excerpt survives ordinary refactoring often enough — whether dismissals lapse
+   too eagerly, or not eagerly enough — is an empirical question needing a real inbox over
+   real weeks. `EVIDENCE_CONTEXT_LINES` and `EVIDENCE_MIN_CHARS` are the knobs.
+
+10. **A fleet that degrades after admission starves its queue.** [open] Admission refuses
+    only when *no* live runner can authenticate, and the claim holds back jobs the claimer
+    cannot run — deliberately under-refusing, which is the safe direction. The gap is what
+    happens when every capable machine goes away *after* a job is admitted: it stays
+    `queued`, correctly, and nothing sweeps it or says so. The same shape as an
+    unsatisfiable `requires:`, which §4.3 now reports at three surfaces; this one has none.
+
+11. **The pnpm store is shared across concurrent sandboxes on one guarantee.** [open] One
+    cache volume per runtime is mounted read-write into every concurrent container, and the
+    reason that is safe is that pnpm names each staging file from its content hash, so a
+    temp-path collision implies identical bytes. That is a maintainer's answer on a GitHub
+    issue rather than documentation — the docs PR has been open since 2022 — which is why
+    `pnpm@10` is pinned in the image. If the pin ever moves, this is the reason to check.
+
+12. **Workspace materialization cost on large repos.** `--no-hardlinks` copies the
    object store per job. Fine for these repos; if one gets big the escape hatch is
    dropping the flag, at the cost of a container being able to corrupt the source.
    No policy yet for when to switch.
