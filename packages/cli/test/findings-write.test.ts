@@ -99,3 +99,49 @@ test('re-filing a dismissed finding is remarked on rather than refused', async (
   // And the document is still written: the remark is information, not a gate.
   assert.match(await readFile(join(dir, '.ogun-out/findings.json'), 'utf8'), /cross-account/)
 })
+
+/**
+ * The inbox the remarks read is the one beside the document being written, and nothing
+ * else. They used to locate it from the module-level default instead of from `--out`, so
+ * the two disagreed the moment those were not the same place — and `OGUN_OUTPUT_PATH` is
+ * exactly that moment: the sandbox image sets it to an absolute
+ * `/workspace/.ogun-out/findings.json`, so a `--out` under a temp directory still read
+ * `/workspace/.ogun-in/`. That is why the test above passed on a laptop and failed inside
+ * the container that runs this suite as a modifier's gate.
+ *
+ * Pinned with the variable set to somewhere else entirely, so this stands whether or not
+ * the machine running it happens to be a sandbox.
+ */
+test('the inbox is found beside the document written, not beside the default', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'ogun-out-'))
+  const elsewhere = await mkdtemp(join(tmpdir(), 'ogun-elsewhere-'))
+  await mkdir(join(dir, '.ogun-in'), { recursive: true })
+  await writeFile(
+    join(dir, '.ogun-in/history.json'),
+    JSON.stringify({
+      findings: [
+        {
+          fingerprint: 'security/public-orders/account-isolation/cross-account-id-swap',
+          status: 'wontfix',
+          severity: 'high',
+          title: 'already decided',
+          seenCount: 4,
+          lastSeenAt: '2026-08-20T00:00:00.000Z',
+        },
+      ],
+    }),
+  )
+
+  const printed = execFileSync(
+    process.execPath,
+    [cli, 'findings', 'write', '--out', join(dir, '.ogun-out/findings.json')],
+    {
+      input: DOC,
+      encoding: 'utf8',
+      cwd: elsewhere,
+      env: { ...process.env, OGUN_OUTPUT_PATH: join(elsewhere, '.ogun-out/findings.json') },
+    },
+  )
+
+  assert.match(printed, /already dismissed/)
+})

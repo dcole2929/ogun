@@ -20,6 +20,19 @@ import { authHeaders } from '../auth.ts'
 const HISTORY_INDEX = '.ogun-in/history.json'
 const OUTPUT_PATH = process.env.OGUN_OUTPUT_PATH ?? '.ogun-out/findings.json'
 
+/**
+ * The inbox that goes with a given output document: `.ogun-in/` is the sibling of the
+ * `.ogun-out/` being written into, which is how the runner mounts the pair.
+ *
+ * Derived from the *resolved target* rather than from `OUTPUT_PATH`, and the difference
+ * is not theoretical. `OUTPUT_PATH` is the default before `--out` has been consulted, and
+ * in a sandbox it is the absolute `/workspace/.ogun-out/findings.json` the image sets —
+ * so the remarks below read `/workspace/.ogun-in/` no matter where the caller asked the
+ * document to go. Somebody writing a document elsewhere got remarks about a different
+ * repository's inbox, or none.
+ */
+const historyIndexFor = (target: string): string => join(dirname(target), '..', HISTORY_INDEX)
+
 /** `ogun findings write` — reads a findings document on stdin, validates, writes it. */
 export async function findingsWrite(args: string[]): Promise<void> {
   const { flags } = parse(args, { '--out': 'string' }, 'ogun findings write [--out <file>]')
@@ -74,8 +87,8 @@ export async function findingsWrite(args: string[]): Promise<void> {
   ]
   console.log(green(`recorded ${parts.join(' and ')} to ${target}`))
 
-  await remarkOnUnjudgedHistory(verdicts)
-  await remarkOnDismissedRepeats(doc.data)
+  await remarkOnUnjudgedHistory(target, verdicts)
+  await remarkOnDismissedRepeats(target, doc.data)
 }
 
 /**
@@ -90,11 +103,9 @@ export async function findingsWrite(args: string[]): Promise<void> {
  * Printed at the one moment the agent can still act on it, and phrased as the count
  * rather than an instruction — the skill says what to do; this says what is true.
  */
-async function remarkOnUnjudgedHistory(verdicts: number): Promise<void> {
+async function remarkOnUnjudgedHistory(target: string, verdicts: number): Promise<void> {
   if (verdicts > 0) return
-  const index = await readFile(join(dirname(OUTPUT_PATH), '..', HISTORY_INDEX), 'utf8').catch(
-    () => null,
-  )
+  const index = await readFile(historyIndexFor(target), 'utf8').catch(() => null)
   if (!index) return
   const known = (JSON.parse(index) as { findings?: unknown[] }).findings?.length ?? 0
   if (known === 0) return
@@ -121,13 +132,12 @@ async function remarkOnUnjudgedHistory(verdicts: number): Promise<void> {
  * Printed at the one moment the agent can still act on it, and phrased as what is true
  * rather than as an instruction — the skill says what to do.
  */
-async function remarkOnDismissedRepeats(doc: {
-  findings: Array<{ fingerprint: string }>
-}): Promise<void> {
+async function remarkOnDismissedRepeats(
+  target: string,
+  doc: { findings: Array<{ fingerprint: string }> },
+): Promise<void> {
   if (doc.findings.length === 0) return
-  const index = await readFile(join(dirname(OUTPUT_PATH), '..', HISTORY_INDEX), 'utf8').catch(
-    () => null,
-  )
+  const index = await readFile(historyIndexFor(target), 'utf8').catch(() => null)
   if (!index) return
   const parsed = JSON.parse(index) as { findings?: Array<{ fingerprint?: string; status?: string }> }
   const dismissed = new Set(
