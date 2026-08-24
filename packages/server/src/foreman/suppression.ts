@@ -68,18 +68,51 @@ export type LapseOutcome = {
   reason: string
 }
 
+/**
+ * What a run is allowed to say about one reported finding — and, for the two decisions
+ * that touch an existing row, *which rows move*.
+ *
+ * The row targets are named, not derived. Every decision here involves up to two rows —
+ * the dismissal that holds the authority and the alias that merges into it — and for a
+ * direct sighting they are the same row, which is what makes the mistake so easy: code
+ * written against the direct case reads `finding.fingerprint`, passes its tests, and
+ * silently writes to the alias the day a `duplicate-of` verdict lands. That is not
+ * hypothetical; it is what `suppress` did, so an aliased suppression bumped the
+ * duplicate's `seen_count` and left the dismissed row reading `seen_count: 1` no matter
+ * how often reviewers re-found it. ADR-0011 rejected time-boxed dismissals *because* that
+ * counter keeps the pressure visible, so the aliased case had quietly lost the only
+ * compensating control the decision rests on.
+ *
+ * So the shape carries `dismissal` and `alias` — never a boolean plus a fingerprint the
+ * caller has to recombine — and `suppress` no longer carries the reported finding at all,
+ * because after the fix nothing about the suppressed write-up is ever written anywhere:
+ * the alias is a row to bump, not content to copy. `alias === null` *is* "this sighting
+ * was the dismissed finding itself", so the two facts cannot disagree. It cannot stop a
+ * caller writing to `alias` — nothing can — but it can stop the two rows from arriving
+ * under names that both read as "the finding", which is the whole of what went wrong.
+ */
 export type Decision =
   | { kind: 'publish'; finding: RawFinding }
-  | { kind: 'suppress'; finding: RawFinding; outcome: SuppressionOutcome }
   | {
-      kind: 'lapse'
-      finding: RawFinding
-      outcome: LapseOutcome
-      /** The dismissed finding to reopen. Equal to `finding.fingerprint` unless aliased. */
+      kind: 'suppress'
+      outcome: SuppressionOutcome
+      /** The `wontfix` row whose authority silenced the sighting. Always the primary. */
       dismissal: string
-      /** True when the sighting arrived under a different fingerprint that merges into it. */
-      aliased: boolean
+      /** The duplicate the sighting arrived under, or null when it *was* the dismissal. */
+      alias: string | null
     }
+  /**
+   * A lapse split in two, so an alias's write-up cannot reach the reopened row.
+   *
+   * The dismissed row is reopened in front of a reader, and the direct case rewrites its
+   * title, body and severity from tonight's report — which is right, because it is that
+   * row's own sighting. The aliased case must not: it is a *different* finding's write-up,
+   * and copying it over would replace the text the person read with text about the
+   * rephrasing. Carrying the sighting only on the variant allowed to use it means the
+   * aliased branch has nothing to copy from rather than a rule not to.
+   */
+  | { kind: 'lapse'; outcome: LapseOutcome; dismissal: string; alias: null; sighting: RawFinding }
+  | { kind: 'lapse'; outcome: LapseOutcome; dismissal: string; alias: string }
 
 /** Highest first in `SEVERITIES`, so a bigger number is a worse problem. */
 const rank = (severity: string): number => {
@@ -115,22 +148,29 @@ export function decideSuppression(input: {
           : undefined
     if (!dismissal || dismissal.status !== 'wontfix') return { kind: 'publish', finding }
 
-    const aliased = dismissal.fingerprint !== finding.fingerprint
-    const via = aliased ? `, reported here as ${finding.fingerprint}` : ''
-    const lapse = (why: string): Decision => ({
-      kind: 'lapse',
-      finding,
-      dismissal: dismissal.fingerprint,
-      aliased,
-      outcome: {
+    /**
+     * The one place the two rows are told apart, and therefore the only place that can
+     * get it wrong. Everything downstream reads `dismissal` and `alias` rather than
+     * working it out again from a fingerprint that means different things in the two
+     * cases.
+     */
+    const alias = dismissal.fingerprint === finding.fingerprint ? null : finding.fingerprint
+    const via = alias ? `, reported here as ${alias}` : ''
+    const lapse = (why: string): Decision => {
+      const reopens = dismissal.fingerprint
+      const outcome: LapseOutcome = {
         fingerprint: finding.fingerprint,
-        dismissal: dismissal.fingerprint,
+        dismissal: reopens,
         reason: `dismissal lapsed: ${why}`,
-      },
-    })
+      }
+      return alias === null
+        ? { kind: 'lapse', outcome, dismissal: reopens, alias: null, sighting: finding }
+        : { kind: 'lapse', outcome, dismissal: reopens, alias }
+    }
     const suppress = (basis: SuppressionOutcome['basis'], why: string): Decision => ({
       kind: 'suppress',
-      finding,
+      dismissal: dismissal.fingerprint,
+      alias,
       outcome: {
         fingerprint: finding.fingerprint,
         dismissal: dismissal.fingerprint,

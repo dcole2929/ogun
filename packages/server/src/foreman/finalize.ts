@@ -334,7 +334,7 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
     const silenced = new Map(
       decisions
         .filter((d) => d.kind === 'suppress')
-        .map((d) => [d.finding.fingerprint, d.outcome as SuppressionOutcome]),
+        .map((d) => [d.outcome.fingerprint, d.outcome as SuppressionOutcome]),
     )
     suppressed = [...silenced.values()]
     lapsed = decisions.filter((d) => d.kind === 'lapse').map((d) => d.outcome as LapseOutcome)
@@ -370,25 +370,41 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
     }
 
     for (const decision of decisions) {
-      const f = decision.finding
-      const primary = f.citations[0]
-      // Host-read, never agent-authored (§4.11). Absent when the runner could not take a
-      // usable excerpt, and absent is left alone rather than nulled: a finding that had a
-      // basis last night keeps it tonight rather than losing one because one read failed.
-      const evidence = evidenceOf.get(f.fingerprint)
-
+      /**
+       * Two rows, and which is which is the whole of what this loop has to get right.
+       *
+       * A sighting that arrives through a `duplicate-of` pointer touches the dismissal
+       * that holds the authority *and* the alias it was reported under, and for an
+       * unaliased sighting those are one row — so code that reaches for "the finding"
+       * works, passes, and starts writing to the wrong row the first night triage merges
+       * a rephrasing. `decideSuppression` therefore hands over `dismissal` and `alias`
+       * rather than a reported finding, and nothing below re-derives either.
+       */
       if (decision.kind === 'suppress') {
         /**
-         * The count and the last-seen run still move, and nothing else does.
+         * The count and the last-seen run still move, and nothing else does — and they
+         * move on the **dismissal**, which is not the row that was reported when the
+         * sighting came in under an alias.
          *
          * The pressure has to stay visible — "you dismissed this and four reviewers have
          * re-found it eleven times" is the signal that a dismissal was wrong, and it is
-         * the reader's call to make, not a timer's. But the title, body and severity are
-         * deliberately *not* rewritten, which they were before this existed: a dismissal's
-         * `status_reason` is a person's answer to a specific write-up, and letting a later
-         * reviewer replace the write-up underneath it leaves the answer attached to a
-         * question nobody asked.
+         * the reader's call to make, not a timer's. That signal is what ADR-0011 rejected
+         * time-boxed expiry *with*, so it is the compensating control for making dismissal
+         * permanent, and it is only worth anything on the row a person opens. This used to
+         * bump the reported fingerprint, so a dismissal re-reported under twenty phrasings
+         * showed `seen_count: 1` and twenty quiet duplicates each showed 1 — the pressure
+         * existed and was spread across rows nobody reads. The aliased case is not the
+         * corner either: it is the case the duplicate-of hop was invented for.
+         *
+         * But the title, body and severity are deliberately *not* rewritten, which they
+         * were before this existed: a dismissal's `status_reason` is a person's answer to
+         * a specific write-up, and letting a later reviewer replace the write-up underneath
+         * it leaves the answer attached to a question nobody asked.
          */
+        // Host-read, never agent-authored (§4.11) — and looked up under the *dismissal's*
+        // own fingerprint, never the sighting's. An alias cites its own code, and code
+        // cited by a different finding is not what the person dismissed; see below.
+        const anchor = evidenceOf.get(decision.dismissal)
         await tx
           .update(findings)
           .set({
@@ -403,21 +419,66 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
              * gives a person something to re-affirm against. Overwriting an existing
              * snippet would be the opposite thing — silently re-anchoring a decision onto
              * code the person who made it never saw.
+             *
+             * An alias's snippet must never become that anchor, which is why the lookup
+             * above is by the dismissal's fingerprint and not the sighting's: the anchor
+             * is the one input to a dismissal's fate that no agent may influence (ADR-0011),
+             * and an alias exists precisely because an agent said two findings were the
+             * same issue. Let a rephrasing's citation land here and a `wontfix` starts
+             * being checked against code the person never read — which would lapse it, or
+             * hold it, for reasons that have nothing to do with what they decided. An
+             * unanchored dismissal stays unanchored until it is re-reported under its own
+             * fingerprint, or a person re-affirms it.
              */
-            ...(evidence
-              ? { snippet: sql`coalesce(${findings.snippet}, ${evidence.snippet})` }
-              : {}),
+            ...(anchor ? { snippet: sql`coalesce(${findings.snippet}, ${anchor.snippet})` } : {}),
             updatedAt: new Date(),
           })
-          .where(and(eq(findings.projectId, job.projectId), eq(findings.fingerprint, f.fingerprint)))
+          .where(
+            and(eq(findings.projectId, job.projectId), eq(findings.fingerprint, decision.dismissal)),
+          )
+
+        /**
+         * The alias is a real row that was really reported tonight, so it keeps its own
+         * books — symmetric with the lapse branch below, and for the same reason: "how
+         * often has this phrasing been reported" is its own fact, and making it depend on
+         * whether the dismissal it merges into happened to hold would leave a number that
+         * means one thing on the nights the code was intact and another on the rest.
+         *
+         * It gets the count and nothing else. It is a pointer, not a place a reader is
+         * sent, and it never needs an anchor because it is not what suppresses.
+         */
+        if (decision.alias) {
+          await tx
+            .update(findings)
+            .set({
+              lastSeenRun: report.runId,
+              seenCount: sql`${findings.seenCount} + 1`,
+              updatedAt: new Date(),
+            })
+            .where(
+              and(eq(findings.projectId, job.projectId), eq(findings.fingerprint, decision.alias)),
+            )
+        }
         continue
       }
 
       if (decision.kind === 'lapse') {
+        // Present only on the variant entitled to use it: the sighting *is* the dismissed
+        // finding. An aliased lapse has no write-up to copy rather than a rule against
+        // copying one — copying it would replace the text the person read with text about
+        // the rephrasing.
+        const sighting = decision.alias === null ? decision.sighting : undefined
+        const evidence = sighting ? evidenceOf.get(sighting.fingerprint) : undefined
+        const line = sighting?.citations[0]?.line
+
         /**
          * The dismissal is spent, so it is emptied as well as reopened. Leaving the basis
          * behind would re-arm the suppression the moment anyone set the status back, on
          * evidence that has already been shown not to hold.
+         *
+         * The count and the last-seen run move whichever fingerprint the sighting arrived
+         * under: the reader is sent to this row (ADR-0011), so it is this row that has to
+         * say it was re-found tonight. Only the *write-up* is withheld for an alias.
          */
         await tx
           .update(findings)
@@ -429,21 +490,18 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
             dismissedBasis: null,
             dismissedBasisPath: null,
             dismissedSeverity: null,
+            lastSeenRun: report.runId,
+            seenCount: sql`${findings.seenCount} + 1`,
             updatedAt: new Date(),
-            // Only when the sighting *is* the dismissed finding. An aliased sighting is a
-            // different row's write-up, and copying it over the dismissed one would lose
-            // the text the person actually read.
-            ...(decision.aliased
-              ? {}
-              : {
-                  lastSeenRun: report.runId,
-                  seenCount: sql`${findings.seenCount} + 1`,
-                  severity: f.severity,
-                  title: f.title,
-                  body: f.body,
+            ...(sighting
+              ? {
+                  severity: sighting.severity,
+                  title: sighting.title,
+                  body: sighting.body,
                   ...(evidence ? { path: evidence.path, snippet: evidence.snippet } : {}),
-                  ...(primary?.line ? { line: primary.line } : {}),
-                }),
+                  ...(line ? { line } : {}),
+                }
+              : {}),
           })
           .where(
             and(eq(findings.projectId, job.projectId), eq(findings.fingerprint, decision.dismissal)),
@@ -451,7 +509,7 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
 
         // The alias keeps its `duplicate` status and its pointer: the reader belongs at
         // the finding it merges into, which is the row that just reopened.
-        if (decision.aliased) {
+        if (decision.alias) {
           await tx
             .update(findings)
             .set({
@@ -460,11 +518,18 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
               updatedAt: new Date(),
             })
             .where(
-              and(eq(findings.projectId, job.projectId), eq(findings.fingerprint, f.fingerprint)),
+              and(eq(findings.projectId, job.projectId), eq(findings.fingerprint, decision.alias)),
             )
         }
         continue
       }
+
+      const f = decision.finding
+      const primary = f.citations[0]
+      // Host-read, never agent-authored (§4.11). Absent when the runner could not take a
+      // usable excerpt, and absent is left alone rather than nulled: a finding that had a
+      // basis last night keeps it tonight rather than losing one because one read failed.
+      const evidence = evidenceOf.get(f.fingerprint)
 
       await tx
         .insert(findings)

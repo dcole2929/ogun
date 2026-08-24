@@ -343,6 +343,78 @@ describe('suppression against a dismissal', () => {
   })
 
   /**
+   * The pressure a suppressed sighting creates has to land on the row a person reads.
+   *
+   * ADR-0011 rejected expiring dismissals on a timer, and this counter is the whole of
+   * what it offered instead: a dismissal is permanent and silent, so `seen_count` keeps
+   * rising underneath the silence — "you dismissed this and reviewers have re-found it
+   * forty times" — and the person decides. Remove that and the ADR's one concession to
+   * the side it ruled against is gone, with nothing in its place.
+   *
+   * The naive implementation bumps the row it was handed, and for an aliased sighting the
+   * row it was handed is the *alias*: the duplicate that merges into the dismissal, a
+   * different row under a different fingerprint. The counter then climbs on a row whose
+   * status is `duplicate` and which the reader is deliberately sent away from, while the
+   * dismissed finding sits at `seen_count: 1` forever. It fails exactly where it is needed
+   * most — aliasing is what happens when one bug is re-reported under twenty phrasings,
+   * which is the case that most deserves a second look.
+   *
+   * The alias's own count moves too, for a separate reason: it was genuinely reported
+   * tonight, and "how many times has this phrasing been seen" must not come to depend on
+   * whether the dismissal it merges into happened to hold that night.
+   *
+   * What must *not* move is the dismissal's anchor. Evidence arriving with an aliased
+   * sighting is a *different finding's* citation; writing it onto the dismissal would
+   * silently re-anchor a person's decision to code they never read, and every later basis
+   * check would then be run against that code — handing an agent the one input to a
+   * dismissal's fate that no agent is allowed to influence.
+   */
+  test('a suppressed rephrasing bumps the dismissal it was suppressed by, not only the alias', async () => {
+    const dismissed = 'runner/patch/extract/binary-hunk-truncated'
+    const rephrased = 'runner/patch/extract/loses-non-utf8-bytes'
+
+    // Dismissed with no evidence on the wire, so the dismissal has no anchor — which is
+    // what makes the snippet assertion below a real check rather than a no-op against a
+    // column that was already full.
+    await publish([finding(dismissed)])
+    await dismiss(dismissed, 'the extractor only ever sees text')
+    await publish([finding(rephrased)], {
+      evidence: [evidence(rephrased, 'const patch = buf.toString("utf8")')],
+    })
+    await db
+      .update(schema.findings)
+      .set({ status: 'duplicate', duplicateOf: dismissed })
+      .where(
+        and(eq(schema.findings.projectId, projectId), eq(schema.findings.fingerprint, rephrased)),
+      )
+
+    const before = await rowOf(dismissed)
+    const { result, runId } = await publish([finding(rephrased)], {
+      evidence: [evidence(rephrased, 'const patch = buf.toString("utf8")')],
+    })
+    assert.equal(result.suppressed.length, 1, 'the alias is silenced by the dismissal it merges into')
+
+    const row = await rowOf(dismissed)
+    assert.equal(row?.status, 'wontfix', 'suppression does not overrule the person')
+    assert.equal(
+      row?.seenCount,
+      (before?.seenCount ?? 0) + 1,
+      'the dismissal is the row a person reads, so the pressure has to accumulate there',
+    )
+    assert.equal(row?.lastSeenRun, runId, 'and it was re-found tonight, whatever it was called')
+    assert.equal(
+      row?.snippet,
+      null,
+      'an alias cites its own code — anchoring a dismissal to it would re-aim a decision at code nobody dismissed',
+    )
+
+    const alias = await rowOf(rephrased)
+    assert.equal(alias?.seenCount, 2, 'the phrasing was reported twice, and that is its own fact')
+    assert.equal(alias?.lastSeenRun, runId)
+    assert.equal(alias?.status, 'duplicate', 'the pointer survives — triage never deletes (§4.12)')
+  })
+
+  /**
    * One hop, never two. `applyAdjudications` refuses a merge onto a duplicate, so a chain
    * cannot be built through the supported path — but a chain that arrived some other way
    * must not quietly extend a dismissal across two findings nobody ever compared.
