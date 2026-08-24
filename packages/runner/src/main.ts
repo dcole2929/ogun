@@ -71,7 +71,8 @@ if (image.state !== 'current') {
       ? '  ogun/base is not built — jobs needing a container will fail  —  `ogun image build`'
       : image.state === 'unstamped'
         ? '  ogun/base predates stamping, so it cannot be compared  —  `ogun image build`'
-        : '  ogun/base was built from different source than this checkout  —  `ogun image build`',
+        : '  ogun/base was built from different source than this checkout — edited since,\n' +
+          '  or another checkout on this machine built it  —  `ogun image build`',
   )
 }
 

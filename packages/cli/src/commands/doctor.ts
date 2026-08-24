@@ -65,7 +65,13 @@ export async function sandboxImage(): Promise<Check> {
       return {
         name: 'sandbox image',
         ok: false,
-        detail: `ogun/base was built from different source (built ${state.built.slice(0, 10)}) — ${rebuild}`,
+        // Two causes, one fact, and the second one is the one nobody guesses: a machine
+        // has a single `ogun/base`, so another checkout that ran `ogun image build` more
+        // recently owns it. Either way a job started now runs an image that is not this
+        // checkout, so either way the answer is the same rebuild.
+        detail:
+          `ogun/base was built from different source (built ${state.built.slice(0, 10)}) — ` +
+          `edited since the last build, or another checkout on this machine built it — ${rebuild}`,
         fatal: false,
       }
     case 'unstamped':

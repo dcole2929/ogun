@@ -373,7 +373,33 @@ Base carries `claude`, `codex`, `git`, node. The project layer adds its toolchai
 - Rebuild when either changes, or the image ages past N days.
 - Build at `ogun project add`, **not** at 2am.
 - Mount a persistent package-manager cache volume, or every nightly run re-downloads
-  the world.
+  the world. One volume per runtime, read-write in every concurrent sandbox — which is
+  the one shared mutable thing here that is safe, and only for a specific reason. pnpm's
+  store is content-addressed *and* names its temp files after the destination, so two
+  containers can only collide on a staging path when they are writing identical bytes;
+  `verify-store-integrity` is the backstop. `container.ts` records the caveats, the
+  chief one being that this rests on a maintainer's statement rather than on pnpm's
+  documentation.
+
+**The tag is keyed on the project slug**, `ogun/project-<slug>`, and on nothing about
+where the repo sits on a disk. `ogun image build <dir>` used to derive it from the
+directory's name while the runner looked it up by `job.projectSlug`; those agree only
+when a checkout happens to be named after its project, so a git worktree or a clone kept
+under another name built an image no job would ever ask for. Both ends now call one
+function (`projectImage` in `packages/core/src/image.ts`). The directory name is a fact
+about one machine, which is the same reason §4.5 keeps absolute paths out of the
+database.
+
+**The content-hash tag above is deliberately not built, and `ogun/base:latest` is a
+fixed name.** A project's `.ogun/Dockerfile` says `FROM ogun/base` by hand, in a
+repository Ogun does not own, so content-hash tagging the base would either break that
+line or require a build arg every existing project Dockerfile lacks. What ships instead
+is a *stamp*: the base image carries a label hashing the sources that went into it, and
+`ogun runner doctor` and `ogun runner start` warn when the installed image no longer
+matches this checkout. The consequence to know about is that one machine has one
+`ogun/base`, so two checkouts of Ogun at different commits cannot each have their own
+sandbox image — the last one to build owns it, and the other is correctly reported
+stale.
 
 **Credentials.** [corrected — ADR-0010] **Nothing live enters a sandbox.** The container
 gets *placeholder* credential files — real enough in shape for the CLI to decide it is

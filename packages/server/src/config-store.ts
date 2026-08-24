@@ -1,5 +1,5 @@
-import { createHash } from 'node:crypto'
-import { readFile, rename, writeFile } from 'node:fs/promises'
+import { createHash, randomBytes } from 'node:crypto'
+import { readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { Document, parseDocument } from 'yaml'
 import {
@@ -38,6 +38,14 @@ export type ConfigStore = {
   /**
    * Read-modify-write. `expectedHash` makes it a compare-and-swap: two concurrent edits,
    * or an edit racing your editor, fail loudly instead of silently dropping one.
+   *
+   * The compare-and-swap only ever guarded the *content*, and a compare-and-swap whose
+   * compare and whose swap are separated by an `await` is not one. Two requests arriving
+   * together both loaded hash H, both passed the check, and both went on to write — so
+   * the loser's edit vanished without the conflict this parameter exists to raise. Every
+   * write into one file therefore runs behind `serialize()` below, which makes the whole
+   * load-modify-write indivisible within this process and gives the second request a
+   * `ConfigConflict` instead of silence.
    */
   mutate: (
     slug: string,
@@ -94,14 +102,15 @@ export function createLocalConfigStore(projectMapPath?: string): ConfigStore {
     return join(root, '.ogun', 'config.yaml')
   }
 
-  const load = async (slug: string): Promise<ConfigFile> => {
-    const path = await configPathFor(slug)
+  const loadFrom = async (path: string): Promise<ConfigFile> => {
     const text = await readFile(path, 'utf8').catch(() => {
       throw new ConfigUnreachable(`${path} is not readable`)
     })
     const parsed = projectConfigSchema.parse(parseDocument(text).toJS())
     return { path, text, hash: hashOf(text), workers: parsed.workers, cycles: expand(parsed.cycles) }
   }
+
+  const load = async (slug: string): Promise<ConfigFile> => loadFrom(await configPathFor(slug))
 
   return {
     root: async (slug) => (await readProjectMap(projectMapPath))[slug],
@@ -117,54 +126,128 @@ export function createLocalConfigStore(projectMapPath?: string): ConfigStore {
 
     read: load,
 
-    mutate: async (slug, expectedHash, fn) => {
-      const current = await load(slug)
-      if (expectedHash !== undefined && expectedHash !== current.hash) {
-        throw new ConfigConflict(
-          'config.yaml changed since this page loaded — reload and reapply the edit',
-        )
-      }
+    mutate: async (slug, expectedHash, fn) =>
+      // Resolved before the queue rather than inside it, because the path is what the
+      // queue is keyed on. Two slugs pointing at one repo is a misconfiguration, but it
+      // would be one that quietly bypassed the lock if the key were the slug.
+      serialize(await configPathFor(slug), async (path) => {
+        const current = await loadFrom(path)
+        if (expectedHash !== undefined && expectedHash !== current.hash) {
+          throw new ConfigConflict(
+            'config.yaml changed since this page loaded — reload and reapply the edit',
+          )
+        }
 
-      // The Document API rather than parse-and-restringify: comments, key order, and
-      // blank lines all survive. A UI that silently reformats a file you hand-wrote is
-      // a UI you stop trusting with the file.
-      const doc = parseDocument(current.text)
-      fn(doc)
-      /**
-       * `flowCollectionPadding` defaults to true, which rewrites every inline list in
-       * the file — `[a, b]` becomes `[ a, b ]` — including lists on lines the edit never
-       * touched. Small, but it is exactly the silent reformatting this store exists to
-       * avoid, and it shows up as noise in the diff a person is meant to review.
-       */
-      const next = doc.toString({ flowCollectionPadding: false })
+        // The Document API rather than parse-and-restringify: comments, key order, and
+        // blank lines all survive. A UI that silently reformats a file you hand-wrote is
+        // a UI you stop trusting with the file.
+        const doc = parseDocument(current.text)
+        fn(doc)
+        /**
+         * `flowCollectionPadding` defaults to true, which rewrites every inline list in
+         * the file — `[a, b]` becomes `[ a, b ]` — including lists on lines the edit never
+         * touched. Small, but it is exactly the silent reformatting this store exists to
+         * avoid, and it shows up as noise in the diff a person is meant to review.
+         */
+        const next = doc.toString({ flowCollectionPadding: false })
 
-      // Validate the *result*, not the input. The UI must not be able to leave a
-      // config.yaml on disk that the next `ogun project sync` refuses to load.
-      const parsed = projectConfigSchema.safeParse(parseDocument(next).toJS())
-      if (!parsed.success) {
-        throw new Error(
-          `refusing to write an invalid config.yaml: ${parsed.error.issues
-            .slice(0, 3)
-            .map((i) => `${i.path.join('.')}: ${i.message}`)
-            .join('; ')}`,
-        )
-      }
+        // Validate the *result*, not the input. The UI must not be able to leave a
+        // config.yaml on disk that the next `ogun project sync` refuses to load.
+        const parsed = projectConfigSchema.safeParse(parseDocument(next).toJS())
+        if (!parsed.success) {
+          throw new Error(
+            `refusing to write an invalid config.yaml: ${parsed.error.issues
+              .slice(0, 3)
+              .map((i) => `${i.path.join('.')}: ${i.message}`)
+              .join('; ')}`,
+          )
+        }
 
-      // Write-then-rename so a crash mid-write cannot leave a truncated config.yaml —
-      // this is the file that defines everything the factory runs.
-      const tmp = `${current.path}.ogun-tmp`
-      await writeFile(tmp, next, 'utf8')
-      await rename(tmp, current.path)
+        await stage(current.path, next)
 
-      return {
-        path: current.path,
-        text: next,
-        hash: hashOf(next),
-        workers: parsed.data.workers,
-        cycles: expand(parsed.data.cycles),
-      }
-    },
+        return {
+          path: current.path,
+          text: next,
+          hash: hashOf(next),
+          workers: parsed.data.workers,
+          cycles: expand(parsed.data.cycles),
+        }
+      }),
   }
+}
+
+/**
+ * Write-then-rename so a crash mid-write cannot leave a truncated config.yaml — this is
+ * the file that defines everything the factory runs.
+ *
+ * The staging path used to be a constant, `<path>.ogun-tmp`, and that is a shared mutable
+ * global wearing a filename. Two writers interleave their `write(2)`s into one file and
+ * then each rename it over the real config: what lands is neither edit but a splice of
+ * both, byte-for-byte plausible and syntactically broken in the middle. The
+ * compare-and-swap above cannot see it, because it compares content and the collision is
+ * on the path.
+ *
+ * A pid suffix — what `machine.ts` does — is not enough, and is not enough there either:
+ * it distinguishes two *processes* and not two concurrent calls inside one. That matters
+ * most here, because this runs inside a server handling concurrent requests, so both
+ * writers always share a pid. The random suffix is what makes the name unique; the pid is
+ * kept because it names the owner of anything left behind.
+ *
+ * `wx` rather than a plain create, so that the guarantee does not rest on the suffix being
+ * unique. If two writers ever did choose one name, the second fails to open instead of
+ * writing into the first's file, and the edit is refused rather than mangled.
+ */
+async function stage(path: string, body: string): Promise<void> {
+  const tmp = `${path}.ogun-tmp-${process.pid}-${randomBytes(4).toString('hex')}`
+  try {
+    await writeFile(tmp, body, { encoding: 'utf8', flag: 'wx' })
+    await rename(tmp, path)
+  } catch (err) {
+    // A staging file left in the repo's `.ogun/` would show up in `git status` as
+    // something the control plane put there and never took away.
+    await rm(tmp, { force: true })
+    throw err
+  }
+}
+
+/**
+ * One read-modify-write per file at a time, within this process.
+ *
+ * `mutate` is documented as a compare-and-swap, and it was not one: the hash check and the
+ * rename that acts on it are separated by parsing, a callback and re-validation, all of
+ * which yield. Two edits submitted together — two tabs, a person and the `fix-a-finding`
+ * modifier, two requests from one impatient click — both read hash H, both find it
+ * current, and both write. The second silently erases the first, which is precisely the
+ * outcome `expectedHash` exists to turn into a visible `ConfigConflict`. Serialising the
+ * whole operation makes the second one observe the first's hash and refuse.
+ *
+ * In-process only, and that is the honest bound. The other writer of a project's
+ * config.yaml is a human with an editor, and no in-process lock reaches them — but they
+ * are covered, because the hash they raced is now genuinely the hash on disk when the
+ * write happens. What is *not* covered is two control planes sharing one checkout, which
+ * nothing in Ogun's design produces: the path map that makes a repo reachable is
+ * machine-local (§4.5), so a second control plane on the same machine is the only way to
+ * get there, and it would be sharing a database as well.
+ *
+ * The queue entry is dropped once it is the tail again, so an idle server holds nothing.
+ */
+const writes = new Map<string, Promise<unknown>>()
+
+function serialize<T>(path: string, fn: (path: string) => Promise<T>): Promise<T> {
+  // `.then(run, run)` and not `.finally`: a rejected predecessor must not cancel the
+  // queue behind it. One bad edit failing validation cannot be allowed to wedge every
+  // later edit to that file for the lifetime of the process.
+  const run = (): Promise<T> => fn(path)
+  const result = (writes.get(path) ?? Promise.resolve()).then(run, run)
+  const tail = result.then(
+    () => undefined,
+    () => undefined,
+  )
+  writes.set(path, tail)
+  void tail.then(() => {
+    if (writes.get(path) === tail) writes.delete(path)
+  })
+  return result
 }
 
 /**

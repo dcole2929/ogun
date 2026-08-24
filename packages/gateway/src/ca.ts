@@ -5,9 +5,18 @@ import {
   generateKeyPairSync,
   randomBytes,
   sign,
+  X509Certificate,
 } from 'node:crypto'
 import type { KeyObject } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import {
@@ -116,21 +125,65 @@ export function caState(directory = defaultCaDirectory()): CaState {
 }
 
 /**
+ * How long a runner will wait for another process that is already generating the CA, and
+ * how old an abandoned claim has to be before it is broken.
+ *
+ * Generation is one P-256 keypair and one signature — single-digit milliseconds. Five
+ * seconds is therefore not a tuning parameter, it is "the holder is not coming back", and
+ * a claim naming a pid that is gone is broken immediately without waiting at all. The
+ * timeout only ever fires for a live holder that is genuinely stuck, and a runner start
+ * that fails with a message naming the lock is better than one that hangs before it
+ * listens.
+ */
+const CA_LOCK_WAIT_MS = 5_000
+const CA_LOCK_STALE_MS = 30_000
+
+/** A private key and the certificate that was minted for *that* key. */
+type CaMaterial = { privateKey: KeyObject; certificatePem: string }
+
+/**
  * Load the CA from disk, or create one on first use.
  *
  * Persisted rather than generated per start, because the container trusts it by content:
  * a CA regenerated on every runner restart would make every previously-written CA file,
  * every cached image layer, and every in-flight job's trust store wrong at once. It also
  * means `ogun runner doctor` can check a real file's mode.
+ *
+ * ### The race this used to lose
+ *
+ * It was `if (!exists) generate()`, then two separate `readFileSync` calls. A CA is two
+ * files that only mean anything as a pair, and nothing tied them together:
+ *
+ *  - Two first-ever runner starts on a fresh box both saw no key, both generated, and the
+ *    second overwrote the first. A start that had already read `ca.key` from generation A
+ *    then read `ca.pem` from generation B.
+ *  - Every leaf that CA signs is then signed by a key the certificate does not name.
+ *    Nothing detects it here — minting succeeds, the gateway starts, the socket listens —
+ *    and it surfaces inside a container as a TLS verification failure against
+ *    `api.anthropic.com`, which reads as an expired credential or a broken proxy. Nothing
+ *    in the message names a certificate authority, let alone this file.
+ *  - It is benign after the first success, because after that the files exist and nobody
+ *    regenerates. That is what makes it expensive: it can only happen on a machine nobody
+ *    has debugged before, and it cannot be reproduced on one that works.
+ *
+ * ### What replaces it
+ *
+ * Two things, and the second is the one that matters:
+ *
+ *  - Generation happens under an exclusive `ca.lock`, so only one process generates. A
+ *    lock rather than exclusive-creating `ca.key` itself, because the lock has to be
+ *    breakable and `ca.key` must never be.
+ *  - Every load *verifies the pair*, with `X509Certificate#checkPrivateKey`. A lock is a
+ *    convention between processes that agree to take it; the check is a property of the
+ *    bytes. It also catches the cases no lock covers — half a directory restored from a
+ *    backup, a `ca.pem` copied off another machine — and turns them into a clear failure
+ *    instead of a chain that silently verifies nowhere.
  */
 export function loadOrCreateCa(directory = defaultCaDirectory()): CertificateAuthority {
   const keyPath = join(directory, 'ca.key')
   const certPath = join(directory, 'ca.pem')
 
-  if (!existsSync(keyPath) || !existsSync(certPath)) generateCa(keyPath, certPath)
-
-  const privateKey = createPrivateKey(readFileSync(keyPath, 'utf8'))
-  const certificatePem = readFileSync(certPath, 'utf8')
+  const { privateKey, certificatePem } = loadPair(keyPath, certPath) ?? createCa(keyPath, certPath)
   const issuer = caName()
   const issuerKeyId = keyIdentifier(createPublicKey(privateKey))
 
@@ -149,7 +202,131 @@ export function loadOrCreateCa(directory = defaultCaDirectory()): CertificateAut
   }
 }
 
-function generateCa(keyPath: string, certPath: string): void {
+/**
+ * The two files as a pair, or nothing — never one of them, and never two that do not go
+ * together.
+ *
+ * `checkPrivateKey` is the whole point. Reading both files proves only that two files
+ * exist; a key from generation A and a certificate from generation B both parse, and the
+ * CA built from them signs leaves that verify against nothing. OpenSSL answers the
+ * question directly, so the mismatch is caught here rather than in a container.
+ *
+ * Anything unreadable, truncated, or unparseable is `undefined` rather than a throw: a
+ * partially-written pair is the *expected* state while another process is mid-generation,
+ * and the caller's job is to wait for it or replace it.
+ */
+function loadPair(keyPath: string, certPath: string): CaMaterial | undefined {
+  try {
+    if (!existsSync(keyPath) || !existsSync(certPath)) return undefined
+    const privateKey = createPrivateKey(readFileSync(keyPath, 'utf8'))
+    const certificatePem = readFileSync(certPath, 'utf8')
+    if (!new X509Certificate(certificatePem).checkPrivateKey(privateKey)) return undefined
+    return { privateKey, certificatePem }
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Generate the CA, or wait for whoever is already generating it.
+ *
+ * The claim is `ca.lock`, created with `wx` — the one filesystem operation that is
+ * atomic across processes without a filesystem that supports anything special. The holder
+ * writes its pid into it, which is what makes the claim breakable without a timeout: a
+ * lock naming a pid that no longer exists cannot be held by anybody, and a crashed
+ * `runner start` must not be able to wedge every later start on the machine forever.
+ *
+ * The timeout is the second half of that, for the case the pid check cannot decide — a pid
+ * recycled by an unrelated process, or a lock left by a container that shared the mount
+ * and not the pid namespace. Thirty seconds against a generation that takes single-digit
+ * milliseconds.
+ *
+ * Two processes can in principle break one stale lock together and both generate, which is
+ * the original bug at a thousandth of the frequency and only after a crash. It is not left
+ * to luck: `loadPair` still checks, so the loser reloads a mismatched pair as `undefined`
+ * and takes the lock again rather than building a CA out of halves.
+ */
+function createCa(keyPath: string, certPath: string): CaMaterial {
+  const lockPath = join(dirname(keyPath), 'ca.lock')
+  mkdirSync(dirname(keyPath), { recursive: true, mode: 0o700 })
+
+  const deadline = Date.now() + CA_LOCK_WAIT_MS
+  for (;;) {
+    if (claim(lockPath)) {
+      try {
+        // Re-read under the lock. Losing the race to claim and then being handed the lock
+        // as the winner releases it is the common path, not an edge case.
+        return loadPair(keyPath, certPath) ?? generateCa(keyPath, certPath)
+      } finally {
+        rmSync(lockPath, { force: true })
+      }
+    }
+
+    const pair = loadPair(keyPath, certPath)
+    if (pair) return pair
+    if (breakIfAbandoned(lockPath)) continue
+    if (Date.now() > deadline) {
+      throw new Error(
+        `another process has held ${lockPath} for over ${CA_LOCK_WAIT_MS}ms without ` +
+          'writing a certificate authority. Delete it if nothing is generating one.',
+      )
+    }
+    // Synchronous by necessity: this function is called from a synchronous constructor
+    // whose result the gateway needs before it can listen. `Atomics.wait` is the only
+    // sleep Node offers that does not require the event loop to turn.
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25)
+  }
+}
+
+const claim = (lockPath: string): boolean => {
+  try {
+    writeFileSync(lockPath, `${process.pid}\n`, { flag: 'wx', mode: 0o600 })
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** True if a lock was removed because nothing could still be holding it. */
+function breakIfAbandoned(lockPath: string): boolean {
+  let owner: number
+  let age: number
+  try {
+    owner = Number.parseInt(readFileSync(lockPath, 'utf8').trim(), 10)
+    age = Date.now() - statSync(lockPath).mtimeMs
+  } catch {
+    // Gone underneath us, which means the holder finished. Retrying is the right move
+    // and reporting a break is not — nothing was broken.
+    return false
+  }
+  // `kill(pid, 0)` asks whether the pid exists without touching it. EPERM means it exists
+  // and belongs to somebody else, which still counts as alive.
+  const alive = Number.isInteger(owner) && processExists(owner)
+  if (alive && age < CA_LOCK_STALE_MS) return false
+  rmSync(lockPath, { force: true })
+  return true
+}
+
+function processExists(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
+
+/**
+ * Both halves written to unique temporary paths and renamed into place.
+ *
+ * Rename because a reader does *not* take the lock — the fast path is a plain `loadPair`,
+ * and it has to be, or every gateway start would serialise on a file that will exist for
+ * the machine's lifetime. So the reader must never see a half-written `ca.pem`, and
+ * `writeFileSync` straight to the real path guarantees it eventually will. Rename makes
+ * each file appear whole; `loadPair`'s pair check covers the remaining window between the
+ * two renames, which is the part no single rename can fix.
+ */
+function generateCa(keyPath: string, certPath: string): CaMaterial {
   mkdirSync(dirname(keyPath), { recursive: true, mode: 0o700 })
   const { privateKey, publicKey } = generateKeyPairSync('ec', { namedCurve: 'prime256v1' })
 
@@ -182,13 +359,35 @@ function generateCa(keyPath: string, certPath: string): void {
     signingKey: privateKey,
   })
 
-  // 0600 before anything is written into it, not after. The window between `writeFileSync`
-  // and a later `chmod` is short, but this is a CA private key on a multi-user-capable
-  // host and `ogun runner doctor` already reports a config file left group-readable.
-  writeFileSync(keyPath, privateKey.export({ type: 'pkcs8', format: 'pem' }) as string, {
-    mode: 0o600,
-  })
-  writeFileSync(certPath, toPem('CERTIFICATE', der), { mode: 0o644 })
+  const suffix = `.tmp-${process.pid}-${randomBytes(4).toString('hex')}`
+  const keyTmp = keyPath + suffix
+  const certTmp = certPath + suffix
+  const certificatePem = toPem('CERTIFICATE', der)
+  try {
+    // 0600 before anything is written into it, not after. The window between
+    // `writeFileSync` and a later `chmod` is short, but this is a CA private key on a
+    // multi-user-capable host and `ogun runner doctor` already reports a config file left
+    // group-readable. `wx` so the mode is a property of every write and not only of the
+    // first: `writeFileSync`'s `mode` reaches `open(2)` and is applied on create, so a
+    // temp file left behind by a killed process — with a pid the OS has since recycled
+    // back to us — would otherwise be written into at whatever mode it already carried.
+    writeFileSync(keyTmp, privateKey.export({ type: 'pkcs8', format: 'pem' }) as string, {
+      flag: 'wx',
+      mode: 0o600,
+    })
+    writeFileSync(certTmp, certificatePem, { flag: 'wx', mode: 0o644 })
+    // The certificate first. Both orders leave a window, but this one leaves the harmless
+    // half of it: a `ca.pem` with no `ca.key` beside it is ignored by `caState` and by
+    // `loadPair`, whereas a `ca.key` alone is a private key on disk that nothing will ever
+    // use and nothing will ever clean up.
+    renameSync(certTmp, certPath)
+    renameSync(keyTmp, keyPath)
+  } catch (err) {
+    rmSync(keyTmp, { force: true })
+    rmSync(certTmp, { force: true })
+    throw err
+  }
+  return { privateKey, certificatePem }
 }
 
 function mintLeaf(

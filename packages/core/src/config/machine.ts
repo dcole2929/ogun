@@ -1,4 +1,4 @@
-import { chmod, mkdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 import { z } from 'zod'
@@ -177,15 +177,152 @@ export async function writeSecretFile(path: string, body: string): Promise<void>
   await writeFile(path, body, { mode: SECRET_MODE, flag: 'wx' })
 }
 
-/** Read-modify-write, preserving anything this version does not know about. */
+/**
+ * How long a writer waits for the lock, and how old an abandoned lock has to be before it
+ * is broken regardless of what it says.
+ *
+ * The critical section is a read, a callback and a rename — a millisecond or two. Two
+ * seconds is not a budget, it is "the holder is not coming back", and the pid check below
+ * usually decides long before the timeout is reached. Long enough is what matters here
+ * rather than exact: an `ogun init` that chains several of these must never trip it, and a
+ * person whose command has genuinely stuck wants an error naming the lock, not a hang.
+ */
+const CONFIG_LOCK_WAIT_MS = 2_000
+const CONFIG_LOCK_STALE_MS = 30_000
+
+/**
+ * Read-modify-write, preserving anything this version does not know about — and doing it
+ * under an exclusive lock, because there is more than one writer.
+ *
+ * ### What was lost without one
+ *
+ * Every caller reads the whole file, changes one branch of it, and writes the whole file
+ * back. With two of them in flight the second read happens before the first write, so the
+ * second write is built on a config that is already out of date and silently drops
+ * whatever the first one added. The three things that can go missing are each of the three
+ * things this file exists to hold:
+ *
+ *  - `projects`, written by `ogun project add` and by every `ogun project sync`. Losing an
+ *    entry means the control plane reports the project unreachable and the runner clones
+ *    from the remote instead of from disk — degraded, not broken, and therefore not
+ *    noticed.
+ *  - `server.token`, generated once, on the first bind beyond localhost. Losing it means
+ *    the admin secret in memory is not the one on disk, and the next process to start
+ *    cannot authenticate.
+ *  - `runner`, written by `ogun runner join`. Losing it un-joins the machine.
+ *
+ * None of these produce an error at the time. `ogun project sync` prints `synced`, exits
+ * 0, and the entry is not there.
+ *
+ * This is not a two-people-typing-fast scenario. `runner join` and `project sync` are both
+ * things a setup script runs, `ogun init` chains several of them, and a `fix-a-finding`
+ * modifier verifying a patch runs Ogun's own suite while a runner on the same box is live.
+ *
+ * ### The lock
+ *
+ * `<config>.lock`, created with `wx` — the one cross-process atomic primitive available on
+ * every filesystem this could sit on. Two things make it safe to leave behind:
+ *
+ *  - It contains the holder's pid, and a lock naming a pid that no longer exists is broken
+ *    immediately. This is the same reasoning the test harness uses to reclaim abandoned
+ *    databases: a live pid is unique on the machine, and any later process can ask the
+ *    kernel about it. A crashed `ogun runner join` therefore costs the next command
+ *    nothing, where a plain lockfile would have wedged `~/.ogun/config.json` until someone
+ *    found it and deleted it by hand.
+ *  - It is broken on age as a second line, for the pid the OS has recycled into something
+ *    unrelated. Thirty seconds against a critical section of a millisecond or two.
+ *
+ * The lock also fixes something `writeConfigFile` could not. Its staging path is
+ * `<path>.tmp-<pid>`, which distinguishes two *processes* and not two concurrent calls
+ * inside one — the second `rename` then failed with ENOENT because the first had already
+ * moved the file out from under it, so an in-process collision surfaced as a spurious
+ * error rather than as the silent loss it caused between processes. Serialised, there is
+ * only ever one writer of that path at a time.
+ *
+ * Rejected: a rename-based compare-and-swap on a content hash, which needs no lock and no
+ * timeout. It gives the loser a conflict to *handle*, and there is nothing sensible for
+ * `ogun runner join` to do with one but retry — so it would be a retry loop around a
+ * function whose callers all want "just make this edit", with the added property that a
+ * caller who forgot to retry loses the edit again. A lock puts the waiting in one place.
+ *
+ * The residual hole, stated rather than hidden: two processes can decide a lock is stale at
+ * the same instant and both proceed. That requires a previous holder to have crashed and
+ * two writers to arrive within the same tick afterwards, and its consequence is the lost
+ * update that happened unconditionally before — so the worst case is what today's best
+ * case is.
+ */
 export async function updateLocalConfig(
   fn: (config: LocalConfig) => LocalConfig,
   path = localConfigPath(),
 ): Promise<LocalConfig> {
-  const next = fn(await loadLocalConfig(path))
   await mkdir(dirname(path), { recursive: true })
-  await writeConfigFile(path, `${JSON.stringify(next, null, 2)}\n`)
-  return next
+  // The lock belongs beside the file that is actually written, which for a symlinked
+  // config.json is the link's target — otherwise two machines' worth of tooling could
+  // take two different locks over one file.
+  const target = await realpath(path).catch(() => path)
+  return withLock(`${target}.lock`, async () => {
+    const next = fn(await loadLocalConfig(path))
+    await writeConfigFile(path, `${JSON.stringify(next, null, 2)}\n`)
+    return next
+  })
+}
+
+async function withLock<T>(lockPath: string, fn: () => Promise<T>): Promise<T> {
+  const deadline = Date.now() + CONFIG_LOCK_WAIT_MS
+  for (;;) {
+    if (await claimLock(lockPath)) {
+      try {
+        return await fn()
+      } finally {
+        await rm(lockPath, { force: true })
+      }
+    }
+    if (!(await breakAbandonedLock(lockPath)) && Date.now() > deadline) {
+      throw new LocalConfigError(
+        `${lockPath} is still held after ${CONFIG_LOCK_WAIT_MS}ms, by a process that is ` +
+          'alive and has not released it. Delete it if nothing is writing the config.',
+      )
+    }
+    // Jittered, so two waiters that arrived together do not keep colliding in lockstep.
+    await new Promise((done) => setTimeout(done, 10 + Math.random() * 20))
+  }
+}
+
+const claimLock = (lockPath: string): Promise<boolean> =>
+  writeFile(lockPath, `${process.pid}\n`, { flag: 'wx', mode: SECRET_MODE }).then(
+    () => true,
+    () => false,
+  )
+
+/** True if the lock was removed because nothing could still be holding it. */
+async function breakAbandonedLock(lockPath: string): Promise<boolean> {
+  const [owner, age] = await Promise.all([
+    readFile(lockPath, 'utf8').then(
+      (t) => Number.parseInt(t.trim(), 10),
+      () => NaN,
+    ),
+    stat(lockPath).then(
+      (s) => Date.now() - s.mtimeMs,
+      () => -1,
+    ),
+  ])
+  // Gone underneath us: the holder finished, so there is nothing to break and retrying is
+  // the whole answer.
+  if (age < 0) return false
+  if (alive(owner) && age < CONFIG_LOCK_STALE_MS) return false
+  await rm(lockPath, { force: true })
+  return true
+}
+
+/** `kill(pid, 0)` asks whether a pid exists without touching it; EPERM is still a yes. */
+function alive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM'
+  }
 }
 
 export const resolveProjectPath = (config: LocalConfig, slug: string): string | undefined =>

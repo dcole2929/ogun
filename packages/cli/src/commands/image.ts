@@ -1,9 +1,17 @@
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { mkdir } from 'node:fs/promises'
-import { dirname, join, resolve } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 import { existsSync } from 'node:fs'
-import { pinnedNodeVersion, sandboxStamp, STAMP_LABEL } from '@ogun/core'
+import {
+  BASE_IMAGE,
+  loadProjectConfig,
+  pinnedNodeVersion,
+  projectImage,
+  sandboxStamp,
+  STAMP_LABEL,
+} from '@ogun/core'
+import { parse } from '../args.ts'
 import { bold, dim, fail, green } from '../output.ts'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -14,10 +22,14 @@ const repoRoot = resolve(here, '../../../..')
  * has to build an image first is a nightly run that fails on a bad network.
  */
 export async function imageBuild(args: string[]): Promise<void> {
-  const project = args[0]
+  const { flags, first: project } = parse(
+    args,
+    { '--name': 'string' },
+    'ogun image build [project-dir] [--name <slug>]',
+  )
   const context = project ? resolve(project) : join(repoRoot, 'images', 'base')
   const dockerfile = project ? join(context, '.ogun', 'Dockerfile') : join(context, 'Dockerfile')
-  const tag = project ? `ogun/project-${basenameOf(context)}:latest` : 'ogun/base:latest'
+  const tag = project ? projectImage(await projectSlug(context, flags.name)) : BASE_IMAGE
 
   if (!existsSync(dockerfile)) {
     fail(
@@ -109,7 +121,42 @@ async function bundleCli(): Promise<void> {
   console.log(dim(`bundled ogun cli -> ${out}`))
 }
 
-const basenameOf = (p: string): string => p.split('/').filter(Boolean).at(-1) ?? 'project'
+/**
+ * What the control plane calls this project, which is what its image has to be named
+ * after.
+ *
+ * This used to be `basename(context)`, and that is the bug: the runner resolves a job's
+ * image as `projectImage(job.projectSlug)`, and a slug is not a directory name. Build Ogun
+ * from a git worktree at `.claude/worktrees/agent-aecf30` and you got a perfectly good
+ * `ogun/project-agent-aecf30:latest` that nothing would ever ask for, while the modifier
+ * job died on `Unable to find image 'ogun/project-ogun:latest'`. The two commands agreed
+ * on the format string and disagreed about what to put in it, which is the hardest kind of
+ * disagreement to see, because both halves look right on their own.
+ *
+ * The same three-way precedence as `ogun project add`, and for the same reason: whatever
+ * registered the path map and whatever builds the image have to reach the same answer, so
+ * they must resolve the name the same way. `--name` for the case where the machine's map
+ * was registered under an override.
+ */
+export async function projectSlug(context: string, override?: string): Promise<string> {
+  if (override) return override
+  const configured = await loadProjectConfig(context)
+    .then((l) => l.config.project.name)
+    .catch(() => null)
+  if (configured) return configured
+
+  // No `.ogun/config.yaml` but a `.ogun/Dockerfile`: possible, and the directory name is
+  // the same guess `ogun project add` makes, so at least the two agree. Said out loud
+  // because a wrong guess here is invisible until a job cannot find its image.
+  const guess = basename(context)
+  console.log(
+    dim(
+      `${context} has no .ogun/config.yaml, so this image is tagged "${guess}" from its\n` +
+        'directory name. If the control plane knows the project by another name, pass --name.',
+    ),
+  )
+  return guess
+}
 
 const runDocker = (args: string[]): Promise<number> =>
   new Promise((res) => {
