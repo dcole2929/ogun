@@ -2,7 +2,7 @@ import { createWriteStream } from 'node:fs'
 import { mkdir, rm } from 'node:fs/promises'
 import { spawn } from 'node:child_process'
 import { join } from 'node:path'
-import { GIT_ENV, GIT_HARDENING, RUNNER_IDENTITY, gitIn } from './workspace.ts'
+import { DIFF_SAFE, GIT_ENV, GIT_HARDENING, RUNNER_IDENTITY, gitIn } from './workspace.ts'
 
 /**
  * Getting a modifier's work out of a workspace the container has just had write access to.
@@ -44,6 +44,44 @@ import { GIT_ENV, GIT_HARDENING, RUNNER_IDENTITY, gitIn } from './workspace.ts'
  */
 export const MAX_PATCH_BYTES = 64 * 1024 * 1024
 
+/**
+ * The subject extraction puts on work the agent left in the worktree.
+ *
+ * A constant rather than a literal because two other things now recognise it: the
+ * `commit-message` lens, which has to tell the harness's own commit apart from the
+ * agent's before it grades prose nobody wrote, and the note that tells a person the
+ * safety net fired. Matching a commit by its subject is a weak join, and it is the one
+ * available — the sweep-up commit is made by a *previous* round in a retry, so "did this
+ * call make one" is not the question a later round can ask.
+ */
+export const SWEEP_UP_SUBJECT = 'Work the agent left uncommitted'
+
+/**
+ * What the host can say about a patch without opening it, read off the workspace's git
+ * history in the same pass that produces the mbox.
+ *
+ * These exist for the verify gate's modifier lenses (§4.10). They are gathered *here*
+ * rather than by the gate for the same reason `knownPaths` and `lineCountOf` are
+ * gathered by the pipeline: every git call against agent-authored content has to go
+ * through `gitIn`'s hardening, and a gate that shelled out for itself would be a second
+ * place for that rule to be true — which is a second place for it to quietly stop being.
+ */
+export type PatchFacts = {
+  /**
+   * Every commit message in `base..HEAD`, in the order they were written, each capped —
+   * a commit message is agent output and the agent decides how long it is.
+   */
+  messages: string[]
+  /**
+   * Paths differing between the base tree and what the agent left. Renames are reported
+   * as the two paths they touch rather than as one arrow, because a lens asks "is this
+   * file in the patch" and `old => new` is not a file.
+   */
+  paths: string[]
+  /** True when `base..HEAD` contains a `SWEEP_UP_SUBJECT` commit, from any round. */
+  sweptUp: boolean
+}
+
 export type PatchExtraction = {
   /** The commit the workspace was pinned to, and what the host will apply the patch to. */
   baseSha: string
@@ -54,12 +92,27 @@ export type PatchExtraction = {
   /** Absent when nothing changed, and when the work could not be turned into a patch. */
   patch?: { ref: string; bytes: number }
   /**
+   * What the gate's modifier lenses read. Absent for a run that changed nothing, where
+   * there is no patch and therefore nothing to ask questions of; present even when
+   * `unextractable` is set, because "what did it touch" is the only thing left to look at
+   * once the workspace is gone.
+   */
+  facts?: PatchFacts
+  /**
    * Set only when there *is* work and no artefact came out of it. Never set for a run
    * that changed nothing — that is an ordinary outcome and must not wear the same value
    * as a failure to extract (principle 6).
    */
   unextractable?: string
 }
+
+/**
+ * A commit message is agent output and there is no ceiling on it. The cap is generous
+ * because the whole message is reproduced in the pull request body and read by a person,
+ * and it exists because this array is held in the runner's heap and then embedded in a
+ * retry prompt.
+ */
+const MAX_MESSAGE_CHARS = 20_000
 
 export async function extractPatch(input: {
   workspace: string
@@ -107,7 +160,7 @@ export async function extractPatch(input: {
       '--no-verify',
       '--no-gpg-sign',
       '-m',
-      'Work the agent left uncommitted',
+      SWEEP_UP_SUBJECT,
       '-m',
       'Collected by the ogun runner after the container exited; the agent wrote no ' +
         'commit message for it.',
@@ -127,6 +180,8 @@ export async function extractPatch(input: {
   const numstat = await gitIn(workspace, ['diff', '--numstat', ...DIFF_SAFE, baseSha, 'HEAD'])
   const filesChanged = numstat.stdout.split('\n').filter(Boolean).length
 
+  const facts = await readFacts(workspace, baseSha)
+
   /**
    * The patch has to apply to the base the host still has. `git am` replays `base..HEAD`
    * onto that commit, so if the agent rewrote or reset past it — `commit --amend` on the
@@ -145,6 +200,7 @@ export async function extractPatch(input: {
       baseSha,
       filesChanged,
       commits: 0,
+      facts,
       unextractable:
         `the workspace's HEAD is not a descendant of the pinned base ${baseSha.slice(0, 12)} — ` +
         'the agent rewrote or reset history, so no patch of this work can be applied to ' +
@@ -163,6 +219,7 @@ export async function extractPatch(input: {
       baseSha,
       filesChanged,
       commits,
+      facts,
       unextractable:
         `the patch is larger than the ${limit} byte limit — ${filesChanged} file(s) ` +
         'changed. A modifier this size has almost certainly committed something it should ' +
@@ -170,19 +227,46 @@ export async function extractPatch(input: {
     }
   }
 
-  return { baseSha, filesChanged, commits, patch: { ref, bytes: written } }
+  return { baseSha, filesChanged, commits, facts, patch: { ref, bytes: written } }
 }
 
 /**
- * Diff options that stop the *repository* deciding how a diff is produced.
+ * The two reads the modifier lenses need, and nothing else.
  *
- * `.gitattributes` is content the agent can write, and it can name a diff driver whose
- * `textconv` or `command` is an arbitrary shell command; `diff.external` in the config it
- * also controls does the same for every diff. Those run on the host, as the runner, at
- * the moment the runner asks what changed. Demonstrated: a `diff.external` of
- * `sh -c 'echo pwned > …'` fires on a plain `git diff` and does not fire with these.
+ * `-z` on both, because the alternative is guessing at a separator inside agent-written
+ * prose: a commit message can contain any line the agent felt like typing, including one
+ * that looks exactly like whatever delimiter a `--format` string invented. NUL is the one
+ * byte git guarantees is not in either a message or a path.
+ *
+ * `--no-renames` on the path listing, so a rename arrives as the two paths it touches
+ * rather than as `old => new`. A lens asks "is `.ogun/config.yaml` in this patch", and a
+ * rename away from that path is exactly the case a naive membership test would miss.
  */
-const DIFF_SAFE = ['--no-ext-diff', '--no-textconv']
+async function readFacts(workspace: string, baseSha: string): Promise<PatchFacts> {
+  const log = await gitIn(workspace, ['log', '--reverse', '-z', '--format=%B', `${baseSha}..HEAD`])
+  const messages = log.stdout
+    .split('\0')
+    .map((m) => m.trim())
+    .filter(Boolean)
+    .map((m) => m.slice(0, MAX_MESSAGE_CHARS))
+
+  const names = await gitIn(workspace, [
+    'diff',
+    '--name-only',
+    '-z',
+    '--no-renames',
+    ...DIFF_SAFE,
+    baseSha,
+    'HEAD',
+  ])
+  const paths = names.stdout.split('\0').filter(Boolean)
+
+  return {
+    messages,
+    paths,
+    sweptUp: messages.some((m) => m.split('\n')[0]?.trim() === SWEEP_UP_SUBJECT),
+  }
+}
 
 /**
  * The mbox, streamed rather than buffered.

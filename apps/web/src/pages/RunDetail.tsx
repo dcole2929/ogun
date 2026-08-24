@@ -47,6 +47,18 @@ export function RunDetailPage() {
           <dd className="muted">{when(data.run.startedAt)}</dd>
           <dt>Duration</dt>
           <dd className="muted">{duration(data.run.durationMs)}</dd>
+          {/* Only when there was more than one. A row saying "1" on every run would be
+              noise; the whole point of the column is that a run which needed a second
+              attempt should not look like one that did not. */}
+          {(data.run.rounds ?? 1) > 1 && (
+            <>
+              <dt>Rounds</dt>
+              <dd className="muted">
+                {data.run.rounds} — the verify gate refused this run's first patch and it was
+                given the rejection and another attempt. The timeline has both.
+              </dd>
+            </>
+          )}
           <dt>Runtime</dt>
           <dd className="muted">
             {data.run.runtime} {data.run.model && `· ${data.run.model}`}

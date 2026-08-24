@@ -166,6 +166,34 @@ describe('a modifier run is recorded', () => {
   })
 
   /**
+   * The retry loop's ledger (§5.2, principle 6).
+   *
+   * `gates` carries only the *final* round's verdict — it has to, because the derivation
+   * below reads any failed gate as the gate's answer, so folding a rejected first round in
+   * would turn a run that recovered into `changes-requested`. That leaves nothing in the
+   * report able to say a run needed two attempts, which is why the count is its own
+   * column and is copied rather than derived.
+   */
+  test('a run that took two rounds is not the same row as one that took one', async () => {
+    const retried = await runOnce({ ...withPatch, rounds: 2 })
+    const [row] = await db.select().from(schema.runs).where(eq(schema.runs.id, retried.runId))
+    assert.equal(row?.rounds, 2)
+    // And it is still a clean run: the retry succeeded, so no gate failed.
+    assert.equal(retried.result.outcome, 'dispatched')
+  })
+
+  /**
+   * Null, not one. A runner that predates the retry loop reports no count, and filling it
+   * in would be the control plane inventing evidence about a night nobody measured — the
+   * same distinction `tests_passed` makes one test above.
+   */
+  test('a run that reported no round count leaves it null', async () => {
+    const r = await runOnce(withPatch)
+    const [row] = await db.select().from(schema.runs).where(eq(schema.runs.id, r.runId))
+    assert.equal(row?.rounds, null)
+  })
+
+  /**
    * Two callers race for every run — the runner reporting and the stale-claim sweep — and
    * the loser applies nothing. `changes` has no unique key on `run_id`, so an insert
    * outside the claim would double-count a modifier's night in every query that goes near

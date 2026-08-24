@@ -1,14 +1,18 @@
 import { existsSync } from 'node:fs'
 import type { GateResult, Lens, VerifyConfig } from '@ogun/core'
 import { findingsDocumentSchema, parseFingerprint } from '@ogun/core'
+import { SWEEP_UP_SUBJECT, type PatchFacts } from './patch.ts'
 import type { Sandbox } from './sandbox/index.ts'
 
 /**
  * The verify gate (§4.10). Deterministic tool checks run first and short-circuit, so a
  * schema-invalid output never spends a grading call.
  *
- * In v1 the gate controls persistence, not retry: a failed gate means findings are not
- * persisted and the run records why. Same shape; phase 3 adds re-delivery on top.
+ * For a reviewer the gate still controls persistence and nothing else: a failed gate
+ * means findings are not persisted and the run records why. For a modifier it now also
+ * decides whether there is another round — the gate is where a rejection reason is
+ * produced, and `retry.ts` is where it is turned into a decision. Nothing about a lens
+ * changes for that; `retryable()` there reads the results this returns.
  */
 export type VerifyInput = {
   config: VerifyConfig | undefined
@@ -28,6 +32,17 @@ export type VerifyInput = {
    */
   testCommand?: string
   /**
+   * What the host read off the workspace's git history after extraction, for the lenses
+   * that grade the *patch* rather than the tree (§4.10).
+   *
+   * Absent for a reviewer, which produces no diff, and for a modifier that changed
+   * nothing. Absent has to pass — a modifier that decided nothing needed doing is an
+   * ordinary `approved` run — but it passes *with a detail saying so*, because "the
+   * messages were read and were clean" and "there were no messages" are not the same
+   * fact and must not wear the same value (principle 6).
+   */
+  patch?: PatchFacts
+  /**
    * When the job's timeout expires, as epoch milliseconds — `startedAt + timeoutMs`, not
    * a second budget of the gate's own. See `testsCheck` for why there is only one number.
    */
@@ -45,7 +60,17 @@ export type VerifyOutcome = {
    * never ran" is a fact about the harness, and a publisher told only that the gate
    * failed cannot tell which it is holding (principle 6).
    */
-  tests?: { ran: boolean; passed: boolean }
+  tests?: {
+    ran: boolean
+    passed: boolean
+    /**
+     * How long the suite took, when it ran at all. The retry loop's whole budget
+     * arithmetic is built on this one measurement rather than on a chosen constant — see
+     * `retryDecision`. Absent when the suite never started, which is also the case where
+     * no retry is possible, so the two absences agree.
+     */
+    durationMs?: number
+  }
 }
 
 export async function runVerifyGate(input: VerifyInput): Promise<VerifyOutcome> {
@@ -59,6 +84,12 @@ export async function runVerifyGate(input: VerifyInput): Promise<VerifyOutcome> 
       tests = outcome.tests
       results.push(outcome.gate)
       if (!outcome.gate.passed) return { gates: results, tests }
+      continue
+    }
+    if (PATCH_LENSES.has(lens.name) && !lens.command) {
+      const result = patchLens(lens.name, input)
+      results.push(result)
+      if (!result.passed) return { gates: results, ...(tests ? { tests } : {}) }
       continue
     }
     const result = await runToolLens(lens, input)
@@ -81,7 +112,30 @@ export async function runVerifyGate(input: VerifyInput): Promise<VerifyOutcome> 
 }
 
 /** The one lens whose command comes from the project rather than from the worker. */
-const TESTS_LENS = 'tests'
+export const TESTS_LENS = 'tests'
+
+/**
+ * Does any commit message in this patch close somebody's issue on merge (ADR-0009)?
+ *
+ * Refuses, rather than warns, and that is the decision worth defending. GitHub scans
+ * commit messages when a branch merges and nothing here can strip a line without
+ * rewriting the artefact a person is reviewing — so a warning would record the harm
+ * without preventing it, and the harm lands weeks later on somebody who never saw this
+ * run: an issue nobody connected to the work closes itself, citing an agent's commit as
+ * the reason. `skills/fix-a-finding` has said "never write a closing keyword" since it
+ * was written, and §4.10 is where an instruction becomes a gate.
+ *
+ * It is also almost always *wrong on its own terms*: a modifier takes work out of the
+ * findings inbox, where things are identified by fingerprint. It has no issue number to
+ * be right about.
+ */
+const COMMIT_MESSAGE_LENS = 'commit-message'
+
+/** Does this patch edit the file that decides how it is judged? See `selfGatingCheck`. */
+const SELF_GATING_LENS = 'self-gating'
+
+/** The lenses that read `input.patch` rather than the tree or the output document. */
+const PATCH_LENSES = new Set([COMMIT_MESSAGE_LENS, SELF_GATING_LENS])
 
 /**
  * Default lens sets differ by permission profile. A standing rubric of
@@ -97,11 +151,24 @@ const TESTS_LENS = 'tests'
  * publish unverified code by editing four words. A project that genuinely wants no test
  * gate declares no test command — and then admission refuses to dispatch modifiers at
  * all, which is the same answer said out loud (§4.3).
+ *
+ * The two patch lenses are mandatory on the same grounds and ordered **before** the test
+ * gate on a different one. They cost microseconds against a suite that costs minutes, and
+ * short-circuiting means a patch carrying `Closes #14` never spends the budget proving
+ * code that is unpublishable whatever the suite says. The cost of that ordering is a
+ * `changes` row with null test columns — which reads as "nobody said", is true, and is
+ * the reason the publisher's three test refusals are three sentences rather than one.
  */
 function resolveLenses(input: VerifyInput): Lens[] {
   const config = input.config
   const mandatory: Lens[] =
-    input.permissions === 'modifier' ? [{ name: TESTS_LENS, method: 'tool' }] : []
+    input.permissions === 'modifier'
+      ? [
+          { name: COMMIT_MESSAGE_LENS, method: 'tool' },
+          { name: SELF_GATING_LENS, method: 'tool' },
+          { name: TESTS_LENS, method: 'tool' },
+        ]
+      : []
   if (config?.lensProfile === 'none') return [...mandatory, ...config.expectations]
   const skip = new Set(config?.skipDefaultLenses ?? [])
   const defaults: Lens[] =
@@ -143,12 +210,19 @@ function resolveLenses(input: VerifyInput): Lens[] {
 async function testsCheck(
   input: VerifyInput,
 ): Promise<{ gate: GateResult; tests: VerifyOutcome['tests'] }> {
+  /**
+   * `durationMs` is passed only where the suite *finished*, which is a narrower thing
+   * than `ran`. A suite killed at the deadline ran and produced no measurement of how
+   * long it takes — only of how much was left — and handing that number to the retry
+   * loop as "what the gate needs next time" would be quoting the budget back at itself.
+   */
   const fail = (
     detail: string,
     ran: boolean,
-  ): { gate: GateResult; tests: { ran: boolean; passed: boolean } } => ({
+    durationMs?: number,
+  ): { gate: GateResult; tests: { ran: boolean; passed: boolean; durationMs?: number } } => ({
     gate: { name: TESTS_LENS, method: 'tool', passed: false, detail },
-    tests: { ran, passed: false },
+    tests: { ran, passed: false, ...(durationMs === undefined ? {} : { durationMs }) },
   })
 
   /**
@@ -216,6 +290,7 @@ async function testsCheck(
       `\`${input.testCommand}\` exited ${code ?? 'on a signal'} after ${elapsed}s` +
         output(tail, stderr),
       true,
+      Date.now() - startedAt,
     )
   }
   return {
@@ -227,7 +302,138 @@ async function testsCheck(
       // seconds" is how a person notices a command that is not running the suite at all.
       detail: `\`${input.testCommand}\` passed in ${elapsed}s`,
     },
-    tests: { ran: true, passed: true },
+    tests: { ran: true, passed: true, durationMs: Date.now() - startedAt },
+  }
+}
+
+/**
+ * The lenses that grade the artefact a modifier actually produced.
+ *
+ * §4.10's table has said `build, test, lint, diff size` for a modifier since it was
+ * written, and three of those four are the project's own `tests.command` under different
+ * names — a repository that lints in CI lints in `tests.command`, and one that does not
+ * would not be linted by a lens either. `diff size` is real and is *already* recorded: the
+ * extraction note carries files, commits and bytes onto the timeline every run, and the
+ * only thing a lens would add is a threshold nobody can derive. So what is here instead
+ * are the two questions the suite structurally cannot answer, both about the patch as a
+ * *published artefact* rather than as code.
+ *
+ * Both are deterministic, and that is not an economy — it is that neither needs judgment.
+ * "Does this message contain a closing keyword" is a regex GitHub itself publishes the
+ * rules for. What genuinely needs an agent lens is listed in §4.10 and deliberately not
+ * built: whether the diff is one change or four, whether a test was weakened to make the
+ * suite green, whether the message explains the repair rather than restating the finding.
+ * Those are the reviewer-lens calibration problem again, and there is one merged modifier
+ * patch in existence to calibrate against.
+ */
+function patchLens(name: string, input: VerifyInput): GateResult {
+  /**
+   * Nothing to look at, so nothing is claimed. A modifier that changed nothing reaches
+   * here, and reporting `passed: true` would mean the ledger could not tell a patch whose
+   * messages were read and cleared from a run that had no messages at all (principle 6).
+   */
+  if (!input.patch) {
+    return {
+      name,
+      method: 'tool',
+      passed: true,
+      detail: 'this run produced no patch, so there was nothing for this lens to read',
+    }
+  }
+  return name === COMMIT_MESSAGE_LENS
+    ? commitMessageCheck(input.patch)
+    : selfGatingCheck(input.patch)
+}
+
+/**
+ * GitHub's own closing-keyword grammar, as narrowly as it can be written.
+ *
+ * `close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved`, any case, optionally
+ * followed by a colon, then whitespace, then an issue reference — and the reference has
+ * to come *immediately* after. That last part is the whole difference between this lens
+ * and a broken one: `skills/fix-a-finding` tells a modifier to write "the bug reported in
+ * #14", which is a sentence GitHub does not act on, and a check that flagged every `#14`
+ * near the word "fixes" would refuse the exact phrasing the skill recommends.
+ *
+ * Four reference forms, because GitHub honours all four: `#14`, `GH-14`, `owner/repo#14`,
+ * and a full issue URL. Missing one means the gate reads as enforced and is not.
+ */
+const CLOSING_KEYWORD =
+  /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b\s*:?\s+(?:#\d+|GH-\d+|[\w.-]+\/[\w.-]+#\d+|https?:\/\/\S+?\/issues\/\d+)/i
+
+function commitMessageCheck(patch: PatchFacts): GateResult {
+  for (const message of patch.messages) {
+    for (const line of message.split('\n')) {
+      const hit = CLOSING_KEYWORD.exec(line)
+      if (!hit) continue
+      return {
+        name: COMMIT_MESSAGE_LENS,
+        method: 'tool',
+        passed: false,
+        detail:
+          `a commit message in this patch says "${hit[0].trim()}", which closes that issue ` +
+          'on GitHub the moment the branch merges. Nothing downstream can strip it: the ' +
+          'pull request body fences agent prose, but GitHub scans the commit messages ' +
+          'themselves and rewriting one would destroy the artefact a person is reviewing ' +
+          `(ADR-0009). The offending line is: ${line.trim().slice(0, 200)}`,
+      }
+    }
+  }
+
+  /**
+   * A pass that is not silent, because the interesting case passes.
+   *
+   * A patch whose only commit is the runner's sweep-up is a pull request with no
+   * explanation in it — the title becomes "Work the agent left uncommitted" and the body
+   * quotes the harness's own words back as "what the agent said it did". That is worth
+   * saying out loud and it is *not* worth refusing over: the sweep-up commit exists to
+   * save work that would otherwise be deleted with the workspace seconds later, and a
+   * gate that threw it away would make the net pointless. It is also already unmistakable
+   * in `git log`, which is what it was designed for.
+   */
+  if (patch.sweptUp) {
+    return {
+      name: COMMIT_MESSAGE_LENS,
+      method: 'tool',
+      passed: true,
+      detail:
+        `no closing keyword, but this patch contains a "${SWEEP_UP_SUBJECT}" commit — the ` +
+        'agent left work in the worktree and the runner committed it under a message ' +
+        'nobody wrote. The pull request is that much harder to review.',
+    }
+  }
+  return { name: COMMIT_MESSAGE_LENS, method: 'tool', passed: true }
+}
+
+/**
+ * Does this patch edit the file that decides whether it is publishable?
+ *
+ * **Passes either way, and says so when it is true.** Refusing was considered and is
+ * wrong: `.ogun/config.yaml` is a file in the repository like any other, a reviewer can
+ * legitimately file a finding about it, and `references/making-a-change.md` §7 already
+ * tells a modifier that changing it is allowed so long as the message says so plainly.
+ * A gate that refused would make one file unfixable by the machinery built to fix files.
+ *
+ * What the check is *for* is that the edit cannot hide. The gates were read from the blob
+ * at the pinned base before the agent started, so nothing an agent writes here changes
+ * how it is judged — but "the agent edited its own exam paper, and it had no effect" is
+ * the single most important sentence a person can be handed before they read the diff,
+ * and it must not depend on them noticing one path in a file list.
+ */
+const GATE_PATHS = ['.ogun/config.yaml']
+
+function selfGatingCheck(patch: PatchFacts): GateResult {
+  const touched = patch.paths.filter((p) => GATE_PATHS.includes(p))
+  if (touched.length === 0) return { name: SELF_GATING_LENS, method: 'tool', passed: true }
+  return {
+    name: SELF_GATING_LENS,
+    method: 'tool',
+    passed: true,
+    detail:
+      `this patch edits ${touched.join(', ')}, which is where this project declares the ` +
+      'test command and the policies that gate publication. The gate read the blob at the ' +
+      'pinned base, so the edit changed nothing about how this run was judged — but a ' +
+      'person reviewing the pull request should know it is in there.',
   }
 }
 

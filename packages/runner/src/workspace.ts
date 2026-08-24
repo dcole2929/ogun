@@ -116,6 +116,57 @@ export async function stageAll(workspace: string): Promise<void> {
 }
 
 /**
+ * Take the gate's own leavings back out of the workspace, between one retry round and
+ * the next.
+ *
+ * A suite writes into the tree it is run against — `coverage/`, a compiled `dist/`, a
+ * `.pytest_cache`, a database dump. Extraction is the reason that has never mattered: it
+ * takes the patch *before* the gate runs, so whatever the suite drops is deleted along
+ * with the workspace moments later. A retry breaks that. The workspace is reused (§5.2),
+ * so the next round's extraction begins with `git add -A` over a tree that now contains
+ * both the agent's work and the previous gate's droppings, and commits the lot under
+ * "work the agent left uncommitted" — into a pull request.
+ *
+ * The invariant that makes this cheap: extraction committed everything before the gate
+ * ran, so at the moment the gate started the worktree was identical to `HEAD`. Anything
+ * untracked afterwards is the gate's, and `git clean -fd` — without `-x`, so an ignored
+ * `node_modules` the next round needs is left alone — is exactly the right instrument.
+ *
+ * **Tracked files are reported, not restored.** `git checkout`/`git restore` would put
+ * them back, and both apply `.gitattributes` smudge filters, which name arbitrary
+ * commands and are content the agent wrote — the same shape as the `core.fsmonitor`
+ * exposure `GIT_HARDENING` exists for, and one that `-c` overrides cannot close because
+ * a filter is named per attribute. So a suite that modifies tracked content is answered
+ * by refusing the retry rather than by running the agent's filters as the runner. It is
+ * a fact about the project's suite, it is rare, and a refusal that names the files is
+ * worth more than a repair nobody would trust.
+ */
+export async function sweepGateArtifacts(
+  workspace: string,
+): Promise<{ removed: string[]; dirty: string[] }> {
+  /**
+   * Asked before the removal rather than read out of it. `git clean` reports what it did
+   * as `Removing <path>`, which is a *translated* string — on a host with a non-English
+   * locale the note would be empty or wrong, and a note nobody can trust is worse than
+   * no note. `ls-files -z` is machine output and says the same thing a moment earlier.
+   */
+  const untracked = await gitIn(workspace, [
+    'ls-files',
+    '--others',
+    '--exclude-standard',
+    '-z',
+  ])
+  const removed = untracked.stdout.split('\0').filter(Boolean)
+
+  // `-d` without `-ff`, so a nested repository a suite happened to clone is left alone
+  // rather than deleted from under the next round.
+  await gitIn(workspace, ['clean', '-fdq'])
+
+  const diff = await gitIn(workspace, ['diff', '--name-only', ...DIFF_SAFE, 'HEAD'])
+  return { removed, dirty: diff.stdout.split('\n').filter(Boolean) }
+}
+
+/**
  * Git configuration the workspace is not allowed to supply, for every git command the
  * runner runs there **after** the container has exited.
  *
@@ -146,6 +197,21 @@ export const GIT_HARDENING = [
   '-c',
   'diff.external=',
 ]
+
+/**
+ * Diff options that stop the *repository* deciding how a diff is produced.
+ *
+ * `.gitattributes` is content the agent can write, and it can name a diff driver whose
+ * `textconv` or `command` is an arbitrary shell command; `diff.external` in the config it
+ * also controls does the same for every diff. Those run on the host, as the runner, at
+ * the moment the runner asks what changed. Demonstrated: a `diff.external` of
+ * `sh -c 'echo pwned > …'` fires on a plain `git diff` and does not fire with these.
+ *
+ * Lives here beside `GIT_HARDENING` rather than in `patch.ts`, where it was written: it
+ * is the diff-shaped half of the same rule, and the sweep between retry rounds needs it
+ * too. Two copies of a hardening list is one copy that stops being updated.
+ */
+export const DIFF_SAFE = ['--no-ext-diff', '--no-textconv']
 
 /**
  * And nothing from the *host's* git configuration either.
