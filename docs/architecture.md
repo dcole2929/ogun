@@ -188,12 +188,34 @@ Guards, each at the scope where its scarce resource actually lives:
 | Guard | Scope | v1? |
 |---|---|---|
 | Concurrent jobs | global (machine) | **yes** — start at 2; WSL2 will OOM otherwise |
+| Concurrent modifiers | project | **yes** — `policies.maxConcurrentModifiers`, default 1 |
 | Consecutive-failure breaker | worker × project | **yes** — ~30 lines, prevents the real disaster |
 | Modifier verifiability | project | **yes** — no image or no test command, no modifier |
 | Credential preflight | runtime × host | **yes** — a job that cannot log in is refused, not dispatched |
 | Runs per day | worker × project | defer |
 | Token budget per day | global, per runtime | defer |
-| Open agent PRs | project | defer (phase 3) |
+| Open agent PRs | project | **built** — `policies.maxOpenPullRequests`, at publish (ADR-0009) |
+
+**The two project-scoped numbers come from `projects.policies`, not from a constant.**
+[settled] They were in `.ogun/config.yaml`, parsed, posted by sync — and dropped on
+arrival, because there was no column and `applySync` never read the field.
+`failureBreakerThreshold: 5` meant three, out of `DEFAULT_LIMITS`, and the Workers page
+kept a third copy of that same 3 to tell you how close a worker was to tripping. The
+threshold now has one home; `AdmissionLimits` carries only what is genuinely the machine's.
+See §4.9 for which policies live in the database and which are read from git, and why that
+must not be tidied into one.
+
+**Concurrent modifiers is answered in two places, and the split is the design.** A cap of
+*zero* is a fact about the config — the project has switched modifiers off — so admission
+refuses, which writes a `skipped` job and a `refused` coverage row naming the line to
+edit. A cap that is merely *full right now* is a fact about this minute, and admission is
+the wrong place for it twice over: admission runs before any of the run's own jobs are in
+flight, so at the moment it would count there is nothing to count, and its refusals are
+permanent. Dropping tonight's second modifier because tonight's first is still going would
+be a worse bug than not having the limit. So the claim holds those jobs back instead —
+still `queued`, nothing recorded, taken on a later poll — per project, never against one
+global counter, since a busy repository throttling a quiet one is a rule neither
+`config.yaml` mentions.
 
 **The credential preflight.** [settled] Both agent CLIs authenticate with OAuth access
 tokens that expire, and the gateway does not refresh them — it re-reads the file the
@@ -789,7 +811,6 @@ because there is one procedure, not seventeen.
 # repo/.ogun/config.yaml
 project:
   name: ogun
-extends: [ogun://typescript]
 
 workers:
   security:
@@ -818,11 +839,64 @@ workers:
       - "*.crates.io"
 
 policies:
+  # Read by the runner from the git blob at the pinned base — never from the workspace
+  # and never from the database. See "Where each policy is read from" below.
   directPush: false
   allowSandboxDowngrade: false
-  maxConcurrentModifiers: 1
   maxOpenPullRequests: 3   # the publisher's cap, counted live on the remote
+
+  # Stored on the project row by `ogun project sync`, read by the foreman.
+  maxConcurrentModifiers: 1
+  failureBreakerThreshold: 3
 ```
+
+**`extends:` is gone.** [breaking] It was declared in the schema and shown here, and it
+was read by nothing — no loader resolved a base config and no worker ever inherited a
+field. A config that sets it now fails to parse and says so. Deleting the key quietly was
+the other option and is worse: zod strips what it is not told about, so every config still
+carrying the line would go on being ignored with nothing left to explain why. If config
+inheritance is ever built it may have this name back; what it may not do is take it back
+without anyone noticing.
+
+#### Where each policy is read from, and why it is not one place
+
+The `policies:` block is one block in one file, read by two processes out of two different
+copies of that file. The split is what makes half of it trustworthy, so it is worth being
+explicit before somebody tidies it up.
+
+| Policy | Read from | By | Because |
+|---|---|---|---|
+| `directPush` | git blob at the pinned base | runner | a gate on what the agent's own work may become |
+| `allowSandboxDowngrade` | git blob at the pinned base | runner | ditto — and the workspace it would contain is one the agent can write |
+| `maxOpenPullRequests` | git blob at the pinned base | publisher | ditto (ADR-0009) |
+| `maxConcurrentModifiers` | `projects.policies` | foreman, at admission and at claim | a scheduling decision, taken before a sandbox exists |
+| `failureBreakerThreshold` | `projects.policies` | foreman, at finalize | ditto |
+
+The first three are read with `git show <baseSha>:.ogun/config.yaml` because a modifier
+has write access to its own checkout: one line appended to `config.yaml` in the workspace
+and `maxOpenPullRequests` is 999. The blob at the pinned base is the copy a person reviewed
+and merged, and it is the only one the agent could not reach. **They have no stored copy on
+purpose.** A copy in postgres would be a second answer to a question that must have one,
+sitting in the place a later caller looks first, and looking exactly as authoritative as
+the real one.
+
+The last two are the reverse case. The control plane decides them before there is a
+sandbox at all, so the agent has no way to influence them — and the runner has no business
+re-deriving a scheduling rule from a file it fetched. `ogun project sync` posts them and
+they live on the `projects` row.
+
+This is enforced in types rather than by remembering. `controlPlanePoliciesSchema` and
+`pinnedPoliciesSchema` in `core/src/config/project.ts` each carry only their own half;
+`readPolicies` returns the pinned half, the `projects.policies` column holds the
+control-plane half, and the sync payload accepts only the control-plane half — so an older
+CLI posting the whole block has the rest stripped at the door. `project.policies
+.maxOpenPullRequests` does not compile, and neither does asking the pinned blob for a
+breaker threshold.
+
+A project that has not synced since the column existed has `policies` null, which resolves
+to the schema defaults and reports itself as `unsynced`. That is deliberately not the same
+value as a project whose config asks for the defaults (principle 6): one is a config we
+read, the other is a guess, and only `source` can tell them apart.
 
 ### 4.10 Verification
 
@@ -1474,7 +1548,8 @@ loop doing the thing it exists to do, on day one.
 
 **Phase 2 — the factory runs itself.** In progress.
 
-Done: the job queue, the global concurrency cap, the failure breaker, and cron —
+Done: the job queue, the global concurrency cap, the per-project modifier cap, the failure
+breaker reading the threshold the project actually set, and cron —
 evaluated in-process, re-scanned rather than registered once so adding a worker needs no
 restart, with `skip` and `runOnce` deciding what happens to an occurrence the machine
 slept through. Schedules are editable from the UI. The findings inbox is the home screen.

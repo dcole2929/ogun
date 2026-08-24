@@ -9,7 +9,7 @@ import {
   writeSecretFile,
   type ClaimedJob,
   type GateResult,
-  type Policies,
+  type PinnedPolicies,
   type RunEvent,
   type RunOutcome,
   type RunReport,
@@ -254,8 +254,15 @@ export async function executeJob(
      * treats `undefined` as "this project's policy could not be established" and takes
      * the strict side of whatever it was deciding: the publisher withholds the pull
      * request, and the gate immediately below refuses the run.
+     *
+     * `PinnedPolicies` and not `Policies`: `readPolicies` returns only the half that
+     * belongs in a repository. `failureBreakerThreshold` and `maxConcurrentModifiers` are
+     * scheduling decisions the control plane has already made and stores on the project
+     * row, and the runner answering either of them from a file it fetched would be a
+     * second answer to a settled question. The type is what keeps that from happening
+     * quietly the next time someone needs a number here.
      */
-    const policies: Policies | undefined = pinned === undefined ? undefined : readPolicies(pinned)
+    const policies: PinnedPolicies | undefined = pinned === undefined ? undefined : readPolicies(pinned)
 
     /**
      * Whether this job may run in the sandbox its worker asked for — the containment
@@ -754,7 +761,7 @@ async function publishIfReady(input: {
   scratch: string
   patchRef: string
   baseSha: string
-  policies?: Policies
+  policies?: PinnedPolicies
   tests: { run?: boolean; passed?: boolean }
 }): Promise<void> {
   const note = (text: string, fields: Record<string, unknown> = {}): void => {
@@ -894,7 +901,7 @@ export function sandboxDowngrade(input: {
   sandbox: 'container' | 'worktree'
   permissions: 'observer' | 'reviewer' | 'modifier'
   /** From the blob at `baseSha`. `undefined` means it could not be read. */
-  policies: Policies | undefined
+  policies: PinnedPolicies | undefined
   /** Named in the refusal, because "which copy of the config" is the whole question. */
   baseSha: string
 }): { allow: boolean; refusal?: string } {
