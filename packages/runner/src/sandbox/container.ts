@@ -262,23 +262,70 @@ export function createContainerSandbox(opts: ContainerOptions): Sandbox {
     readFile: (relPath) => readContained(opts.hostWorkspace, relPath),
     dispose: async () => {
       /**
-       * The token dies first, before the containers are torn down.
+       * The token dies first, and now that is the whole of the credential story.
        *
-       * That is the opposite of the ordering this used to have, and the reason it
-       * changed is that revoking is not closing. Closing the old per-sandbox proxy first
-       * would drop a live tunnel and fail the agent's last request on the way out of a
-       * job that had already finished. Revoking only affects the *next* CONNECT, and a
-       * container we are about to `docker rm -f` has no legitimate next request — while
-       * `docker rm -f` can hang or fail, and a token that outlived a container we failed
-       * to remove is exactly the leak §3.1 revokes for.
+       * The ordering has always been revoke-then-remove, but the reason written here used
+       * to be a smaller claim than it looked: revoking deleted the token, the token was
+       * checked once per CONNECT, and so a tunnel the container had *already* opened kept
+       * being handed the host's live credentials on every request until something else
+       * closed the socket. The comment leaned on `docker rm -f` to be that something else,
+       * and then acknowledged in the same breath that `docker rm -f` can hang or fail. The
+       * two halves did not add up: the case it named as the leak was exactly the case
+       * nothing covered.
+       *
+       * `revoke()` now closes what the token opened — every tunnel, every upgraded
+       * WebSocket — and every request inside one re-checks the grant besides. So this call
+       * ends the container's reach at the moment the job ends, on its own, whatever docker
+       * does next. `docker rm -f` is back to being what it should always have been: a
+       * resource cleanup, not a security control.
+       *
+       * Still first, and still for a reason. A container we are about to force-remove has
+       * no legitimate request left to make — every `exec()` has already resolved, so its
+       * `docker run` has already exited — and a job that is finishing cleanly has nothing
+       * open for this to interrupt. Reversing it would leave a window between the last
+       * container dying and the token dying, which is the window §3.1 exists to close.
        */
       session?.revoke()
-      // --rm handles the normal path; this catches a container left behind by a kill —
-      // including the verification one, which is exactly the container most likely to
-      // have been killed, since the gate is what runs against a deadline.
+      /**
+       * --rm handles the normal path; this catches a container left behind by a kill —
+       * including the verification one, which is exactly the container most likely to have
+       * been killed, since the gate is what runs against a deadline.
+       *
+       * The failure is reported rather than swallowed, which it was not before. Swallowing
+       * it was understandable — on the normal path there is nothing here to remove, `--rm`
+       * having already done it, and a report that could not tell that from a real failure
+       * would print a line per job and be muted inside a week. The answer is to tell the
+       * two apart rather than to say nothing. An already-gone container is the expected
+       * outcome and stays silent; a daemon that is wedged, out of disk, or refusing the
+       * removal leaves a container holding a workspace bind-mount and a `--name` the next
+       * job of this worker will collide with, and nothing else in the system would ever
+       * mention it.
+       *
+       * What this is no longer reporting is a credential leak. It was one before — the
+       * revoked token did not close the tunnels the container had already opened, so a
+       * container that survived this call went on spending the host's credentials. Now
+       * `revoke()` above has ended its reach whatever docker does, and what is left to
+       * report is a resource leak, which is why this warns instead of failing the run.
+       *
+       * Warned, never thrown. `dispose()` runs in the pipeline's `finally` and its own
+       * caller already discards what it throws, so a throw here would be swallowed one
+       * level up *and* would skip the stub-directory removal below — trading a reported
+       * leak for two silent ones.
+       */
       for (const name of [opts.name, verificationName(opts.name)]) {
-        await spawnJsonl('docker', ['rm', '-f', name], { timeoutMs: 15_000 }).done.catch(
-          () => undefined,
+        const removal = await spawnJsonl('docker', ['rm', '-f', name], {
+          timeoutMs: 15_000,
+        }).done.catch((err: unknown) => ({
+          code: null,
+          stderr: err instanceof Error ? err.message : String(err),
+          timedOut: false,
+        }))
+        if (removal.code === 0 || alreadyGone(removal.stderr)) continue
+        console.warn(
+          `[runner] ${name}: docker rm -f did not remove the container` +
+            `${removal.timedOut ? ' (timed out after 15s)' : ''} — its egress token is ` +
+            'revoked and its tunnels are closed (ADR-0010), so it can no longer reach ' +
+            `anything, but it is still holding host resources: ${lastLine(removal.stderr)}`,
         )
       }
       // The stubs go after the containers, not before: a container still shutting down
@@ -289,6 +336,31 @@ export function createContainerSandbox(opts: ContainerOptions): Sandbox {
     },
   }
 }
+
+/**
+ * The one `docker rm -f` failure that is not a failure: there was nothing to remove.
+ *
+ * `--rm` removes the container as the run exits, so on every clean job this command is
+ * asked for a container that is already gone — which is the *expected* outcome, not an
+ * error, and must not produce a line in the runner's log.
+ *
+ * Two checks rather than one because docker does not answer this the same way everywhere.
+ * Current versions exit 0 for a missing container under `-f` (verified on the docker this
+ * was written against); older ones exit 1 with `Error: No such container: …`. The caller
+ * accepts exit 0, and this accepts the message — matched on the message rather than on the
+ * code, because a bare exit 1 is also what a wedged daemon gives and separating those two
+ * is the entire point of reporting at all.
+ */
+const alreadyGone = (stderr: string): boolean => /no such container/i.test(stderr)
+
+/**
+ * The last thing docker said, not the whole of it.
+ *
+ * `spawnJsonl` keeps up to 64KB of stderr, and a wedged daemon can fill it. One line is
+ * what makes the warning readable in a runner log that is mostly job output.
+ */
+const lastLine = (stderr: string): string =>
+  stderr.trim().split('\n').at(-1)?.trim() || 'no output from docker'
 
 /**
  * A verification command runs in its own container, under its own name.

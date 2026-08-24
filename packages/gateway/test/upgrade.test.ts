@@ -1,4 +1,5 @@
 import { strict as assert } from 'node:assert'
+import type { Duplex } from 'node:stream'
 import { after, test } from 'node:test'
 import {
   openRawTunnel,
@@ -50,6 +51,24 @@ const openai = async (allowedHosts?: readonly string[]): Promise<Harness> => {
 
 /** The handshake a container's CLI actually sends, minus the frames. */
 const CODEX_PATH = '/backend-api/codex/responses'
+
+/**
+ * Did this socket go down, or is it still up after a generous wait?
+ *
+ * Returns rather than throws, so a failure names the property instead of surfacing as a
+ * suite timeout with nothing attached to it.
+ */
+const closed = (socket: Duplex, timeoutMs = 5_000): Promise<boolean> =>
+  new Promise((resolve) => {
+    if (socket.destroyed || socket.readableEnded) return resolve(true)
+    const timer = setTimeout(() => resolve(false), timeoutMs)
+    const done = (): void => {
+      clearTimeout(timer)
+      resolve(true)
+    }
+    socket.once('close', done)
+    socket.once('end', done)
+  })
 
 test('a websocket handshake completes through the tunnel and relays bytes both ways', async () => {
   /**
@@ -268,6 +287,103 @@ test('an upgrade with no host credential is answered by the gateway, not by the 
   assert.match(result.body, /no_credential/)
   assert.equal(harness.upstream.upgraded.length, 0)
   socket.destroy()
+})
+
+/**
+ * The longest-lived connection the gateway holds, and the one a fix aimed only at
+ * `'request'` would leave uncovered.
+ *
+ * Codex runs its whole model turn over `wss://chatgpt.com/backend-api/codex/responses`, so
+ * on that runtime the *typical* connection is one that outlives every request-shaped thing
+ * on it — it is checked once at CONNECT, once at the handshake, and then it is two
+ * pipelines relaying opaque bytes with no further reference to `sessions` anywhere. If
+ * revocation only reaches tunnels that are between requests, the connection most likely to
+ * still be spending the host's credential after the job ends is the one it cannot touch.
+ *
+ * The naive implementation to catch here is a re-check bolted onto the `'request'` handler
+ * only: it passes every test on the request path and changes nothing at all about this one.
+ */
+test('revoking a token tears down the websocket that token opened', async () => {
+  const harness = await openai()
+  const session = harness.gateway.open(undefined, ['chatgpt.com'])
+  const tunnel = await openRawTunnel(harness, { token: session.token, hostname: 'chatgpt.com' })
+
+  const result = await speakUpgrade(tunnel, CODEX_PATH, { host: 'chatgpt.com' })
+  assert.equal(result.status, 101, 'the turn is live before the job ends')
+  assert.equal(
+    harness.upstream.upgraded[0]?.headers.authorization,
+    'Bearer oai-REAL-ACCESS-TOKEN',
+    'and it is carrying the real credential, which is what makes it worth closing',
+  )
+
+  // The upstream echoes, so a frame that comes back is a frame that crossed the relay.
+  const echo = result.next()
+  result.socket.write('BEFORE-REVOKE')
+  assert.equal((await echo).toString('utf8'), 'BEFORE-REVOKE')
+
+  session.revoke()
+
+  assert.equal(await closed(tunnel), true, 'the socket carrying the turn is gone')
+  // And the relay with it: a frame written after the revoke has nowhere to go. Asserted as
+  // "nothing comes back" rather than as a write error, because a destroyed socket swallows
+  // the write locally and the observable fact is the silence.
+  const afterRevoke = await Promise.race([
+    result.next().then((chunk) => chunk.toString('utf8')),
+    new Promise<string>((resolve) => setTimeout(() => resolve('<nothing>'), 500)),
+  ])
+  assert.equal(afterRevoke, '<nothing>')
+})
+
+/**
+ * The same property on the plain door, because an upgrade can arrive in absolute form
+ * straight at the proxy port with no tunnel in front of it.
+ *
+ * That socket never becomes a `TLSSocket` and never carries an `ogunAuthority`, so a fix
+ * that hangs its bookkeeping off the CONNECT handler alone misses it — and what it misses
+ * is, again, a connection that is authenticated once and then relays for as long as it
+ * likes with the host's credential already spliced into its handshake.
+ */
+test('revoking a token tears down an absolute-form upgrade too', async () => {
+  const harness = await openai()
+  const session = harness.gateway.open(undefined, ['chatgpt.com'])
+  const socket = await proxySocket(harness)
+
+  const result = await speakUpgrade(socket, `https://chatgpt.com${CODEX_PATH}`, {
+    host: 'chatgpt.com',
+    proxyToken: session.token,
+  })
+  assert.equal(result.status, 101)
+
+  session.revoke()
+  assert.equal(await closed(socket), true, 'the relayed socket goes down with the token')
+})
+
+/**
+ * Revocation is surgical on this door as well.
+ *
+ * `revoke()` runs at the end of every job on a gateway shared by every container on the
+ * host, so an implementation that closed "the open sockets" rather than "this session's
+ * open sockets" would end one job by cutting the model turn of every other job on the
+ * machine. On the WebSocket path that damage is maximal: the turn is the connection.
+ */
+test("revoking one session leaves another session's websocket alone", async () => {
+  const harness = await openai()
+  const ending = harness.gateway.open(undefined, ['chatgpt.com'])
+  const running = harness.gateway.open(undefined, ['chatgpt.com'])
+
+  const doomed = await openRawTunnel(harness, { token: ending.token, hostname: 'chatgpt.com' })
+  const survivor = await openRawTunnel(harness, { token: running.token, hostname: 'chatgpt.com' })
+  await speakUpgrade(doomed, CODEX_PATH, { host: 'chatgpt.com' })
+  const alive = await speakUpgrade(survivor, CODEX_PATH, { host: 'chatgpt.com' })
+  assert.equal(alive.status, 101)
+
+  ending.revoke()
+  assert.equal(await closed(doomed), true)
+
+  const echo = alive.next()
+  alive.socket.write('STILL-RELAYING')
+  assert.equal((await echo).toString('utf8'), 'STILL-RELAYING')
+  survivor.destroy()
 })
 
 test('an upstream that declines to upgrade is reported as its own status, not as a dropped socket', async () => {

@@ -155,12 +155,66 @@ find a directory where it expects its credential file and fail with something th
 nothing like an egress fault.
 
 `dispose()` reverses it: `session.revoke()` **first**, then `docker rm -f` on both
-containers, then the stub directory. Revoking first is the opposite of the ordering the
-per-sandbox proxy had, and the difference is that revoking is not closing — closing a proxy
-first drops a live tunnel and fails the agent's last request, while revoking only affects
-the *next* CONNECT, and a container about to be force-removed has no legitimate next
-request. `docker rm -f` can hang; a token that outlived a container we failed to remove is
-exactly the leak the revoke exists for.
+containers, then the stub directory.
+
+Revoking **is** closing, and for a long time it was not. `revoke()` used to be
+`sessions.delete(token)` and nothing more, and the token is consulted exactly once — on the
+CONNECT that builds a tunnel. After that, TLS is terminated and the plaintext socket is fed
+to an HTTP server that reads its target off the socket and calls `prepare()`, which
+re-reads the host's live credential file on *every* request. So a tunnel opened while the
+token was alive kept receiving freshly spliced, currently-valid credentials for as long as
+it stayed open, no matter how many times `revoke()` was called. The comment in
+`container.ts` named the leak — "a token that outlived a container we failed to remove" —
+and then leaned on `docker rm -f` to close it, in the same breath as admitting `docker
+rm -f` can hang or fail. The case it named was the case nothing covered. Under this
+component's threat model that is not a corner: the adversary is a prompt-injected agent,
+which can hold a socket open on purpose with a heartbeat request.
+
+It is now two halves, because either alone has a gap:
+
+- **Every connection is remembered by the session that opened it**, and `revoke()` destroys
+  them — the CONNECT tunnels, and the upgraded relays on the absolute-form door which never
+  become tunnels at all. The bookkeeping is one rule: added when the connection is
+  accepted, removed on its `'close'`. A map of sockets that only grows would be its own bug
+  in a process meant to run for weeks. `close()` does the same sweep for every session at
+  once — `proxy.closeAllConnections()` does not reach these, because `node:http` stops
+  tracking a socket the moment it hands it to `'connect'` or `'upgrade'`.
+- **Every request re-checks the grant**, on the intercepted `'request'` and `'upgrade'`
+  doors, by comparing the `Session` marked on the socket at CONNECT against the one the map
+  holds now. In the ordinary case this never fires, which is the point: it covers a request
+  that crossed the revoke in flight, and it means "does this connection still have a grant"
+  is not answered solely by a `Set` being correct. A revoked tunnel answers `403
+  session_revoked` with `x-should-retry: false` — not `407`, because inside the tunnel the
+  client believes it is talking to the provider and a proxy challenge from the provider is
+  both nonsense and an invitation to retry forever.
+
+Revocation is per session, never global. `revoke()` runs at the end of *every* job on a
+gateway shared by every container on the host, so closing "the open sockets" instead of
+"this session's open sockets" would end one job by cutting the model turn of every other
+job on the machine — and on the Codex path, where the turn *is* the connection, that is
+total. Two tests hold that line, one per door.
+
+Tearing down does not disturb a job that is finishing cleanly, and that is a property of
+where `dispose()` is called rather than of timing: it runs in the pipeline's `finally`,
+after every `exec()` has resolved, so every `docker run` for the job has already exited. A
+socket still open at that moment belongs to a container that outlived its run. The
+verification container is covered by the same fact — it is another `exec()` on the same
+session and has long since exited too.
+
+Revoking still goes first. A container about to be force-removed has no legitimate request
+left to make, and reversing the order would leave a window between the last container dying
+and the token dying.
+
+`docker rm -f` is consequently back to being a resource cleanup rather than a security
+control, and its failure is now **reported**. It used to be swallowed with
+`.catch(() => undefined)`, which was defensible only because on the normal path the command
+fails: `--rm` has already removed the container, so `docker rm -f` says "No such container".
+On the normal path there is nothing here to remove and the command says so, and a report
+that could not tell that from a real failure would print a line per job and be muted inside
+a week — so the two are told apart. An already-gone container is silent (exit 0 on current
+docker, `No such container` on older); a daemon that is wedged, out of disk, or refusing
+the removal gets one warning naming the container and what docker said. Warned, never thrown: `dispose()`'s caller discards what it throws, so a throw would
+be swallowed one level up *and* skip the stub-directory removal below it.
 
 ### 3.2 One gateway, or one per sandbox
 
@@ -346,6 +400,13 @@ Worth recording, because the tests that existed at the time did not catch any of
 - **The streaming test was vacuous.** It timed when the *upstream* saw the request, which a
   fully buffering proxy does exactly as fast. It would have passed against an
   implementation it was written to distinguish from.
+- **`revoke()` only blocked the next CONNECT.** The token is checked once, when the tunnel
+  is built; every request inside it thereafter took its target off the socket and re-read
+  the host's live credential file, with nothing on that path ever consulting `sessions`
+  again. A tunnel opened while the token was alive went on being handed real, current
+  credentials for as long as it stayed open — and the upgrade doors, which hold the
+  longest-lived sockets in the component, were worse: after the 101 they are two pipelines
+  relaying bytes with no further reference to anything. See §3.1.
 
 The pattern is worth naming: every bug was in a path with no test, and the one bad test was
 bad in the specific way that made it pass. Coverage now includes the absolute-form door,

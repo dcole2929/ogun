@@ -80,6 +80,47 @@ const waitFor = async (condition: () => boolean, message: string, timeoutMs = 5_
 }
 
 /**
+ * Did this socket go down, or is it still up after a generous wait?
+ *
+ * Returns rather than throws, so the assertion that fails names the property — "revoke
+ * tore the tunnel down" — instead of surfacing as a timeout somewhere in the harness.
+ */
+const closed = (socket: Socket, timeoutMs = 5_000): Promise<boolean> =>
+  new Promise((resolve) => {
+    if (socket.destroyed || socket.readableEnded) return resolve(true)
+    const timer = setTimeout(() => resolve(false), timeoutMs)
+    const done = (): void => {
+      clearTimeout(timer)
+      resolve(true)
+    }
+    socket.once('close', done)
+    socket.once('end', done)
+  })
+
+/**
+ * A request whose failure is part of the answer, plus a guard against it doing neither.
+ *
+ * A revoked tunnel may refuse the request or may simply be gone, and both are correct — so
+ * the test has to be able to look at either. The third outcome, hanging forever, is the one
+ * that must not be reported as a passing test or as an inscrutable suite timeout: a client
+ * left waiting on a budget it will burn to zero is its own failure mode, and it gets a name
+ * here rather than a stack trace.
+ */
+type Settled<T> =
+  | { kind: 'answered'; value: T }
+  | { kind: 'failed'; error: Error }
+  | { kind: 'hung' }
+
+const settle = <T,>(work: Promise<T>, timeoutMs = 5_000): Promise<Settled<T>> =>
+  Promise.race([
+    work.then(
+      (value): Settled<T> => ({ kind: 'answered', value }),
+      (error: Error): Settled<T> => ({ kind: 'failed', error }),
+    ),
+    new Promise<Settled<T>>((resolve) => setTimeout(() => resolve({ kind: 'hung' }), timeoutMs)),
+  ])
+
+/**
  * The proxy's other door: an absolute-form request URI sent straight at the proxy port,
  * with no CONNECT and no tunnel.
  *
@@ -540,6 +581,99 @@ test('a revoked session token stops working immediately', async () => {
       .connect,
     407,
   )
+})
+
+/**
+ * The half of revocation that the token check cannot reach.
+ *
+ * The property: after `revoke()`, a tunnel the token opened *while it was live* carries
+ * nothing more. Not "the next CONNECT is refused" — that was already true, and it is not
+ * what `revoke()` is documented to mean or what ADR-0010 §3.1 rests on.
+ *
+ * What a naive implementation gets wrong, and what this codebase actually shipped:
+ * `revoke()` was `sessions.delete(token)` and nothing else. The token is consulted exactly
+ * once, on the CONNECT that builds the tunnel; from there TLS is terminated and the
+ * plaintext socket is handed to an HTTP server whose handler reads its target off the
+ * socket and calls `prepare()`, which re-reads the host's live credential file on every
+ * single request. So a tunnel opened one second before the job ended kept being handed
+ * fresh, currently-valid Anthropic credentials for as long as it stayed open, and nothing
+ * on that path ever looked at `sessions` again. The threat model is a prompt-injected
+ * agent (ADR-0010), which can hold a socket open on purpose with a heartbeat request.
+ *
+ * The assertion that matters is `upstream.received`: the client's view can legitimately be
+ * either a refusal or a dead socket, but the upstream must never see a second request,
+ * because seeing one means the real credential was spliced into it.
+ */
+test('a tunnel the revoked token opened carries nothing more', async () => {
+  const harness = await anthropic()
+  const session = harness.gateway.open()
+  const tunnel = await openTunnel(harness, { token: session.token, hostname: 'api.anthropic.com' })
+
+  const first = await tunnel.send({ path: '/v1/messages' })
+  assert.equal(first.status, 200)
+  assert.equal(
+    harness.upstream.received[0]?.headers.authorization,
+    'Bearer sk-ant-oat01-REAL',
+    'the tunnel was live and credentialed before the revoke',
+  )
+
+  session.revoke()
+
+  const second = await settle(tunnel.send({ path: '/v1/messages' }))
+  // Read before the teardown, because on the broken implementation nothing tears down and
+  // the leaked socket would otherwise hold the event loop open past the end of the suite.
+  const tornDown = await closed(tunnel.socket)
+  tunnel.close()
+
+  assert.equal(
+    harness.upstream.received.length,
+    1,
+    'a request on a revoked tunnel must never reach the upstream — one that does was ' +
+      'handed a freshly re-read, currently-valid host credential',
+  )
+  // Whichever way the client saw it, it must not have been served. A 403 is the courteous
+  // shape; a dead socket is what a client mid-flight at the moment of the revoke sees.
+  if (second.kind === 'answered') {
+    assert.equal(second.value.status, 403)
+    assert.match(second.value.body, /session_revoked/)
+  } else {
+    assert.equal(second.kind, 'failed', 'the request must not simply hang')
+  }
+  // Revoking closes, it does not merely forget. Waiting for the next request would leave
+  // the decision with the container, and a container kept alive by a `--rm` that did not
+  // fire gets to choose when — or whether — it next speaks.
+  assert.equal(tornDown, true, 'revoke tore the tunnel down')
+})
+
+/**
+ * Revocation is surgical, and this is the test that stops the cure being worse.
+ *
+ * `revoke()` runs on the *normal* path, at the end of every job, and one gateway serves
+ * every container on the host (ADR-0010 §3.2). An implementation that tore down "the open
+ * sockets" rather than "the open sockets of this session" would end one job by killing
+ * the model turn of every other job on the machine — a failure that no single-session test
+ * can see, and that in production looks like random unexplained mid-turn disconnects.
+ */
+test("revoking one session leaves another session's tunnel alone", async () => {
+  const harness = await anthropic()
+  const ending = harness.gateway.open()
+  const running = harness.gateway.open()
+
+  const doomed = await openTunnel(harness, { token: ending.token, hostname: 'api.anthropic.com' })
+  const survivor = await openTunnel(harness, {
+    token: running.token,
+    hostname: 'api.anthropic.com',
+  })
+  assert.equal((await doomed.send({ path: '/v1/models' })).status, 200)
+  assert.equal((await survivor.send({ path: '/v1/models' })).status, 200)
+
+  ending.revoke()
+
+  const still = await settle(survivor.send({ path: '/v1/messages' }))
+  survivor.close()
+  doomed.close()
+  assert.equal(still.kind, 'answered', "the untouched session's tunnel is still usable")
+  assert.equal(still.kind === 'answered' ? still.value.status : 0, 200)
 })
 
 /**
