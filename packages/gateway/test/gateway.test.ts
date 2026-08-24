@@ -862,3 +862,71 @@ test('a percent-encoded push is still a push', async () => {
   })
   assert.equal(fetch.status, 200)
 })
+
+/**
+ * A container that dies mid-request must not take the runner with it.
+ *
+ * `pipeline()` does not report a destroyed destination through its callback — it *throws*
+ * `ERR_STREAM_UNABLE_TO_PIPE` synchronously. Thrown from inside a `'response'` handler
+ * that is an uncaught exception, and the runner process ends: not this job, every job on
+ * the machine. The window is small and entirely ordinary — a job budget expiring, a
+ * `docker kill`, an agent that exits while a turn is in flight — and it is reached by the
+ * upstream answering *after* the client has gone.
+ *
+ * Found by killing a container mid-run rather than by reading the code, which is why the
+ * test drives the same order: hang up first, answer second. A gateway without the guard
+ * does not fail this test with an assertion — it dies with the test runner still holding
+ * the results.
+ */
+test('an upstream answering after the client hung up does not crash the gateway', async () => {
+  const harness = await anthropic()
+  const session = harness.gateway.open()
+
+  let release = (): void => undefined
+  const held = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  harness.upstream.respond((_req, res) => {
+    void held.then(() => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end('{"late":true}')
+    })
+  })
+
+  const socket = rawTunnel(harness, session.token, () => undefined)
+  await new Promise<void>((resolve) => {
+    socket.once('data', () => {
+      const tls = secureTunnel(harness, socket)
+      const req = request({
+        createConnection: () => tls,
+        host: 'api.anthropic.com',
+        path: '/v1/messages',
+        headers: { host: 'api.anthropic.com' },
+      })
+      req.on('error', () => undefined)
+      // The request is on the wire and the upstream is holding it; now the container dies.
+      req.end(() => {
+        tls.destroy()
+        socket.destroy()
+        resolve()
+      })
+    })
+  })
+
+  await waitFor(() => harness.upstream.received.length > 0, 'the upstream never saw the request')
+  // Only now does the upstream answer, into a response object that is already gone.
+  release()
+
+  // The proof is that the gateway is still here to serve the next job. A process that
+  // threw in the handler above never reaches this line.
+  harness.upstream.respond((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end('{"ok":true}')
+  })
+  const after = await requestThroughProxy(harness, {
+    token: session.token,
+    hostname: 'api.anthropic.com',
+    path: '/v1/messages',
+  })
+  assert.equal(after.status, 200)
+})
