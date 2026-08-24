@@ -232,7 +232,7 @@ token lapses, and every 3am job fails on auth until somebody notices.
 **Use an API key on a machine nobody logs into. An API key does not expire.**
 
 ```sh
-# Visible to BOTH the control plane and the runner — see the warning below.
+# In the runner's own environment. That is the process that authenticates.
 ANTHROPIC_API_KEY=sk-ant-api03-…
 OPENAI_API_KEY=sk-…
 ```
@@ -243,11 +243,28 @@ account than the host's `claude` is logged into, which is the other reason to se
 The trade is that an API key is billed per token where a subscription is not — on a
 workstation you use daily, leaving the OAuth token in place is still the cheaper answer.
 
-**Export it where both halves can see it.** Ogun checks the credential *before* a job
-starts, and the check runs on the control plane. A key exported into the runner's service
-unit but not the server's means the control plane sees only a stale OAuth token and
-refuses jobs the runner could have run perfectly well. The repo-root `.env` is read by
-both; a systemd drop-in should cover both units.
+**Set it wherever the runner can see it, and only there.** This used to say "where both
+the control plane and the runner can see it", because the preflight read
+`~/.claude/.credentials.json` on the machine the *control plane* was running on and called
+the answer the runner's. A key exported into the runner's systemd unit and not the
+server's therefore had the runner authenticating perfectly while every job was refused
+with a reason that sounded certain.
+
+That is fixed rather than documented around: **each runner reports its own credential
+state**, on the same claim that already carries its labels and its capacity, and the
+control plane judges what it was told. A key in the runner's unit is now simply correct.
+The report is expiries only — no token, no API key, no account id ever leaves the runner
+host (ADR-0010).
+
+Two consequences worth knowing:
+
+- **A job is refused only if _no_ live runner can authenticate it.** With two machines and
+  one lapsed token, the job is still admitted and goes to the machine that can run it. A
+  job a runner cannot authenticate is never handed to that runner: it stays queued and is
+  picked up by one that can, or by the same one once you have logged in there.
+- **A runner that has not reported is not treated as having no credentials.** An older
+  runner, or one that has just gone quiet, is admitted rather than refused — the gateway's
+  own `502 no_credential` and the provider's 401 remain the backstop, exactly as before.
 
 **Checking it, ahead of the night rather than after it:**
 
@@ -261,8 +278,13 @@ $ ogun runner doctor
 `ok` means the credential outlives the longest job this machine is likely to be handed.
 `warn` means it does not, and the line says which fix applies. If a job is dispatched
 anyway it is refused rather than run, and the run's coverage row carries the same
-sentence — so a night lost to a lapsed token says so in words instead of leaving a
-provider 401 buried in an agent transcript.
+sentence — naming the machine — so a night lost to a lapsed token says so in words instead
+of leaving a provider 401 buried in an agent transcript.
+
+The Runners page shows the other half: what each machine has *told* the control plane,
+under **Can log in**. `doctor` is what the machine thinks; that column is what the control
+plane believes, and when a run is refused over a credential it is the thing that separates
+"the token is dead" from "that machine has not reported".
 
 ### Names are unique
 

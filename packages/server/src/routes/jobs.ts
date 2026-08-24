@@ -11,8 +11,10 @@ import type { Env } from '../context.ts'
 import { runnerForRequest } from '../auth.ts'
 import {
   DEFAULT_LIMITS,
+  jobsThisRunnerCannotAuthenticate,
   modifierJobs,
   modifiersOverCap,
+  queuedJobRuntimes,
   remainingCapacity,
 } from '../foreman/admission.ts'
 import { policiesByProject } from '../foreman/policies.ts'
@@ -67,7 +69,8 @@ jobsRoutes.post('/claim', async (c) => {
     )
   }
 
-  // A claim is also the heartbeat, and the moment a pending enrollment becomes real.
+  // A claim is also the heartbeat, the moment a pending enrollment becomes real, and the
+  // moment this machine tells us what it can authenticate — see the update below.
   const runner =
     credentialed ??
     (await db.query.runners.findFirst({
@@ -82,14 +85,29 @@ jobsRoutes.post('/claim', async (c) => {
       404,
     )
   }
+  const seenAt = new Date()
   await db
     .update(runners)
     .set({
       labels: body.labels,
       maxConcurrency: body.capacity,
-      lastSeenAt: new Date(),
-      updatedAt: new Date(),
+      lastSeenAt: seenAt,
+      updatedAt: seenAt,
       pending: false,
+      /**
+       * What this machine says about its own credentials, stored only when it actually
+       * said something.
+       *
+       * Spread rather than written unconditionally, and the difference matters in both
+       * directions. A runner built before this field existed sends nothing, and writing
+       * `null` over a previous report would be inventing the claim that it has no
+       * credentials — the absence-of-evidence trap, in the direction that refuses work.
+       * And leaving the *old* report in place is safe precisely because `credentials_at`
+       * does not move with it: `fleetCredentials` ignores a report older than
+       * `RUNNER_STALE_MS`, so a machine that stops reporting fades to `silent` within a
+       * minute rather than being quoted forever on what it used to hold.
+       */
+      ...(body.credentials ? { credentials: body.credentials, credentialsAt: seenAt } : {}),
     })
     .where(eq(runners.id, runner.id))
 
@@ -124,10 +142,32 @@ jobsRoutes.post('/claim', async (c) => {
   // unreachable — and were it ever reached, that project's policy is unknown and the
   // schema default is the only honest number to use. Not "unlimited".
   const fallback = defaultControlPlanePolicies().maxConcurrentModifiers
-  const heldBack = modifiersOverCap(
+  const overCap = modifiersOverCap(
     modifiers,
     (projectId) => caps.get(projectId)?.policies.maxConcurrentModifiers ?? fallback,
   )
+
+  /**
+   * The second hold-back, and the one that makes a fleet of unlike machines work.
+   *
+   * Admission has already refused anything *no* machine could authenticate. What it could
+   * not decide is which machine — it runs when a cycle run is created, before anybody has
+   * claimed — so a job whose Anthropic credential only the desktop has is queued, and this
+   * is what stops the Mac taking it and 401-ing. Held back rather than refused: the job
+   * stays `queued` and is claimed by a machine that can run it, or by this one after
+   * somebody runs `claude` over here.
+   *
+   * The outlook comes from the body, which is this machine's own reading from seconds ago,
+   * by the same `credentialReader` the gateway will inject from. A runner that sends none
+   * holds nothing back, which is exactly the behaviour it had before this existed.
+   *
+   * Skipped entirely when nothing was reported, so an older fleet does not pay for a query
+   * whose answer is always empty.
+   */
+  const unauthenticated = body.credentials
+    ? jobsThisRunnerCannotAuthenticate(await queuedJobRuntimes(db), body.credentials)
+    : []
+  const heldBack = [...new Set([...overCap, ...unauthenticated])]
 
   /**
    * FOR UPDATE SKIP LOCKED is the whole reason postgres is here (§4.4). Two runners

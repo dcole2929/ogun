@@ -87,6 +87,7 @@ function RunnerTable({ runners }: { runners: NonNullable<Awaited<ReturnType<type
           <th />
           <th>Runner</th>
           <th>Can run</th>
+          <th>Can log in</th>
           <th>Capacity</th>
           <th>Last seen</th>
           <th>Added</th>
@@ -121,6 +122,9 @@ function RunnerTable({ runners }: { runners: NonNullable<Awaited<ReturnType<type
                 )}
               </div>
             </td>
+            <td>
+              <Credentials reported={r.credentials} />
+            </td>
             <td className="muted">{r.maxConcurrency}</td>
             <td className="muted" title={exact(r.lastSeenAt)}>
               {r.pending ? <span className="muted">never connected</span> : when(r.lastSeenAt)}
@@ -153,6 +157,55 @@ function RunnerTable({ runners }: { runners: NonNullable<Awaited<ReturnType<type
         ))}
       </tbody>
     </table>
+  )
+}
+
+/**
+ * What a machine last said about its own model credentials.
+ *
+ * This column exists because the control plane's belief about a runner is now a thing
+ * that can be wrong in a way neither end shows on its own: `ogun runner doctor` says what
+ * the machine thinks, and until the machine started reporting, nothing anywhere said what
+ * the control plane had been *told*. When a run comes back `refused` over a credential,
+ * this is the row that separates "the token is dead" from "that machine has not reported".
+ *
+ * Three renderings, never two. "Not reported" is its own thing and gets a neutral pill:
+ * it is what an older runner shows, it is what admission admits on, and drawing it as a
+ * cross would teach whoever sees it to go and fix a machine that is fine (principle 6).
+ */
+function Credentials({
+  reported,
+}: {
+  reported: NonNullable<Awaited<ReturnType<typeof api.runners>>>['runners'][number]['credentials']
+}) {
+  if (!reported) {
+    return (
+      <span className="pill" title="this machine has not reported — jobs are not refused for it">
+        not reported
+      </span>
+    )
+  }
+  // Only the states that mean a job would fail on auth. `no-expiry` is an API key and
+  // `unknown-expiry` is a codex token whose file records nothing; both are working
+  // machines, and a warning on either is a warning people learn to ignore.
+  const bad = (state: string) =>
+    state === 'absent' || state === 'expired' || state === 'expiring'
+  const providers = [
+    ['claude', reported.anthropic],
+    ['codex', reported.openai],
+  ] as const
+  return (
+    <div className="row" style={{ flexWrap: 'wrap' }}>
+      {providers.map(([label, state]) => (
+        <span
+          key={label}
+          className={bad(state) ? 'pill red' : 'pill'}
+          title={`${state}, as of ${exact(reported.reportedAt)}`}
+        >
+          {label}
+        </span>
+      ))}
+    </div>
   )
 }
 

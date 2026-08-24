@@ -1,3 +1,4 @@
+import { RUNNER_STALE_MS } from './admission.ts'
 import { and, eq, isNull } from 'drizzle-orm'
 import { schema } from '@ogun/core/db'
 import type { Db } from '@ogun/core/db'
@@ -52,8 +53,14 @@ export type ReachVerdict = {
  * A machine counts as up if it has been seen inside this window. It is the runner's poll
  * interval with room for one missed beat — a runner polls every few seconds, so a minute
  * of silence is a machine that is genuinely gone rather than one mid-request.
+ *
+ * Imported rather than written again. This number had four homes at one point — the
+ * Runners page, a SQL `interval '60 seconds'` in the runs route where nobody grepping the
+ * constant would find it, the credential freshness check, and here. Two of them
+ * disagreeing is how a page says a job is claimable while admission has already written
+ * the machine off, which is exactly the sentence somebody reads that row to trust.
  */
-const STALE_MS = 60_000
+const STALE_MS = RUNNER_STALE_MS
 
 export type Fleet = {
   /** Registered, not revoked, and past enrollment — whether or not it is up. */

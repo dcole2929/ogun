@@ -2,14 +2,21 @@ import { existsSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { and, count, eq, inArray, sql } from 'drizzle-orm'
-import { DEFAULT_WORKER_TIMEOUT_MS, readTestCommand, type ControlPlanePolicies } from '@ogun/core'
+import {
+  credentialHealth,
+  DEFAULT_WORKER_TIMEOUT_MS,
+  humanDuration,
+  readTestCommand,
+  wouldFailAuth,
+  type ControlPlanePolicies,
+  type CredentialHealth,
+  type CredentialOutlook,
+} from '@ogun/core'
 import { schema } from '@ogun/core/db'
 import type { Db } from '@ogun/core/db'
-import { credentialHealth, credentialOutlook, humanDuration, readCredentials } from '@ogun/gateway'
-import type { CredentialOutlook } from '@ogun/gateway'
 import { readProjectMap } from '../config-store.ts'
 
-const { breakers, jobs, workers } = schema
+const { breakers, jobs, runners, workers } = schema
 
 export type AdmissionVerdict = { allowed: true } | { allowed: false; reason: string }
 
@@ -62,11 +69,11 @@ export async function admit(
    */
   modifier?: ModifierReadiness,
   /**
-   * What the runner host's credential files say, established once per cycle run by the
-   * caller for the same reason `modifier` is: it reads the disk, and the answer cannot
-   * differ between the nodes of one graph.
+   * What the fleet's runners last said about their own credentials, established once per
+   * cycle run by the caller for the same reason `modifier` is: it is a query, and the
+   * answer cannot differ between the nodes of one graph.
    */
-  credentials?: CredentialOutlook,
+  credentials?: FleetCredentials,
 ): Promise<AdmissionVerdict> {
   /**
    * Before the breaker, because these are different kinds of "no". An open breaker is a
@@ -122,7 +129,7 @@ export async function admit(
    * A lapsed credential fails every job on the machine. Three nights of that and every
    * worker has an open breaker, so the reason attached to each refusal becomes "breaker
    * open: 3 consecutive failures" — a sentence about the worker, pointing whoever reads
-   * it at a prompt that is fine, while the one true sentence ("the host's Anthropic token
+   * it at a prompt that is fine, while the one true sentence ("desktop's Anthropic token
    * expired on Tuesday") is nowhere in the record. Saying the credential first turns a
    * fleet of misleading refusals into one actionable one.
    */
@@ -238,6 +245,16 @@ export async function probeProject(slug: string): Promise<ModifierRequirements> 
 //
 // This is the half of the answer that runs before dispatch. `ogun runner doctor` is the
 // other half and is the one a person reads; this one is what stops the night being spent.
+//
+// **Where the fact comes from.** From the runner, on its claim, and never from this
+// process's own `~/`. The control plane used to read its own disk and call the answer the
+// runner's, which is correct only while they are the same host — and was already wrong on
+// one host, in the direction that refuses: an `ANTHROPIC_API_KEY` exported into the
+// runner's systemd unit and not the server's had the runner authenticating perfectly while
+// every job was refused with a sentence that sounded certain. A machine is the only thing
+// that can answer for its own disk, so the machine answers, over the same claim that
+// already carries its labels and its capacity — credential health being a capability fact
+// about a host in exactly the way a label is.
 
 /** Which credential each runtime actually authenticates with, through the gateway. */
 const PROVIDER_FOR_RUNTIME: Record<string, keyof CredentialOutlook> = {
@@ -245,17 +262,73 @@ const PROVIDER_FOR_RUNTIME: Record<string, keyof CredentialOutlook> = {
   codex: 'openai',
 }
 
+/**
+ * The fix, and it now names *the runner's* environment rather than "somewhere both halves
+ * can see".
+ *
+ * That phrasing was in these strings because the check ran on the wrong machine, and it
+ * was advice for working around the bug rather than a description of the system. A key
+ * exported into the runner's unit is simply correct now: that is the process which
+ * authenticates, and it is the process which reports. docs/setup.md's warning about
+ * exporting into both units goes with it.
+ */
 const FIX: Record<keyof CredentialOutlook, string> = {
   anthropic:
-    'run `claude` on the runner host, or set ANTHROPIC_API_KEY where both the control ' +
-    'plane and the runner can see it — an API key does not expire (docs/setup.md)',
+    "run `claude` on that machine, or set ANTHROPIC_API_KEY in the runner's own " +
+    'environment — an API key does not expire (docs/setup.md)',
   openai:
-    'run `codex login` on the runner host, or set OPENAI_API_KEY where both the control ' +
-    'plane and the runner can see it (docs/setup.md)',
+    "run `codex login` on that machine, or set OPENAI_API_KEY in the runner's own " +
+    'environment (docs/setup.md)',
+}
+
+/** One machine's own account of what it can authenticate. */
+export type RunnerCredentials = { name: string; outlook: CredentialOutlook }
+
+/**
+ * What the fleet says about itself, as of a moment.
+ *
+ * Two lists rather than one, and the second is the whole backwards-compatibility story.
+ *
+ *   `reporting`  Live runners whose report is recent enough to act on.
+ *   `silent`     Live runners that have reported *nothing* recent — an older build, or a
+ *                machine whose last report has aged out of the window.
+ *
+ * One list would collapse "this machine cannot authenticate" into "this machine has not
+ * said", which is the absence-of-evidence trap pointing in the direction that refuses
+ * work. With one dead reporter and one silent machine beside it, the true answer is that
+ * nobody knows whether the job can run — and the true answer has to admit, because
+ * admitting wrongly costs one job and refusing wrongly costs every job on the fleet, every
+ * night, with a reason that reads as certain.
+ */
+export type FleetCredentials = {
+  reporting: RunnerCredentials[]
+  silent: string[]
 }
 
 /**
- * Whether this worker's runtime could authenticate for the whole of this job.
+ * How long a runner's word is good for, and how long since a claim it still counts as
+ * live.
+ *
+ * A runner claims every `pollIntervalMs` — three seconds by default — and the claim is the
+ * heartbeat, so this is twenty missed beats. Deliberately one constant for both questions
+ * and shared with the Runners page's `online` pill, because they *are* one question: a
+ * machine we have not heard from is not going to run this job either, so it should stop
+ * being quoted rather than be believed forever.
+ *
+ * Note what the window is *not* protecting against. `{ kind: 'at', expiresAt }` is an
+ * absolute instant, so an old report is still exactly true about when that token dies —
+ * staleness never makes an expiry wrong. What goes stale is the assumption that the
+ * machine still holds that credential, and every way that assumption breaks breaks toward
+ * a false refusal: somebody runs `claude`, somebody exports an API key, somebody restarts
+ * the unit. A minute is short enough that the fix a refusal asks for takes effect within a
+ * poll or two — the property `probeCredentials` had by reading on demand, which had to
+ * survive the move to a report.
+ */
+export const RUNNER_STALE_MS = 60_000
+
+/**
+ * Whether this worker's runtime could authenticate for the whole of this job, on any
+ * machine that could take it.
  *
  * **Why refuse rather than dispatch and let it fail.** A dispatched job that cannot
  * authenticate spends a runner slot, an agent round and a workspace clone to arrive at a
@@ -275,27 +348,53 @@ const FIX: Record<keyof CredentialOutlook, string> = {
  * it does not refuse anything over the GitHub token, whose absence is the intended
  * default (ADR-0005).
  *
+ * **Why one bad machine is not a refusal.** Admission runs when a cycle run is created,
+ * which is before any runner has claimed anything — so "the credential state" is not one
+ * state, it is one per machine. A job only one machine can authenticate is not
+ * unadmittable; it is admittable *there*. This therefore refuses only what no live machine
+ * can do, which is the half of the question that cannot change while the queue drains, and
+ * the per-machine half is answered at claim time by `jobsThisRunnerCannotAuthenticate` —
+ * where a job is held back rather than skipped, stays `queued`, and is picked up by a
+ * machine that can run it. The same split `maxConcurrentModifiers` gets, for the same
+ * reason: admission's refusals are permanent, and a permanent refusal is the wrong answer
+ * to a condition that clears on its own.
+ *
+ * It deliberately does not consult `requires`/`labels`. A fleet whose only `docker`
+ * machine has a dead token, with a label-less machine beside it holding a good one, is
+ * admitted here and held at the claim — under-refusing, which is the safe direction, and
+ * the direction the label system already behaves in for every other capability.
+ *
  * **Why an unrecorded expiry is admitted.** An API key does not expire and a `~/.codex/
- * auth.json` token records no expiry anywhere this can read. Refusing on either would
+ * auth.json` token records no expiry anywhere a runner can read. Refusing on either would
  * refuse a machine that is working perfectly, which is the failure this function is
  * supposed to prevent, inverted.
  *
- * **Why no outlook at all is admitted.** The opposite of `modifierReadiness`, on purpose.
- * Modifier readiness is a fact about a repository, and a control plane that cannot
- * establish it has to fail closed because the consequence is an unverifiable patch. This
- * is a fact about the *runner host*, which the control plane can only see while they are
- * the same machine (§3, ADR-0001). When they separate, a control plane that failed closed
- * on what it could not see would refuse every job forever — a preflight that becomes an
- * outage. So absence means "not checked", the gateway's own `502 no_credential` and the
- * job's 401 remain the backstop, and the seam is here for a runner that reports its own
- * credential state later.
+ * **Why silence is admitted.** The opposite of `modifierReadiness`, on purpose. Modifier
+ * readiness is a fact about a repository, and a control plane that cannot establish it has
+ * to fail closed because the consequence is an unverifiable patch. This is a fact about a
+ * *machine*, and there are three ways not to have it: no fleet outlook was established at
+ * all, no runner is live, or a live runner has never reported. Every one means "we have
+ * not been told", and a control plane that failed closed on what it has not been told
+ * would refuse every job forever the day a runner is one release behind it — a preflight
+ * that becomes an outage. So silence admits, and the gateway's own `502 no_credential` and
+ * the job's 401 remain the backstop they always were.
  */
 export function credentialVerdict(
   worker: { runtime?: string; timeoutMs?: number },
-  outlook: CredentialOutlook | undefined,
+  fleet: FleetCredentials | undefined,
   now = Date.now(),
 ): AdmissionVerdict {
-  if (!outlook) return { allowed: true }
+  // Not established by the caller at all — every test that drives `startCycleRun`
+  // directly, and any future path with no fleet to ask.
+  if (!fleet) return { allowed: true }
+  // Some live machine has told us nothing. It may be the one that takes this job, and
+  // "has not said" must never be answered "so, no".
+  if (fleet.silent.length > 0) return { allowed: true }
+  // Nobody live at all. Queued jobs wait for a machine to wake up — that is the designed
+  // behaviour of the whole claim model, and refusing them here would file a night as
+  // refused because a laptop was closed at 3am.
+  if (fleet.reporting.length === 0) return { allowed: true }
+
   const provider = worker.runtime ? PROVIDER_FOR_RUNTIME[worker.runtime] : undefined
   // A runtime nobody has taught this function about authenticates with something unknown,
   // and "I do not know which credential this needs" must not be answered "the Anthropic
@@ -303,54 +402,168 @@ export function credentialVerdict(
   if (!provider) return { allowed: true }
 
   const horizonMs = worker.timeoutMs ?? DEFAULT_WORKER_TIMEOUT_MS
-  const health = credentialHealth(outlook[provider], { now, horizonMs })
-  const fix = FIX[provider]
+  const judged = fleet.reporting.map((runner) => ({
+    name: runner.name,
+    health: credentialHealth(runner.outlook[provider], { now, horizonMs }),
+  }))
+  // One machine that can do it is enough. The job goes there, or waits for it.
+  if (judged.some((r) => !wouldFailAuth(r.health))) return { allowed: true }
+
+  /**
+   * Every machine named, with what is wrong with each. On a one-runner control plane this
+   * reads almost exactly as it did before this became a fleet question; on a bigger one it
+   * is the difference between knowing which box to go and fix and being told only that
+   * "no runner can authenticate anthropic", which sends a person round all of them.
+   */
+  const detail = judged.map((r) => `${r.name}: ${describeFailure(provider, r.health)}`).join('; ')
+  return {
+    allowed: false,
+    reason:
+      `no runner can authenticate ${provider} for the ${humanDuration(horizonMs)} this ` +
+      `worker may run — ${detail}. ${FIX[provider]}`,
+  }
+}
+
+/** The half-sentence naming what is wrong with one machine's credential. */
+function describeFailure(provider: keyof CredentialOutlook, health: CredentialHealth): string {
   switch (health.state) {
     case 'absent':
-      return {
-        allowed: false,
-        reason:
-          `there is no ${provider} credential on this host, so the gateway would answer ` +
-          `502 no_credential for every request this job made — ${fix}`,
-      }
+      // Named as the mechanism it would actually hit, rather than implying a stale token.
+      return `no ${provider} credential, so the gateway would answer 502 no_credential`
     case 'expired':
-      return {
-        allowed: false,
-        reason:
-          `the host's ${provider} OAuth token expired ${humanDuration(health.msElapsed)} ` +
-          `ago, so this job would 401 on its first request — ${fix}`,
-      }
+      return `OAuth token expired ${humanDuration(health.msElapsed)} ago`
     case 'expiring':
-      return {
-        allowed: false,
-        reason:
-          `the host's ${provider} OAuth token has ${humanDuration(health.msRemaining)} ` +
-          `left and this worker may run for ${humanDuration(horizonMs)}, so it would 401 ` +
-          `partway through — ${fix}`,
-      }
+      return `OAuth token has only ${humanDuration(health.msRemaining)} left`
     default:
-      return { allowed: true }
+      /**
+       * Unreachable — `wouldFailAuth` selected these and it selects exactly the three
+       * above. A sentence rather than a `throw` because this runs on the path that writes
+       * a refusal reason, and an exception here would replace an actionable coverage row
+       * with a 500, which is the one outcome worse than an odd string.
+       */
+      return `${provider} credential unusable (${health.state})`
   }
 }
 
 /**
- * The credential files on the machine this control plane is running on.
+ * What every live runner last said about itself.
  *
- * Correct only while the control plane and the runner are the same host, which §3 says
- * they are and ADR-0001 says they will not always be. Two things follow, and both are
- * deliberate: `credentialVerdict` takes the outlook as an argument and never reads a file
- * itself, so the day a runner reports its own state this function is the only thing that
- * has to go; and the refusal text says "where both the control plane and the runner can
- * see it", because the one way this is wrong *today* is an `ANTHROPIC_API_KEY` exported
- * into the runner's unit and not the server's — the runner would authenticate fine and
- * the control plane would refuse every job with a reason that looks certain.
+ * Queried on demand rather than cached, exactly as `probeProject` is read on demand: the
+ * fix a refusal asks for is running `claude` on some *other* machine, and that machine's
+ * next claim — three seconds later — is what carries the news. A cache here would mean the
+ * fix took a server restart, which is the property the old `probeCredentials` was careful
+ * to avoid and this had to inherit.
  *
- * Read on demand rather than cached, exactly as `probeProject` is: running `claude` on
- * the host is the fix this refusal asks for, and a cached answer would mean it took a
- * server restart to take effect.
+ * `pending` runners are excluded along with revoked ones. A pending row is a machine that
+ * was invited and has never connected: it has no credential state and no ability to take
+ * work, and counting it as `silent` would make it a permanent excuse to admit everything —
+ * a preflight switched off by an invite nobody redeemed.
  */
-export function probeCredentials(): CredentialOutlook {
-  return credentialOutlook(readCredentials())
+export async function fleetCredentials(db: Db, now = Date.now()): Promise<FleetCredentials> {
+  const rows = await db
+    .select({
+      name: runners.name,
+      credentials: runners.credentials,
+      credentialsAt: runners.credentialsAt,
+      lastSeenAt: runners.lastSeenAt,
+      pending: runners.pending,
+      revokedAt: runners.revokedAt,
+    })
+    .from(runners)
+
+  const fleet: FleetCredentials = { reporting: [], silent: [] }
+  for (const row of rows) {
+    const live = !row.revokedAt && !row.pending && now - row.lastSeenAt.getTime() < RUNNER_STALE_MS
+    if (!live) continue
+    const fresh =
+      row.credentials !== null &&
+      row.credentialsAt !== null &&
+      now - row.credentialsAt.getTime() < RUNNER_STALE_MS
+    /**
+     * Not re-validated against `credentialOutlookSchema` on the way out. It was validated
+     * by `claimRequestSchema` at the boundary that faces the network; re-parsing here
+     * would be guarding against this control plane's own database, and the cost of getting
+     * that wrong — a parse error thrown inside `startCycleRun`'s transaction — is worse
+     * than the shape it would be catching.
+     */
+    if (fresh) {
+      fleet.reporting.push({ name: row.name, outlook: row.credentials as CredentialOutlook })
+    } else fleet.silent.push(row.name)
+  }
+  return fleet
+}
+
+/**
+ * Which queued jobs this particular runner must not be handed, because *its* credential
+ * for their runtime is dead or will die before they finish.
+ *
+ * ### Why a hold-back rather than a refusal
+ *
+ * The same shape as `modifiersOverCap`, for the same reason. Admission answers the
+ * question that cannot change while the queue drains — no machine on the fleet can
+ * authenticate this at all — and its answer is permanent: a `skipped` job and a `refused`
+ * coverage row, for the night. "*This* machine cannot, right now" is not that question. It
+ * stops being true the moment somebody runs `claude` over there, and it may never have
+ * been true of the machine next to it. A job held back here stays `queued`, is recorded as
+ * nothing, and is claimed by whichever runner can actually run it — or by this one on a
+ * later poll, after the token is refreshed.
+ *
+ * ### Why the runner's own report and not the stored one
+ *
+ * The outlook arrives in the claim body, read seconds earlier by the very
+ * `credentialReader` the gateway will inject from. There is no freshness window to argue
+ * about and no way for the control plane's belief to diverge from what the machine will
+ * actually put on the wire — which is this whole feature's failure appearing in its
+ * smallest and most avoidable form.
+ *
+ * ### The gap it leaves, stated rather than hidden
+ *
+ * A fleet that degrades *after* admission — the one healthy machine's token lapsing while
+ * the job sits queued — leaves that job queued indefinitely rather than refused. That is
+ * exactly what `requires <@ labels` already does to a container job on a fleet with no
+ * docker; it is visible on the Runs page as a pending job nothing claims; and it recovers
+ * by itself the moment the credential is fixed, which a permanent refusal would not.
+ *
+ * Pure and separately testable: the interesting cases are a mixed queue, a runner with one
+ * dead provider and one good one, and a runtime nobody has heard of, none of which need a
+ * database to state.
+ */
+export function jobsThisRunnerCannotAuthenticate(
+  candidates: Array<{ id: string; runtime?: string; timeoutMs?: number }>,
+  outlook: CredentialOutlook | undefined,
+  now = Date.now(),
+): string[] {
+  // An older runner sends nothing and gets exactly the behaviour it had before this
+  // existed. Reading its silence as "no credentials" would strand every job on the fleet.
+  if (!outlook) return []
+  const fleet: FleetCredentials = { reporting: [{ name: 'this runner', outlook }], silent: [] }
+  return candidates
+    .filter((job) => !credentialVerdict(job, fleet, now).allowed)
+    .map((job) => job.id)
+}
+
+/**
+ * The queued jobs `jobsThisRunnerCannotAuthenticate` has to judge, with the two facts it
+ * needs about each: which provider it will authenticate against, and for how long.
+ *
+ * `timeoutMs` comes out of `workers.config` rather than a column, the same way the claim
+ * route reads it a few lines later — a worker indexed before `timeoutMs` existed has none
+ * and gets the default it will actually run under, rather than zero, which would hand out
+ * a doomed job.
+ */
+export async function queuedJobRuntimes(
+  db: Db,
+): Promise<Array<{ id: string; runtime: string; timeoutMs: number }>> {
+  const rows = await db
+    .select({ id: jobs.id, runtime: workers.runtime, config: workers.config })
+    .from(jobs)
+    .innerJoin(workers, eq(workers.id, jobs.workerId))
+    .where(eq(jobs.state, 'queued'))
+  return rows.map((r) => ({
+    id: r.id,
+    runtime: r.runtime,
+    timeoutMs: Number((r.config as { timeoutMs?: unknown }).timeoutMs ?? DEFAULT_WORKER_TIMEOUT_MS),
+  }))
 }
 
 /**

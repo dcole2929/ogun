@@ -90,6 +90,25 @@ export type Gateway = {
   caCertificatePath: string
   caCertificatePem: string
   /**
+   * Exactly what this gateway would splice onto the next request, memoised for five
+   * seconds like every other read of it.
+   *
+   * Exposed so the runner can *report* its credential state to the control plane without
+   * opening the files a second time — and, more to the point, without opening them by a
+   * second route. The failure this closes is a control plane and a runner disagreeing
+   * about the same machine: an `ANTHROPIC_API_KEY` exported into the runner's systemd unit
+   * and not the server's used to have the runner authenticating fine while admission
+   * refused every job, because admission read `~/` on its own host. A reporter with its
+   * own reader would reintroduce the same class of bug one process further in — a
+   * different `process.env`, a different `homedir()`, a different moment. One reader, one
+   * answer, and the answer is the one that will actually be injected.
+   *
+   * A `CredentialSet` and not an outlook: this is the raw fact, and the caller decides
+   * what to do with it. Nothing here sends a token anywhere — `credentialOutlook()` is
+   * what the runner puts on the wire, and it carries expiries only.
+   */
+  credentials: () => CredentialSet
+  /**
    * Mint a token for one job.
    *
    * `containerAuthority` is the `host:port` the *container* reaches the proxy at, which is
@@ -826,6 +845,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
     listening,
     caCertificatePath: ca.certificatePath,
     caCertificatePem: ca.certificatePem,
+    credentials: readCredentials,
     open: (containerAuthority?: string, allow?: readonly string[]) => {
       // A socket has no authority to put in a URL. A caller listening on one and not
       // saying where the container reaches it has not finished wiring the sandbox, and a

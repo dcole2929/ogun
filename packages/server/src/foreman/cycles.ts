@@ -9,8 +9,13 @@ import {
   type JobState,
   type WorkerConfig,
 } from '@ogun/core'
-import type { CredentialOutlook } from '@ogun/gateway'
-import { admit, modifierReadiness, probeProject, type ModifierReadiness } from './admission.ts'
+import {
+  admit,
+  modifierReadiness,
+  probeProject,
+  type FleetCredentials,
+  type ModifierReadiness,
+} from './admission.ts'
 import { projectPolicies } from './policies.ts'
 
 const { coverage, cycleRuns, cycles, jobs, projects, skills, workers } = schema
@@ -27,23 +32,24 @@ export type StartCycleRunInput = {
    */
   modifierReadiness?: ModifierReadiness
   /**
-   * What the host's credential files say (§4.3), for the preflight that refuses a job no
-   * credential on this machine could authenticate.
+   * What the fleet's runners last reported about their own credentials (§4.3), for the
+   * preflight that refuses a job no live machine could authenticate.
    *
    * Established by the caller and — unlike `modifierReadiness` — deliberately *not*
-   * probed here when it is missing. Every trigger passes through this function, including
-   * the twenty-odd tests that call it directly, and a `probeCredentials()` default would
-   * make each of their outcomes depend on whatever `~/.claude/.credentials.json` happened
-   * to hold: green on a laptop somebody used this morning, red on CI, red on the very
-   * machine whose lapsed token this feature exists to catch. A suite that fails when the
-   * host is misconfigured is a suite that gets ignored.
+   * established here when it is missing. Every trigger passes through this function,
+   * including the twenty-odd tests that call it directly; those tests are about graph
+   * shape and admission arithmetic, and a default would make each of their outcomes
+   * depend on which rows happen to be in `runners`. That was a sharper edge when this read
+   * a file — green on a laptop somebody used this morning, red on CI — and it is a milder
+   * one now, but the reason holds: a test that has to stand up a live runner with a fresh
+   * credential report to assert something about edges is a test about fixtures.
    *
    * The two production callers — `scheduler.ts` for cron and `routes/trigger.ts` for a
    * manual run — pass it. Omitting it means the credential guard does not run, which is
    * the documented open case: the gateway's `502 no_credential` and the provider's 401
    * are still there behind it.
    */
-  credentials?: CredentialOutlook
+  credentials?: FleetCredentials
 }
 
 /**

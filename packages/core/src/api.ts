@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import type { CredentialOutlook } from './credentials.ts'
 import { egressSchema } from './config/egress.ts'
 import { runEventSchema } from './events.ts'
 import { dismissalCheckSchema, findingEvidenceSchema } from './evidence.ts'
@@ -18,6 +19,30 @@ export const runnerHeartbeatSchema = z.object({
   maxConcurrency: z.number().int().positive(),
 })
 
+/**
+ * When one credential on a runner host stops working, on the wire.
+ *
+ * The shape is `CredentialExpiry` from `./credentials.ts`, declared again here because
+ * that module deliberately imports nothing — the gateway loads it and must not pay for a
+ * zod runtime. The two are kept in step by `credentialOutlookSchema` being typed as
+ * producing a `CredentialOutlook`, so a variant added there and forgotten here fails to
+ * compile rather than silently arriving as garbage.
+ *
+ * Note what is *not* on the wire: an access token, an API key, a refresh token, an
+ * account id. A runner reports when its credential dies, never what it is (ADR-0010).
+ */
+const credentialExpirySchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('absent') }),
+  z.object({ kind: z.literal('never') }),
+  z.object({ kind: z.literal('unrecorded') }),
+  z.object({ kind: z.literal('at'), expiresAt: z.number() }),
+])
+
+export const credentialOutlookSchema: z.ZodType<CredentialOutlook> = z.object({
+  anthropic: credentialExpirySchema,
+  openai: credentialExpirySchema,
+})
+
 export const claimRequestSchema = z.object({
   /** The name this machine registered under. Its real id lives on the control plane. */
   runnerName: z.string().min(1),
@@ -25,6 +50,25 @@ export const claimRequestSchema = z.object({
   labels: z.array(z.string()),
   /** How many slots the runner has free right now. */
   capacity: z.number().int().positive().default(1),
+  /**
+   * What this machine's model-provider credentials look like right now, as the gateway on
+   * this same machine sees them.
+   *
+   * A capability fact about a host, exactly like `labels` — so it rides the path `labels`
+   * already rides rather than a channel of its own. That is the whole freshness design:
+   * the claim *is* the heartbeat, it happens every `pollIntervalMs` (three seconds by
+   * default), and a report that arrives with it can never be more than one poll old. A
+   * dedicated endpoint would have needed its own timer, its own retry, and its own failure
+   * mode — runner claiming, reporter silent — which is a state that has to be detected and
+   * decided about, for a fact that was already travelling this way.
+   *
+   * **Optional, and its absence is not "no credentials".** A runner built before this
+   * field existed sends nothing, and the control plane must read that as "this machine has
+   * not told us", never as "this machine cannot authenticate" — the absence-of-evidence
+   * trap the preflight was careful about from the start. `credentialVerdict` admits on
+   * silence; see its doc comment for why that direction and not the other.
+   */
+  credentials: credentialOutlookSchema.optional(),
 })
 
 /** Everything the runner needs to execute without a second round trip. */
