@@ -2,11 +2,13 @@ import { and, eq, inArray, not } from 'drizzle-orm'
 import { schema } from '@ogun/core/db'
 import type { Db } from '@ogun/core/db'
 import { markCoverage } from './foreman/cycles.ts'
+import { fleet } from './foreman/reach.ts'
 import {
   cycleGraphProblems,
   cycleMembers,
   hashContent,
   singleWorkerCycle,
+  workerRequirements,
   type CycleDefinition,
   type WorkerConfig,
 } from '@ogun/core'
@@ -36,6 +38,47 @@ export type ReindexResult = {
    * reason it no longer means what it looks like belongs in the sync output.
    */
   overriddenSchedules: string[]
+  /**
+   * Workers asking for a capability label that no runner registered here advertises,
+   * and which labels those are.
+   *
+   * This is the diagnostic half of honouring `requires:`, and it is the half that
+   * matters. Unioning the declared labels into a job's requirements is one line; the
+   * consequence of that line is that a worker asking for `gpu` on a fleet with no GPU
+   * machine produces a job that sits in `queued` and is never claimed, forever, with
+   * nothing anywhere saying why. The claim query is a `requires <@ labels` test that
+   * simply does not match, so there is no error, no timeout and no coverage row — just a
+   * row that stays. That is the exact shape of failure principle 6 exists to forbid.
+   *
+   * Reported here, at sync, because this is the moment somebody wrote the label and the
+   * only moment when the fix (`ogun runner init --labels gpu` on the machine that has
+   * one, or delete the line) is the thing they are already thinking about.
+   *
+   * **Not** an admission refusal, and that was the tempting shape. A job refused at
+   * admission is refused permanently — a `skipped` job and a `refused` coverage row — and
+   * "no runner advertises this label" is a fact about *right now*, not about the job. The
+   * GPU box that is being provisioned this afternoon, the laptop that has not run
+   * `ogun runner init` since the label was added, the runner rebuilt after a disk
+   * failure: in every one of those the job is waiting for a machine that is coming, and
+   * throwing it away because the machine has not arrived yet is worse than leaving it
+   * queued. What was wrong was never the waiting. It was that nobody was told.
+   *
+   * Counted against every runner ever registered, online or not: an offline machine that
+   * advertises `gpu` is proof such a machine exists and will come back. Whether one is
+   * *up* is a different question, answered per job by the queue view in `routes/runs.ts`.
+   */
+  unmetRequirements: Array<{ worker: string; missing: string[] }>
+  /**
+   * How many runners have joined this control plane at all.
+   *
+   * Travels with `unmetRequirements` because it is what makes it readable. On a control
+   * plane nobody has joined a runner to yet, *every* worker's requirements are unmet and
+   * the list says nothing except "you have not set up a runner" — once, loudly, rather
+   * than once per worker. A caller that printed the list without this number would greet
+   * every new install with a wall of warnings about `claude` and `docker`, and a warning
+   * you see on a correct configuration is one you stop reading.
+   */
+  registeredRunners: number
 }
 
 /**
@@ -240,7 +283,45 @@ export async function reindexProject(
     await db.delete(cycles).where(and(eq(cycles.projectId, project.id), eq(cycles.name, r.name)))
   }
 
-  return { workers: out, removed: removed.map((r) => r.name), overriddenSchedules }
+  return {
+    workers: out,
+    removed: removed.map((r) => r.name),
+    overriddenSchedules,
+    ...(await requirementGaps(db, file.workers)),
+  }
+}
+
+/**
+ * Which of this file's workers ask for something no machine here can offer.
+ *
+ * `workerRequirements` rather than a second derivation: the set compared here has to be
+ * the identical set that `startCycleRun` stamps onto `jobs.requires` and that the claim
+ * query tests, or this warning is about a different question than the one the queue will
+ * ask. That is not hypothetical — the derivation living in two places is how `requires:`
+ * came to be honoured by neither.
+ */
+async function requirementGaps(
+  db: Db,
+  fileWorkers: Record<string, WorkerConfig>,
+): Promise<Pick<ReindexResult, 'unmetRequirements' | 'registeredRunners'>> {
+  /**
+   * The same fleet snapshot the queue view and the manual trigger ask, so all three agree
+   * about which machines count — `pending` and revoked ones do not, for the reasons
+   * `fleet` gives. Three components each deciding what "a registered runner" means is how
+   * the sync warning and the page it sends you to end up contradicting each other.
+   *
+   * Only `missing` is used here: `offline` versus `claimable` is a question about a job
+   * waiting right now, and at sync there is no job yet.
+   */
+  const machines = await fleet(db)
+  const unmetRequirements = Object.entries(fileWorkers).flatMap(([worker, config]) => {
+    // A disabled worker produces no jobs, so it cannot be the one sitting in the queue —
+    // and warning about it would be a warning with no failure behind it.
+    if (!config.enabled) return []
+    const { missing } = machines.verdict(workerRequirements(config))
+    return missing.length > 0 ? [{ worker, missing }] : []
+  })
+  return { unmetRequirements, registeredRunners: machines.live }
 }
 
 /**

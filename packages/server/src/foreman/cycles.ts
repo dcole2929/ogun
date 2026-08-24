@@ -1,7 +1,14 @@
 import { and, eq, inArray } from 'drizzle-orm'
 import { schema } from '@ogun/core/db'
 import type { Db } from '@ogun/core/db'
-import { cycleDefinitionSchema, isTerminal, type CycleDefinition, type JobState } from '@ogun/core'
+import {
+  cycleDefinitionSchema,
+  isTerminal,
+  workerRequirements,
+  type CycleDefinition,
+  type JobState,
+  type WorkerConfig,
+} from '@ogun/core'
 import type { CredentialOutlook } from '@ogun/gateway'
 import { admit, modifierReadiness, probeProject, type ModifierReadiness } from './admission.ts'
 import { projectPolicies } from './policies.ts'
@@ -155,7 +162,22 @@ export async function startCycleRun(
           nodeKey: node.key,
           prompt,
           dependsOn,
-          requires: workerRequirements(worker),
+          /**
+           * The columns *and* the stored config. `workerRequirements` used to live in
+           * this file and take only `{runtime, sandbox}`, so a worker's `requires:` — a
+           * field the schema documents, sync stores, the API returns and the UI is
+           * careful to preserve through a PATCH — reached the queue as nothing at all.
+           *
+           * Snapshotted onto the job rather than looked up at claim time for the same
+           * reason `prompt` and `workerName` are: the claim query is a single statement
+           * against `jobs`, and a run's requirements must be the ones it was created
+           * with rather than whatever `ogun project sync` wrote since.
+           */
+          requires: workerRequirements({
+            runtime: worker.runtime as WorkerConfig['runtime'],
+            sandbox: worker.sandbox as WorkerConfig['sandbox'],
+            ...requiresOf(worker.config),
+          }),
           state,
         })
         .returning()
@@ -310,6 +332,27 @@ async function resolveWorkers(db: Db, projectId: string, definition: CycleDefini
 }
 
 /**
+ * The worker's declared `requires:`, if its stored config carries a usable one.
+ *
+ * Guarded rather than cast, for the same reason `timeoutOf` below is. `workers.config` is
+ * a jsonb column typed `Record<string, unknown>`; everything that writes it goes through
+ * `workerSchema.parse`, but a column is not a type and this is the one place its contents
+ * reach a queue that decides which machine may run the job. A `requires: gpu` written by
+ * hand into the database — no list — would otherwise be a `.map` on a string, thrown
+ * inside the transaction that creates the whole cycle run, taking every other node with
+ * it.
+ *
+ * Spread, so "this worker did not say" arrives at `workerRequirements` as an absence and
+ * the derivation stays the single place that decides what an absence means.
+ */
+function requiresOf(config: Record<string, unknown>): { requires?: string[] } {
+  const requires = config.requires
+  return Array.isArray(requires) && requires.every((r) => typeof r === 'string')
+    ? { requires }
+    : {}
+}
+
+/**
  * The worker's own timeout, if its stored config carries one.
  *
  * Spread rather than defaulted here so that "this worker did not say" reaches admission
@@ -321,9 +364,3 @@ function timeoutOf(config: Record<string, unknown>): { timeoutMs?: number } {
   return typeof timeoutMs === 'number' && Number.isFinite(timeoutMs) ? { timeoutMs } : {}
 }
 
-/** A job's requirements are derived from its worker, not hand-maintained. */
-function workerRequirements(worker: { runtime: string; sandbox: string }): string[] {
-  const req = [worker.runtime]
-  if (worker.sandbox === 'container') req.push('docker')
-  return req
-}

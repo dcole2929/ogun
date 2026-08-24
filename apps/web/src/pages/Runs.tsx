@@ -48,12 +48,27 @@ export function RunsPage() {
                   <td>
                     {p.job.state === 'blocked' ? (
                       <span className="pill">waiting on a dependency</span>
-                    ) : p.claimable ? (
+                    ) : p.reach === 'claimable' ? (
                       <span className="pill blue">waiting for a runner</span>
+                    ) : p.reach === 'offline' ? (
+                      // A machine that can run this exists and is not up. It resolves
+                      // itself the moment that machine comes back, so it is not the red
+                      // one — calling it "nothing can run this" is how the red one stops
+                      // being believed.
+                      <span
+                        className="pill yellow"
+                        title="a runner advertising all of these is registered but offline"
+                      >
+                        its runner is offline
+                      </span>
                     ) : (
-                      // The difference that matters: this one will never be picked up.
-                      <span className="pill red" title="no online runner advertises all of these">
-                        nothing can run this
+                      // The difference that matters: this one will never be picked up,
+                      // by anything, until a machine advertising those labels joins.
+                      <span
+                        className="pill red"
+                        title={`no runner registered here advertises: ${p.missing.join(', ')}`}
+                      >
+                        nothing advertises {p.missing.join(', ')}
                       </span>
                     )}
                   </td>
@@ -61,21 +76,39 @@ export function RunsPage() {
               ))}
             </tbody>
           </table>
-          {pending.some((p) => !p.claimable) && (
+          {/*
+            Three states, three different things to go and do — which is the reason the
+            server stopped answering this with a boolean. "Start a runner", "wait, or
+            wake that machine", and "label a machine, or delete the line" are not
+            interchangeable, and one sentence covering all three sends two thirds of
+            readers to the wrong place.
+          */}
+          {pending.some((p) => p.reach === 'unmatched') ? (
             <p className="error" style={{ fontSize: 13 }}>
-              {data?.onlineRunners === 0 ? (
+              {data?.liveRunners === 0 ? (
                 <>
-                  No runner is online. <Link to="/runners">Runners</Link> — or start one here
-                  with <span className="mono">ogun runner start</span>.
+                  No runner has joined yet, so nothing can claim these.{' '}
+                  <Link to="/runners">Runners</Link> — or set one up with{' '}
+                  <span className="mono">ogun runner init</span>.
                 </>
               ) : (
                 <>
-                  No online runner advertises everything those jobs need. See{' '}
-                  <Link to="/runners">Runners</Link> for what each machine can do.
+                  No runner registered here advertises{' '}
+                  <span className="mono">
+                    {[...new Set(pending.flatMap((p) => p.missing))].join(', ')}
+                  </span>
+                  . Those jobs will wait indefinitely. See <Link to="/runners">Runners</Link> for
+                  what each machine can do — a capability Ogun cannot detect is declared with{' '}
+                  <span className="mono">ogun runner init --labels</span>.
                 </>
               )}
             </p>
-          )}
+          ) : pending.some((p) => p.reach === 'offline') ? (
+            <p className="muted" style={{ fontSize: 13 }}>
+              A runner that could take these is registered but offline. They will be claimed
+              when it comes back — <Link to="/runners">Runners</Link>.
+            </p>
+          ) : null}
           <h2>Finished</h2>
         </>
       )}

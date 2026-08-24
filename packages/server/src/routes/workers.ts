@@ -9,6 +9,7 @@ import {
   cycleMembers,
   SANDBOX_KINDS,
   workerSchema,
+  type Policies,
   type WorkerConfig,
 } from '@ogun/core'
 import type { Env } from '../context.ts'
@@ -17,6 +18,7 @@ import {
   ConfigUnreachable,
   workerToYamlBlock,
   workerToYamlNode,
+  type ConfigStore,
 } from '../config-store.ts'
 import { ConfigInvalid, reindexProject } from '../reindex.ts'
 import { projectPolicies, type ResolvedPolicies } from '../foreman/policies.ts'
@@ -160,9 +162,28 @@ workersRoutes.get('/', async (c) => {
   const slugs = [...new Set(rows.map((r) => r.project.slug))]
   const editable: Record<string, boolean> = {}
   const hashes: Record<string, string> = {}
+  /**
+   * Whether each project's config.yaml permits a modifier on the `worktree` sandbox.
+   *
+   * Sent so the form can offer the combination a project has opted into, and describe
+   * what it costs, instead of greying it out for everyone. It is not in `policies` below
+   * and must not be: that map is `ResolvedPolicies`, the control-plane half read off the
+   * `projects` row, and `allowSandboxDowngrade` is deliberately not stored there (§4.9).
+   * This comes from the file, which is the copy the UI is editing.
+   *
+   * Absent for a project this control plane cannot reach — the form has no button to
+   * offer there anyway, since the write itself would fail.
+   */
+  const allowSandboxDowngrade: Record<string, boolean> = {}
   for (const s of slugs) {
     editable[s] = await config.writable(s)
-    if (editable[s]) hashes[s] = (await config.read(s)).hash
+    if (!editable[s]) continue
+    // One read for both, rather than one per fact: they come out of the same parse of
+    // the same file, and two reads is two chances for them to describe different
+    // versions of it if somebody saves in an editor between them.
+    const file = await config.read(s)
+    hashes[s] = file.hash
+    allowSandboxDowngrade[s] = file.policies.allowSandboxDowngrade
   }
 
   /**
@@ -197,6 +218,7 @@ workersRoutes.get('/', async (c) => {
     })),
     editable,
     hashes,
+    allowSandboxDowngrade,
     policies,
   })
 })
@@ -242,7 +264,12 @@ workersRoutes.post('/', async (c) => {
   })
   if (!project) return c.json({ error: `no such project: ${body.projectSlug}` }, 404)
 
-  const invalid = await validate(c.var.ctx.db, project.id, body)
+  const invalid = await validate(
+    c.var.ctx.db,
+    project.id,
+    body,
+    await filePolicies(config, body.projectSlug),
+  )
   if (invalid) return c.json({ error: invalid }, 400)
 
   const existing = await db.query.workers.findFirst({
@@ -275,7 +302,12 @@ workersRoutes.patch('/:id', async (c) => {
   if (!project) return c.json({ error: 'no such project' }, 404)
 
   const merged = { ...(worker.config as Record<string, unknown>), ...stripUndefined(body) }
-  const invalid = await validate(db, project.id, merged as z.infer<typeof workerFields>)
+  const invalid = await validate(
+    db,
+    project.id,
+    merged as z.infer<typeof workerFields>,
+    await filePolicies(config, project.slug),
+  )
   if (invalid) return c.json({ error: invalid }, 400)
 
   const fields = toWorkerConfig(merged as z.infer<typeof workerFields>)
@@ -420,10 +452,33 @@ const toWorkerConfig = (input: z.infer<typeof workerFields> & Record<string, unk
     ...(input.timeoutMs ? { timeoutMs: input.timeoutMs } : {}),
   })
 
+/**
+ * What this API refuses to write into config.yaml, and — for the sandbox downgrade — on
+ * whose authority.
+ *
+ * `allowSandboxDowngrade` is read from the file being edited rather than from the
+ * `projects` row, because it is not on the `projects` row and must not be: it is a gate
+ * on what an agent's own work may become, and the control plane deliberately drops it at
+ * sync so no second copy can be reached by a caller who does not know which one counts
+ * (§4.9). The file in front of us is the same file the runner will read from git once it
+ * is committed, so it is the only honest answer available here.
+ *
+ * That is a weaker guarantee than the runner's and deliberately so: the runner reads the
+ * blob at the pinned base, which an agent cannot write, and it is the gate that decides
+ * whether a container is skipped. This one decides whether a form submission is accepted,
+ * and the working tree is what a person is about to commit. Nothing is trusted to this
+ * check that the runner does not check again.
+ *
+ * `undefined` means the config could not be read. It is not folded into "the project said
+ * no": the caller lets it through to `config.mutate`, which fails with the reachable
+ * message and the yaml block to paste. Refusing here instead would replace a useful error
+ * with a misleading one, on a request that cannot write anything either way.
+ */
 async function validate(
   db: Env['Variables']['ctx']['db'],
   projectId: string,
   input: { skill?: string; permissions?: string; sandbox?: string },
+  policies: Policies | undefined,
 ): Promise<string | null> {
   if (input.skill) {
     const skill = await db.query.skills.findFirst({
@@ -435,10 +490,41 @@ async function validate(
       return `no skill named "${input.skill}" — run \`ogun project sync\` after adding it`
     }
   }
-  if (input.permissions === 'modifier' && input.sandbox === 'worktree') {
-    return 'a modifier on the worktree sandbox edits files directly on the host'
+  /**
+   * The refusal this route used to make unconditionally.
+   *
+   * `policies.allowSandboxDowngrade` genuinely exists now and the runner genuinely
+   * honours it, so refusing regardless meant a project that had opted in could still
+   * create the worker — by hand, in config.yaml, followed by `ogun project sync` — and
+   * watch it run, while the UI over that same file said it was not allowed. Two answers
+   * to one question, and the wrong one was the one with a button.
+   */
+  const downgrading = input.permissions === 'modifier' && input.sandbox === 'worktree'
+  if (downgrading && policies?.allowSandboxDowngrade === false) {
+    return (
+      'a modifier on the worktree sandbox edits files directly on the host, and this ' +
+      "project's policies.allowSandboxDowngrade is false. Set it true and commit it if " +
+      'you mean to allow that.'
+    )
   }
   return null
+}
+
+/**
+ * The project's `policies:` as its config.yaml currently says, or `undefined` when this
+ * control plane cannot reach that file.
+ *
+ * Swallowing the error is the whole reason this is a function rather than an inline
+ * `config.read`. An unreachable config is not an error at this point in the request: it
+ * is the remote-control-plane deployment, and the route already handles it further down
+ * by handing back the yaml to paste. Letting the read throw here would turn that into a
+ * 500 for every worker edit on such a deployment.
+ */
+async function filePolicies(config: ConfigStore, slug: string): Promise<Policies | undefined> {
+  return await config.read(slug).then(
+    (file) => file.policies,
+    () => undefined,
+  )
 }
 
 const stripUndefined = (o: Record<string, unknown>): Record<string, unknown> =>

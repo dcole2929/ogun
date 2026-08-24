@@ -255,3 +255,77 @@ test('a container sandbox is built whatever the policy says', async () => {
   })
   assert.equal(sandbox.kind, 'container')
 })
+
+/**
+ * What a *permitted* downgrade says, which is the half nothing else covers.
+ *
+ * A refusal explains itself — that is what a refusal is for. A permission is silent, and
+ * this one is silent about a great deal: `allowSandboxDowngrade: true` does not relax one
+ * property, it opts out of the containment model whole. No read-only mount, and the mount
+ * is where the permission profile is actually enforced (`--disallowedTools` never
+ * restricted `Bash`, and codex has no equivalent); no network namespace, so the worker's
+ * `egress:` allowlist is dropped without a word; no gateway, so the agent reads this
+ * machine's credential files directly; and the process runs as the runner's user with the
+ * runner's environment.
+ *
+ * A person can turn all of that on having read four words of a key name. What a naive
+ * implementation does is treat the flag as answered once it is honoured — `allow: true`,
+ * nothing more to say — and then the only record that a night's work ran uncontained is
+ * the absence of a container in a log nobody kept.
+ *
+ * The notice carries the base sha for the same reason the refusal does: it is a statement
+ * about which copy of config.yaml was consulted, and a working copy sitting in front of
+ * the reader may well say something else by now.
+ */
+test('a permitted downgrade says what it cost, not just that it was permitted', async () => {
+  const { root, workspace, baseSha } = await factory(CONFIG(true))
+  try {
+    const decision = await decide(workspace.path, baseSha)
+    assert.equal(decision.allow, true)
+    assert.equal(decision.refusal, undefined)
+
+    const notice = decision.notice ?? ''
+    assert.match(notice, /uncontained/)
+    assert.match(notice, /read-only/, 'the mount is where the permission profile is enforced')
+    assert.match(notice, /egress/, 'a declared allowlist is dropped, and that must be said')
+    assert.match(notice, /gateway/)
+    assert.match(notice, new RegExp(baseSha.slice(0, 12)), 'which copy of the config said yes')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+/**
+ * And it fires only for the case the policy is about.
+ *
+ * This is the noise bound, and it is the reason the notice is worth having at all. A
+ * container run is the ordinary configuration and gives up nothing; a reviewer on a
+ * worktree is §4.6's documented fast path, needs no policy, and reaches it whatever the
+ * project set. Announcing "uncontained" on either would put the sentence on almost every
+ * run, at which point it is scenery — and scenery is worse than silence here, because it
+ * was supposed to be the loud thing.
+ */
+test('nothing is announced for a run that gave nothing up', async () => {
+  const { root, workspace, baseSha } = await factory(CONFIG(true))
+  try {
+    const container = await decide(workspace.path, baseSha, { sandbox: 'container' })
+    assert.equal(container.allow, true, 'the policy is true; it simply does not apply')
+    assert.equal(container.notice, undefined)
+
+    const reviewer = await decide(workspace.path, baseSha, { permissions: 'reviewer' })
+    assert.equal(reviewer.notice, undefined)
+
+    // And a refusal is not also a notice — one run produces one sentence, and the two
+    // would say opposite things.
+    const forbidden = await factory(CONFIG(false))
+    try {
+      const decision = await decide(forbidden.workspace.path, forbidden.baseSha)
+      assert.ok(decision.refusal)
+      assert.equal(decision.notice, undefined)
+    } finally {
+      await rm(forbidden.root, { recursive: true, force: true })
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})

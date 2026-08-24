@@ -286,6 +286,17 @@ export async function executeJob(
       baseSha: workspace.sha,
     })
     if (downgrade.refusal) return await refuse(downgrade.refusal)
+    /**
+     * Immediately, on the runner's own stdout, as well as on the timeline further down.
+     *
+     * Two surfaces because they answer for two different people at two different moments.
+     * The timeline is for whoever reads the run afterwards; this line is for whoever is
+     * watching a runner they just started, and it is the one that arrives *before* the
+     * agent does anything — which is the only point at which stopping it is cheap.
+     */
+    if (downgrade.notice) {
+      console.warn(`[runner] run=${job.runId} ${job.workerName} — ${downgrade.notice}`)
+    }
 
     /**
      * A modifier has to be able to prove its work, and this is where that becomes
@@ -445,6 +456,50 @@ export async function executeJob(
           historyAvailable: Boolean(history),
         },
       },
+      /**
+       * What this run gave up, when it gave anything up — see `sandboxDowngrade`.
+       *
+       * On the timeline rather than only in the runner's log because the log belongs to
+       * whoever was watching at the time, and the question "was this agent contained"
+       * gets asked weeks later by somebody reading the run. `uncontained: true` rides
+       * along as a field so it can be found without matching on prose.
+       *
+       * Emitted here, before the agent's first turn, so the record of what it could reach
+       * precedes everything it did rather than trailing it.
+       */
+      ...(downgrade.notice
+        ? [
+            {
+              type: 'runner.note' as const,
+              ts: new Date().toISOString(),
+              seq: nextSeq(parser),
+              payload: { note: downgrade.notice, uncontained: true, sandbox: 'worktree' },
+            },
+          ]
+        : []),
+      /**
+       * A `worktree` sandbox has no network namespace, so a worker that declared
+       * `egress:` does not get it — the same silent-drop family as `requires:`, and the
+       * one place it can still be said. The refusal above does not cover it: a *reviewer*
+       * on a worktree needs no policy and reaches this line with its allowlist quietly
+       * gone.
+       */
+      ...(job.sandbox === 'worktree' && job.egress !== undefined
+        ? [
+            {
+              type: 'runner.note' as const,
+              ts: new Date().toISOString(),
+              seq: nextSeq(parser),
+              payload: {
+                note:
+                  "this worker declares `egress:`, and the worktree sandbox cannot apply it — " +
+                  "there is no network namespace to confine. The agent reaches whatever this " +
+                  'machine reaches. Use `sandbox: container` for the allowlist to mean anything.',
+                egressApplied: false,
+              },
+            },
+          ]
+        : []),
     ])
 
     for (let round = 0; round < maxRounds; round++) {
@@ -948,6 +1003,28 @@ export async function projectTestCommand(
  * fast path — file-state isolation for an agent that cannot write anyway — and needs no
  * policy; a modifier there is an agent editing files directly on the host, as the runner
  * user, on the runner's network, with no capability isolation at all.
+ *
+ * ### Why a permitted downgrade still says something
+ *
+ * `notice` is set when the policy is honoured — when the answer is yes. That is not
+ * belt-and-braces, it is the case with nothing else guarding it. A refusal explains
+ * itself; a permission is silent, and this one is silent about a lot. Turning
+ * `allowSandboxDowngrade` on does not relax one property, it opts out of the containment
+ * model: no read-only mount, and mounts are where the permission profile is actually
+ * enforced (`--disallowedTools` never restricted `Bash`, and codex has no equivalent); no
+ * network namespace, so the worker's `egress:` allowlist is dropped without a word; no
+ * gateway, so the agent reads the runner's own credential files directly; and the process
+ * is the runner's user with the runner's `process.env`.
+ *
+ * A person can set that flag having read four words of a key name. The sentence has to
+ * arrive somewhere they will be, so it goes on the run timeline — once per run that
+ * actually downgraded, next to the run it applied to, where a fortnight later it is still
+ * the answer to "what was this agent able to touch".
+ *
+ * Deliberately *not* fatal, not a prompt, and not repeated per exec. A warning that fires
+ * on a configuration somebody chose on purpose, and fires often, is one they filter — and
+ * then it is worth less than nothing, because it was the loud thing that was supposed to
+ * be enough.
  */
 export function sandboxDowngrade(input: {
   sandbox: 'container' | 'worktree'
@@ -956,9 +1033,24 @@ export function sandboxDowngrade(input: {
   policies: PinnedPolicies | undefined
   /** Named in the refusal, because "which copy of the config" is the whole question. */
   baseSha: string
-}): { allow: boolean; refusal?: string } {
+}): { allow: boolean; refusal?: string; notice?: string } {
   const allow = input.policies?.allowSandboxDowngrade ?? false
-  if (allow || input.sandbox !== 'worktree' || input.permissions !== 'modifier') return { allow }
+  const downgrading = input.sandbox === 'worktree' && input.permissions === 'modifier'
+  if (allow) {
+    return downgrading
+      ? {
+          allow,
+          notice:
+            "uncontained: this modifier runs on the host as the runner's user, with the " +
+            "runner's environment and network, because policies.allowSandboxDowngrade is " +
+            `true at ${input.baseSha.slice(0, 12)}. The workspace is not mounted read-only, ` +
+            'so the permission profile is not enforced by anything; the egress allowlist ' +
+            'does not apply, since there is no network namespace; and the agent reads this ' +
+            "machine's credential files rather than going through the gateway.",
+        }
+      : { allow }
+  }
+  if (!downgrading) return { allow }
 
   const at = input.baseSha.slice(0, 12)
   return {

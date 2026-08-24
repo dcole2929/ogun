@@ -7,6 +7,7 @@ import { basename } from 'node:path'
 import {
   discoverSkills,
   expandCycle,
+  inertPolicies,
   loadProjectConfig,
   localConfigPath,
   updateLocalConfig,
@@ -93,7 +94,12 @@ export async function projectSync(args: string[], serverUrl: string): Promise<vo
     fail(`sync failed: ${res ? await res.text() : `could not reach ${serverUrl}`}`)
   }
 
-  const result = (await res.json()) as { removed?: string[]; overriddenSchedules?: string[] }
+  const result = (await res.json()) as {
+    removed?: string[]
+    overriddenSchedules?: string[]
+    unmetRequirements?: Array<{ worker: string; missing: string[] }>
+    registeredRunners?: number
+  }
 
   console.log(green(`synced ${payload.slug}`))
   console.log(
@@ -136,6 +142,49 @@ export async function projectSync(args: string[], serverUrl: string): Promise<vo
           `\n  Put the schedule on the cycle instead; triggering the worker by name still works.`,
       ),
     )
+  }
+
+  /**
+   * Labels this fleet cannot satisfy, and the setting that says nothing.
+   *
+   * Both are the same failure wearing two faces: a line in config.yaml that the rest of
+   * the system does not act on. `requires: [gpu]` produces jobs that sit in `queued`
+   * until a GPU machine joins — which is legitimate if one is coming and a silent hole
+   * if one is not, and only the person who just typed it knows which. Printed here
+   * because this is the moment they typed it.
+   */
+  if (result.registeredRunners === 0) {
+    // Not a per-worker list: with no runner joined, *every* worker's requirements are
+    // unmet and the list would say nothing the first line does not.
+    console.log(
+      yellow(
+        '\n  no runner has joined this control plane, so nothing will claim these jobs.' +
+          '\n  `ogun runner init` on the machine that should run them.',
+      ),
+    )
+  } else if (result.unmetRequirements?.length) {
+    console.log(
+      yellow(
+        '\n  no runner here advertises these, so their jobs would queue and never be claimed:',
+      ),
+    )
+    for (const { worker, missing } of result.unmetRequirements) {
+      console.log(yellow(`    ${worker}: ${missing.join(', ')}`))
+    }
+    console.log(
+      dim(
+        '  `ogun runner doctor` on the machine that has them; labels Ogun cannot detect\n' +
+          '  are declared with `ogun runner init --labels <name>`.',
+      ),
+    )
+  }
+
+  /**
+   * Settings this build stores and does not act on. A key that does nothing is
+   * indistinguishable from a key that works, right up until the night it mattered.
+   */
+  for (const note of inertPolicies(loaded.config.policies)) {
+    console.log(yellow(`\n  ${note}`))
   }
 
   // A skill only reaches an automated run once it lands on the default branch, since

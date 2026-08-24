@@ -20,6 +20,16 @@ const HELP: Record<string, string> = {
 
 export type WorkerFormProps = {
   projectSlug: string
+  /**
+   * This project's `policies.allowSandboxDowngrade`, from its config.yaml.
+   *
+   * Without it the form refused `modifier` + `worktree` for everyone, including projects
+   * that had set the policy true and whose runs the runner would happily have executed.
+   * The API refused it too, so the only way to build such a worker was to hand-edit the
+   * file — which worked, which is how you could end up with a worker the UI insists is
+   * not allowed sitting in the list, running every night.
+   */
+  allowSandboxDowngrade: boolean
   existing?: WorkerRow['worker']
   /**
    * Name of the cycle that runs this worker, when one does. The schedule field is still
@@ -38,6 +48,7 @@ export type WorkerFormProps = {
  */
 export function WorkerForm({
   projectSlug,
+  allowSandboxDowngrade,
   existing,
   drivenBy,
   configHash,
@@ -109,7 +120,8 @@ export function WorkerForm({
 
   const modifierOnWorktree = permissions === 'modifier' && sandbox === 'worktree'
   const nameValid = /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(name)
-  const canSave = Boolean(skill) && nameValid && !modifierOnWorktree && !save.isPending
+  const canSave =
+    Boolean(skill) && nameValid && (!modifierOnWorktree || allowSandboxDowngrade) && !save.isPending
 
   return (
     <div className="card" style={{ marginBottom: 22 }}>
@@ -191,10 +203,34 @@ export function WorkerForm({
               <option key={s}>{s}</option>
             ))}
           </select>
-          <small className={modifierOnWorktree ? 'error' : 'muted'}>
-            {modifierOnWorktree
-              ? 'a modifier on a worktree edits files directly on your host — refused'
-              : HELP[sandbox]}
+          {/*
+            Three states, because "allowed" and "refused" were being told apart by the
+            wrong thing. The interesting one is the middle: the project *has* opted in, so
+            the answer is yes — and yes is the moment the cost has to be said, since
+            `allowSandboxDowngrade` is not one knob among several. It opts out of the
+            containment model whole. Naming it as a policy key and leaving it there is how
+            somebody turns it on having read four words.
+          */}
+          <small className={modifierOnWorktree && !allowSandboxDowngrade ? 'error' : 'muted'}>
+            {!modifierOnWorktree ? (
+              HELP[sandbox]
+            ) : allowSandboxDowngrade ? (
+              <>
+                <strong>No containment.</strong> This project sets{' '}
+                <span className="mono">policies.allowSandboxDowngrade: true</span>, so this is
+                allowed — and the agent will run as an ordinary process on the runner's
+                machine, as the runner's user, with the runner's environment and network. No
+                read-only mount, which is where the permission profile is enforced; and{' '}
+                <span className="mono">egress:</span> is dropped, since there is no network
+                namespace to apply it to.
+              </>
+            ) : (
+              <>
+                a modifier on a worktree edits files directly on your host — refused, because
+                this project's <span className="mono">policies.allowSandboxDowngrade</span> is
+                false
+              </>
+            )}
           </small>
         </label>
 

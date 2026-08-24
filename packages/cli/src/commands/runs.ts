@@ -1,4 +1,4 @@
-import { bold, cyan, dim, fail, outcomeColor, table } from '../output.ts'
+import { bold, cyan, dim, fail, outcomeColor, table, yellow } from '../output.ts'
 import { authHeaders } from '../auth.ts'
 
 type RunRow = {
@@ -58,7 +58,7 @@ export async function trigger(args: string[], serverUrl: string): Promise<void> 
 
   const body = (await res.json()) as {
     cycleRunId: string
-    jobs: Array<{ nodeKey: string; state: string }>
+    jobs: Array<{ nodeKey: string; state: string; reach?: string; missing?: string[] }>
   }
   for (const j of body.jobs) {
     if (j.state === 'skipped') {
@@ -67,6 +67,27 @@ export async function trigger(args: string[], serverUrl: string): Promise<void> 
       console.log(
         `${cyan(j.nodeKey)}: ${outcomeColor('skipped')} — admission refused it; see \`ogun coverage\``,
       )
+    } else if (j.state !== 'queued') {
+      // `blocked` waits on a dependency, not on a machine. Saying anything about runners
+      // here would point at the wrong thing entirely.
+      console.log(`${cyan(j.nodeKey)}: ${j.state}`)
+    } else if (j.reach === 'unmatched') {
+      /**
+       * `queued` is the truth and not the whole truth. This job asks for a capability no
+       * runner registered here advertises, so nothing will ever claim it — and the word
+       * "queued" is precisely what makes that invisible, since it is also what a job
+       * about to run in four seconds says. Printed at the moment somebody pressed run,
+       * which is when they decide the system is working.
+       */
+      console.log(
+        `${cyan(j.nodeKey)}: ${j.state} — ${yellow(
+          `no runner advertises ${(j.missing ?? []).join(', ')}, so nothing will claim this`,
+        )}`,
+      )
+    } else if (j.reach === 'offline') {
+      // Different, and not a warning: the machine exists and is asleep. It runs when the
+      // machine comes back, which is what an unattended fleet is supposed to do.
+      console.log(`${cyan(j.nodeKey)}: ${j.state} — ${dim('its runner is offline')}`)
     } else {
       console.log(`${cyan(j.nodeKey)}: ${j.state}`)
     }

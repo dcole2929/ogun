@@ -60,7 +60,18 @@ export const workerSchema = z.object({
   timezone: z.string().optional(),
   onMissed: z.enum(['skip', 'runOnce']).default('skip'),
   enabled: z.boolean().default(true),
-  /** Capability labels a runner must advertise. Derived when omitted. */
+  /**
+   * Extra capability labels a runner must advertise before it may claim this worker's
+   * jobs — for things Ogun cannot detect by looking for a binary: `gpu`, `vpn`,
+   * `staging-db`. See `workerRequirements`, which is what actually reads this.
+   *
+   * *Added to* what the worker's own shape implies, never a replacement for it. The
+   * previous wording here — "derived when omitted" — reads as though declaring the field
+   * takes the derivation over, and that reading has a silent failure: a `container`
+   * worker declaring `requires: [gpu]` would stop requiring `docker`, and its jobs would
+   * be offered to a machine that cannot run them. Nothing about writing "this also needs
+   * a GPU" says "and it no longer needs Docker".
+   */
   requires: z.array(z.string()).optional(),
   timeoutMs: z.number().int().positive().default(DEFAULT_WORKER_TIMEOUT_MS),
   /**
@@ -74,6 +85,45 @@ export const workerSchema = z.object({
   verify: verifySchema.optional(),
 })
 export type WorkerConfig = z.infer<typeof workerSchema>
+
+/**
+ * The capability labels a runner must advertise before it may claim a job for this
+ * worker (§4.5) — `jobs.requires`, and the left-hand side of the `requires <@ labels`
+ * test the claim query makes.
+ *
+ * Two sources, unioned, and the union is the point. The derived half is what the
+ * worker's shape implies and no config can waive: a `codex` runtime needs the `codex`
+ * binary, a `container` sandbox needs `docker`. The declared half is `requires:` — the
+ * capabilities Ogun has no way to detect, which is why they can only be asserted by
+ * hand at both ends (`ogun runner init --labels gpu` on the machine, `requires: [gpu]`
+ * on the worker).
+ *
+ * The declared half was being dropped entirely: the derivation lived in `cycles.ts` and
+ * never looked at the worker's config, so `requires:` was parsed by the schema, stored
+ * in `workers.config`, echoed back by the API and preserved through UI edits — and read
+ * by nothing. A worker asking for a GPU was offered to every runner, and found out by
+ * failing on whichever machine happened to be free.
+ *
+ * Lives here rather than beside its one caller because it now has two, and they hold a
+ * worker in different shapes: the foreman holds a `workers` row (columns plus a jsonb
+ * `config`), and the sync-time check holds a `WorkerConfig` straight out of the file.
+ * Two derivations of the same set is how the queue and the warning about the queue end
+ * up disagreeing about which labels a job needs.
+ *
+ * Order is derived-then-declared and duplicates are dropped, so the array is stable for
+ * a given worker: it is stored on every job row and shown in the UI, and a set that
+ * reshuffles makes diffs and screenshots lie about a change that did not happen.
+ */
+export function workerRequirements(
+  worker: Pick<WorkerConfig, 'runtime' | 'sandbox'> & { requires?: string[] | undefined },
+): string[] {
+  const derived = [worker.runtime, ...(worker.sandbox === 'container' ? ['docker'] : [])]
+  // Trimmed and emptied-out, because these reach a postgres array comparison against
+  // labels that `listFlag` already trimmed on the way in. A `requires: ["gpu "]` that
+  // matches nothing on any machine is indistinguishable from the feature being broken.
+  const declared = (worker.requires ?? []).map((label) => label.trim()).filter(Boolean)
+  return [...new Set([...derived, ...declared])]
+}
 
 /**
  * How this repository runs its own suite (§9's tests-must-pass gate).
@@ -128,6 +178,31 @@ export type TestsConfig = z.infer<typeof testsSchema>
  * for the breaker threshold" do not compile.
  */
 export const policiesSchema = z.object({
+  /**
+   * Whether Ogun may write to the project's default branch. It may not, and `true` is a
+   * value this build accepts and does not implement.
+   *
+   * The publisher builds every branch as `ogun/<worker>/<runid>` and pushes
+   * `HEAD:refs/heads/<that>`, so "never the default branch" is true by construction for
+   * any project whose default branch is not itself under `ogun/`. `publishPatch` checks
+   * the policy anyway, for the one case construction does not cover — a default branch
+   * literally named `ogun/<worker>/<runid>`, which is a legal ref. That check is a
+   * backstop, it is tested, and it is written against this flag rather than against the
+   * prefix so that a direct-push path, if one is ever built, finds the gate already in
+   * the right shape.
+   *
+   * The consequence for a reader is the part worth stating here rather than only in
+   * `publishPatch`: setting this `true` does not make Ogun push. It opens a draft pull
+   * request exactly as before. `ogun project sync` says so out loud (`inertPolicies`)
+   * rather than leaving you to infer it from a night of pull requests you did not want.
+   *
+   * Not refused outright the way `extends:` is, though the two are the same kind of
+   * declared-and-unimplemented. `extends:` silently changed *nothing* about a run;
+   * `directPush` is a safety flag whose only implemented value is the safe one, so a
+   * config carrying `true` is producing the conservative behaviour rather than a wrong
+   * one. Failing to parse it would stop a project's runs over a setting that is, today,
+   * being honoured in the strict direction.
+   */
   directPush: z.boolean().default(false),
   /** A modifier on `worktree` is an agent editing files directly on the host. */
   allowSandboxDowngrade: z.boolean().default(false),
@@ -174,6 +249,35 @@ export const policiesSchema = z.object({
   maxOpenPullRequests: z.number().int().nonnegative().default(3),
 })
 export type Policies = z.infer<typeof policiesSchema>
+
+/**
+ * Settings this build accepts, stores, and does not act on — said out loud at
+ * `ogun project sync`, which is the moment somebody has just written one.
+ *
+ * The whole family of bugs this branch is about is a declared setting that never reaches
+ * the thing it names, and the reason each survived is that nothing anywhere says "that
+ * key does nothing". A `false` that is being honoured strictly and a `true` that is being
+ * ignored look identical from outside, and both look identical to a working feature.
+ *
+ * A list rather than a boolean because it is expected to grow and shrink: an entry
+ * leaves the moment its setting is implemented, and a value that is inert is a property
+ * of the value rather than of the key — `directPush: false` is not inert, it is the rule.
+ *
+ * Deliberately empty for a default config. A warning that fires on an ordinary
+ * configuration is one people learn to scroll past, and then the one that matters
+ * scrolls past too.
+ */
+export function inertPolicies(policies: Policies): string[] {
+  const notes: string[] = []
+  if (policies.directPush) {
+    notes.push(
+      'policies.directPush: true has no implementation — Ogun always opens a draft pull ' +
+        'request from an `ogun/<worker>/<run>` branch and never pushes to the default ' +
+        'branch. The setting is a gate, and its only implemented value is the closed one.',
+    )
+  }
+  return notes
+}
 
 /**
  * The half the control plane stores and decides with. See `policiesSchema` for why there
