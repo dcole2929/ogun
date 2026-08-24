@@ -3,7 +3,7 @@ import { and, desc, eq, inArray } from 'drizzle-orm'
 import { z } from 'zod'
 import { schema } from '@ogun/core/db'
 import type { Db } from '@ogun/core/db'
-import { cycleDefinitionSchema, policiesSchema, workerSchema } from '@ogun/core'
+import { controlPlanePoliciesSchema, cycleDefinitionSchema, workerSchema } from '@ogun/core'
 import { discoverSkills, expandCycle, hashSkillSet, loadProjectConfig } from '@ogun/core'
 import { builtinSkillsRoot, driftAcross } from '../drift.ts'
 import { reindexProject } from '../reindex.ts'
@@ -23,7 +23,20 @@ const syncSchema = z.object({
   remoteUrl: z.string().optional(),
   configHash: z.string(),
   workers: z.record(z.string(), workerSchema),
-  policies: policiesSchema,
+  /**
+   * The control-plane half only, and the narrowing is the security property rather than
+   * an economy.
+   *
+   * `allowSandboxDowngrade` and `maxOpenPullRequests` are gates on what an agent's own
+   * work may become, and the runner reads them from the git blob at the pinned base
+   * because a modifier can write to its checkout (§4.6, ADR-0009). Accepting them here
+   * would create a second copy in the one place a future caller is most likely to reach
+   * for — and a caller reading a scheduling table has no way to know that this particular
+   * column must not be trusted. So they do not arrive: zod strips what the schema does
+   * not name, an older CLI posting the whole block still syncs, and the extra keys are
+   * dropped at the door rather than stored and then remembered not to read.
+   */
+  policies: controlPlanePoliciesSchema,
   skills: z
     .array(
       z.object({
@@ -57,17 +70,44 @@ export type SyncPayload = z.infer<typeof syncSchema>
  * is one, and the difference is only where the payload came from.
  */
 async function applySync(db: Db, body: SyncPayload) {
+  const policies = controlPlanePoliciesSchema.parse(body.policies)
+
+  /**
+   * `policies` is written unconditionally on both halves of the upsert, unlike
+   * `remoteUrl` above which is only written when present.
+   *
+   * The difference is what absence means for each. A payload without a remote is a repo
+   * that has none, and blanking a URL we already knew would lose a fact; a payload's
+   * `policies` is never absent — `syncSchema` requires it and `projectConfigSchema`
+   * prefaults an omitted block to the defaults — so what arrives is always this config's
+   * complete answer. Writing it wholesale is what makes deleting a policy line take
+   * effect, which is the same reasoning the skills upsert below spells out: this row is
+   * an index of a file, and a stale half of it is worse than none.
+   *
+   * The column therefore only stays null for a project that has not synced since it
+   * existed, which is exactly the fact `projectPolicies` reports as `unsynced`.
+   *
+   * Re-parsed here even though `body.policies` is already typed as the control-plane half.
+   * It looks redundant and is not: `/sync` gets its payload through `syncSchema`, which
+   * strips, but `sync-local` builds one in TypeScript out of `loaded.config.policies` — a
+   * whole `Policies`, which is *structurally assignable* to the narrower type and would
+   * be handed to drizzle with `maxOpenPullRequests` still on it. jsonb stores what it is
+   * given. One `parse` at the single write site means the pinned-blob keys cannot reach
+   * the column by any route, including one added later by someone who never read this.
+   */
   const [project] = await db
     .insert(projects)
     .values({
       slug: body.slug,
       defaultBranch: body.defaultBranch,
+      policies,
       ...(body.remoteUrl ? { remoteUrl: body.remoteUrl } : {}),
     })
     .onConflictDoUpdate({
       target: projects.slug,
       set: {
         defaultBranch: body.defaultBranch,
+        policies,
         ...(body.remoteUrl ? { remoteUrl: body.remoteUrl } : {}),
       },
     })

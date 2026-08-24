@@ -3,7 +3,7 @@ import { after, before, describe, test } from 'node:test'
 import { eq } from 'drizzle-orm'
 import { schema } from '@ogun/core/db'
 import { startHarness } from './harness.ts'
-import { singleWorkerCycle } from '@ogun/core'
+import { defaultControlPlanePolicies, singleWorkerCycle } from '@ogun/core'
 import { startCycleRun } from '../src/foreman/cycles.ts'
 import { finalizeRun } from '../src/foreman/finalize.ts'
 import { admit } from '../src/foreman/admission.ts'
@@ -141,7 +141,9 @@ describe('run lifecycle', () => {
     await runOnce(fail)
     await runOnce(fail)
 
-    const verdict = await admit(db, { id: workerId })
+    // The project's own policies — `admit` takes no default, so a test cannot silently
+    // assert against a machine constant the way the production path used to.
+    const verdict = await admit(db, { id: workerId }, defaultControlPlanePolicies())
     assert.equal(verdict.allowed, false)
 
     const r = await runOnce(fail)

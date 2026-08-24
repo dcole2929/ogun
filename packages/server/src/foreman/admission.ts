@@ -2,27 +2,38 @@ import { existsSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { and, count, eq, inArray, sql } from 'drizzle-orm'
-import { DEFAULT_WORKER_TIMEOUT_MS, readTestCommand } from '@ogun/core'
+import { DEFAULT_WORKER_TIMEOUT_MS, readTestCommand, type ControlPlanePolicies } from '@ogun/core'
 import { schema } from '@ogun/core/db'
 import type { Db } from '@ogun/core/db'
 import { credentialHealth, credentialOutlook, humanDuration, readCredentials } from '@ogun/gateway'
 import type { CredentialOutlook } from '@ogun/gateway'
 import { readProjectMap } from '../config-store.ts'
 
-const { breakers, jobs } = schema
+const { breakers, jobs, workers } = schema
 
 export type AdmissionVerdict = { allowed: true } | { allowed: false; reason: string }
 
+/**
+ * What the *machine* can bear. Nothing here is a property of a project.
+ *
+ * `failureBreakerThreshold` used to live in this type and in `DEFAULT_LIMITS` beside it,
+ * which is how `policies.failureBreakerThreshold` came to mean nothing: the config
+ * declared it, sync posted it, and the two readers — `finalizeRun` and the Workers page —
+ * each took the constant instead. Setting 5 got you 3.
+ *
+ * It is gone from here rather than merely defaulted from here, because a project policy
+ * with a machine-scoped fallback is the same bug wearing a coat: the fallback is what
+ * gets used the moment somebody forgets to thread the real value through, and nothing
+ * says so. The breaker threshold now has exactly one home, `projects.policies`, reached
+ * through `projectPolicies`, whose defaults come from `policiesSchema` itself.
+ */
 export type AdmissionLimits = {
   /** Global, machine-scoped. WSL2 caps at ~50% of Windows RAM and will OOM otherwise. */
   maxConcurrentJobs: number
-  /** Consecutive failures for one worker before it stops being dispatched. */
-  failureBreakerThreshold: number
 }
 
 export const DEFAULT_LIMITS: AdmissionLimits = {
   maxConcurrentJobs: 2,
-  failureBreakerThreshold: 3,
 }
 
 /**
@@ -35,8 +46,15 @@ export const DEFAULT_LIMITS: AdmissionLimits = {
  */
 export async function admit(
   db: Db,
+  // Carries `runtime` and `timeoutMs` because the credential gate needs to know which
+  // provider this job will authenticate against and for how long it must stay valid.
   worker: { id: string; permissions?: string; runtime?: string; timeoutMs?: number },
-  limits: AdmissionLimits = DEFAULT_LIMITS,
+  /**
+   * The project's control-plane policies. Required rather than defaulted: every caller
+   * already holds a project, and a default here would be the same silent fallback that
+   * made `failureBreakerThreshold` mean nothing for as long as it did.
+   */
+  policies: ControlPlanePolicies,
   /**
    * What the project can offer a modifier, established once per cycle run by the caller.
    * Only consulted for a modifier; absent for every other profile, and absent for a
@@ -57,6 +75,30 @@ export async function admit(
    * and it is the sentence the person reading the coverage row has to act on.
    */
   if (worker.permissions === 'modifier') {
+    /**
+     * `maxConcurrentModifiers: 0` first, ahead of readiness, on the same grounds the
+     * sandbox-downgrade gate goes ahead of the tests gate: several refusals can be true
+     * at once and the order decides which sentence a person is left holding. A project
+     * that has switched modifiers off has said the operative thing; told instead that it
+     * has no `.ogun/Dockerfile`, somebody writes one and the worker still does not run.
+     *
+     * Only zero is answered here. A cap of one that is *currently* full is not a fact
+     * about the config — it is a fact about this minute, it stops being true when the
+     * running job finishes, and admission's refusals are permanent: they write a
+     * `skipped` job and a `refused` coverage row for the night. Turning "wait your turn"
+     * into "your work was dropped" would be a worse bug than the unenforced limit. That
+     * half is enforced at claim time by `modifiersOverCap`, where a job simply is not
+     * handed out yet and is picked up on the next poll.
+     */
+    if (policies.maxConcurrentModifiers === 0) {
+      return {
+        allowed: false,
+        reason:
+          'this project sets policies.maxConcurrentModifiers: 0, so no modifier runs at ' +
+          'all. Nothing about this worker failed — raise the cap in .ogun/config.yaml and ' +
+          'sync if you meant it to run.',
+      }
+    }
     /**
      * Fail closed. A caller that did not establish readiness has not proved the project
      * can build an image or run a suite, and the whole rule is that a modifier which
@@ -331,6 +373,122 @@ export async function remainingCapacity(
     .from(jobs)
     .where(inArray(jobs.state, ['claimed', 'running']))
   return Math.max(0, limits.maxConcurrentJobs - (row?.n ?? 0))
+}
+
+/** One queued or in-flight modifier job, as much of it as the cap needs to know. */
+export type ModifierJob = {
+  id: string
+  projectId: string
+  /** Already claimed or running — it is spending the project's allowance right now. */
+  inFlight: boolean
+  priority: number
+  createdAt: Date
+}
+
+/**
+ * Which queued modifier jobs must not be handed out yet, because their project already
+ * has `policies.maxConcurrentModifiers` of them going.
+ *
+ * ### Why this is a hold-back rather than a refusal
+ *
+ * `maxConcurrentModifiers` had no consumer at all. The only cap in force was
+ * `maxConcurrentJobs`, which is the machine's — so two projects nightly-modifying
+ * themselves were bounded only by how much RAM this box has, and a project that wrote
+ * `maxConcurrentModifiers: 1` got whatever number the machine allowed.
+ *
+ * The obvious place to enforce it was admission, and it is the wrong one for the *dynamic*
+ * half. Admission runs when a cycle run is created, which is before any of that run's own
+ * jobs are in flight — so at the moment it would count, there is nothing to count. And its
+ * refusals are permanent: a `skipped` job and a `refused` coverage row, for the night. A
+ * concurrency limit that dropped tonight's second modifier because tonight's first was
+ * still going would be a worse failure than not having the limit. So admission answers
+ * only the question that cannot change while the queue drains — a cap of zero — and this
+ * answers the one that can. A job held back here stays `queued`, is not skipped, is not
+ * recorded as anything, and is claimed on a later poll.
+ *
+ * ### Per project, and that is the whole point
+ *
+ * The counter is per `projectId`, never global. `maxConcurrentJobs` is the machine's
+ * scarce resource; this is a statement one repository makes about how much unattended
+ * change it wants at once, and two of them sharing a counter would mean a busy project
+ * throttling a quiet one for a reason neither `config.yaml` mentions.
+ *
+ * ### The race it does not close
+ *
+ * Two runners polling in the same instant can both read the same headroom and both claim,
+ * overshooting by one. That is the shape `remainingCapacity` already has and the reason it
+ * calls itself defence in depth: closing it needs the count inside the `FOR UPDATE SKIP
+ * LOCKED` statement, which cannot hold a window function. The machine cap is the one that
+ * has to be hard, because exceeding it is an OOM; exceeding this one briefly costs an
+ * extra agent round. Worth knowing, not worth a lock table.
+ *
+ * Pure and separately testable, because the interesting cases — a full project beside an
+ * empty one, a cap of zero, ordering — are arithmetic, and a test that has to stand up two
+ * projects and a runner to assert arithmetic is a test about fixtures.
+ */
+export function modifiersOverCap(
+  candidates: ModifierJob[],
+  capOf: (projectId: string) => number,
+): string[] {
+  const byProject = new Map<string, ModifierJob[]>()
+  for (const job of candidates) {
+    const list = byProject.get(job.projectId)
+    if (list) list.push(job)
+    else byProject.set(job.projectId, [job])
+  }
+
+  const held: string[] = []
+  for (const [projectId, group] of byProject) {
+    const running = group.filter((j) => j.inFlight).length
+    let room = Math.max(0, capOf(projectId) - running)
+    /**
+     * Ordered the way the claim orders, so the jobs kept back are the ones the claim
+     * would have reached last. Sorting differently here would hold back a high-priority
+     * job to make room for one the claim then does not take, and the slot goes unused.
+     */
+    const queued = group
+      .filter((j) => !j.inFlight)
+      .sort((a, b) => b.priority - a.priority || a.createdAt.getTime() - b.createdAt.getTime())
+    for (const job of queued) {
+      if (room > 0) room -= 1
+      else held.push(job.id)
+    }
+  }
+  return held
+}
+
+/**
+ * The rows `modifiersOverCap` needs, in one statement.
+ *
+ * `innerJoin` on workers rather than a column on `jobs`: the permission profile is the
+ * worker's, and a job whose worker has since been deleted (`worker_id` goes null, §4.4)
+ * cannot be claimed anyway — the claim's own join drops it — so it is not a modifier this
+ * cap has to reserve room for.
+ */
+export async function modifierJobs(db: Db): Promise<ModifierJob[]> {
+  const rows = await db
+    .select({
+      id: jobs.id,
+      projectId: jobs.projectId,
+      state: jobs.state,
+      priority: jobs.priority,
+      createdAt: jobs.createdAt,
+    })
+    .from(jobs)
+    .innerJoin(workers, eq(workers.id, jobs.workerId))
+    .where(
+      and(
+        eq(workers.permissions, 'modifier'),
+        inArray(jobs.state, ['queued', 'claimed', 'running']),
+      ),
+    )
+  return rows.map((r) => ({
+    id: r.id,
+    projectId: r.projectId,
+    inFlight: r.state !== 'queued',
+    priority: r.priority,
+    createdAt: r.createdAt,
+  }))
 }
 
 export async function recordWorkerFailure(

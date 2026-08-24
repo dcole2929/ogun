@@ -343,6 +343,24 @@ export const api = {
       /** Per project: can this control plane reach the repo to edit config.yaml? */
       editable: Record<string, boolean>
       hashes: Record<string, string>
+      /**
+       * Per project: the control-plane policies actually in force, from the server.
+       *
+       * The page used to keep `const BREAKER_THRESHOLD = 3` and do the arithmetic itself,
+       * which meant a project that had set `failureBreakerThreshold: 5` was told the wrong
+       * number of runs remained. There is no default on this side on purpose — a fallback
+       * constant here is how the mirror grows back.
+       *
+       * `source: 'unsynced'` means no config has ever been indexed for that project and
+       * these are the schema defaults rather than anything the project asked for.
+       */
+      policies: Record<
+        string,
+        {
+          policies: { maxConcurrentModifiers: number; failureBreakerThreshold: number }
+          source: 'project' | 'unsynced'
+        }
+      >
     }>(`/api/workers${project ? `?project=${project}` : ''}`),
   createWorker: (input: WorkerInput) =>
     json<{ worker: WorkerRow['worker']; config: ConfigSnapshot }>('/api/workers', {

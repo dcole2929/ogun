@@ -92,10 +92,64 @@ export const testsSchema = z.object({
 })
 export type TestsConfig = z.infer<typeof testsSchema>
 
+/**
+ * What a project permits, as one `policies:` block in one file — and read by two
+ * different processes, out of two different copies of that file.
+ *
+ * That split is not tidiness. It is the reason half of these can be trusted at all, and
+ * the two subsets declared below exist so that mixing them up is a type error rather
+ * than a review comment somebody has to think of.
+ *
+ * ### Control-plane policies — `maxConcurrentModifiers`, `failureBreakerThreshold`
+ *
+ * Scheduling and admission. `ogun project sync` posts them; they live on the `projects`
+ * row; the foreman reads them from there and nowhere else. Two properties make that the
+ * right home. The agent cannot influence them — by the time a sandbox exists, the
+ * decisions they govern (may this job be dispatched, has this worker earned a breaker)
+ * have already been taken. And the runner has no business re-deriving them: it would be
+ * answering a *scheduling* question from a file it fetched out of a repository, which is
+ * how one question ends up with two answers that drift.
+ *
+ * ### Pinned-blob policies — `directPush`, `allowSandboxDowngrade`, `maxOpenPullRequests`
+ *
+ * Gates on what an agent's own work is allowed to become. The runner reads these from
+ * `git show <baseSha>:.ogun/config.yaml` (`readPolicies`) — never from the workspace, and
+ * never from the database. A modifier has write access to its checkout, so a gate read
+ * from that checkout is a gate the agent sets for itself; one line appended to its own
+ * `config.yaml` and `maxOpenPullRequests` is 999. The blob at the pinned base is the copy
+ * a person reviewed and merged, and it is the only one the agent could not reach. See
+ * ADR-0009 and §4.6.
+ *
+ * These deliberately have **no** stored copy. Not because storing one would be extra
+ * work, but because a stored copy is a second answer to the same question sitting
+ * somewhere a future caller can find it — and that caller will not know which copy
+ * counted. `controlPlanePoliciesSchema` and `pinnedPoliciesSchema` each carry only their
+ * own half, so "read `maxOpenPullRequests` off the project row" and "ask the pinned blob
+ * for the breaker threshold" do not compile.
+ */
 export const policiesSchema = z.object({
   directPush: z.boolean().default(false),
   /** A modifier on `worktree` is an agent editing files directly on the host. */
   allowSandboxDowngrade: z.boolean().default(false),
+  /**
+   * How many of this project's modifier jobs may be in flight at once (§4.3).
+   *
+   * The runaway-loop bound. A modifier is the profile that writes, commits and leaves a
+   * patch behind, and several of them churning on one repository at 3am is the shape of
+   * night that spends a rate limit and leaves a pile nobody asked for —
+   * `maxOpenPullRequests` bounds what reaches the remote, this bounds what is produced
+   * in the first place.
+   *
+   * Per project, not per machine. `maxConcurrentJobs` is the machine's cap and exists
+   * because WSL2 will OOM; this one is a statement about how much unattended change one
+   * repository wants at a time, and two projects sharing a counter would mean a busy repo
+   * silently throttling a quiet one for a reason neither config mentions.
+   *
+   * Zero is meaningful and is not "unlimited": it switches modifiers off for the project
+   * while leaving every other profile running. Refused at admission with a sentence
+   * rather than left queued, because a job that is never dispatched and never explained
+   * is the coverage hole principle 6 exists to prevent.
+   */
   maxConcurrentModifiers: z.number().int().nonnegative().default(1),
   /** Consecutive failures before the breaker opens for a worker (§4.3). */
   failureBreakerThreshold: z.number().int().positive().default(3),
@@ -121,13 +175,82 @@ export const policiesSchema = z.object({
 })
 export type Policies = z.infer<typeof policiesSchema>
 
+/**
+ * The half the control plane stores and decides with. See `policiesSchema` for why there
+ * are halves at all.
+ *
+ * A `pick`, not a second literal list of fields: the defaults, the bounds and the prose
+ * stay written once, and adding a key to `policiesSchema` without deciding which side of
+ * the boundary it falls on is then a visible omission rather than a copied line that
+ * quietly disagrees.
+ *
+ * Zod strips what it is not told about, so parsing a whole `policies` block through this
+ * is also the projection — a payload that still carries `maxOpenPullRequests` cannot
+ * smuggle it into the database.
+ */
+export const controlPlanePoliciesSchema = policiesSchema.pick({
+  maxConcurrentModifiers: true,
+  failureBreakerThreshold: true,
+})
+export type ControlPlanePolicies = z.infer<typeof controlPlanePoliciesSchema>
+
+/**
+ * What the defaults are, as a value, for a project the control plane has never had
+ * policies for.
+ *
+ * A function rather than a frozen constant because callers hold it, and a shared mutable
+ * object that four call sites can write to is a bug waiting for its first `.threshold =`.
+ */
+export const defaultControlPlanePolicies = (): ControlPlanePolicies =>
+  controlPlanePoliciesSchema.parse({})
+
+/**
+ * The half the runner reads out of the blob at the pinned base, and the only half it can
+ * read: `readPolicies` returns this type, so a gate that has no business coming out of a
+ * repository cannot accidentally be answered from one.
+ */
+export const pinnedPoliciesSchema = policiesSchema.pick({
+  directPush: true,
+  allowSandboxDowngrade: true,
+  maxOpenPullRequests: true,
+})
+export type PinnedPolicies = z.infer<typeof pinnedPoliciesSchema>
+
 export const projectConfigSchema = z.object({
   project: z.object({
     name: z.string().min(1),
     defaultBranch: z.string().default('main'),
     remoteUrl: z.string().optional(),
   }),
-  extends: z.array(z.string()).default([]),
+  /**
+   * Withdrawn, and withdrawn loudly.
+   *
+   * `extends: [ogun://typescript]` was in this schema and in §4.9's example config, and
+   * was read by nothing: no loader resolved a base config, no worker inherited a field,
+   * and a project that set it got precisely the config it had written out itself. There
+   * were no consumers to remove, because there had never been one.
+   *
+   * Deleting the field would have left the same silence with one fewer place to find it —
+   * zod strips keys it is not told about, so an existing `extends:` line would go on
+   * being ignored, now with nothing in the schema to explain what had happened to it. So
+   * the key stays declared, and is declared as unacceptable: a config carrying it fails
+   * to parse, names itself in the message, and is fixed in the thirty seconds it takes to
+   * delete a line.
+   *
+   * That is a breaking change for any config that sets it, and is meant to be. Config
+   * inheritance was never delivered; someone believing they had it is the failure worth
+   * interrupting. If it is built later it may take this name back — what it may not do is
+   * take the name back quietly, since a key that once meant nothing and now means
+   * something is the worst of the three states.
+   */
+  extends: z
+    .never({
+      error:
+        '`extends:` is not supported. It was declared but never implemented — no config ' +
+        'was ever inherited from it — so it is now refused rather than ignored. Remove ' +
+        'the line from .ogun/config.yaml.',
+    })
+    .optional(),
   workers: z.record(z.string(), workerSchema).default({}),
   /** Multi-worker graphs. A single worker needs none — it is already a one-node cycle. */
   cycles: z.record(z.string(), cycleConfigSchema).default({}),
@@ -177,14 +300,26 @@ export function readTestCommand(yamlText: string): string | undefined {
  * caller treats `undefined` as "this project's policy could not be established" and
  * refuses to publish. So the tolerance can only ever withhold a pull request; it can
  * never produce one that a readable config would have refused.
+ *
+ * Returns the *pinned* half only (`pinnedPoliciesSchema`), which is a boundary and not a
+ * convenience. The runner is a process holding a repository it was handed; it must not be
+ * able to answer a control-plane question — "what is this project's breaker threshold" —
+ * from a file, because the control plane already has an answer and two answers is one
+ * too many. A caller reaching for `readPolicies(...).failureBreakerThreshold` gets a type
+ * error rather than a plausible number.
+ *
+ * The narrowing also means a malformed *control-plane* key no longer withholds a pull
+ * request here. That is right: it is caught at `ogun project sync`, where the whole
+ * `projectConfigSchema` is parsed and a bad value stops the sync with a message, rather
+ * than at 3am by refusing to publish work that was in every other respect fine.
  */
-export function readPolicies(yamlText: string): Policies | undefined {
+export function readPolicies(yamlText: string): PinnedPolicies | undefined {
   let raw: unknown
   try {
     raw = parseYaml(yamlText)
   } catch {
     return undefined
   }
-  const parsed = z.object({ policies: policiesSchema.prefault({}) }).safeParse(raw)
+  const parsed = z.object({ policies: pinnedPoliciesSchema.prefault({}) }).safeParse(raw)
   return parsed.success ? parsed.data.policies : undefined
 }

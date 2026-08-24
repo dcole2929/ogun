@@ -3,21 +3,14 @@ import { schema } from '@ogun/core/db'
 import type { Db } from '@ogun/core/db'
 import { cycleDefinitionSchema, isTerminal, type CycleDefinition, type JobState } from '@ogun/core'
 import type { CredentialOutlook } from '@ogun/gateway'
-import {
-  admit,
-  DEFAULT_LIMITS,
-  modifierReadiness,
-  probeProject,
-  type AdmissionLimits,
-  type ModifierReadiness,
-} from './admission.ts'
+import { admit, modifierReadiness, probeProject, type ModifierReadiness } from './admission.ts'
+import { projectPolicies } from './policies.ts'
 
 const { coverage, cycleRuns, cycles, jobs, projects, skills, workers } = schema
 
 export type StartCycleRunInput = {
   cycleId: string
   trigger: string
-  limits?: AdmissionLimits
   /** Per-node prompt override, keyed by node key. Used by a manual trigger. */
   promptOverrides?: Record<string, string>
   /**
@@ -59,7 +52,6 @@ export async function startCycleRun(
   db: Db,
   input: StartCycleRunInput,
 ): Promise<{ cycleRunId: string; jobIds: string[] }> {
-  const limits = input.limits ?? DEFAULT_LIMITS
   const cycle = await db.query.cycles.findFirst({ where: eq(cycles.id, input.cycleId) })
   if (!cycle) throw new Error(`no such cycle: ${input.cycleId}`)
 
@@ -78,6 +70,20 @@ export async function startCycleRun(
   const readiness = [...byName.values()].some((w) => w.permissions === 'modifier')
     ? (input.modifierReadiness ?? (await probeReadiness(db, cycle.projectId)))
     : undefined
+
+  /**
+   * The project's own policies, read once for the same reason readiness is: they are a
+   * property of the project, not of a node, and every node in this graph belongs to one
+   * project. Read outside the transaction so a write transaction is not held open across
+   * a lookup none of the writes depend on.
+   *
+   * Control-plane half only — `ControlPlanePolicies`, not `Policies`. The publisher's
+   * `maxOpenPullRequests` and the sandbox's `allowSandboxDowngrade` are read by the runner
+   * from the git blob at the pinned base, because a modifier can write to its checkout
+   * (§4.6, ADR-0009); admission has no business holding a second copy of either, and the
+   * type is what stops one appearing here later.
+   */
+  const { policies } = await projectPolicies(db, cycle.projectId)
 
   return db.transaction(async (tx) => {
     const [cycleRun] = await tx
@@ -119,7 +125,7 @@ export async function startCycleRun(
               runtime: worker.runtime,
               ...timeoutOf(worker.config),
             },
-            limits,
+            policies,
             readiness,
             input.credentials,
           )

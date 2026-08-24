@@ -100,13 +100,25 @@ cycles:
 tests:
   command: pnpm install --frozen-lockfile && pnpm -s test
 
+# One block, two readers, and the difference matters (§4.9).
 policies:
+  # --- Read by the runner from the git blob at the pinned base, never from the workspace
+  # and never from the database. These decide what an agent's own work may become, and a
+  # modifier can write to its checkout — a gate the agent can edit is not a gate.
   directPush: false
   allowSandboxDowngrade: false
-  maxConcurrentModifiers: 1
-  failureBreakerThreshold: 3
   # The publisher's cap on *unreviewed* work, counted live against open pull requests
   # under the `ogun/` branch prefix — merging or closing one makes room immediately.
   # Written out rather than left to the default because it is the number you reach for
   # when the drafts start piling up, and a key you cannot see is a key you do not edit.
   maxOpenPullRequests: 3
+
+  # --- Stored on the project row by `ogun project sync` and read by the foreman. These
+  # are scheduling decisions taken before a sandbox exists, so the agent cannot reach
+  # them and the runner has no business re-deriving them from a file.
+  #
+  # How many modifier jobs of this project's may be in flight at once. Zero switches
+  # modifiers off entirely and is refused at admission with a sentence, not left queued.
+  maxConcurrentModifiers: 1
+  # Consecutive failures before a worker's breaker latches open (§4.3).
+  failureBreakerThreshold: 3

@@ -10,6 +10,11 @@ import { startCycleRun } from '../src/foreman/cycles.ts'
 
 
 /**
+ * `AdmissionLimits` carries only `maxConcurrentJobs` now. `failureBreakerThreshold` used
+ * to sit beside it, which is how `policies.failureBreakerThreshold` came to mean nothing:
+ * a project policy with a machine-scoped home. It lives on the project row — see
+ * `policies.test.ts`.
+ *
  * The global concurrency cap is a hard limit, not a hint: it exists because a container
  * running an agent plus a test suite is not small and WSL2 caps at ~50% of Windows RAM
  * (§8). Exceeding it is the OOM it was written to prevent.
@@ -74,7 +79,7 @@ describe('global concurrency cap', () => {
   }
 
   test('capacity is a count of free slots, not a yes/no', async () => {
-    const limits = { maxConcurrentJobs: 2, failureBreakerThreshold: 3 }
+    const limits = { maxConcurrentJobs: 2 }
     const before = await inFlight()
 
     await queueJob('running')
@@ -90,12 +95,12 @@ describe('global concurrency cap', () => {
   })
 
   test('it never reports more slots than the cap', async () => {
-    const limits = { maxConcurrentJobs: 2, failureBreakerThreshold: 3 }
+    const limits = { maxConcurrentJobs: 2 }
     assert.ok((await remainingCapacity(db, limits)) <= 2)
   })
 
   test('a machine already at the cap reports nothing free', async () => {
-    const limits = { maxConcurrentJobs: 1, failureBreakerThreshold: 3 }
+    const limits = { maxConcurrentJobs: 1 }
     await queueJob('running')
     assert.equal(await remainingCapacity(db, limits), 0)
   })
@@ -103,7 +108,7 @@ describe('global concurrency cap', () => {
   test('it floors at zero rather than going negative', async () => {
     // Over the cap already — a runner asking for work must be told none, not offered a
     // negative number that a `limit` would reject or, worse, treat as unbounded.
-    const limits = { maxConcurrentJobs: 0, failureBreakerThreshold: 3 }
+    const limits = { maxConcurrentJobs: 0 }
     assert.equal(await remainingCapacity(db, limits), 0)
   })
 })
