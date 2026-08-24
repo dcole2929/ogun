@@ -5,6 +5,27 @@ import { promisify } from 'node:util'
 
 const run = promisify(execFile)
 
+/**
+ * Strip the userinfo out of every URL in a string.
+ *
+ * A project's `remoteUrl` can carry a credential — `https://x-access-token:PAT@host/repo`
+ * — and it reaches the runner as an argv element to `git clone`. Node builds a rejected
+ * `execFile`'s `message` out of the whole command line, so *any* clone failure (DNS, a
+ * missing branch, a refused connection) hands back a string with the token in it, and
+ * that string is forwarded as the run's `detail` and persisted. Nothing after that point
+ * cleans it: it ends up in run history, in console output, and in whatever a person
+ * pastes when they ask why a run failed.
+ *
+ * Over the whole message rather than just the argv we passed, because git quotes the URL
+ * back in its own stderr too (`fatal: unable to access 'https://user:PAT@host/'`).
+ *
+ * The entire userinfo goes, not just the password half: `https://PAT:x-oauth-basic@host`
+ * is a real GitHub form, so a rule that kept the username would keep the secret.
+ */
+export function redactUrlCredentials(text: string): string {
+  return text.replace(/([a-zA-Z][a-zA-Z\d+.-]*:\/\/)[^/\s'"@]+@/g, '$1***@')
+}
+
 export type MaterializedWorkspace = {
   path: string
   sha: string
@@ -50,13 +71,21 @@ export async function materializeWorkspace(input: {
      * a large repository on every run is a lot of network for something discarded after.
      */
     const depth = process.env.OGUN_CLONE_DEPTH ?? '50'
-    await run('git', [
-      'clone',
-      ...(depth === 'full' ? [] : ['--depth', depth]),
-      ...(input.ref ? ['--branch', input.ref] : []),
-      input.remoteUrl,
-      path,
-    ])
+    try {
+      await run('git', [
+        'clone',
+        ...(depth === 'full' ? [] : ['--depth', depth]),
+        ...(input.ref ? ['--branch', input.ref] : []),
+        input.remoteUrl,
+        path,
+      ])
+    } catch (err) {
+      // Rethrown rather than re-wrapped: no `cause`, because the original error's own
+      // message is the thing carrying the credential and a cause chain is printed by
+      // `console.error`. The redacted text keeps git's stderr, which is the part that
+      // says what actually went wrong.
+      throw new Error(redactUrlCredentials(err instanceof Error ? err.message : String(err)))
+    }
   } else {
     throw new Error('no local path and no remote url — nothing to materialize from')
   }
