@@ -5,6 +5,8 @@ import { cycleDefinitionSchema, nodesWithDependents } from '@ogun/core'
 import type { CoverageOutcome, JobState, RunOutcome, RunReport } from '@ogun/core'
 import { projectPolicies } from './policies.ts'
 import { finalizeCycleIfDone, markCoverage, releaseDependents } from './cycles.ts'
+import { decideSuppression } from './suppression.ts'
+import type { LapseOutcome, SuppressionOutcome } from './suppression.ts'
 
 const {
   artifacts,
@@ -36,6 +38,15 @@ export type FinalizeResult = {
   coverage: CoverageOutcome
   /** One entry per verdict on a pre-existing finding, applied or refused with a reason. */
   adjudicated: AdjudicationOutcome[]
+  /**
+   * What this run reported and was not allowed to say, because somebody had already
+   * dismissed it (§4.11). Separate from `lapsed` on purpose: these are two opposite
+   * things a dismissal can do to a night, and one list carrying both would make "we
+   * stayed quiet" and "we stopped staying quiet" the same fact.
+   */
+  suppressed: SuppressionOutcome[]
+  /** Dismissals this run found no longer applied, and therefore stopped honouring. */
+  lapsed: LapseOutcome[]
 }
 
 /**
@@ -113,6 +124,18 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
    */
   const destination = await destinationOf(db, job.cycleRunId, job.nodeKey)
   let adjudicated: AdjudicationOutcome[] = []
+  let suppressed: SuppressionOutcome[] = []
+  let lapsed: LapseOutcome[] = []
+  let written = 0
+
+  /**
+   * What the runner read off the disk for each finding, keyed by fingerprint (§4.11).
+   *
+   * The last write wins for a repeated fingerprint, which cannot arise from one document
+   * that passed the schema gate and is harmless if it ever does — the two excerpts are of
+   * the same citation in the same tree.
+   */
+  const evidenceOf = new Map((report.evidence ?? []).map((e) => [e.fingerprint, e]))
   /**
    * `dispatched` as well as `approved`, so a modifier can report what it noticed.
    *
@@ -273,26 +296,168 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
     }
 
     /**
+     * What this run is allowed to say, decided before anything is written (§4.11).
+     *
+     * Only over `raw`, never over `reported`: a reviewer feeding triage stages everything
+     * it found and suppresses nothing, because suppression is one implementation at the
+     * one node that publishes rather than N drifting copies inside each reviewer (§4.12).
+     * The staged rows below stay complete either way — triage has to see what was
+     * dismissed in order to merge tonight's rephrasing into it.
+     */
+    const decisions =
+      raw.length > 0
+        ? decideSuppression({
+            reported: raw,
+            known: await tx
+              .select({
+                fingerprint: findings.fingerprint,
+                status: findings.status,
+                duplicateOf: findings.duplicateOf,
+                severity: findings.severity,
+                dismissedAt: findings.dismissedAt,
+                dismissedBasis: findings.dismissedBasis,
+                dismissedSeverity: findings.dismissedSeverity,
+              })
+              .from(findings)
+              .where(eq(findings.projectId, job.projectId)),
+            checks: report.dismissalChecks ?? [],
+          })
+        : []
+    const silenced = new Map(
+      decisions
+        .filter((d) => d.kind === 'suppress')
+        .map((d) => [d.finding.fingerprint, d.outcome as SuppressionOutcome]),
+    )
+    suppressed = [...silenced.values()]
+    lapsed = decisions.filter((d) => d.kind === 'lapse').map((d) => d.outcome as LapseOutcome)
+    // What actually reached the inbox, which is no longer the same as what was reported.
+    // A lapse counts: the row it reopened is live and in front of a reader again.
+    written = decisions.filter((d) => d.kind !== 'suppress').length
+
+    /**
      * Reviewers write to staging; only triage promotes to `findings` (§4.12). Phase 1
      * has no triage node, so a reviewer's output is promoted directly — but it goes
      * through staging first regardless, so wiring triage in phase 2 changes who reads
      * staging rather than who writes it.
      */
     // Staged regardless of whether they are promoted — this is what triage reads, and
-    // what makes a discarded finding recoverable rather than gone.
+    // what makes a discarded finding recoverable rather than gone. A suppressed one is
+    // annotated here rather than dropped: the staged row plus its reason is the whole
+    // answer to "what did tonight's review stay silent about, and on whose authority".
     if (reported.length > 0) {
       await tx.insert(stagedFindings).values(
-        reported.map((f) => ({
-          runId: report.runId,
-          workerId: job.workerId,
-          workerName: job.workerName,
-          raw: f as unknown as Record<string, unknown>,
-        })),
+        reported.map((f) => {
+          const hushed = silenced.get(f.fingerprint)
+          return {
+            runId: report.runId,
+            workerId: job.workerId,
+            workerName: job.workerName,
+            raw: f as unknown as Record<string, unknown>,
+            ...(hushed
+              ? { suppressedBy: hushed.dismissal, suppressionReason: hushed.reason }
+              : {}),
+          }
+        }),
       )
     }
 
-    for (const f of raw) {
+    for (const decision of decisions) {
+      const f = decision.finding
       const primary = f.citations[0]
+      // Host-read, never agent-authored (§4.11). Absent when the runner could not take a
+      // usable excerpt, and absent is left alone rather than nulled: a finding that had a
+      // basis last night keeps it tonight rather than losing one because one read failed.
+      const evidence = evidenceOf.get(f.fingerprint)
+
+      if (decision.kind === 'suppress') {
+        /**
+         * The count and the last-seen run still move, and nothing else does.
+         *
+         * The pressure has to stay visible — "you dismissed this and four reviewers have
+         * re-found it eleven times" is the signal that a dismissal was wrong, and it is
+         * the reader's call to make, not a timer's. But the title, body and severity are
+         * deliberately *not* rewritten, which they were before this existed: a dismissal's
+         * `status_reason` is a person's answer to a specific write-up, and letting a later
+         * reviewer replace the write-up underneath it leaves the answer attached to a
+         * question nobody asked.
+         */
+        await tx
+          .update(findings)
+          .set({
+            lastSeenRun: report.runId,
+            seenCount: sql`${findings.seenCount} + 1`,
+            /**
+             * Filled, never overwritten — `coalesce` is doing the whole job.
+             *
+             * A dismissal made before this mechanism existed has no snippet to have been
+             * anchored to, and a suppressed sighting is the only chance it will ever get
+             * to acquire one: the row is quiet, so nothing else writes to it again. This
+             * gives a person something to re-affirm against. Overwriting an existing
+             * snippet would be the opposite thing — silently re-anchoring a decision onto
+             * code the person who made it never saw.
+             */
+            ...(evidence
+              ? { snippet: sql`coalesce(${findings.snippet}, ${evidence.snippet})` }
+              : {}),
+            updatedAt: new Date(),
+          })
+          .where(and(eq(findings.projectId, job.projectId), eq(findings.fingerprint, f.fingerprint)))
+        continue
+      }
+
+      if (decision.kind === 'lapse') {
+        /**
+         * The dismissal is spent, so it is emptied as well as reopened. Leaving the basis
+         * behind would re-arm the suppression the moment anyone set the status back, on
+         * evidence that has already been shown not to hold.
+         */
+        await tx
+          .update(findings)
+          .set({
+            status: 'open',
+            statusReason: decision.outcome.reason,
+            statusRun: report.runId,
+            dismissedAt: null,
+            dismissedBasis: null,
+            dismissedBasisPath: null,
+            dismissedSeverity: null,
+            updatedAt: new Date(),
+            // Only when the sighting *is* the dismissed finding. An aliased sighting is a
+            // different row's write-up, and copying it over the dismissed one would lose
+            // the text the person actually read.
+            ...(decision.aliased
+              ? {}
+              : {
+                  lastSeenRun: report.runId,
+                  seenCount: sql`${findings.seenCount} + 1`,
+                  severity: f.severity,
+                  title: f.title,
+                  body: f.body,
+                  ...(evidence ? { path: evidence.path, snippet: evidence.snippet } : {}),
+                  ...(primary?.line ? { line: primary.line } : {}),
+                }),
+          })
+          .where(
+            and(eq(findings.projectId, job.projectId), eq(findings.fingerprint, decision.dismissal)),
+          )
+
+        // The alias keeps its `duplicate` status and its pointer: the reader belongs at
+        // the finding it merges into, which is the row that just reopened.
+        if (decision.aliased) {
+          await tx
+            .update(findings)
+            .set({
+              lastSeenRun: report.runId,
+              seenCount: sql`${findings.seenCount} + 1`,
+              updatedAt: new Date(),
+            })
+            .where(
+              and(eq(findings.projectId, job.projectId), eq(findings.fingerprint, f.fingerprint)),
+            )
+        }
+        continue
+      }
+
       await tx
         .insert(findings)
         .values({
@@ -301,6 +466,7 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
           fingerprint: f.fingerprint,
           ...(primary?.path ? { path: primary.path } : {}),
           ...(primary?.line ? { line: primary.line } : {}),
+          ...(evidence ? { path: evidence.path, snippet: evidence.snippet } : {}),
           severity: f.severity,
           ...(f.confidence !== undefined ? { confidence: Math.round(f.confidence * 100) } : {}),
           title: f.title,
@@ -323,6 +489,7 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
             severity: f.severity,
             title: f.title,
             body: f.body,
+            ...(evidence ? { path: evidence.path, snippet: evidence.snippet } : {}),
             ...(f.revisitOf ? { revisitOf: f.revisitOf } : {}),
             ...(f.revisitReason ? { revisitReason: f.revisitReason } : {}),
             status: reopenClause,
@@ -396,8 +563,10 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
     ok: true,
     outcome,
     jobState,
-    findingsWritten: raw.length,
+    findingsWritten: written,
     adjudicated,
+    suppressed,
+    lapsed,
     /** Reported but held for triage rather than published. */
     staged: destination.withheld ? reported.length : 0,
     coverage: coverageOutcome,
@@ -438,6 +607,8 @@ async function recordedResult(
     findingsWritten: 0,
     staged: 0,
     adjudicated: [],
+    suppressed: [],
+    lapsed: [],
     // `abandoned` is what the sweep already calls a job that ended without the ledger
     // being told (§4.11), so a missing row is reported as that rather than guessed at.
     coverage: (ledger?.outcome ?? 'abandoned') as CoverageOutcome,
@@ -452,12 +623,20 @@ async function recordedResult(
  *                         review protocol tells every reviewer to run first.
  *   gated | overflow   -> reopen. Those mean triage set it aside, not that anyone
  *                         decided anything. A fresh sighting is new evidence.
- *   wontfix | duplicate-> hold. Those are human decisions, and a reviewer re-reporting
- *                         something does not overrule one. The seen count still bumps,
- *                         so the pressure is visible without the row nagging.
+ *   duplicate          -> hold. Somebody decided this row is another row's problem, and
+ *                         a reviewer re-reporting it does not overrule that. The seen
+ *                         count still bumps, so the pressure is visible without the row
+ *                         nagging.
  *   open | triaged     -> unchanged.
  *
  * Found by ogun's own adversarial-review worker on its first real run.
+ *
+ * `wontfix` is no longer reachable here at all: a sighting of a dismissed finding is
+ * decided by `decideSuppression` before this runs, and never arrives at the upsert. It
+ * used to be held by this clause — which was right about the status and wrong about
+ * everything else, because the same statement rewrote the row's title, body and severity
+ * from tonight's report. A person's `status_reason` then answered a write-up that had
+ * been silently replaced, and nothing anywhere recorded that a finding had been silenced.
  */
 const reopenClause = sql`case
   when ${findings.status} in ('fixed', 'gated', 'overflow') then 'open'

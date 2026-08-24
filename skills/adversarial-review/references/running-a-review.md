@@ -56,7 +56,13 @@ Rules:
 - An **open** finding already accounts for its surface. Do not investigate it again.
 - A **fixed** finding permits exactly one revisit to verify the fix. If it is still
   broken, that is a new, related finding — say so explicitly.
-- A **wontfix** finding is a decision. Treat it like an ADR.
+- A **wontfix** finding is a decision. Treat it like an ADR. Re-reporting one is not
+  merely poor manners — the control plane refuses it: a sighting of a dismissed finding
+  never reaches the inbox, it is recorded as suppressed, and the night's work has bought
+  nothing. If you genuinely believe the decision no longer holds, the honest routes are
+  the two the machine already understands: report it at a *higher severity* than it was
+  dismissed at, if that is true, or write a proposed ADR that supersedes the reasoning.
+  Both put the argument in front of a person; re-filing the same finding does not.
 - A **duplicate** or cancelled finding is treated as though it never existed.
 
 Renaming an attempt does not make it new. If your finding is the same problem in

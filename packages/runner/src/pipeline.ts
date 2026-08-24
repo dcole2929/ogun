@@ -24,6 +24,7 @@ import {
   type Sandbox,
 } from './sandbox/index.ts'
 import { nextSeq, newParserState, resolveModel, resolveRuntime } from './runtimes/index.ts'
+import { checkDismissals, gatherEvidence } from './evidence.ts'
 import { extractPatch, type PatchExtraction } from './patch.ts'
 import { githubCli, publishPatch } from './publish.ts'
 import { gitIn, materializeWorkspace, resolveHeadSha, stageAll } from './workspace.ts'
@@ -563,6 +564,53 @@ export async function executeJob(
     const transcriptRef = await writeTranscript(config, job, workspace.path)
     const usage = usageFrom(lastEvent)
 
+    /**
+     * Re-adjudication's host-side half (§4.11), computed here and not by the agent.
+     *
+     * `evidence` is the cited code as the runner reads it off this tree; it becomes a
+     * dismissal's anchor the day somebody dismisses the finding. `dismissalChecks` says
+     * whether each dismissal already standing is still about code that exists here, which
+     * is what stops a dismissal being permanent by accident.
+     *
+     * Both run after the gate rather than before, so a run whose output failed the schema
+     * check does not spend file reads on findings the control plane is about to refuse —
+     * and `gatherEvidence` re-parses the document itself rather than trusting the gate,
+     * because a worker may legitimately skip the schema lens (§4.10).
+     *
+     * Neither is fatal. Losing evidence costs a dismissal made tomorrow its anchor; losing
+     * the checks leaves tonight's dismissals standing on nobody having looked, which the
+     * control plane records on every suppression it writes. A review that refuses to
+     * finish reports nothing at all, and that is the worse outcome (§4.11).
+     */
+    const evidence = await gatherEvidence(workspace.path, output).catch(() => [])
+    const dismissalChecks = await checkDismissals(workspace.path, history?.bases ?? []).catch(
+      () => [],
+    )
+
+    /**
+     * On the timeline, because suppression's whole effect is an absence and the run that
+     * produced it should be able to account for itself without a database query. A night
+     * that checked no dismissals because none reached it reads differently from one that
+     * checked eleven and found them all intact.
+     */
+    if ((history?.bases?.length ?? 0) > 0 || dismissalChecks.length > 0) {
+      const moved = dismissalChecks.filter((c) => c.basis === 'moved').length
+      flusher.push([
+        {
+          type: 'runner.note',
+          ts: new Date().toISOString(),
+          seq: nextSeq(parser),
+          payload: {
+            note:
+              `dismissals: checked ${dismissalChecks.length} of ${history?.bases?.length ?? 0} ` +
+              `anchored dismissal(s); ${moved} no longer describe code in this tree`,
+            checked: dismissalChecks.length,
+            lapsedBases: moved,
+          },
+        },
+      ])
+    }
+
     const report: RunReport = {
       runId: job.runId,
       /**
@@ -576,6 +624,8 @@ export async function executeJob(
       ...(usage ? { usage } : {}),
       gates: verdict.gates,
       ...(output !== undefined ? { findings: output as never } : {}),
+      evidence,
+      dismissalChecks,
       ...(change ? { change: changeRecord(change, verdict.tests) } : {}),
       coverage: { outcome: change?.patch ? 'changed' : 'clean' },
       artifacts: [

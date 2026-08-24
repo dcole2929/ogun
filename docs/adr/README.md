@@ -102,3 +102,4 @@ wrong is a proposed ADR that supersedes it, not a finding.
 - [ADR-0008 — No build step: Node runs the TypeScript](0008-no-build-step-node-runs-the-typescript.md)
 - [ADR-0009 — The runner publishes, and reports before it does](0009-the-runner-publishes-and-reports-before-it-does.md)
 - [ADR-0010 — The sandbox never holds a credential](0010-the-sandbox-never-holds-a-credential.md)
+- [ADR-0011 — A dismissal is enforced by the control plane, and lapses with the code it was about](0011-a-dismissal-is-enforced-and-lapses-with-its-code.md)

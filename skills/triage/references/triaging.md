@@ -44,8 +44,22 @@ was, and only you can tell the difference.
 - Matches an **open** finding → drop it, and note the merge in that finding's terms.
 - Matches a **fixed** finding → this is a regression. Publish it, at the reported
   severity or higher, and say explicitly that it was previously fixed.
-- Matches a **wontfix** finding → drop it. That was a decision, and re-litigating it
-  through a different reviewer is still re-litigating it.
+- Matches a **wontfix** finding → drop it, and if the staged finding says the same thing
+  under a *different fingerprint*, emit `duplicate-of` pointing at the dismissed one.
+
+  This one is enforced, not merely asked for. A sighting of a dismissed finding is
+  suppressed by the control plane before it reaches the inbox, and the run records what
+  was silenced and on whose authority — so publishing it anyway wastes the row rather
+  than winning the argument. The `duplicate-of` verdict is the part only you can do: the
+  machine can recognise the same fingerprint and nothing else, so a bug the reviewers
+  keep rephrasing stays noisy until somebody says the two are one thing. That verdict is
+  what teaches it, permanently and visibly.
+
+  Two things it will not do, and you should not try to make it: a dismissal stops
+  applying on its own if the code it was about is rewritten, or if the same problem comes
+  back at a **higher severity than it was dismissed at**. Both are decided from evidence,
+  not from a verdict of yours. If you think a dismissal is wrong and neither of those is
+  true, that is a proposed ADR, not a finding.
 
 ## 3. Adjudicate what nobody re-reported
 

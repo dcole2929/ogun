@@ -1,6 +1,7 @@
 import { z } from 'zod'
 import { egressSchema } from './config/egress.ts'
 import { runEventSchema } from './events.ts'
+import { dismissalCheckSchema, findingEvidenceSchema } from './evidence.ts'
 import { findingsDocumentSchema } from './findings.ts'
 import { RUN_OUTCOMES } from './outcomes.ts'
 import { COVERAGE_OUTCOMES } from './outcomes.ts'
@@ -143,6 +144,24 @@ export const runReportSchema = z.object({
   gates: z.array(gateResultSchema).default([]),
   /** Absent when the gate failed or the run errored before producing output. */
   findings: findingsDocumentSchema.optional(),
+  /**
+   * What the runner read off the disk about the findings above, and about the dismissals
+   * already standing against this project (§4.11).
+   *
+   * Two arrays rather than fields inside `findings`, because `findings` is the agent's
+   * document and these are not the agent's to write. The runner computes both from the
+   * workspace after the container has exited; nothing inside the sandbox contributes to
+   * either, and the control plane refuses to take a basis or a basis check from anywhere
+   * else. A dismissal an agent could re-anchor is a dismissal an agent could use to
+   * silence a finding about its own work.
+   *
+   * Optional rather than defaulted, because a runner that predates re-adjudication sends
+   * neither and that is a fact worth keeping shaped like one. Absent and empty mean the
+   * same thing to `finalizeRun` and it is not a pass: a dismissal with no check against it
+   * stands on nobody having looked, and every suppression it produces says so.
+   */
+  evidence: z.array(findingEvidenceSchema).optional(),
+  dismissalChecks: z.array(dismissalCheckSchema).optional(),
   /** Only a modifier reports one. Absent for a reviewer, which produces no diff. */
   change: runChangeSchema.optional(),
   coverage: z.object({

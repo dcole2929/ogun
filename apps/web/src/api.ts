@@ -72,6 +72,12 @@ export type RunDetail = RunSummary & {
    */
   produced: {
     findings: Array<Record<string, unknown>>
+    /** Reported and not allowed to be said, because somebody had already dismissed it. */
+    suppressed: Array<{
+      finding: Record<string, unknown>
+      dismissal: string | null
+      reason: string | null
+    }>
     promoted: Array<{
       id: string
       fingerprint: string
