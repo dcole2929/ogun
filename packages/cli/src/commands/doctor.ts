@@ -83,7 +83,9 @@ export async function projectSecrets(path = localConfigPath()): Promise<Check> {
     return {
       name: 'project secrets',
       ok: true,
-      detail: 'none stored here — `ogun connect <integration>` in the project directory',
+      detail:
+        'none stored here — `ogun connect <integration>` (or `ogun secret set <name> ' +
+        '<key>`) in the project directory',
       fatal: false,
     }
   }

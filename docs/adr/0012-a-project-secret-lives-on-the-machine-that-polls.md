@@ -145,9 +145,10 @@ behaviour for a credential anyway: a secret that migrates itself is a secret in 
   doing; it is not possible now, and guessing would be the absence-of-evidence mistake the
   credential preflight was built to avoid.
 
-- **Setting is `ogun connect <integration>`, on the control-plane machine.** [amended —
-  ADR-0014: this bullet said `ogun secret set <name>`; the namespace was subsumed, see the
-  amendment above.] There is no route that accepts a
+- **Setting is `ogun connect <integration>` for an integration and `ogun secret set
+  <name> <key>` for anything else, on the control-plane machine.** [amended — ADR-0014
+  subsumed the `secret` namespace into `connect`; a later amendment, at the end of this
+  bullet, brought it back for values that are not integrations.] There is no route that accepts a
   secret, because a value in a request body is a value in a reverse proxy's access log and
   in a browser's network panel. The UI shows presence and points at the command. **This is
   a real gap for a remote control plane** — the operator has to reach a shell on that
@@ -303,6 +304,77 @@ behaviour for a credential anyway: a secret that migrates itself is a secret in 
   nothing, because a row the listing shows has to be a row you can remove. ADR-0014's
   amendment argues the subsumption; what belongs here is that nothing about *where the
   value lives* changed.
+
+  [amended] **The namespace is back, and it is not integration-scoped.** `ogun secret set
+  <name> <key>`, `ogun secret list`, `ogun secret rm <name>`, with the project inferred
+  from the directory exactly as everything else here infers it. The subsumption above was
+  reversed by the product owner for one reason, and it is the reason:
+
+  > *"a secret is not guaranteed to be an integration. that's an obviously poor
+  > assumption. we should have both connect and secret as these have different uses that
+  > may sometimes overlap."*
+
+  The deletion rested on *"every name in `SECRET_NAMES` today is an integration
+  credential"*, which was true and was a fact about the validator rather than about the
+  world: nothing else was in that set because the set refused everything else. A webhook
+  signing key, a shared HMAC, a token something other than a poll consumes — each of those
+  is a per-project value with nowhere to live, and "build the namespace when one appears"
+  means the first one to appear has to wait for a command.
+
+  **What happens to `SECRET_NAMES`.** It stays closed, and it belongs to `connect`. There
+  the argument is exact: a name Ogun *polls* under, misspelled, is a live credential filed
+  where nothing will ever read it, which is this record's own sentence — *"a secret nothing
+  reads looks exactly like one that works, right up until the night it mattered"*. That
+  argument cannot be made about a store whose purpose is arbitrary names, so `setProjectSecret`
+  now takes a `string` and `secret set` validates differently rather than not at all:
+
+  - **A name shape**, `[a-z0-9][a-z0-9.-]{0,63}`. This is aimed at one specific accident.
+    `secret set` prompts for the key when it is left off, so `ogun secret set lin_api_9f3…`
+    — somebody who remembered that the key does not belong in argv and forgot that the
+    *name* does — cannot be told apart from a deliberate invocation by counting arguments.
+    It can be told apart by shape: an API key is long, or mixed case, or has underscores,
+    and Linear's has all three. Kebab rather than snake for exactly that reason —
+    `stripe_webhook` is a name somebody would plausibly want and `lin_api_…` is a key
+    somebody would plausibly paste, and no rule admits the first and refuses the second.
+    The refusal does not repeat the argument back, which is this record's existing rule for
+    the same reason it was written.
+  - **A line that says nothing reads it.** After storing a name that is not in
+    `SECRET_NAMES`, the command says so and names the set Ogun does poll under. The closed
+    set was a refusal; a free-form store cannot refuse, so the fact moves to a statement at
+    the one moment somebody is looking at the screen. A nearest-match "did you mean" was
+    considered and is not worth twelve lines while `SECRET_NAMES` has one element — listing
+    the set *is* the did-you-mean. When it grows past what fits on a line, it becomes worth
+    them.
+
+  **What happens to the overlap**, which is real and is acknowledged rather than designed
+  away. `ogun connect linear --api-key` and `ogun secret set linear <key>` both put a
+  Linear key on disk.
+
+  - **They write the same row.** `secrets.<project>.linear`, through `setProjectSecret`,
+    under `updateLocalConfig`'s lock. Two maps that could each hold a `linear` key is the
+    "two stores that can disagree" shape this record already rejected when it refused
+    `~/.ogun/secrets.json`, and it would be worse here, because the disagreement would be
+    between two commands the same operator runs on the same afternoon.
+  - **Neither is a thin alias.** They are the same write wearing two vocabularies, and the
+    vocabularies are not decoration: `connect --api-key` knows the name is an integration,
+    so it says what connecting *as a person* means for attribution and names the
+    application flow that avoids it; `secret set` says the storage half and warns when
+    nothing reads the name. The rules about the row itself — the refusal behind a live
+    grant, the "you already have one" warning, the `stored`/`replaced`/`filled` reporting —
+    are three shared functions called by both, because a rule enforced at one of two doors
+    is not a rule.
+  - **The listings answer consistently by construction.** `ogun connect list` shows what a
+    project can *reach*: grants, plus keys whose name is in `SECRET_NAMES`. It does not
+    show a webhook key, because that is not something a project reaches anything with — and
+    it counts what it left out on its last line, so a short table never implies an empty
+    store. `ogun secret list` shows what is *stored* under a name, integration or not, with
+    a `READ BY` column; a key a grant has taken over is red and says *"nothing — the linear
+    grant wins"*, which is the same sentence `connect list` prints for the same row.
+
+  **The stored shape did not move.** `secrets` and `oauth` are the same two blocks in the
+  same file at 0600, `readProjectSecret` is unchanged, and `packages/gateway` reads grants
+  through the same retrieval it always did. What changed is which command may write which
+  name, and what each one says while doing it.
 
   [amended] **A value passed as an argument is now accepted with a warning, where it used
   to be refused.** This reverses a decision this record made deliberately and tested, so it

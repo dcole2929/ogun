@@ -2,32 +2,40 @@ import {
   connectWithAppToken,
   describeGrant,
   disconnectProject,
-  InvalidSecret,
   isSecretName,
   LinearOAuthError,
   listOAuthApps,
   listProjectSecrets,
   loadLocalConfig,
   localConfigPath,
-  normalizeSecretInput,
   readOAuthApp,
   registeredApplication,
   SECRET_NAMES,
   setProjectSecret,
   type LinearConnection,
-  type LocalConfig,
   type ProjectGrantPresence,
   type SecretName,
 } from '@ogun/core'
 import { parse } from '../args.ts'
 import { authHeaders } from '../auth.ts'
 import { bold, cyan, dim, fail, green, red, table, yellow } from '../output.ts'
-import { projectFlag, resolveProject, type ResolvedProject } from '../project-slug.ts'
-import { prompt, promptHidden, readAllStdin, warnInlineSecret } from '../prompt.ts'
+import {
+  projectFlag,
+  requireKnownProject,
+  resolveProject,
+  type ResolvedProject,
+} from '../project-slug.ts'
+import { prompt, promptHidden, readSecretValue } from '../prompt.ts'
+import {
+  refuseShadowedKey,
+  shadowedKeys,
+  warnAboutReplacing,
+  writeProjectKey,
+} from './secret.ts'
 
 /**
- * `ogun connect`, `ogun connections`, `ogun disconnect` — one vocabulary for giving a
- * project access to an integration (ADR-0012 and ADR-0014, both amended).
+ * `ogun connect`, `ogun connect list`, `ogun disconnect` — one vocabulary for *access*
+ * (ADR-0012 and ADR-0014, both amended).
  *
  * ### What this replaces, and why it is not two commands wearing one hat
  *
@@ -41,32 +49,34 @@ import { prompt, promptHidden, readAllStdin, warnInlineSecret } from '../prompt.
  * ```
  *
  * `linear` sat in the *command path*, which made a GitHub or Jira integration a whole new
- * command tree rather than a new value — and `secret set linear` was a second, unrelated
- * spelling of "let Ogun into this workspace", filed under storage rather than under
- * access. An operator asking "how do I connect this project to Linear" had to already know
- * which of two grammars the answer lived in.
+ * command tree rather than a new value. So the integration is a **value**: `ogun connect
+ * <integration>`. `github` and `jira` become arguments rather than command trees.
  *
- * So the integration is a **value**: `ogun connect <integration>`. `github` and `jira`
- * become arguments rather than command trees, and `--api-key` becomes one of the
- * mechanisms `connect` offers rather than a separate command with its own conventions.
+ * ### Why `ogun secret` sits beside this rather than inside it
  *
- * ### Why the API key is a mechanism here rather than a command beside this
+ * The previous shape deleted `ogun secret` on the grounds that every name in
+ * `SECRET_NAMES` was an integration credential, so the namespace held one kind of thing
+ * and called it something else. The observation was right; the conclusion was not, and the
+ * product owner reversed it: **a secret is not guaranteed to be an integration.** The
+ * reason nothing but integrations was in that set is that the set refused everything else,
+ * so "no counter-example exists" was a fact about the validator rather than about the
+ * world.
  *
- * It is the question the brief asked to be argued rather than assumed, and the argument is
- * short: two vocabularies for one act is the thing being fixed, and leaving `ogun secret
- * set linear` in place would have landed on two again. Every name in `SECRET_NAMES` today
- * *is* an integration credential, so the `secret` namespace was holding exactly one kind
- * of thing and calling it something else. If a secret ever appears that is not a
- * connection — a webhook signing key, say — `ogun secret` comes back for it, and
- * `connect` keeps the connections. Building that namespace now, for nothing that exists,
- * is the mistake ADR-0014 refused to make about write scopes.
+ * So there are two commands with two jobs, overlapping on one slot:
  *
- * The old spellings are dropped rather than aliased, and answer with a line naming the new
- * one. Muscle memory outlives a release; "unknown command" is a dead end.
+ *  - `connect` is *access*. Which product, and how Ogun gets in — a grant, a client id and
+ *    a secret, an expiry, a workspace. The integration is checked against `SECRET_NAMES`,
+ *    because here a misspelling is a credential nothing polls.
+ *  - `secret set` is *storage*. One free-form name, one value, for anything at all.
+ *
+ * `connect <integration> --api-key` and `secret set <integration> <key>` write the same
+ * row through the same function under the same lock, and share `refuseShadowedKey`,
+ * `warnAboutReplacing` and `writeProjectKey` so neither door can enforce a rule the other
+ * does not. `commands/secret.ts` carries the full argument.
  *
  * ### Which of these need the control plane
  *
- * `connect` (default), `connections` and `disconnect` reach **no server**. That is a
+ * `connect`, `connect list` and `disconnect` reach **no server**. That is a
  * promise ADR-0012 made about the credential this replaces — *"it works before `ogun
  * init`, with the database down, and over SSH"* — and it had to be kept, because a
  * preferred mechanism that is *less* available than the discouraged one teaches operators
@@ -85,61 +95,137 @@ import { prompt, promptHidden, readAllStdin, warnInlineSecret } from '../prompt.
 /**
  * The usage lines name **every** input, including the ones that are not arguments.
  *
- * This is the third time the point has been made and it is the acceptance bar for the
+ * This is the fourth time the point has been made and it is the acceptance bar for the
  * change: `ogun linear app [--project <slug>]` read as a complete command that takes
  * nothing, and the only way to discover that it prompts for a Client ID and a Client
  * Secret was to run it. A usage line that hides the input a command exists to collect is a
  * usage line that is wrong.
  *
- * So the values are positionals in the signature — where a reader sees them — and the help
- * beneath says where each one comes from when it is left out. That they are *optional*
- * positionals is deliberate and is explained at `warnInlineSecret`: passing a credential
- * inline works and warns, rather than being refused.
+ * ### Why the credentials are named flags and not positionals
+ *
+ * They were positionals for one commit — `ogun connect <integration> <client-id>
+ * <client-secret>` — which does put them in the signature, and is still wrong. **Two
+ * values of the same shape in a fixed order is a coin flip at the keyboard.** A client id
+ * and a client secret are both opaque strings from the same page of Linear's settings;
+ * nothing about either one tells you which slot it belongs in, and getting them the wrong
+ * way round produces a token request that fails with a message about the *client*, not
+ * about the order.
+ *
+ * So they are named: `--client-id <id> --client-secret <secret>`, in any order, each
+ * unmistakable. The rule this expresses, and the one the rest of the CLI is now held to:
+ * **a lone value can be positional; several credential values of the same shape must be
+ * named.** That is why `ogun secret set <name> <key>` keeps `<key>` positional — it is the
+ * only value there, and `<name>` is not a credential — and why `--api-key [<key>]` carries
+ * its own.
+ *
+ * Nothing about *how* the values arrive changed: omit a flag and it is prompted for (the
+ * Client ID visibly, the secret with the echo off) or read from stdin when stdin is a
+ * pipe, and passing one inline works and warns. See `warnInlineSecret` for why that last
+ * one is a warning rather than the refusal it briefly was.
  */
-const USAGE_CONNECT = 'ogun connect <integration> <client-id> <client-secret> [--project <slug>]'
-const USAGE_CONNECT_KEY = 'ogun connect <integration> --api-key <key> [--project <slug>]'
-const USAGE_CONNECTIONS = 'ogun connections [--project <slug>]'
+const USAGE_OAUTH =
+  'ogun connect <integration> --client-id <id> --client-secret <secret> [--project <slug>]'
+const USAGE_CONSENT =
+  'ogun connect <integration> --consent --client-id <id> --client-secret <secret>'
+const USAGE_KEY = 'ogun connect <integration> --api-key [<key>] [--project <slug>]'
+const USAGE_LIST = 'ogun connect list [--project <slug>]'
 const USAGE_DISCONNECT = 'ogun disconnect <integration> [--project <slug>] [--keep-application]'
 
 const REGISTER_URL = 'https://linear.app/settings/api/applications/new'
 
 /**
- * The three mechanisms, as flags rather than as a `--via <word>` whose values have to be
- * remembered.
+ * The flag names **what kind of thing you are connecting**, and the kind decides which
+ * inputs are required.
  *
- * They are mutually exclusive and the default needs no flag. `--app-token` exists anyway,
- * as the explicit spelling of the default, for the reason `LINEAR_SCOPES` is sent
- * explicitly even though Linear says `read` is always present: **a script that relies on a
- * default is a script whose meaning changes when the default does.** An automated connect
- * that must stay a client-credentials connect can say so.
+ * ### `--oauth` is back, and the reason it was rejected stopped being true
  *
- * The names describe what the credential *is*, because that is what an operator is
- * choosing between, and none of them is `--oauth`: two of the three *are* OAuth, so a flag
- * by that name would be the ambiguity this change exists to remove, one level down.
+ * The previous shape had three flags treated as peers — `--app-token`, `--consent`,
+ * `--api-key` — and rejected `--oauth` in as many words:
+ *
+ * > *"The names describe what the credential is, because that is what an operator is
+ * > choosing between, and none of them is `--oauth`: two of the three are OAuth, so a flag
+ * > by that name would be the ambiguity this change exists to remove, one level down."*
+ *
+ * That was a correct description of the triple, and the triple was the mistake. The three
+ * are not peers. **Two of them name a kind of integration and the third names a grant
+ * inside one of those kinds**, and flattening that put a fork in the road where there is
+ * no fork: somebody choosing between `--app-token` and `--consent` has already decided
+ * they are connecting an OAuth application, and somebody choosing `--api-key` has decided
+ * something else entirely. Once `--consent` is a modifier, "two of the three are OAuth" is
+ * no longer a sentence about the kinds — both kinds are exactly one thing each.
+ *
+ * The two kinds are the two things that differ in what an operator has to *have*:
+ *
+ *  - `--oauth` — an application registered in the provider, which always means a client id
+ *    and a client secret. The default, because it is the one that does not act as a
+ *    person; the explicit spelling exists for the reason `LINEAR_SCOPES` is sent even
+ *    though Linear says `read` is implied — a script that relies on a default is a script
+ *    whose meaning changes when the default does.
+ *  - `--api-key` — one key, and nothing else. There is no client id anywhere in it.
+ *
+ * ### `--consent` is a modifier inside the OAuth kind, and it implies it
+ *
+ * It selects the *grant*: authorization-code instead of client-credentials. It exists
+ * because a client-credentials token reaches the workspace's public teams and no others,
+ * so consent is the only path to a private one — and because some workspaces want
+ * user-scoped access rather than an app installed at the workspace level.
+ *
+ * **`--consent` implies `--oauth`**, so nobody has to type both; `--oauth --consent` is
+ * accepted and redundant rather than required, which is what makes it a modifier rather
+ * than a second word to remember. `--api-key --consent` is refused, because there is no
+ * such thing as an api key somebody approves in a browser.
+ *
+ * Considered and rejected: `--grant <client-credentials|authorization-code>`, which names
+ * exactly what is being selected and matches the stored `grantType` and RFC 6749's own
+ * words. It loses on what an operator is actually deciding. Nobody reaches for this flag
+ * because they want a different grant; they reach for it because their teams are private,
+ * and `--consent` is the word for the step that makes that work. The grant is the
+ * mechanism, not the reason, and two long values to spell would be a second thing to look
+ * up at the moment somebody is already lost.
  */
-const MECHANISM_FLAGS = {
-  '--app-token': 'boolean',
-  '--consent': 'boolean',
-  '--api-key': 'boolean',
+const KIND_FLAGS = {
+  '--oauth': 'boolean',
+  '--api-key': 'optional-string',
 } as const
 
 const CONNECT_FLAGS = {
-  ...MECHANISM_FLAGS,
+  ...KIND_FLAGS,
+  '--consent': 'boolean',
+  '--client-id': 'string',
+  '--client-secret': 'string',
   '--project': 'string',
   '--allow-unregistered': 'boolean',
+  /**
+   * Declared so it can be refused by name. It was the explicit spelling of the default for
+   * one commit and `--oauth` replaces it; "Unknown option '--app-token'" is a dead end for
+   * anybody who copied a line out of that commit's help.
+   */
+  '--app-token': 'boolean',
 } as const
 
-type Mechanism = 'app-token' | 'consent' | 'api-key'
+type Kind = 'oauth' | 'api-key'
+
+type ConnectFlags = {
+  oauth?: boolean
+  'api-key'?: string
+  consent?: boolean
+  'client-id'?: string
+  'client-secret'?: string
+  project?: string
+  'allow-unregistered'?: boolean
+  'app-token'?: boolean
+}
 
 export async function connect(args: string[], serverUrl: string): Promise<void> {
-  const { flags, positionals } = parse(args, CONNECT_FLAGS, USAGE_CONNECT)
-  const mechanism = chooseMechanism(flags)
+  const { flags, positionals } = parse(args, CONNECT_FLAGS, USAGE_OAUTH)
+  const kind = chooseKind(flags)
   const integration = requireIntegration(positionals[0])
+  refuseStrayPositional(positionals[1])
 
   const config = await loadLocalConfig()
   const project = await resolveProject(flags.project, config)
   /**
-   * The slug is checked **before anything is prompted for or read**, in every mechanism.
+   * The slug is checked **before anything is prompted for or read**, in every kind.
    *
    * A command that collects a Client Secret and then says the project was misspelled has
    * already had a credential typed into a terminal that scrolls back, for nothing — and
@@ -147,42 +233,85 @@ export async function connect(args: string[], serverUrl: string): Promise<void> 
    */
   requireKnownProject(project, config, flags['allow-unregistered'] === true)
 
-  if (mechanism === 'api-key') return connectApiKey(integration, project, positionals.slice(1))
-  if (mechanism === 'consent') {
-    return connectConsent(integration, project, positionals.slice(1), serverUrl)
-  }
-  return connectAppToken(integration, project, positionals.slice(1))
+  if (kind === 'api-key') return connectApiKey(integration, project, flags['api-key'] ?? '')
+  if (flags.consent === true) return connectConsent(integration, project, flags, serverUrl)
+  return connectAppToken(integration, project, flags)
 }
 
 /**
- * One mechanism, or a refusal naming the ones that were asked for.
+ * Which kind of thing is being connected, or a refusal naming what was asked for.
  *
- * Refused rather than resolved by precedence. `--api-key --consent` is not a preference to
+ * Refused rather than resolved by precedence. `--oauth --api-key` is not a preference to
  * be arbitrated; it is somebody who believes one of those two words means something other
  * than what it does, and silently honouring the winner would store a credential of a kind
- * they did not ask for and tell them it worked.
+ * they did not ask for — with a different attribution in Linear — and tell them it worked.
+ *
+ * The three refusals are three different mistakes and are worded separately, because "pick
+ * one" is useless advice to somebody who wrote `--api-key --client-id abc`: they did pick
+ * one, and then described an application to it.
  */
-function chooseMechanism(flags: {
-  'app-token'?: boolean
-  consent?: boolean
-  'api-key'?: boolean
-}): Mechanism {
-  const chosen: Mechanism[] = [
-    ...(flags['app-token'] ? (['app-token'] as const) : []),
-    ...(flags.consent ? (['consent'] as const) : []),
-    ...(flags['api-key'] ? (['api-key'] as const) : []),
-  ]
-  if (chosen.length > 1) {
+function chooseKind(flags: ConnectFlags): Kind {
+  if (flags['app-token'] === true) {
     fail(
-      `--${chosen.join(' and --')} ask for different credentials, and a project has one.\n` +
-        '  Pick one:\n' +
-        '    (nothing)     Ogun takes a token in its own name. No browser, no approval.\n' +
-        '    --consent     somebody approves an install in a browser. Private teams.\n' +
-        '    --api-key     a personal API key. Everything Ogun does appears as you.\n' +
+      '`--app-token` is now `--oauth`. The flag names what you are connecting rather than\n' +
+        '  which token comes back, because an OAuth application always means a client id and\n' +
+        '  a client secret and an api key never does. Nothing was stored.\n' +
+        `    ${USAGE_OAUTH}`,
+    )
+  }
+
+  const key = flags['api-key'] !== undefined
+  if (key && flags.oauth === true) {
+    fail(
+      '--oauth and --api-key are different kinds of integration, and a project connects\n' +
+        '  through one of them:\n' +
+        '    --oauth       an application you registered. Needs --client-id and ' +
+        '--client-secret.\n' +
+        '    --api-key     one key, issued to you. Everything Ogun does appears as you.\n' +
         '  Nothing was stored.',
     )
   }
-  return chosen[0] ?? 'app-token'
+  if (key && flags.consent === true) {
+    fail(
+      '--consent is an OAuth grant, not a kind of connection: it is how somebody approves\n' +
+        '  an application in a browser, and an api key has nobody to approve it. Drop one.\n' +
+        `    reach private teams:  ${USAGE_CONSENT}\n` +
+        `    use a personal key:   ${USAGE_KEY}\n` +
+        '  Nothing was stored.',
+    )
+  }
+  if (key && (flags['client-id'] !== undefined || flags['client-secret'] !== undefined)) {
+    fail(
+      '--api-key takes one key and no application: a client id and a client secret belong\n' +
+        '  to an OAuth application, which is what --oauth connects. Nothing was stored.\n' +
+        `    ${USAGE_OAUTH}\n` +
+        `    ${USAGE_KEY}`,
+    )
+  }
+  return key ? 'api-key' : 'oauth'
+}
+
+/**
+ * The positional credentials are gone, and a leftover one is refused without being echoed.
+ *
+ * `ogun connect linear <client-id> <client-secret>` was the shape for one commit, so the
+ * plausible second positional here is a **client secret** — and the next most plausible is
+ * an api key from somebody who read `--api-key <key>` and dropped the flag. Quoting either
+ * back would write a live credential to stderr on top of the shell history and the `ps`
+ * window it is already in, which is the rule `requireIntegration` states below and the
+ * same one the route in `system.ts` states.
+ */
+function refuseStrayPositional(extra: string | undefined): void {
+  if (extra === undefined) return
+  fail(
+    'the client id and the client secret are flags now, not positionals — two opaque\n' +
+      '  strings from the same page, in a fixed order, is a coin flip. Nothing was stored.\n' +
+      `    ${USAGE_OAUTH}\n` +
+      `    ${USAGE_KEY}\n` +
+      '  What you typed is not repeated back, because the thing most likely to be in that\n' +
+      '  position is a credential. If it was: treat it as compromised, and clear your shell\n' +
+      '  history.',
+  )
 }
 
 // ── the default: a token in Ogun's own name ────────────────────────────────
@@ -197,7 +326,7 @@ function chooseMechanism(flags: {
  *
  * ### It asks for nothing when there is nothing new to ask for
  *
- * With no positionals and an application already registered, the stored client id and
+ * With no `--client-id` and an application already registered, the stored client id and
  * secret are reused. That covers the reconnect after a 30-day token lapses, the retry
  * after a token request that failed on the network, and rotating nothing at all — three
  * paths that would otherwise each send somebody back to Linear's settings page for a value
@@ -207,7 +336,7 @@ function chooseMechanism(flags: {
 async function connectAppToken(
   integration: SecretName,
   project: ResolvedProject,
-  rest: string[],
+  flags: ConnectFlags,
 ): Promise<void> {
   const existing = await readOAuthApp(project.slug, integration)
 
@@ -234,7 +363,7 @@ async function connectAppToken(
     )
   }
 
-  const credentials = await collectApplication(integration, project, rest, existing.state)
+  const credentials = await collectApplication(integration, project, flags, existing.state)
 
   let connection: LinearConnection
   try {
@@ -264,30 +393,54 @@ async function connectAppToken(
  * settings page. So it is prompted for *visibly* — an operator has to be able to check
  * they pasted the right one — and passing it inline draws no warning. Warning about a
  * value that is not a secret is how an operator learns to scroll past warnings.
+ *
+ * ### Each half falls back to the store on its own, and the secret only with its id
+ *
+ * Separate flags made a rotation expressible that two positionals could not carry:
+ * `ogun connect linear --client-secret <new>` is "I rotated the secret in Linear's
+ * settings and the application is otherwise the same". So a missing `--client-id` takes
+ * the registered one rather than sending somebody back for a value this machine holds.
+ *
+ * The reverse fallback is **conditional on the id matching**, and that is the important
+ * half. A stored client secret belongs to a stored client id; reusing it under a client id
+ * the operator just typed would pair a secret with an application it was never issued for,
+ * and the token request fails with a message about the *client* that names neither. So a
+ * new id asks for its own secret.
  */
 async function collectApplication(
   integration: SecretName,
   project: ResolvedProject,
-  rest: string[],
+  flags: ConnectFlags,
   storedState: string,
 ): Promise<{ clientId: string; clientSecret: string; redirectUri: string }> {
-  const [inlineId, inlineSecret, extra] = rest
-  if (extra !== undefined) fail(`usage: ${USAGE_CONNECT}`)
+  const inlineId = flags['client-id']
+  const inlineSecret = flags['client-secret']
+  const stored =
+    storedState === 'present'
+      ? await registeredApplication(project.slug, integration)
+      : undefined
 
-  if (inlineId === undefined && storedState === 'present') {
-    const stored = await registeredApplication(project.slug, integration)
-    if (stored) {
-      console.log(
-        dim(`  using the ${integration} application already registered here (client ` +
-          `${stored.clientId})`),
-      )
-      return stored
-    }
+  // Neither given and an application on file: the reconnect, which asks for nothing.
+  if (inlineId === undefined && inlineSecret === undefined && stored) {
+    console.log(
+      dim(
+        `  using the ${integration} application already registered here (client ` +
+          `${stored.clientId})`,
+      ),
+    )
+    return stored
   }
+
+  const clientId = (inlineId ?? stored?.clientId ?? '').trim()
+  /** Only usable while it still belongs to the client id actually being registered. */
+  const reusableSecret =
+    stored !== undefined && clientId === stored.clientId ? stored.clientSecret : undefined
+  const asksForId = clientId === ''
+  const asksForSecret = inlineSecret === undefined && reusableSecret === undefined
 
   console.log(bold(`\nConnect ${cyan(project.slug)} to ${cyan(integration)}\n`))
   if (project.from !== 'flag') console.log(dim(`  project taken from ${project.from}\n`))
-  if (inlineId === undefined) {
+  if (asksForId || asksForSecret) {
     console.log(`  Create an application at ${cyan(REGISTER_URL)}`)
     console.log(
       dim(
@@ -299,12 +452,20 @@ async function collectApplication(
     )
   }
 
-  const clientId = (inlineId ?? (await prompt('  Client ID: '))).trim()
-  if (clientId === '') fail('nothing was stored — a client id is required')
+  const resolvedId = asksForId ? (await prompt('  Client ID: ')).trim() : clientId
+  if (resolvedId === '') fail('nothing was stored — a client id is required')
+  // Said out loud: binding a rotated secret to an id the operator cannot see is how the
+  // wrong application ends up authenticating a poll nobody is watching.
+  if (inlineId === undefined && stored && !asksForId) {
+    console.log(dim(`  keeping the registered client id (${resolvedId})\n`))
+  }
 
-  const clientSecret = await readSecretValue(inlineSecret, 'a client secret', () =>
-    promptHidden('  Client secret (not echoed): '),
-  )
+  const clientSecret =
+    inlineSecret === undefined && reusableSecret !== undefined
+      ? reusableSecret
+      : await readSecretValue(inlineSecret, 'a client secret', () =>
+          promptHidden('  Client secret (not echoed): '),
+        )
 
   /**
    * Empty rather than a plausible-looking `http://localhost:7777/…`.
@@ -342,11 +503,11 @@ async function collectApplication(
 async function connectConsent(
   integration: SecretName,
   project: ResolvedProject,
-  rest: string[],
+  flags: ConnectFlags,
   serverUrl: string,
 ): Promise<void> {
-  const [inlineId, inlineSecret, extra] = rest
-  if (extra !== undefined) fail(`usage: ${USAGE_CONNECT} --consent`)
+  const inlineId = flags['client-id']
+  const inlineSecret = flags['client-secret']
 
   await requireProjectOnControlPlane(project, serverUrl)
   const here = projectFlag(project)
@@ -355,7 +516,11 @@ async function connectConsent(
   const redirectUri = String(status.redirectUri)
 
   const stored = await registeredApplication(project.slug, integration)
-  const reuse = inlineId === undefined && stored !== undefined && stored.redirectUri === redirectUri
+  const reuse =
+    inlineId === undefined &&
+    inlineSecret === undefined &&
+    stored !== undefined &&
+    stored.redirectUri === redirectUri
 
   if (!reuse) {
     console.log(bold(`\nConnect ${cyan(project.slug)} to ${cyan(integration)}, with consent\n`))
@@ -370,11 +535,19 @@ async function connectConsent(
       ),
     )
 
-    const clientId = (inlineId ?? (await prompt('  Client ID: '))).trim()
+    // The same per-field fallback `collectApplication` documents: a rotated secret keeps
+    // the registered client id, and a new client id never inherits the old one's secret.
+    const known = (inlineId ?? stored?.clientId ?? '').trim()
+    const clientId = known === '' ? (await prompt('  Client ID: ')).trim() : known
     if (clientId === '') fail('nothing was stored — a client id is required')
-    const clientSecret = await readSecretValue(inlineSecret, 'a client secret', () =>
-      promptHidden('  Client secret (not echoed): '),
-    )
+    const reusableSecret =
+      stored !== undefined && clientId === stored.clientId ? stored.clientSecret : undefined
+    const clientSecret =
+      inlineSecret === undefined && reusableSecret !== undefined
+        ? reusableSecret
+        : await readSecretValue(inlineSecret, 'a client secret', () =>
+            promptHidden('  Client secret (not echoed): '),
+          )
     await send(serverUrl, `/api/oauth/linear/app/${project.slug}`, 'PUT', {
       clientId,
       clientSecret,
@@ -400,7 +573,7 @@ async function connectConsent(
   console.log('  2. Linear sends your browser back to:\n')
   console.log(`     ${dim(String(start.redirectUri))}\n`)
   console.log(
-    dim(`     If your browser can reach that, you are done — \`ogun connections${here}\`.\n`),
+    dim(`     If your browser can reach that, you are done — \`ogun connect list${here}\`.\n`),
   )
 
   if (!process.stdin.isTTY) {
@@ -419,7 +592,7 @@ async function connectConsent(
   )
   const pasted = (await promptHidden('     URL (not echoed): ')).trim()
   if (pasted === '') {
-    console.log(dim(`\n  left to the browser. \`ogun connections${here}\``))
+    console.log(dim(`\n  left to the browser. \`ogun connect list${here}\``))
     return
   }
   const done = await send(serverUrl, '/api/oauth/linear/exchange', 'POST', { redirectUrl: pasted })
@@ -441,124 +614,50 @@ async function connectConsent(
  * typing and permanent afterwards: everything Ogun reads it does as **you**, and the
  * moment write-back lands every comment it posts appears under your name on a board other
  * people make decisions from.
+ *
+ * ### It is `ogun secret set <integration>` wearing this command's vocabulary
+ *
+ * The same slot, the same lock, the same three shared rules — `refuseShadowedKey`,
+ * `warnAboutReplacing`, `writeProjectKey` are called from both doors rather than copied
+ * into each. What is different is what surrounds them: this one knows the name is an
+ * integration, so it can say what connecting by key *means* for attribution and name the
+ * application flow that avoids it. `ogun secret set linear <key>` reaches the identical
+ * state and says the storage half.
+ *
+ * Two doors onto one slot is a cost, and it is a smaller cost than the alternative was:
+ * folding the store into `connect` meant a project could not hold a secret that is not a
+ * connection, and separating the stores would mean two places a `linear` key can be and
+ * two answers to whether one is live.
  */
 async function connectApiKey(
   integration: SecretName,
   project: ResolvedProject,
-  rest: string[],
+  inline: string,
 ): Promise<void> {
-  const [inlineKey, extra] = rest
-  if (extra !== undefined) fail(`usage: ${USAGE_CONNECT_KEY}`)
+  // `''` is `--api-key` with no value: prompt at a terminal, read the pipe otherwise.
+  const inlineKey = inline === '' ? undefined : inline
 
-  /**
-   * Refused when the project is already connected as an application, rather than stored
-   * behind it.
-   *
-   * `readProjectSecret` prefers a grant over a key (ADR-0014), so storing one here would
-   * put a live credential in the file that nothing reads — the precise failure the closed
-   * set of secret names exists to prevent, arriving through the other half of a key's
-   * address. The refusal names the command that makes room for it.
-   */
-  const existing = await readOAuthApp(project.slug, integration)
-  if (existing.state === 'present' && existing.app.grant) {
-    fail(
-      `"${project.slug}" is already connected to ${integration} as an application, and a\n` +
-        '  personal key would sit behind that grant being read by nothing. Nothing was ' +
-        'stored.\n' +
-        `  \`ogun disconnect ${integration}${projectFlag(project)}\` first if you mean to ` +
-        'swap.',
-    )
-  }
-
-  /**
-   * At a terminal, say there is already one there *before* asking for the new one.
-   *
-   * Advisory rather than authoritative — it is a second read of the store and the fact it
-   * reports could change before the write takes the lock. That is fine for what it is for:
-   * a person one keystroke from pasting a key over a working one who does not know it. The
-   * line printed *afterwards* is the one taken under the lock.
-   *
-   * Only at a TTY, and only when the value was not already on the command line. A pipe is a
-   * rotation somebody wrote down on purpose, and a warning it cannot act on is noise in a
-   * script's output.
-   */
-  if (process.stdin.isTTY && inlineKey === undefined) {
-    const stored = await listProjectSecrets().catch(() => [])
-    if (stored.some((e) => e.project === project.slug && e.name === integration)) {
-      console.log(yellow(`  ${project.slug} already has a ${integration} key on this machine.`))
-      console.log(dim('  Storing replaces it, and there is no history. Ctrl-C to stop.'))
-    }
-  }
+  await refuseShadowedKey(project, integration)
+  await warnAboutReplacing(project, integration, inlineKey)
 
   const value = await readSecretValue(inlineKey, 'an api key', () =>
-    promptHidden(`${integration} key for ${project.slug}: `),
+    promptHidden(`  ${integration} key for ${project.slug} (not echoed): `),
   )
   const displaced = await setProjectSecret(project.slug, integration, value)
 
-  /**
-   * The confirmation says the length and nothing else about the value.
-   *
-   * Not even the last four characters: a suffix is the standard reassurance and it is a
-   * disclosure, and this command is run over SSH into a terminal that scrolls back. The
-   * length catches the two mistakes a set can make — a truncated paste, and a value that
-   * picked up something it should not have — and narrows a random key by nothing.
-   */
-  const verb = displaced === 'absent' ? 'connected' : 'reconnected'
-  console.log(
-    green(`\n  ${project.slug} ${verb} to ${integration} with a personal api key`) +
-      dim(` (${value.length} characters)`),
-  )
-  if (project.from !== 'flag') console.log(dim(`  project taken from ${project.from}`))
-  if (displaced === 'present') {
-    console.log(dim('  The previous key is gone: there is no history and no second slot.'))
-    console.log(dim('  If the new one is wrong, mint another in Linear — the old value'))
-    console.log(dim('  cannot be recovered from this machine.'))
-  } else if (displaced === 'empty') {
-    // Only reachable by hand-editing config.json, and worth naming: a blank entry is what
-    // a poller reads as a key that exists and does not work, so this is a repair.
-    console.log(dim(`  ${project.slug} had a blank ${integration} entry here, which a poller`))
-    console.log(dim('  reads as a key that exists and does not work. It is filled in now.'))
-  }
-  console.log(dim(`  stored in ${localConfigPath()}, mode 0600, on this machine only`))
+  await writeProjectKey(project, integration, value.length, displaced, {
+    stored: `  ${project.slug} connected to ${integration} with a personal api key`,
+    replaced: `  ${project.slug} reconnected to ${integration} with a personal api key`,
+  })
+
   console.log(
     yellow('  Everything Ogun reads, it reads as you.') +
       dim(
         ' Once write-back lands, every comment it\n  posts appears under your name. ' +
-          `\`ogun connect ${integration}\` connects as an application\n  instead, and needs ` +
-          'no approval when your teams are public.',
+          `\`ogun connect ${integration} --oauth\` connects as an\n  application instead, ` +
+          'and needs no approval when your teams are public.',
       ),
   )
-}
-
-/**
- * A credential, from argv, a pipe, or a prompt — in that order, and never echoed.
- *
- * The three sources are not a preference: the shape of the invocation has already chosen.
- * An inline value was chosen explicitly, a pipe means stdin is not a terminal, and a
- * terminal means there is somebody to ask. A `--stdin` flag that had to be remembered
- * would mostly be discovered by pasting a key into a hung command.
- *
- * `warnInlineSecret` carries the argument for accepting an inline value at all, and for
- * the refusal that used to be here instead.
- */
-async function readSecretValue(
-  inline: string | undefined,
-  what: string,
-  ask: () => Promise<string>,
-): Promise<string> {
-  const raw =
-    inline !== undefined
-      ? (warnInlineSecret(what), inline)
-      : process.stdin.isTTY
-        ? await ask()
-        : await readAllStdin()
-  try {
-    return normalizeSecretInput(raw)
-  } catch (err) {
-    if (!(err instanceof InvalidSecret)) throw err
-    // `err.message` names the rule that was broken and never the value that broke it.
-    return fail(err.message)
-  }
 }
 
 /** What a finished connection looks like, from whichever mechanism finished it. */
@@ -615,14 +714,25 @@ function announce(
     console.log(dim('  a key, so leaving it would have left a credential nothing reads'))
   }
   console.log(dim(`  ${localConfigPath()}, mode 0600, on this machine only`))
-  console.log(dim(`  \`ogun connections${projectFlag(project)}\``))
+  console.log(dim(`  \`ogun connect list${projectFlag(project)}\``))
 }
 
 // ── the listing ────────────────────────────────────────────────────────────
 
 /**
- * `ogun connections [--project <slug>]` — what this machine can reach, and how healthy it
- * is.
+ * `ogun connect list [--project <slug>]` — what this machine can reach, and how healthy.
+ *
+ * ### A subcommand, not a second top-level noun
+ *
+ * It was `ogun connections`, which put a *listing* at the same level as the three verbs
+ * that act — and then `ogun secret list` came back beside it, so the CLI would have had
+ * two conventions for "show me what is stored" depending on which noun you started from.
+ * `connect list` mirrors `secret list`, and the top level keeps the verbs. `ogun
+ * connections` is dropped rather than aliased and answers with a line naming this.
+ *
+ * `disconnect` stays a top-level verb, deliberately. It is an act rather than a view, it
+ * is the one somebody reaches for during an incident, and `ogun connect rm` would read as
+ * removing a listing row rather than revoking a token at Linear.
  *
  * ### One table, where there were two
  *
@@ -631,6 +741,14 @@ function announce(
  * commands you happened to run, and a project with both showed up twice with no indication
  * that only one of them was being read. This shows every credential a project has for an
  * integration in one row, and says which one a poll would actually use.
+ *
+ * ### It shows keys, but only the ones that are integrations
+ *
+ * `secrets` may now hold anything (`ogun secret set <name>`), and a webhook signing key is
+ * not a connection: listing one here would answer "what can this project reach" with a
+ * value nothing reaches anything with. So key rows are filtered to `SECRET_NAMES`, and the
+ * footer says how many were left out and where they are, because a listing that silently
+ * omits rows is how the two commands start disagreeing about what is stored.
  *
  * ### It reads the store, not the server
  *
@@ -650,18 +768,18 @@ function announce(
  * remembered: `ProjectGrantPresence` carries a client id, a workspace, scopes and an
  * expiry, and `ProjectSecretPresence` carries a name and a state.
  */
-export async function connections(args: string[]): Promise<void> {
-  const { flags } = parse(args, { '--project': 'string' }, USAGE_CONNECTIONS)
+export async function connectList(args: string[]): Promise<void> {
+  const { flags } = parse(args, { '--project': 'string' }, USAGE_LIST)
   const only = flags.project
 
   const apps = (await listOAuthApps()).filter((a) => (only ? a.project === only : true))
-  const keys = (await listProjectSecrets().catch(() => [])).filter((s) =>
+  const secrets = (await listProjectSecrets().catch(() => [])).filter((s) =>
     only ? s.project === only : true,
   )
+  const keys = secrets.filter((s) => isSecretName(s.name))
+  const otherSecrets = secrets.length - keys.length
 
-  const shadowed = new Set(
-    apps.filter((a) => a.connected).map((a) => `${a.project}/${a.provider}`),
-  )
+  const shadowed = await shadowedKeys()
   const keyRows = keys.map((k) => ({
     project: k.project,
     integration: k.name,
@@ -697,7 +815,8 @@ export async function connections(args: string[]): Promise<void> {
           : 'nothing is connected on this machine',
       ),
     )
-    console.log(dim(`  ${USAGE_CONNECT}`))
+    console.log(dim(`  ${USAGE_OAUTH}`))
+    if (otherSecrets > 0) console.log(dim(`  ${storedElsewhere(otherSecrets)}`))
     return
   }
 
@@ -708,7 +827,17 @@ export async function connections(args: string[]): Promise<void> {
     ]),
   )
   console.log(dim(`\ntokens and keys are never printed. ${localConfigPath()}`))
+  if (otherSecrets > 0) console.log(dim(storedElsewhere(otherSecrets)))
 }
+
+/**
+ * Said whenever this listing has left something out, because "nothing is connected" on a
+ * machine that is holding four stored values is the answer an operator is least equipped
+ * to disbelieve.
+ */
+const storedElsewhere = (count: number): string =>
+  `${count} other stored ${count === 1 ? 'secret is' : 'secrets are'} not an integration ` +
+  'and not listed here — `ogun secret list`'
 
 /**
  * How a project is connected, in one column, because the two grants differ in what they
@@ -776,7 +905,7 @@ export async function disconnect(args: string[]): Promise<void> {
       yellow(`${project.slug} had no ${integration} credential on this machine — nothing changed`),
     )
     if (project.from !== 'flag') {
-      console.log(dim(`  project taken from ${project.from} — \`ogun connections\` has the rest`))
+      console.log(dim(`  project taken from ${project.from} — \`ogun connect list\` has the rest`))
     }
     return
   }
@@ -841,7 +970,14 @@ export async function disconnect(args: string[]): Promise<void> {
  */
 function requireIntegration(name: string | undefined): SecretName {
   if (name !== undefined && isSecretName(name)) return name
-  if (name === undefined) fail(`usage: ${USAGE_CONNECT}\n         ${USAGE_CONNECT_KEY}`)
+  if (name === undefined) {
+    fail(
+      `usage: ${USAGE_OAUTH}\n` +
+        `       ${USAGE_CONSENT}\n` +
+        `       ${USAGE_KEY}\n` +
+        `       ${USAGE_LIST}`,
+    )
+  }
   return fail(
     `that is not an integration Ogun connects to. Known: ${SECRET_NAMES.join(', ')}.\n` +
       '  Nothing was stored — a credential nothing reads looks exactly like one that ' +
@@ -849,87 +985,6 @@ function requireIntegration(name: string | undefined): SecretName {
       '  What you typed is not repeated back, because the thing most likely to be there ' +
       'by\n  mistake is the credential itself. If it was: treat it as compromised, and ' +
       'clear your\n  shell history.',
-  )
-}
-
-/**
- * A slug this machine has never heard of is refused, and nothing is stored.
- *
- * ### One oracle, and the asymmetry that used to exist is gone
- *
- * ADR-0014 had two rules: `ogun secret set` checked the slug against this machine's
- * projects map with an `--allow-unregistered` escape, while `ogun linear app` checked it
- * against the control plane's database with no escape. The stated principle — *"each
- * command checks the slug against the best oracle it already depends on"* — was sound while
- * they were two commands. Under one `connect` it would become "each *mechanism* checks
- * against a different oracle", which is an asymmetry an operator has no way to predict:
- * the same command, the same slug, two different refusals and one flag that works in one of
- * them.
- *
- * So there is one user-visible rule: **`connect` checks the slug against this machine's own
- * evidence, before it asks for anything.** Local evidence is available in every mechanism,
- * costs no network, and — the part that matters — arrives *before the prompts*, which is
- * the property that made the control-plane check worth having in the first place.
- *
- * The control plane still checks its database when a mechanism reaches one. That is not a
- * second rule for the operator to learn: it is the server refusing a write it should not
- * accept, in the same sentence it always did, and with a database present there is no case
- * where an unknown slug is the right answer.
- *
- * ### Why there is an escape at all
- *
- * A hosted control plane is the legitimate case and is not exotic. `project sync` runs
- * where the repo is checked out; the machine that polls may never have held a copy, so its
- * projects map is legitimately empty while it polls four projects. The credential still
- * works there — `readProjectSecret` looks one up by slug and never consults that map — so a
- * refusal with no way through would lock the *correct* operator out of the one path that
- * works with the database down.
- *
- * `--allow-unregistered`, spelled out rather than `--force`, because what is being
- * overridden should be legible in the line that overrode it. It warns on the way through:
- * silence was the bug, and a flag somebody had to type is not silence.
- *
- * A slug read out of a `.ogun/config.yaml` in the current directory is accepted with no
- * flag even when the map has never heard of it. A repository declaring its own name is
- * stronger evidence than this machine's cache of that declaration, and demanding a
- * `project add` first would make "connect it, then sync" impossible for no gain.
- */
-function requireKnownProject(
-  project: ResolvedProject,
-  config: LocalConfig,
-  allowUnregistered: boolean,
-): void {
-  if (Object.hasOwn(config.projects, project.slug) || project.from === '.ogun/config.yaml') return
-
-  if (allowUnregistered) {
-    console.log(
-      yellow(`  "${project.slug}" is not a project this machine knows — connecting anyway.`),
-    )
-    console.log(
-      dim(
-        '  Nothing here can confirm the slug, so a typo stays a typo until a poll 401s.\n' +
-          '  It has to match the name the control plane polls this project under, exactly.',
-      ),
-    )
-    return
-  }
-
-  const known = Object.keys(config.projects).sort()
-  fail(
-    `"${project.slug}" is not a project this machine knows.\n` +
-      '  ' +
-      (known.length > 0
-        ? `Known here: ${known.join(', ')}.`
-        : `No projects are registered in ${localConfigPath()}.`) +
-      '\n' +
-      '  Nothing was stored. A credential filed under a slug nothing polls reports as\n' +
-      '  connected and is read by nothing.\n' +
-      (project.from === 'the directory name'
-        ? '  This directory has no .ogun/config.yaml, so the name was guessed from it. Run\n' +
-          '  this inside the repository instead, or pass --project <slug>.\n'
-        : '') +
-      '  Register it with `ogun project sync` (or `ogun project add`), or — if the repo is\n' +
-      '  checked out on another machine entirely — repeat with --allow-unregistered.',
   )
 }
 

@@ -1,4 +1,4 @@
-import { InvalidSecret } from '@ogun/core'
+import { InvalidSecret, normalizeSecretInput } from '@ogun/core'
 import { fail } from './output.ts'
 
 /**
@@ -104,6 +104,42 @@ export async function readAllStdin(): Promise<string> {
   process.stdin.setEncoding('utf8')
   for await (const chunk of process.stdin) chunks.push(chunk as string)
   return chunks.join('')
+}
+
+/**
+ * A credential, from argv, a pipe, or a prompt — in that order, and never echoed.
+ *
+ * The three sources are not a preference: the shape of the invocation has already chosen.
+ * An inline value was chosen explicitly, a pipe means stdin is not a terminal, and a
+ * terminal means there is somebody to ask. A `--stdin` flag that had to be remembered
+ * would mostly be discovered by pasting a key into a hung command.
+ *
+ * `warnInlineSecret` carries the argument for accepting an inline value at all, and for
+ * the refusal that used to be here instead.
+ *
+ * It lives here rather than in `connect.ts` because there are two doors onto the same
+ * store — `ogun connect <integration> --api-key` and `ogun secret set <name>` — and a
+ * second copy of "where does the value come from" is how one of them ends up echoing, or
+ * accepting a trailing newline the other strips.
+ */
+export async function readSecretValue(
+  inline: string | undefined,
+  what: string,
+  ask: () => Promise<string>,
+): Promise<string> {
+  const raw =
+    inline !== undefined
+      ? (warnInlineSecret(what), inline)
+      : process.stdin.isTTY
+        ? await ask()
+        : await readAllStdin()
+  try {
+    return normalizeSecretInput(raw)
+  } catch (err) {
+    if (!(err instanceof InvalidSecret)) throw err
+    // `err.message` names the rule that was broken and never the value that broke it.
+    return fail(err.message)
+  }
 }
 
 /**

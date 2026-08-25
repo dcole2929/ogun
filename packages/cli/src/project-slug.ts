@@ -1,5 +1,6 @@
 import { basename, resolve as resolvePath, sep } from 'node:path'
-import { loadProjectConfig, resolveProjectPath, type LocalConfig } from '@ogun/core'
+import { localConfigPath, loadProjectConfig, resolveProjectPath, type LocalConfig } from '@ogun/core'
+import { dim, fail, yellow } from './output.ts'
 
 /**
  * Which project a command acts on, when the command does not make you say.
@@ -16,12 +17,12 @@ import { loadProjectConfig, resolveProjectPath, type LocalConfig } from '@ogun/c
  *
  * What a caller *checks* the resolved slug against used to differ per command — "each
  * command checks against the best oracle it already depends on", which was true while
- * `secret set` and `linear app` were separate commands with separate dependencies. They
- * are one command now, and one command with two oracles is an asymmetry nobody can
- * predict: the same words, the same slug, two different refusals. So `connect` checks the
- * local evidence in every mechanism, before it asks for anything, and the control plane's
- * own check on the routes that reach one is the server refusing a write rather than a
- * second rule for an operator to learn.
+ * `secret set` and `linear app` were separate commands with separate dependencies. Two
+ * oracles is an asymmetry nobody can predict: the same words, the same slug, two different
+ * refusals. So `requireKnownProject` below is the one rule, and every command that writes
+ * a credential under a slug — `connect` in all its kinds, and `secret set` — calls it
+ * before it asks for anything. The control plane's own check on the routes that reach one
+ * is the server refusing a write it should not accept, not a second rule to learn.
  */
 
 /**
@@ -102,3 +103,89 @@ function registeredContaining(config: LocalConfig, cwd: string): string | undefi
  */
 export const projectFlag = (project: ResolvedProject): string =>
   project.from === 'flag' ? ` --project ${project.slug}` : ''
+
+/**
+ * A slug this machine has never heard of is refused, and nothing is stored.
+ *
+ * ### One oracle, and the asymmetry that used to exist is gone
+ *
+ * ADR-0014 had two rules: `ogun secret set` checked the slug against this machine's
+ * projects map with an `--allow-unregistered` escape, while `ogun linear app` checked it
+ * against the control plane's database with no escape. The stated principle — *"each
+ * command checks the slug against the best oracle it already depends on"* — was sound while
+ * they were two commands. Under one `connect` it would become "each *kind* checks against
+ * a different oracle", which is an asymmetry an operator has no way to predict: the same
+ * command, the same slug, two different refusals and one flag that works in one of them.
+ *
+ * So there is one user-visible rule: **every command that writes a credential under a slug
+ * checks it against this machine's own evidence, before it asks for anything.** That is
+ * `connect` in all its kinds and `ogun secret set`, and this function is why the rule
+ * cannot end up existing at one of those doors and not the other. Local evidence costs no
+ * network and — the part that matters — arrives *before the prompts*, which is the property
+ * that made the control-plane check worth having in the first place.
+ *
+ * The control plane still checks its database when a command reaches one. That is not a
+ * second rule for the operator to learn: it is the server refusing a write it should not
+ * accept, in the same sentence it always did, and with a database present there is no case
+ * where an unknown slug is the right answer.
+ *
+ * ### Why there is an escape at all
+ *
+ * A hosted control plane is the legitimate case and is not exotic. `project sync` runs
+ * where the repo is checked out; the machine that polls may never have held a copy, so its
+ * projects map is legitimately empty while it polls four projects. The credential still
+ * works there — `readProjectSecret` looks one up by slug and never consults that map — so a
+ * refusal with no way through would lock the *correct* operator out of the one path that
+ * works with the database down.
+ *
+ * `--allow-unregistered`, spelled out rather than `--force`, because what is being
+ * overridden should be legible in the line that overrode it. It warns on the way through:
+ * silence was the bug, and a flag somebody had to type is not silence.
+ *
+ * A slug read out of a `.ogun/config.yaml` in the current directory is accepted with no
+ * flag even when the map has never heard of it. A repository declaring its own name is
+ * stronger evidence than this machine's cache of that declaration, and demanding a
+ * `project add` first would make "connect it, then sync" impossible for no gain.
+ *
+ * `disconnect` and `ogun secret rm` call none of this, on purpose: a closed set and a known
+ * slug guard *writes*, where a wrong one creates a credential nothing reads. A removal
+ * creates nothing, and a row the listing shows has to be a row you can remove.
+ */
+export function requireKnownProject(
+  project: ResolvedProject,
+  config: LocalConfig,
+  allowUnregistered: boolean,
+): void {
+  if (Object.hasOwn(config.projects, project.slug) || project.from === '.ogun/config.yaml') return
+
+  if (allowUnregistered) {
+    console.log(
+      yellow(`  "${project.slug}" is not a project this machine knows — connecting anyway.`),
+    )
+    console.log(
+      dim(
+        '  Nothing here can confirm the slug, so a typo stays a typo until a poll 401s.\n' +
+          '  It has to match the name the control plane polls this project under, exactly.',
+      ),
+    )
+    return
+  }
+
+  const known = Object.keys(config.projects).sort()
+  fail(
+    `"${project.slug}" is not a project this machine knows.\n` +
+      '  ' +
+      (known.length > 0
+        ? `Known here: ${known.join(', ')}.`
+        : `No projects are registered in ${localConfigPath()}.`) +
+      '\n' +
+      '  Nothing was stored. A credential filed under a slug nothing polls reports as\n' +
+      '  connected and is read by nothing.\n' +
+      (project.from === 'the directory name'
+        ? '  This directory has no .ogun/config.yaml, so the name was guessed from it. Run\n' +
+          '  this inside the repository instead, or pass --project <slug>.\n'
+        : '') +
+      '  Register it with `ogun project sync` (or `ogun project add`), or — if the repo is\n' +
+      '  checked out on another machine entirely — repeat with --allow-unregistered.',
+  )
+}
