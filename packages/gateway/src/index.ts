@@ -50,6 +50,22 @@ export type {
 } from './credentials.ts'
 
 export {
+  CONNECTED_APPS,
+  CONNECTION_HOSTS,
+  connectionForHost,
+  connectionInjections,
+  connectionRequestRefusal,
+  NO_CONNECTIONS,
+} from './connections.ts'
+export type {
+  ConnectedApp,
+  ConnectionCredential,
+  ConnectionCredentials,
+  LinearConnection,
+  SessionConnections,
+} from './connections.ts'
+
+export {
   ALLOWED_CONNECT_PORT,
   DEFAULT_ALLOWED_HOSTS,
   hostMatches,
@@ -77,8 +93,13 @@ export {
   claudeCredentialStub,
   CODEX_STUB_CONTAINER_PATH,
   codexAuthStub,
+  CONNECTIONS_CONTAINER_DIR,
+  connectionStub,
+  connectionStubPath,
+  connectionStubs,
   credentialStubs,
   PLACEHOLDER,
+  sandboxConnectionEnv,
   sandboxProxyEnv,
 } from './stubs.ts'
 export type { CredentialStub } from './stubs.ts'

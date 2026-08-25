@@ -326,7 +326,51 @@ filtering proxy, which conflicts with the no-sibling-containers rule" and was "t
 open question rather than faked". That is answered: the proxy is a host process inside the
 runner, not a sibling container.
 
-### 3.6 Refusals the runner makes before starting a container
+### 3.6 Connected applications
+
+A worker declares `connections: [linear]` and its sandbox may call that application at
+runtime — the same mechanism `api.anthropic.com` uses, aimed at a different subject. §4.13
+and ADR-0013's amended Consequences carry the decision and the cost; this section is the
+mechanics.
+
+**The default is no connection, and that is the feature.** The host is not on
+`DEFAULT_ALLOWED_HOSTS`. The one-line implementation — appending it there — would give
+every worker on the machine a credentialed path to the project's issue tracker, including
+`adversarial-review`, which is pointed at untrusted repository content on purpose. Instead
+`open(authority, allow, connections)` mints the grant on the *session*, so it lives and dies
+with the job, and granting an application is what adds its hosts to that session's
+allowlist — the two halves come from one argument and cannot come apart.
+
+| Layer | What it decides |
+|---|---|
+| `workerSchema` | `connections:` is a closed set; refuses `egress: open`, `egress: none`, `sandbox: worktree` |
+| `createContainerSandbox` | reads the grant through `readProjectSecret`, awaits the first read, refuses a missing project slug |
+| `gateway.open()` | the grant is per session; its hosts join that session's allowlist |
+| `prepareConnection()` | grant → request shape → credential, in that order, on every door |
+| `connectionStubs` / `sandboxConnectionEnv` | what the container is told: an endpoint and a placeholder |
+
+Three checks run on every request, and the ordering is deliberate. The **grant** is checked
+first, so a session with none learns nothing about whether the host holds a credential for
+this project. The **request shape** is second: `POST /graphql` and nothing else, because
+`api.linear.app` also serves `/oauth/revoke`, and a sandbox that could reach it would end
+the project's connection using the credential the gateway had just attached — a destructive
+capability no allowlist entry expresses. The **credential** is last, and its absence is
+answered `502 no_connection_credential` here rather than forwarded, for the same reason
+`no_credential` is: a placeholder sent to Linear comes back as `AUTHENTICATION_ERROR`, which
+reads as "your connection is revoked".
+
+**Only an OAuth grant is injectable.** `readProjectSecret` returns `present` for a personal
+API key and the poll uses it happily; a sandbox may not. A personal key is everything its
+owner can do in that workspace, forever, and Linear attributes every write to them by name
+(ADR-0014) — so the refusal names the fix rather than falling back to it.
+
+The credential is read behind a five-second memo in the runner, not captured at
+`provision()`: an access token lasts 24 hours and is renewed by the control plane on demand,
+and a session holding the token it saw at minute zero would 401 at minute twenty for a
+credential renewed at minute three. The first read is awaited in `provision()` so the
+agent's first call does not race a cold cache.
+
+### 3.7 Refusals the runner makes before starting a container
 
 Three, all fail-closed, all naming the fix:
 
@@ -343,7 +387,7 @@ Three, all fail-closed, all naming the fix:
   Project images inherit the marker from `FROM ogun/base`, so this is telling you to
   rebuild, which is the actual fix.
 
-### 3.7 The verification container
+### 3.8 The verification container
 
 `verificationOptions()` builds a second container for the test gate, and it shares the
 agent's session — the same socket, the same CA, the same allowlist, one denial log. It
@@ -351,7 +395,11 @@ needs egress: a project's suite installs dependencies, and a gate with no route 
 a red suite that gets blamed on the modifier whose patch it was gating.
 
 It gets **no credential file at all** — not the placeholder, and not `settings.json`. No
-agent runs in it, and a test suite has no business holding either.
+agent runs in it, and a test suite has no business holding either. The same goes for a
+connection: `verificationOptions()` empties the stub list *and* the granted roster, so a
+suite never sees `OGUN_CONNECTIONS`. Emptying only the files would leave a container
+advertising a connection with no description behind it, which reads as one that exists and
+is broken.
 
 ## 4. What is verified, and what is not
 

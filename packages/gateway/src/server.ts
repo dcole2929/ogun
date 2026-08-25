@@ -9,8 +9,17 @@ import type { Socket } from 'node:net'
 import { dirname } from 'node:path'
 import { pipeline } from 'node:stream'
 import { TLSSocket } from 'node:tls'
+import { connectionHosts } from '@ogun/core/connections'
 import type { CertificateAuthority } from './ca.ts'
 import { loadOrCreateCa } from './ca.ts'
+import {
+  connectionForHost,
+  connectionInjections,
+  connectionRequestRefusal,
+  NO_CONNECTIONS,
+  type ConnectedApp,
+  type SessionConnections,
+} from './connections.ts'
 import type { CredentialSet } from './credentials.ts'
 import { credentialReader } from './credentials.ts'
 import {
@@ -130,8 +139,22 @@ export type Gateway = {
    * not always where the gateway listens: over a unix socket it is the in-image forwarder's
    * loopback address, because `HTTPS_PROXY` has no syntax for a socket path. Omitted, the
    * bound TCP address is used.
+   *
+   * `connections` is this job's grant to reach a connected application (§4.13). Omitted
+   * means none, which is what every worker gets unless it wrote `connections:` — and the
+   * default is the point of the parameter existing rather than the hosts sitting on
+   * `DEFAULT_ALLOWED_HOSTS`, where every worker on the machine would inherit them.
+   *
+   * Granting an application also puts its hosts on this session's allowlist, so a caller
+   * cannot half-grant one: an allowlist entry with no credential behind it would reach the
+   * upstream carrying the container's placeholder, and a credential with no allowlist
+   * entry would never be reached at all. Both halves come from one argument.
    */
-  open: (containerAuthority?: string, allow?: readonly string[]) => GatewaySession
+  open: (
+    containerAuthority?: string,
+    allow?: readonly string[],
+    connections?: SessionConnections,
+  ) => GatewaySession
   close: () => Promise<void>
 }
 
@@ -203,6 +226,20 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
   type Session = {
     token: string
     allow: readonly string[]
+    /**
+     * Which connected applications this job was granted, and how to read their current
+     * credential (§4.13).
+     *
+     * On the session for exactly the reason `allow` is: one gateway serves every job on
+     * the machine, and a connection held anywhere else would be a connection every worker
+     * on the box inherits. `adversarial-review` is aimed at untrusted repository content
+     * on purpose — a global here would give the attacker in that story a credentialed path
+     * to the project's issue tracker, which is a strictly worse outcome than the mounted
+     * model token ADR-0010 removed.
+     *
+     * `NO_CONNECTIONS` is the default and is what every session that does not ask gets.
+     */
+    connections: SessionConnections
     sockets: Set<Socket>
   }
 
@@ -257,7 +294,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
    * identity is the question actually being asked ("is *this grant* still in force"), and
    * it stays correct if anything ever mints a session for a token twice.
    */
-  const inForce = (session: Session | undefined): boolean =>
+  const inForce = (session: Session | undefined): session is Session =>
     session !== undefined && sessions.get(session.token) === session
 
   /**
@@ -292,11 +329,12 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
      * original bug was exactly what happens when the only answer to that question is
      * somewhere else. Refused before `prepare()`, so no credential file is read.
      */
-    if (!inForce(marked.ogunSession)) return refuseRevoked(res)
+    const session = marked.ogunSession
+    if (!inForce(session)) return refuseRevoked(res)
     // The port from the CONNECT line, not a hardcoded 443. An allowlisted host reached on
     // a non-standard port would otherwise be silently retargeted at 443, which either
     // works against the wrong service or fails as a connection refused nobody can explain.
-    void forward(authority.hostname, authority.port, req, res)
+    void forward(authority.hostname, authority.port, req, res, session)
   })
   intercepted.on('clientError', (_err, socket) => socket.destroy())
 
@@ -327,10 +365,11 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
     if (!authority) {
       return refuseSocket(socket, 500, 'internal', 'intercepted socket has no host')
     }
-    if (!inForce(marked.ogunSession)) {
+    const session = marked.ogunSession
+    if (!inForce(session)) {
       return refuseSocket(socket, 403, 'session_revoked', REVOKED_MESSAGE)
     }
-    forwardUpgrade(authority.hostname, authority.port, req, socket, head)
+    forwardUpgrade(authority.hostname, authority.port, req, socket, head, session)
   })
 
   const proxy = createHttpServer()
@@ -399,7 +438,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
       return refuseHost(res, target.hostname)
     }
     req.url = target.pathname + target.search
-    void forward(target.hostname, port, req, res)
+    void forward(target.hostname, port, req, res, session)
   })
 
   /**
@@ -473,7 +512,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
       )
     }
     req.url = target.pathname + target.search
-    forwardUpgrade(target.hostname, port, req, socket, head)
+    forwardUpgrade(target.hostname, port, req, socket, head, session)
   })
 
   proxy.on('connect', (req, socket: Socket, head: Buffer) => {
@@ -610,6 +649,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
     method: string,
     path: string,
     requestHeaders: IncomingHttpHeaders,
+    session: Session,
   ): Prepared {
     /**
      * ADR-0005, enforced here as well as at the workspace.
@@ -630,6 +670,17 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
           'extracts a patch on the host',
       }
     }
+
+    /**
+     * A connected application (§4.13), which is a different subject from a provider.
+     *
+     * Before the provider path and before `readCredentials()`, because these hosts belong
+     * to no provider and reaching one is decided entirely by *this session's* grant. A
+     * request that falls through to the provider path would be forwarded with the
+     * container's placeholder and collect somebody else's 401.
+     */
+    const app = connectionForHost(hostname)
+    if (app) return prepareConnection(app, session, hostname, port, method, path, requestHeaders)
 
     const credentials = readCredentials()
     const provider = providerForHost(hostname)
@@ -663,16 +714,102 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
     return { ok: true, headers }
   }
 
+  /**
+   * The three checks a request to a connected application passes, in the order their
+   * answers stop being guesses.
+   *
+   * Split out of `prepare()` rather than inlined, and kept behind the same single funnel
+   * every door already goes through: `prepare()` exists because this gateway has shipped
+   * the "second entrance that skipped a check" bug twice, and a connection is now the
+   * fourth kind of thing a door can be asked to forward. A separate function that some
+   * door called directly would be that bug again with a new name — so nothing calls this
+   * but `prepare()`, and every door calls `prepare()` because it is where headers come
+   * from.
+   *
+   * See `connections.ts` for what each check is for. What is worth repeating here is the
+   * ordering: the grant is checked before the request shape, and the request shape before
+   * the credential. Checking the credential first would mean a session with no grant at
+   * all learns whether the *host* holds a Linear credential for this project, by the
+   * difference between two refusal codes — a small oracle, on a machine whose whole job is
+   * to hold credentials for things that cannot have them.
+   */
+  function prepareConnection(
+    app: ConnectedApp,
+    session: Session,
+    hostname: string,
+    port: number,
+    method: string,
+    path: string,
+    requestHeaders: IncomingHttpHeaders,
+  ): Prepared {
+    if (!session.connections.granted.includes(app)) {
+      refused(hostname, `no \`${app}\` connection was granted to this job`)
+      return {
+        ok: false,
+        status: 403,
+        error: 'connection_not_granted',
+        message:
+          `${hostname} belongs to the \`${app}\` connection, and this job's worker did not ` +
+          `declare one. Add \`connections: [${app}]\` to the worker if its skill genuinely ` +
+          'needs to call it — that grant is per worker on purpose, so that a reviewer ' +
+          'reading untrusted code does not inherit it',
+      }
+    }
+
+    const shapeRefusal = connectionRequestRefusal(app, method, path)
+    if (shapeRefusal) {
+      refused(hostname, `${method} ${path.split('?', 1)[0] ?? ''} is not a ${app} api call`)
+      return { ok: false, status: 403, error: 'connection_path_refused', message: shapeRefusal }
+    }
+
+    /**
+     * Read now, not at `open()`. An access token is renewed by the control plane in place,
+     * and a session that captured one when the job started would present a dead token at
+     * minute twenty of a thirty-minute job — a 401 blamed on the workspace connection,
+     * which was renewed seventeen minutes earlier.
+     */
+    const credentials = session.connections.read()
+    const injections = connectionInjections(app, credentials)
+    if (injections.length === 0) {
+      /**
+       * Granted, and there is nothing to send. Answered here for the same reason
+       * `no_credential` is: forwarding a placeholder to Linear produces an
+       * `AUTHENTICATION_ERROR` that names the workspace credential, and an operator reads
+       * that as "reconnect the application" when the actual cause may be that this
+       * machine is not the one holding the store at all.
+       */
+      return {
+        ok: false,
+        status: 502,
+        error: 'no_connection_credential',
+        message:
+          `this job was granted the \`${app}\` connection and no ${app} credential is ` +
+          'available on this runner, so the request cannot be completed. A connection is ' +
+          'read from `~/.ogun/config.json` on the machine running the job (ADR-0012), and ' +
+          'only an OAuth grant is injectable — a personal API key is refused. Connect an ' +
+          `application for this project, on this machine.`,
+      }
+    }
+
+    const headers = applyInjections(
+      stripHopByHop(requestHeaders as Record<string, string | string[] | undefined>),
+      injections,
+    )
+    headers.host = port === 443 ? hostname : `${hostname}:${port}`
+    return { ok: true, headers }
+  }
+
   async function forward(
     hostname: string,
     port: number,
     req: IncomingMessage,
     res: ServerResponse,
+    session: Session,
   ): Promise<void> {
     const path = req.url ?? '/'
     const method = req.method ?? 'GET'
 
-    const prepared = prepare(hostname, port, method, path, req.headers)
+    const prepared = prepare(hostname, port, method, path, req.headers, session)
     if (!prepared.ok) {
       return refuse(res, prepared.status, prepared.error, prepared.message)
     }
@@ -819,11 +956,12 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
     req: IncomingMessage,
     client: Socket,
     head: Buffer,
+    session: Session,
   ): void {
     const path = req.url ?? '/'
     const method = req.method ?? 'GET'
 
-    const prepared = prepare(hostname, port, method, path, req.headers)
+    const prepared = prepare(hostname, port, method, path, req.headers, session)
     if (!prepared.ok) {
       return refuseSocket(client, prepared.status, prepared.error, prepared.message)
     }
@@ -998,7 +1136,11 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
     caCertificatePath: ca.certificatePath,
     caCertificatePem: ca.certificatePem,
     credentials: readCredentials,
-    open: (containerAuthority?: string, allow?: readonly string[]) => {
+    open: (
+      containerAuthority?: string,
+      allow?: readonly string[],
+      connections?: SessionConnections,
+    ) => {
       // A socket has no authority to put in a URL. A caller listening on one and not
       // saying where the container reaches it has not finished wiring the sandbox, and a
       // silently wrong `HTTPS_PROXY` is a container that talks to nothing and says nothing
@@ -1024,7 +1166,25 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
        * worth defending against on a full-entropy secret that is never partially matched.
        */
       const token = randomBytes(32).toString('base64url')
-      const session: Session = { token, allow: allow ?? allowedHosts, sockets: new Set() }
+      const granted = connections ?? NO_CONNECTIONS
+      /**
+       * The connection's hosts join *this* session's allowlist, here, rather than being
+       * expected from the caller.
+       *
+       * Composed in one place so the two halves of a grant cannot come apart. A caller
+       * that had to remember `allow: [...egress, 'api.linear.app']` beside
+       * `connections: {...}` would eventually pass one and not the other, and both
+       * mistakes are quiet: an entry with no credential reaches Linear with a placeholder
+       * and 401s, and a credential with no entry is a connection that is simply never
+       * reachable. `prepareConnection` re-checks the grant anyway, so a hand-composed
+       * allowlist carrying the host does not become a way in.
+       */
+      const session: Session = {
+        token,
+        allow: [...(allow ?? allowedHosts), ...connectionHosts(granted.granted)],
+        connections: granted,
+        sockets: new Set(),
+      }
       sessions.set(token, session)
       const authority =
         containerAuthority ??

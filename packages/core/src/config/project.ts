@@ -3,6 +3,7 @@ import { z } from 'zod'
 import { cycleConfigSchema } from './cycle.ts'
 import { sourceSchema } from './source.ts'
 import { egressSchema } from './egress.ts'
+import { CONNECTED_APPS } from '../connections.ts'
 
 export const RUNTIMES = ['claude', 'codex'] as const
 export type Runtime = (typeof RUNTIMES)[number]
@@ -83,8 +84,83 @@ export const workerSchema = z.object({
    * `egress: []` when this config is round-tripped back into yaml by the UI.
    */
   egress: egressSchema.optional(),
+  /**
+   * Which connected applications this worker's skill may call at runtime, from inside the
+   * sandbox — `connections: [linear]` and nothing else today (§4.13, ADR-0010).
+   *
+   * **Absent is the default and absent means none**, which is the field's entire reason
+   * for existing. Putting `api.linear.app` on the *gateway's* standing allowlist would have
+   * been three lines and would have given every worker on the machine a credentialed path
+   * to the project's issue tracker — including `adversarial-review`, which is pointed at
+   * untrusted repository content on purpose and whose whole threat model is that the
+   * content is trying to make it do something. A reviewer reading code has no business
+   * calling Linear, and the way it has no business is that nobody wrote this line for it.
+   *
+   * Declaring it grants three things at once, which is why it is one field rather than a
+   * host in `egress:` plus a credential somewhere:
+   *
+   *  1. the application's hosts join *this session's* allowlist, not the gateway's;
+   *  2. the gateway will splice this project's real credential into requests to them;
+   *  3. the container is told the connection exists, and given a placeholder.
+   *
+   * What it does **not** grant is any part of ticket selection. `admitsTicket` runs
+   * host-side and returns a brand a sandbox cannot mint, so a skill with this field can
+   * read a ticket it was already given and cannot choose which tickets Ogun works on. See
+   * `src/connections.ts`.
+   */
+  connections: z.array(z.enum(CONNECTED_APPS)).min(1).optional(),
   verify: verifySchema.optional(),
 })
+  /**
+   * Two ways of declaring a connection that cannot work, refused where they are written.
+   *
+   * Both are the same shape of mistake — asking for a credential to be spliced in at a
+   * gateway the sandbox is not talking to — and both fail *silently* if allowed through.
+   * The agent starts, reaches Linear with a placeholder or does not reach it at all, and
+   * reports an authentication failure that names the workspace credential. An operator
+   * then rotates a key that was never used.
+   *
+   * `egress: open` is the sharper of the two. It has no gateway at all (ADR-0010's named
+   * escape hatch), so a `connections:` beside it is not merely ineffective: it reads as a
+   * *narrowing* — "this worker may reach one extra application" — sitting next to
+   * unrestricted internet plus a real mounted model credential. Refusing it stops the
+   * config from carrying a claim in the opposite direction to what it does.
+   *
+   * `sandbox: worktree` is refused rather than warned, which is a deliberate difference
+   * from how `egress:` is treated on a worktree (dropped, with a note on the timeline).
+   * The reason is that there is nothing to protect: a worktree agent runs as the runner,
+   * on the runner's network, with read access to the runner's home — which is where
+   * `~/.ogun/config.json` and the project's Linear grant live. Injecting a credential into
+   * a process that can already read the file it came from is theatre, and theatre is worse
+   * than nothing because it reads like a protection. A note on the timeline would say
+   * "this was not applied"; a refusal says "this was never a thing you could ask for".
+   */
+  .check((ctx) => {
+    const worker = ctx.value
+    if (!worker.connections || worker.connections.length === 0) return
+    if (worker.egress === 'open' || worker.egress === 'none') {
+      ctx.issues.push({
+        code: 'custom',
+        input: worker,
+        path: ['connections'],
+        message:
+          `\`connections:\` needs the egress gateway, and \`egress: ${worker.egress}\` has ` +
+          'none — `open` bypasses it entirely and `none` is an airgap. Declare the extra ' +
+          'hosts your suite needs as a list instead, or drop `connections:`',
+      })
+    }
+    if (worker.sandbox !== 'container') {
+      ctx.issues.push({
+        code: 'custom',
+        input: worker,
+        path: ['connections'],
+        message:
+          '`connections:` needs `sandbox: container`. A worktree agent runs as the runner, ' +
+          'on the runner\'s network, and can already read the config.json the credential ' +
+          'would be read from — so there is nothing for the gateway to keep out of it',
+      })
+    }
+  })
 export type WorkerConfig = z.infer<typeof workerSchema>
 
 /**

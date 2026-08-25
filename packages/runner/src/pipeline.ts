@@ -427,6 +427,20 @@ export async function executeJob(
       // runtime, inside the sandbox (§4.6).
       ...(job.egress === undefined ? {} : { egress: job.egress }),
       /**
+       * The connected applications this worker declared, and whose connection to use
+       * (§4.13). Absent for every worker that did not write `connections:`, which is the
+       * default and the point — a reviewer aimed at untrusted repository content must not
+       * inherit a credentialed path to the project's issue tracker.
+       *
+       * `projectSlug` travels with it rather than being derived from the workspace path: a
+       * connection is stored per project (ADR-0012), and the slug is the key. Deriving it
+       * from a directory name is how a runner with two checkouts hands one project's
+       * credential to the other's job.
+       */
+      ...(job.connections === undefined
+        ? {}
+        : { connections: job.connections, projectSlug: job.projectSlug }),
+      /**
        * One gateway, owned by the runner process, handed to every job (ADR-0010). The
        * sandbox mints its own session from it and revokes it in `dispose()`, so what a
        * container gets is a token and an allowlist of its own rather than a share of
@@ -548,6 +562,32 @@ export async function executeJob(
        * on a worktree needs no policy and reaches this line with its allowlist quietly
        * gone.
        */
+      /**
+       * The same silent-drop family as `egress:` above, one step louder.
+       *
+       * A `worktree` worker declaring `connections:` is refused by `workerSchema` and by
+       * `createSandbox`, so this note is for the case a *container* worker's grant did not
+       * produce a credential — which `connectionReader` warns about on the runner's log and
+       * which the run timeline is the only place a reader will find weeks later. Recorded
+       * as a positive fact when it *was* granted, so "this agent could call Linear" is
+       * answerable from the run rather than from whatever the config says today.
+       */
+      ...(job.connections && job.sandbox !== 'worktree'
+        ? [
+            {
+              type: 'runner.note' as const,
+              ts: new Date().toISOString(),
+              seq: nextSeq(parser),
+              payload: {
+                note:
+                  `this worker was granted the connections [${job.connections.join(', ')}] — ` +
+                  'the sandbox may call them through the gateway, which splices this ' +
+                  "project's credential in on the host. The container holds a placeholder.",
+                connections: job.connections,
+              },
+            },
+          ]
+        : []),
       ...(job.sandbox === 'worktree' && job.egress !== undefined
         ? [
             {

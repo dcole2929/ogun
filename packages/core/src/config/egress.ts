@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { namesConnectionHost } from '../connections.ts'
 
 /**
  * What a worker's sandbox is allowed to reach (§4.6).
@@ -63,6 +64,28 @@ function egressHost(): z.ZodString {
     )
     // `*` alone would be `open` spelled in a way that does not read as an opt-out.
     .refine((h) => h !== '*' && h !== '*.', 'use `egress: open` to say "anywhere"')
+    /**
+     * A connected application's host is not an egress host, and typing it here is refused
+     * rather than honoured.
+     *
+     * Reaching `api.linear.app` needs two things: the host on the allowlist *and* the
+     * gateway splicing the project's credential into the request. `egress:` grants only
+     * the first. A worker that named the host here would reach Linear carrying the
+     * placeholder it was given, collect a `401 AUTHENTICATION_ERROR`, and report it as
+     * "Linear rejected the credential" — sending an operator to rotate a key that is fine,
+     * for a worker that was never granted the connection at all.
+     *
+     * Refusing at parse time is the only place that failure can be named cheaply. The
+     * alternative — allow it and let the gateway explain — means the explanation arrives
+     * inside an agent transcript at 3am, which is where every other comment in this
+     * package's history says explanations go to die.
+     */
+    .refine(
+      (h) => !namesConnectionHost(h),
+      'that host belongs to a connected application — declare `connections: [linear]`, ' +
+        'which puts the host on this worker\'s allowlist *and* gives the gateway a ' +
+        'credential to splice in. `egress:` alone would reach it with a placeholder',
+    )
 }
 
 /**

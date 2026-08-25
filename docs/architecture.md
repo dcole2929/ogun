@@ -672,6 +672,16 @@ the API host, the OAuth refresh host, the feature-flag host a CLI stalls on — 
 wrong produces a hang that reads as anything but a firewall rule, and it buys nothing:
 the attacker in the prompt-injection story does not control a host under `anthropic.com`.
 
+**A connected application is a separate field, and `egress:` cannot grant one.** [built]
+`connections: [linear]` on a worker lets its skill call that application through the
+gateway — the host joins *that session's* allowlist and the project's credential is spliced
+in at the wire, so the container holds a placeholder as it does for the model API. Absent,
+which is every worker that does not write it, means no connection. Writing the host into
+`egress:` instead is refused at parse: it would put the host on the allowlist with no
+credential behind it, so the request would reach the application carrying the placeholder
+and come back a 401 that names the wrong thing. See §4.13 for the grant, its limits, and
+what it costs.
+
 **How it is enforced: `--network none`, plus one unix socket.** [built — ADR-0010] The
 container has no network interface but `lo`. Its only route out is a unix socket the
 runner bind-mounts in at `/run/ogun/egress.sock`, on the far side of which is the egress
@@ -965,6 +975,16 @@ workers:
     egress:
       - proxy.golang.org
       - "*.crates.io"
+
+  ticket-work:
+    skill: ./skills/ticket-work
+    permissions: modifier
+    sandbox: container
+    # Connected applications this skill may call at runtime, through the gateway (§4.13).
+    # Absent — as it is for every worker above — means none: the host is not on any
+    # standing allowlist, so a worker that does not name it cannot reach it. Declaring it
+    # grants read access to the whole workspace the project's grant covers; see §4.13.
+    connections: [linear]
 
 policies:
   # Read by the runner from the git blob at the pinned base — never from the workspace
@@ -1379,10 +1399,38 @@ Five things about it are decisions rather than details:
   expired key, a team key that was renamed, a `status:` with a typo and a genuinely quiet
   week are otherwise the same observation — and identical to a poll loop that was never
   started (principle 6).
-- **Nothing about Linear reaches a sandbox.** The key is fetched per project from the host's
-  secret store and used in one header in one file. The ticket reaches an agent as prompt
-  text. A worker in this pipeline needing `api.linear.app` on its egress allowlist is a
-  symptom, not a configuration (ADR-0010).
+- **Ticket *selection* never reaches a sandbox, and a skill working on a ticket may still
+  call Linear.** These are two statements about two different things and both are true.
+
+  *Selection* is the deterministic filter, and it is enforced by the type system rather
+  than by the network: `admitsTicket` runs host-side, before a prompt exists, and returns a
+  branded `AdmittedTicket` that only the filter can mint. Nothing in a container can produce
+  that brand whatever it can reach, so **a worker in this pipeline needing
+  `api.linear.app` to decide what to work on is still a symptom, not a configuration**
+  (ADR-0010, ADR-0013). The key the *poll* uses is fetched per project from the host's
+  secret store, used in one header in one file, and is structurally unable to reach a
+  container.
+
+  *Acting on a ticket already selected* is a different request at a different time. A skill
+  handed a ticket may legitimately need to read its comments, follow a linked issue, or —
+  when write-back lands — post its result, and that is a runtime API call from inside the
+  sandbox. It is served the way `api.anthropic.com` already is: the container holds a
+  placeholder, the gateway splices the project's real credential in at the wire on the
+  host, and there is nothing in the container to steal. A worker opts in with
+  `connections: [linear]`; the default for every worker that says nothing is **no
+  connection**, because a reviewer aimed at untrusted repository content must not inherit a
+  credentialed path to the issue tracker. The grant is per session, the host is not on the
+  standing allowlist, only `POST /graphql` is carried (so `/oauth/revoke` is not), and only
+  an OAuth grant is injectable — a personal API key is refused, because it is everything its
+  owner can do in that workspace and Linear attributes writes to them by name (ADR-0014).
+
+  **The honest cost**, since it belongs here rather than in a footnote: a worker with
+  `connections: [linear]` can issue arbitrary GraphQL reads against the whole workspace the
+  grant covers — every issue, comment and document in every team it can see, not just the
+  ticket it was given. There is no per-ticket or per-team scope on a Linear access token, so
+  no layer below Linear can narrow it, and `api.anthropic.com` is on every allowlist, so
+  anything readable can leave in a prompt. Declaring the field is a real grant and reads
+  like one.
 
 #### The scope evaluator
 

@@ -36,6 +36,7 @@ const session = (): SandboxEgress =>
         containerPath: '/host-credentials/claude/.credentials.json',
       },
     ],
+    connections: [],
   }) as SandboxEgress
 
 const argsFor = () =>

@@ -1,6 +1,6 @@
 import { createContainerSandbox, GUEST_WORKSPACE } from './container.ts'
 import { createWorktreeSandbox } from './worktree.ts'
-import type { EgressPolicy } from '@ogun/core'
+import type { ConnectedApp, EgressPolicy } from '@ogun/core'
 import type { Gateway } from '@ogun/gateway'
 import type { Sandbox, SandboxSpec } from './types.ts'
 
@@ -19,6 +19,13 @@ export type CreateSandboxInput = SandboxSpec & {
   /** Container sandboxes only — see `ContainerOptions.egress` (§4.6). */
   egress?: EgressPolicy
   /**
+   * Connected applications this worker's skill may call from inside the sandbox (§4.13).
+   * Container sandboxes only, and absent for every worker that did not declare one.
+   */
+  connections?: readonly ConnectedApp[]
+  /** Which project's connection to use. Required when `connections` is non-empty. */
+  projectSlug?: string
+  /**
    * The runner's egress gateway. Container sandboxes only, and not optional for one:
    * a container authenticates through it and has no other route out (ADR-0010).
    */
@@ -32,6 +39,25 @@ export function createSandbox(input: CreateSandboxInput): Sandbox {
     if (input.permissions === 'modifier' && !input.allowSandboxDowngrade) {
       throw new Error(
         'a modifier worker may not use the worktree sandbox unless policies.allowSandboxDowngrade is true',
+      )
+    }
+    /**
+     * A connection, unlike `egress`, is **refused** here rather than dropped.
+     *
+     * `workerSchema` already refuses the combination where it is written, so reaching this
+     * means a worker row indexed by an older build. Dropped silently it would look like a
+     * connection that exists and does not work; the honest answer is that there was never
+     * anything to apply. A worktree agent runs as the runner, on the runner's network,
+     * with read access to the runner's home — which is where `~/.ogun/config.json` and the
+     * project's grant live. Splicing a credential into a process that can already open the
+     * file it came from is theatre, and theatre reads like a protection.
+     */
+    if (input.connections && input.connections.length > 0) {
+      throw new Error(
+        `this worker declares \`connections: [${input.connections.join(', ')}]\` and the ` +
+          'worktree sandbox has no gateway to splice a credential in at — it runs as the ' +
+          'runner, on the runner\'s network, and can already read the config.json the ' +
+          'credential comes from. Give the worker `sandbox: container`',
       )
     }
     /**

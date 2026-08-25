@@ -68,6 +68,8 @@ const session = (over: Partial<SandboxEgress> = {}): SandboxEgress => ({
       containerPath: '/host-credentials/claude/.credentials.json',
     },
   ],
+  // No connected applications, which is what every worker gets unless it declares one.
+  connections: [],
   ...over,
 })
 
@@ -314,6 +316,77 @@ test('the verification container shares the egress and holds no credential file'
   assert.ok(
     !flagValues(args, '--volume').some((m) => m.includes('/host-credentials/')),
     'nothing under /host-credentials belongs in a container that runs a test suite',
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Connected applications (§4.13)
+// ---------------------------------------------------------------------------
+
+/**
+ * What the *container* is given when a worker declares `connections: [linear]`.
+ *
+ * The property is the same one every other test in this file is about, aimed at a new
+ * subject: what crosses the boundary is a description and a placeholder, and the thing
+ * worth stealing is never on this side of it. `docker run`'s argv is visible to any
+ * process on the host that can read `/proc`, so a real token here would be a leak even
+ * before the container started.
+ */
+test('a granted connection reaches the container as a placeholder and an endpoint', () => {
+  const args = argsFor({
+    egress: ['example.com'],
+    egressSession: {
+      ...session({ connections: ['linear'] }),
+      stubs: [
+        {
+          hostPath: '/tmp/ogun-credentials/ogun-test/linear.json',
+          containerPath: '/etc/ogun/connections/linear.json',
+        },
+      ],
+    },
+  })
+  assert.equal(envOf(args, 'OGUN_CONNECTIONS'), 'linear')
+  assert.equal(envOf(args, 'OGUN_LINEAR_ENDPOINT'), 'https://api.linear.app/graphql')
+  assert.equal(envOf(args, 'LINEAR_API_KEY'), PLACEHOLDER)
+  assert.ok(
+    flagValues(args, '--volume').includes(
+      '/tmp/ogun-credentials/ogun-test/linear.json:/etc/ogun/connections/linear.json:ro',
+    ),
+    'the stub is mounted read-only at the path the environment points at',
+  )
+})
+
+/**
+ * The default, asserted as an absence.
+ *
+ * `OGUN_CONNECTIONS=` and no `OGUN_CONNECTIONS` are the same to a shell test and different
+ * to anything that splits on commas — and a worker that declared nothing must produce no
+ * variable at all, not an empty one an agent could read as "something I could not name".
+ */
+test('a worker that declares no connection gets no connection environment', () => {
+  const args = argsFor({ egress: ['example.com'], egressSession: session() })
+  assert.equal(envOf(args, 'OGUN_CONNECTIONS'), undefined)
+  assert.equal(envOf(args, 'LINEAR_API_KEY'), undefined)
+})
+
+/**
+ * A test suite has no business calling a project's issue tracker, and unlike the agent
+ * container it was never asked to. Dropping the roster as well as the stub is what stops
+ * `OGUN_CONNECTIONS=linear` reaching a container with no stub behind it, which reads as a
+ * connection that exists and is broken.
+ */
+test('the verification container gets no connection, roster or stub', () => {
+  const args = argsFor({
+    name: 'ogun-test-verify',
+    egress: ['example.com'],
+    egressSession: { ...session({ connections: [] }), stubs: [] },
+    credentials: 'none',
+    env: { CI: '1' },
+  })
+  assert.equal(envOf(args, 'OGUN_CONNECTIONS'), undefined)
+  assert.ok(
+    !flagValues(args, '--volume').some((m) => m.includes('/etc/ogun/connections')),
+    'a suite gets no connection description either',
   )
 })
 
