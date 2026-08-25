@@ -22,7 +22,10 @@ import { fileURLToPath } from 'node:url'
  *
  *  - a free-form name is **stored**, and the operator is **told** when nothing reads it —
  *    which is what replaces a closed set that could refuse;
- *  - a name that could be a pasted API key is refused **by shape**, without being echoed;
+ *  - a name is whatever the project calls it: `DATABASE_URL` and `my_api_key` are stored,
+ *    and only what cannot work is refused — without the argument being echoed back;
+ *  - a name that is already taken is **settled before the value is collected**: refused off
+ *    a terminal unless `--replace` says so;
  *  - `secret set linear` and `connect linear --api-key` write **the same row** and enforce
  *    **the same rules** about it, so the two commands cannot disagree.
  *
@@ -118,30 +121,131 @@ test('a name Ogun does poll under draws no such warning', async (t) => {
   assert.ok(!/Nothing in this build reads/.test(set.stdout), set.stdout)
 })
 
-test('a name that could be a pasted key is refused by shape, and not echoed', async (t) => {
+test('a name is whatever the project calls it, including SCREAMING_SNAKE_CASE', async (t) => {
   /**
-   * The property: `ogun secret set lin_api_…` fails, and the failure does not contain what
-   * was typed.
+   * The property: the names secrets actually have are stored.
    *
-   * This is the accident the shape rule exists for and it cannot be caught by counting
-   * arguments: leaving `<key>` off is the *recommended* invocation, so somebody who
-   * remembered that the key does not belong in argv and forgot that the name does looks
-   * identical to somebody asking to be prompted. It can be caught by shape — an API key is
-   * long, or mixed case, or has underscores, and Linear's has all three — and a name is
-   * none of those.
+   * A format rule stood here for two days — `[a-z0-9][a-z0-9.-]{0,63}` — and it refused
+   * `DATABASE_URL`, `STRIPE_SECRET_KEY` and `my_api_key`, which is how every `.env` file,
+   * `flyctl`, Heroku and Kubernetes spell a secret's name. It was aimed at somebody pasting
+   * a key into the name slot, and it refused the normal case to prevent an abnormal one.
    *
-   * Not echoing is ADR-0012's rule arriving at a second door: quoting the argument back
-   * would write a live credential to stderr on top of the shell history and the `ps`
-   * window it is already in.
+   * This test is the reversal, and it is deliberately three names rather than one: the rule
+   * that died refused each of them for a different reason (case, underscores, both), so a
+   * single example would leave two thirds of it able to come back.
    */
   const config = await machineKnowing(t, { ogun: '/does/not/matter' })
 
-  const set = await ogun(['secret', 'set', KEY, '--project', 'ogun'], config, 'x\n')
+  for (const name of ['DATABASE_URL', 'STRIPE_SECRET_KEY', 'my_api_key', 'stripe-webhook']) {
+    const set = await ogun(['secret', 'set', name, '--project', 'ogun'], config, HMAC)
+    assert.equal(set.code, 0, `${name}: ${set.stderr}`)
+    assert.equal((await secretsIn(config)).ogun![name], HMAC, name)
+    // Case is kept exactly: `DATABASE_URL` and `database_url` are two names.
+    assert.match(set.stdout, new RegExp(`reads a secret named ${name}`))
+  }
+})
 
-  assert.equal(set.code, 1)
-  assert.ok(!`${set.stdout}${set.stderr}`.includes(KEY), set.stderr)
-  assert.match(set.stderr, /not a secret name/)
-  assert.match(set.stderr, /compromised/)
+test('a name that is a pasted key is stored, and the line that says so is the warning', async (t) => {
+  /**
+   * The property: `ogun secret set lin_api_…` **works**, and prints the sentence that makes
+   * the mistake visible if it was one.
+   *
+   * The old shape rule refused this on the theory that the likeliest thing in that position
+   * is the key. It is a legal invocation — the name is `lin_api_…` and the command then
+   * prompts for the value — and there is no rule that admits `AWS_SECRET_ACCESS_KEY` and
+   * refuses `lin_api_…`, because they are the same shape. So the refusal is replaced by the
+   * information it was standing in front of: *nothing in this build reads a secret named
+   * `lin_api_…`* is exactly what somebody who mis-positioned their key needs to read.
+   *
+   * The name is echoed here where a refusal would not echo it, and the asymmetry is the
+   * point: the store accepted it, so it is now a row in `secret list` and a word to type at
+   * `secret rm`. A refusal has stored nothing, so quoting it back would be the only place
+   * it appeared.
+   */
+  const config = await machineKnowing(t, { ogun: '/does/not/matter' })
+
+  const set = await ogun(['secret', 'set', KEY, '--project', 'ogun'], config, `${HMAC}\n`)
+
+  assert.equal(set.code, 0, set.stderr)
+  assert.equal((await secretsIn(config)).ogun![KEY], HMAC)
+  assert.match(set.stdout, /Nothing in this build reads a secret named lin_api_/)
+  // The VALUE is still never echoed, whatever the name is.
+  assert.ok(!`${set.stdout}${set.stderr}`.includes(HMAC), set.stdout)
+})
+
+test('only what cannot work is refused, and the refusal never repeats the argument', async (t) => {
+  /**
+   * The property: each surviving rule refuses something that genuinely breaks, and none of
+   * them quotes what was typed.
+   *
+   * Every case here is a failure rather than an untidiness:
+   *  - **empty** has no name to be addressed by;
+   *  - **whitespace** cannot be typed back at `ogun secret rm`, which takes one positional,
+   *    and cannot be read out of `secret list`, whose columns are separated by spaces;
+   *  - **a control character** is printed back to a terminal, where `\r` and a CSI sequence
+   *    rewrite the line they land on — and is the signature of a value pasted with its
+   *    newline attached;
+   *  - **`__proto__`** does not survive `config.json`: `z.record` does not carry that key
+   *    onto the parsed object, so the value would be written now and silently dropped by
+   *    the next command that writes the file. That one is asserted rather than argued.
+   *
+   * Not echoing is ADR-0012's rule, and it outlives the shape rule it used to share a
+   * paragraph with: a key can still end up in this position, and quoting the argument back
+   * would write a live credential to stderr on top of the shell history and the `ps` window
+   * it is already in.
+   */
+  const config = await machineKnowing(t, { ogun: '/does/not/matter' })
+
+  for (const [name, why] of [
+    ['', /cannot be empty/],
+    ['two words', /whitespace/],
+    ['tab\tname', /whitespace/],
+    ['line\nname', /whitespace/],
+    ['esc\u001b[2Kname', /control character/],
+    ['__proto__', /__proto__/],
+  ] as [string, RegExp][]) {
+    const set = await ogun(['secret', 'set', name, '--project', 'ogun'], config, `${HMAC}\n`)
+    assert.equal(set.code, 1, `${JSON.stringify(name)} was not refused`)
+    assert.match(set.stderr, why)
+    assert.deepEqual(await secretsIn(config), {}, JSON.stringify(name))
+  }
+
+  // And the argument is not repeated back, whatever it was.
+  const pasted = await ogun(['secret', 'set', `${KEY} ${KEY}`, '--project', 'ogun'], config, HMAC)
+  assert.equal(pasted.code, 1)
+  assert.ok(!`${pasted.stdout}${pasted.stderr}`.includes(KEY), pasted.stderr)
+  assert.match(pasted.stderr, /compromised/)
+})
+
+test('a name inherited from Object.prototype is a name like any other', async (t) => {
+  /**
+   * The property: `constructor` can be stored, and removing one that is not there says so.
+   *
+   * `entries[name]` walks the prototype chain, so before this was fixed `ogun secret set
+   * constructor` read a *function* out of an object holding no such secret and died with
+   * `previous.trim is not a function` — a stack trace, on a name the validator of the day
+   * accepted. `name in entries` had the matching bug on the way out: `ogun secret rm
+   * constructor` reported a removal that never happened, which is the one distinction that
+   * function exists to make.
+   *
+   * It is fixed with `Object.hasOwn` in the store rather than by refusing the name, because
+   * the store's own lookups have to be honest about what the store contains whatever the
+   * callers let through — and because `constructor` is a perfectly ordinary word for a
+   * project to have a secret about.
+   */
+  const config = await machineKnowing(t, { ogun: '/does/not/matter' })
+
+  const missing = await ogun(['secret', 'rm', 'constructor', '--project', 'ogun'], config)
+  assert.equal(missing.code, 0, missing.stderr)
+  assert.match(missing.stdout, /has no constructor secret/)
+
+  const set = await ogun(['secret', 'set', 'constructor', '--project', 'ogun'], config, HMAC)
+  assert.equal(set.code, 0, set.stderr)
+  assert.equal((await secretsIn(config)).ogun!.constructor, HMAC)
+  assert.match(set.stdout, /stored for ogun/)
+
+  const removed = await ogun(['secret', 'rm', 'constructor', '--project', 'ogun'], config)
+  assert.equal(removed.code, 0, removed.stderr)
   assert.deepEqual(await secretsIn(config), {})
 })
 
@@ -192,7 +296,7 @@ test('an empty pipe is refused, not stored as a value that does not work', async
 test('secret set and connect --api-key write the same row', async (t) => {
   /**
    * The property: a key stored by one is the key the other reports, byte for byte, in the
-   * same place.
+   * same place — and the second write is gated by the same rule the first would have been.
    *
    * Two maps that could each hold a `linear` key is the "two stores that can disagree"
    * shape ADR-0012 rejected when it refused a second secrets file — and it would be worse
@@ -207,7 +311,7 @@ test('secret set and connect --api-key write the same row', async (t) => {
 
   const replaced = 'lin_api_YYYYYYYYYYYYYYYYYYYYYYYYYYYY'
   const connected = await ogun(
-    ['connect', 'linear', '--api-key', '--project', 'ogun'],
+    ['connect', 'linear', '--api-key', '--replace', '--project', 'ogun'],
     config,
     `${replaced}\n`,
   )
@@ -220,6 +324,126 @@ test('secret set and connect --api-key write the same row', async (t) => {
   assert.match(listed.stdout, /linear/)
   assert.match(listed.stdout, /the linear poll/)
   assert.ok(!listed.stdout.includes(replaced), listed.stdout)
+})
+
+// ── a name that is already taken ──────────────────────────────────────────
+
+test('an overwrite off a terminal is refused, and --replace is how a script means it', async (t) => {
+  /**
+   * The property: a piped `secret set` onto a name that already holds a value **fails**,
+   * changes nothing, and names the flag — and with the flag it goes through.
+   *
+   * Overwriting is unrecoverable by ADR-0012's deliberate choice: no history, no second
+   * slot, and a rotation window belongs to whoever issued the value. The question is who
+   * may do that in silence, and off a terminal the answer is nobody, because there is
+   * nobody to ask. A script that destroys a credential it did not know was there should
+   * fail loudly once and gain a `--replace` that says what it does, rather than succeed
+   * quietly every night.
+   *
+   * ADR-0012 considered a gate and rejected it, on the grounds that a `--yes` would be set
+   * once in every script and never removed. That was written when this command took a name
+   * from a closed set of one, on a project that had to already exist, so every replace
+   * *was* the intended rotation. Free-form names collide; that is the premise that changed.
+   */
+  const config = await machineKnowing(t, { ogun: '/does/not/matter' })
+
+  await ogun(['secret', 'set', 'stripe-webhook', '--project', 'ogun'], config, HMAC)
+
+  const second = 'whsec_ZZZZZZZZZZZZZZZZZZZZZZZZ'
+  const refused = await ogun(
+    ['secret', 'set', 'stripe-webhook', '--project', 'ogun'],
+    config,
+    second,
+  )
+
+  assert.equal(refused.code, 1, refused.stdout)
+  assert.match(refused.stderr, /already has a stripe-webhook secret/)
+  assert.match(refused.stderr, /--replace/)
+  // The value that was there is untouched, and neither value is echoed.
+  assert.equal((await secretsIn(config)).ogun!['stripe-webhook'], HMAC)
+  assert.ok(!`${refused.stdout}${refused.stderr}`.includes(second), refused.stderr)
+  assert.ok(!`${refused.stdout}${refused.stderr}`.includes(HMAC), refused.stderr)
+
+  const forced = await ogun(
+    ['secret', 'set', 'stripe-webhook', '--replace', '--project', 'ogun'],
+    config,
+    second,
+  )
+  assert.equal(forced.code, 0, forced.stderr)
+  assert.equal((await secretsIn(config)).ogun!['stripe-webhook'], second)
+  assert.match(forced.stdout, /replaced for ogun/)
+})
+
+test('the gate is about a value, so a first set and a blank entry pass it', async (t) => {
+  /**
+   * The property: it fires on a value that would be destroyed and on nothing else.
+   *
+   * A first set has nothing to displace. A blank entry — only reachable by hand-editing the
+   * file — is what a poller reads as a key that exists and does not work, so filling one in
+   * is the repair `writeProjectKey` calls it rather than a replace, and asking permission
+   * to perform a repair would be a gate on the fix. `--replace` where nothing is stored is
+   * a no-op for the reason `rm -f` is: a script that has to know the answer in advance is a
+   * script with a race in it.
+   */
+  const dir = await box(t)
+  const config = join(dir, 'config.json')
+  await writeFile(
+    config,
+    JSON.stringify({
+      projects: { ogun: '/does/not/matter' },
+      secrets: { ogun: { blank: '' } },
+    }),
+    { mode: 0o600 },
+  )
+
+  const first = await ogun(['secret', 'set', 'fresh', '--project', 'ogun'], config, HMAC)
+  assert.equal(first.code, 0, first.stderr)
+  assert.match(first.stdout, /fresh stored for ogun/)
+
+  const repair = await ogun(['secret', 'set', 'blank', '--project', 'ogun'], config, HMAC)
+  assert.equal(repair.code, 0, repair.stderr)
+  assert.match(repair.stdout, /blank/)
+
+  // And the flag on a name nothing holds is accepted, and still reports a plain store.
+  const eager = await ogun(
+    ['secret', 'set', 'brand-new', '--replace', '--project', 'ogun'],
+    config,
+    HMAC,
+  )
+  assert.equal(eager.code, 0, eager.stderr)
+  assert.match(eager.stdout, /brand-new stored for ogun/)
+})
+
+test('both doors onto the row are gated identically, and --oauth is exempt on purpose', async (t) => {
+  /**
+   * The property: `ogun connect linear --api-key` gets the same refusal `ogun secret set
+   * linear` gets, from the same function — and `--replace` is refused beside `--oauth`,
+   * where there is no stored key to destroy.
+   *
+   * A rule enforced at one of two doors is not a rule, and this is the one place two
+   * commands the same operator runs could disagree about destroying a credential. The OAuth
+   * exemption is the line the rule is drawn on: a reconnect spends a client id and secret
+   * that stay registered in the provider and replaces a token that was going to expire
+   * anyway, so gating it would put a confirmation in front of the repair for a connection
+   * that has just lapsed.
+   */
+  const config = await machineKnowing(t, { ogun: '/does/not/matter' })
+
+  await ogun(['secret', 'set', 'linear', '--project', 'ogun'], config, `${KEY}\n`)
+
+  const refused = await ogun(
+    ['connect', 'linear', '--api-key', '--project', 'ogun'],
+    config,
+    'lin_api_WWWWWWWWWWWWWWWWWWWWWWWWWWWW\n',
+  )
+  assert.equal(refused.code, 1, refused.stdout)
+  assert.match(refused.stderr, /already has a linear api key/)
+  assert.match(refused.stderr, /--replace/)
+  assert.equal((await secretsIn(config)).ogun!.linear, KEY)
+
+  const wrongKind = await ogun(['connect', 'linear', '--replace', '--project', 'ogun'], config, '')
+  assert.equal(wrongKind.code, 1)
+  assert.match(wrongKind.stderr, /--replace is about a stored api key/)
 })
 
 test('a key behind a working grant is refused through this door too', async (t) => {
@@ -461,11 +685,18 @@ test('the usage lines name every input, including the ones that are not argument
 
   const help = await ogun(['secret', 'set', '--help'], config)
   assert.equal(help.code, 0, help.stderr)
-  assert.match(help.stdout, /ogun secret set <name> <key>/)
+  assert.match(help.stdout, /ogun secret set <name> <key> \[--replace\]/)
   assert.match(help.stdout, /prompt/)
   assert.match(help.stdout, /stdin/)
   assert.match(help.stdout, /proc/)
   assert.match(help.stdout, /history/)
+  // `--replace` is an input this command needs in the case it needs it, so it is in the
+  // signature and not only in the flag list — the bar that has been missed four times.
+  assert.match(help.stdout, /--replace/)
+
+  // The other door onto the same row names it in its own signature, for the same reason.
+  const connectHelp = await ogun(['connect', '--help'], config)
+  assert.match(connectHelp.stdout, /--api-key \[<key>\] \[--replace\]/)
 
   // And the overlap with `connect` is stated where somebody choosing between them looks.
   const page = await ogun(['secret', '--help'], config)
@@ -474,5 +705,5 @@ test('the usage lines name every input, including the ones that are not argument
 
   const bare = await ogun(['secret', 'set'], config)
   assert.equal(bare.code, 1)
-  assert.match(bare.stderr, /ogun secret set <name> <key>/)
+  assert.match(bare.stderr, /ogun secret set <name> <key> \[--replace\]/)
 })

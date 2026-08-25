@@ -414,6 +414,128 @@ behaviour for a credential anyway: a secret that migrates itself is a secret in 
   The test that asserted the refusal is gone, replaced by one asserting the warning fires,
   the value is stored, and no surface repeats it back.
 
+  [amended] **The name shape is gone, and a name that is already taken is settled before
+  the value is collected.** Two reversals in one, because they are two halves of the same
+  mistake: the store was being defended against its own users. The superseded rule:
+
+  > *"A name shape, `[a-z0-9][a-z0-9.-]{0,63}`. This is aimed at one specific accident …
+  > an API key is long, or mixed case, or has underscores, and Linear's has all three.
+  > Kebab rather than snake for exactly that reason."*
+
+  The reasoning inside that paragraph is sound and its premise is not. **It refused the
+  conventional spelling of a secret name to prevent something that is not an error.**
+
+  - **`DATABASE_URL`, `STRIPE_SECRET_KEY` and `my_api_key` were all refused.** That is how
+    every `.env` file, `flyctl`, Heroku and Kubernetes spell a secret's name. A store whose
+    stated purpose is arbitrary per-project values refused the names those values actually
+    have — and a reader who met that refusal learned that this store is not for their
+    secrets, which is precisely backwards.
+  - **The accident it guarded against is a legal invocation.** `ogun secret set
+    lin_api_nVD6…` names a secret `lin_api_nVD6…` and then prompts for its value. Odd, and
+    not a thing to refuse. Nothing distinguishes it from `ogun secret set
+    AWS_SECRET_ACCESS_KEY` — they are the same shape, which is the argument that already
+    killed the snake-case half of the rule and, followed through, kills all of it.
+  - **`flyctl`, named by the product owner as the model, validates nothing.** Its own help
+    says *"Names are case sensitive and stored as-is, so ensure names are appropriate for
+    the application and vm environment."* It states the consequence and stores what you
+    typed. There is no `ValidateSecretName` anywhere in that codebase.
+
+  What is kept is what *breaks* rather than what looks untidy, and each one names a
+  failure: an **empty** name has nothing to address it by; **whitespace** cannot be typed
+  back at `ogun secret rm`, which takes one positional, and cannot be read out of `secret
+  list`, whose columns are separated by spaces; a **control character** is printed back to
+  a terminal, where a CR or a CSI sequence rewrites the line it lands on, including the
+  confirmation after it; and **`__proto__`** does not survive the file at all, because
+  `localConfigSchema` reads `secrets` through `z.record`, which does not carry that key onto
+  the parsed object — the value would be written now and silently dropped by the next
+  command that writes `config.json`. A length cap was considered and dropped: every number
+  was arbitrary and nothing downstream has a limit.
+
+  The protection the shape rule was carrying moves to the line that was already there. A
+  free-form store cannot refuse, so *"nothing in this build reads a secret named
+  `lin_api_9f3…`"* is printed after the store — which is exactly what somebody who put the
+  key in the name slot needs to read. That line echoes the name where the refusal does not,
+  and the split survives the change: a stored name is already a row in `secret list` and a
+  word to type at `secret rm`, while a refusal has stored nothing, so quoting it back would
+  be the only place it appeared. **The refusals still never repeat the argument**, for the
+  reason this record has given twice.
+
+  One bug fell out of removing the gate, and it was reachable before it. `entries[name]`
+  walks the prototype chain, so `ogun secret set constructor` — a name the old rule
+  *accepted* — read a function out of an object holding no such secret and died on
+  `previous.trim is not a function`; `name in entries` had the matching bug on the way out,
+  reporting a removal that never happened. Both are `Object.hasOwn` now, in the store rather
+  than in a name rule: the store's lookups have to be honest about what the store contains
+  whatever the callers let through.
+
+  **And the conflict.** This record considered a gate on a replace and rejected it:
+
+  > *"Considered and rejected: a `[y/N]` gate on a replace. It needs a `--yes` for the
+  > non-interactive path; every script would set that flag once and never remove it; the
+  > gate would then guard nobody while costing everybody a keystroke — on the operation this
+  > record settled as the intended one."*
+
+  That was right about the world it was written in, and the world it described is the one
+  the amendment above dismantled. When it was written, `secret set` took a name from a
+  **closed set of one**, on a project that had to already exist, so every replace *was* the
+  intended operation: a rotation of a credential the operator was holding a new copy of. A
+  name **collision** was not expressible. It is now. `token`, `api-key` and `DATABASE_URL`
+  are names two different values both plausibly want, and with the shape rule gone the space
+  of nameable things is the space of strings.
+
+  So, one rule with two faces, in `settleReplacement`, called by `ogun secret set` **and**
+  by `ogun connect <integration> --api-key` — two doors onto one row that disagreed about
+  overwriting would be worse than either rule alone:
+
+  - **At a terminal there is somebody to ask**, so it asks, *before* the value is prompted
+    for. Declining costs nothing and leaves the working value in place.
+  - **Off a terminal there is nobody to ask**, so it refuses and names `--replace`. A script
+    that destroys a credential it did not know was there fails loudly once, and its author
+    adds a flag that says what the script does — which is the half of the old objection that
+    does not survive: `--yes` would only record that somebody was tired of being asked.
+
+  The gate is not on the happy path — it fires only when there is a value to destroy, and
+  not on a first set, not on `--replace`, and not on a blank entry, which `writeProjectKey`
+  already calls a repair rather than a replace. The warning this replaces (*"already has a
+  `<name>` secret … Ctrl-C to stop"*) is gone: it is the confirm's text now.
+
+  `flyctl` is the same shape read twice, and both readings are in it. `fly secrets set`
+  replaces silently — no confirmation, no `--force` — and there is an open pull request
+  against it from an operator who overwrote production's secrets because they forgot
+  `--app`, which is this command's `--project` inference exactly. Meanwhile `fly secrets
+  keys set`, for the values Fly treats as unrecoverable, answers `refusing to overwrite
+  existing key` unless `--force` is passed. The tool models both answers and disagrees with
+  itself; the half it applies to values that cannot be got back again is the half taken
+  here, because that is the half this store is made of.
+
+  **Where the rule is not applied, and why.** `PUT /api/system/secrets/:project/:name` still
+  overwrites without a gate of its own. It is not an exception being waved through: that
+  route validates the name against `SECRET_NAMES`, and the only client renders those names
+  as a `<select>` — so the collision this rule exists for, a name somebody *typed*, cannot
+  be reached through it. What that surface has instead is the same fact in its own idiom:
+  the form says *"already has a `<name>` key. Storing replaces it — there is no history"*
+  and the button reads **Replace** rather than **Store** before it is clicked. If that route
+  ever accepts a name from outside the closed set, it inherits `--replace` as a field in the
+  body on the same day.
+
+  **What was considered and rejected from `flyctl`.** `NAME=value` pairs on the command
+  line, which is how `fly secrets set` takes everything: rejected, because it puts every
+  value in argv and therefore in `/proc/<pid>/cmdline` and the shell's history — the hazard
+  this record has now written down three times — and flyctl carries no warning about it at
+  all. Its own argv-safe form, `fly secrets set NAME=- < file`, is a spelling of what `ogun
+  secret set <name> < file` already does. A **digest column** in `secret list`: rejected,
+  and it is the tempting one. Fly's is a change hint, and the history of it is the argument
+  — it began as a plain `MD5` of the value and had to be replaced with a keyed, truncated,
+  deliberately collidable digest, which is to say the first shape of that idea was a
+  disclosure. Ogun would have no server-side key to compute one with, and this record has
+  already refused the last four characters of a value on weaker grounds. What is **worth
+  taking and is not built here** is `fly secrets import`: `NAME=value` lines read from
+  stdin. It is the only multi-secret form that keeps every value out of argv, and the names
+  it would carry — a `.env` file's — are exactly the ones this amendment stopped refusing.
+  It is a new command surface with its own questions (what a per-line refusal does to the
+  lines around it, what the conflict rule means for twenty names at once), so it is recorded
+  as worth doing rather than smuggled into a reversal.
+
 - **The value cannot enter a sandbox, and it is a test rather than a promise.** The wire
   has no field for it (`claimedJobSchema` strips one), so it cannot reach a runner; the
   runner is the only thing that builds `docker run`; and nothing the runner mounts contains

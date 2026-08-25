@@ -18,7 +18,7 @@ import {
   resolveProject,
   type ResolvedProject,
 } from '../project-slug.ts'
-import { promptHidden, readSecretValue } from '../prompt.ts'
+import { confirm, promptHidden, readSecretValue } from '../prompt.ts'
 
 /**
  * `ogun secret set | list | rm` — a value a project needs, kept on the machine that polls.
@@ -59,46 +59,29 @@ import { promptHidden, readSecretValue } from '../prompt.ts'
  * be between two commands the same operator runs.
  *
  * What that costs is that `secret set linear` inherits `connect`'s rules about that slot,
- * and it does inherit them rather than reimplementing them: `refuseShadowedKey` and
- * `writeProjectKey` below are called by both, so a key cannot be stored behind a working
- * grant through one door and refused through the other. The two listings then answer
- * consistently by construction: `connect list` shows what a project can *reach* — grants,
- * plus keys whose name is an integration — and `secret list` shows what is *stored* under
- * a name, integration or not, marking any row a grant has taken over with the same red
- * "NOT used" the other one prints.
+ * and it does inherit them rather than reimplementing them: `refuseShadowedKey`,
+ * `settleReplacement` and `writeProjectKey` below are called by both, so a key cannot be
+ * stored behind a working grant through one door and refused through the other, and one
+ * door cannot overwrite a value in silence that the other asks about. The two listings
+ * then answer consistently by construction: `connect list` shows what a project can
+ * *reach* — grants, plus keys whose name is an integration — and `secret list` shows what
+ * is *stored* under a name, integration or not, marking any row a grant has taken over
+ * with the same red "NOT used" the other one prints.
  *
  * Neither command reaches a server. The store is this machine's `config.json` (ADR-0012),
  * which is what lets both work before `ogun init`, with the database down, and over SSH.
  */
 
-const USAGE_SET = 'ogun secret set <name> <key> [--project <slug>]'
+const USAGE_SET = 'ogun secret set <name> <key> [--replace] [--project <slug>]'
 const USAGE_LIST = 'ogun secret list [--project <slug>]'
 const USAGE_RM = 'ogun secret rm <name> [--project <slug>]'
-
-/**
- * What a name may look like: lowercase, starting with a letter or digit, then letters,
- * digits, dots and dashes, up to 64 characters.
- *
- * This is one of the two things that replace the protection the closed set used to give
- * `secret set`, and it is aimed at one specific accident. `ogun secret set <name> <key>`
- * prompts for the key when it is left off, so `ogun secret set lin_api_9f3…` — somebody
- * who remembered that the key does not go in argv and forgot that the *name* does — is a
- * command this can never distinguish from a deliberate one by counting arguments. It can
- * refuse it by shape: an API key is long, or mixed case, or has underscores, and Linear's
- * has all three. A name does not.
- *
- * Kebab and not snake for exactly that reason. `stripe_webhook` is a name somebody would
- * plausibly want and `lin_api_…` is a key somebody would plausibly paste, and there is no
- * rule that admits the first and refuses the second. Refusing both costs a dash.
- */
-const NAME_SHAPE = /^[a-z0-9][a-z0-9.-]{0,63}$/
 
 // ── setting ────────────────────────────────────────────────────────────────
 
 export async function secretSet(args: string[]): Promise<void> {
   const { flags, positionals } = parse(
     args,
-    { '--project': 'string', '--allow-unregistered': 'boolean' },
+    { '--project': 'string', '--allow-unregistered': 'boolean', '--replace': 'boolean' },
     USAGE_SET,
   )
   const name = requireSecretName(positionals[0])
@@ -122,7 +105,11 @@ export async function secretSet(args: string[]): Promise<void> {
    */
   requireKnownProject(project, config, flags['allow-unregistered'] === true)
   await refuseShadowedKey(project, name)
-  await warnAboutReplacing(project, name, inline)
+  await settleReplacement(project, name, {
+    replace: flags.replace === true,
+    what: 'secret',
+    usage: USAGE_SET,
+  })
 
   const value = await readSecretValue(inline, 'a secret', () =>
     promptHidden(`  ${name} for ${project.slug} (not echoed): `),
@@ -135,7 +122,7 @@ export async function secretSet(args: string[]): Promise<void> {
   })
 
   /**
-   * The second thing that replaces the closed set: say so, now, when nothing reads it.
+   * What replaces the closed set: say so, now, when nothing reads it.
    *
    * `SECRET_NAMES` used to refuse this outright, and the sentence it was refusing for is
    * still true — *"a secret nothing reads looks exactly like one that works, right up
@@ -148,9 +135,21 @@ export async function secretSet(args: string[]): Promise<void> {
    * past what fits on a line, a nearest-match is worth the twelve lines; it is not worth
    * them for a list of one.
    *
-   * The name is echoed here where the shape refusal above withholds it, and the split is
-   * the point: this branch is only reachable for a name that passed `NAME_SHAPE`, which a
-   * pasted API key cannot. A refusal, by definition, has not proved that yet.
+   * ### It echoes the name, and now that is the only thing standing where the shape was
+   *
+   * This used to be justified by the shape rule — the branch was only reachable for a name
+   * `NAME_SHAPE` had passed, which a pasted API key could not be. That rule is gone, so a
+   * key pasted into the name slot reaches this line and is printed. Echoing it is still
+   * right, and the reason is that **a name is not a secret**: it is a key in a 0600 JSON
+   * file, a row in `ogun secret list`, and the word you type at `ogun secret rm`. It is
+   * already visible everywhere a name is visible. Withholding it *here* would remove the
+   * one sentence that makes the accident noticeable — `Nothing in this build reads a
+   * secret named lin_api_9f3…` is exactly what somebody who put the key in the wrong
+   * position needs to read — while changing nothing about where the string ended up.
+   *
+   * A refusal is the other way round, and `requireSecretName` still withholds: a refusal
+   * has stored nothing, so the string is not yet a name and quoting it back would be the
+   * only place it appears.
    */
   if (!isSecretName(name)) {
     console.log(
@@ -166,24 +165,125 @@ export async function secretSet(args: string[]): Promise<void> {
 }
 
 /**
- * A name is refused before anything else, and is **not** repeated back.
+ * A secret name is whatever the project calls it, and only what cannot work is refused.
  *
- * ADR-0012 settled this for the single-positional shape and the reasoning survives the
- * second positional: the plausible way to arrive here is somebody who put the key where
- * the name goes, and quoting the argument would write a live credential to stderr on top
- * of the shell history and the `ps` window it is already in.
+ * ### The format rule is gone, and it was refusing the normal case
+ *
+ * For two days a name had to match `[a-z0-9][a-z0-9.-]{0,63}`. That was aimed at one
+ * accident — `ogun secret set lin_api_9f3…`, from somebody who remembered that the key
+ * does not belong in argv and forgot that the *name* does — and the shape was chosen
+ * because a Linear key is long, mixed case and full of underscores where a kebab name is
+ * none of those. Kebab and not snake was the deliberate part of it.
+ *
+ * It cost more than it bought, on two counts, and the second one is fatal:
+ *
+ *  - **It refused the conventional spelling of a secret name.** `DATABASE_URL`,
+ *    `STRIPE_SECRET_KEY`, `my_api_key` — every `.env` file, `flyctl`, Heroku, Kubernetes.
+ *    A store whose whole purpose is arbitrary per-project values refused the names those
+ *    values actually have, and it did so to prevent something rarer than what it broke.
+ *  - **The accident it guarded against is not an error.** `ogun secret set lin_api_nVD6…`
+ *    is a legal invocation: the name is `lin_api_nVD6…`, and the command then prompts for
+ *    the value. Odd, and not a thing to refuse. There is no rule that admits
+ *    `AWS_SECRET_ACCESS_KEY` and refuses `lin_api_nVD6…` — they are the same shape, which
+ *    is what killed the snake-case half of the rule and, followed through, kills all of
+ *    it. What is left of the protection is the line `secretSet` prints afterwards, which
+ *    names the mistake without refusing anything.
+ *
+ * `flyctl`, which the product owner named as the model, validates **nothing** client-side:
+ * *"Names are case sensitive and stored as-is, so ensure names are appropriate for the
+ * application and vm environment."* It states the consequence and stores what you typed.
+ *
+ * ### What survives, and why each one is structural rather than tidy
+ *
+ * Every rule below names something that *breaks* — a value that cannot be addressed, a
+ * value that vanishes, or output that lies. None of them is about what a name should look
+ * like.
+ *
+ *  - **Empty.** There is no name to store it under; `secrets.<project>` would grow a `""`
+ *    key that `secret list` renders as a blank cell.
+ *  - **Whitespace anywhere.** The name has to survive a round trip through a shell —
+ *    `ogun secret rm <name>` is the only way to undo a set, and it takes exactly one
+ *    positional, so a name with a space in it is refused by the command that removes it.
+ *    It also has to survive `secret list`, whose columns are separated by spaces.
+ *  - **Control characters.** Names are printed back to a terminal. A carriage return, or
+ *    an ESC starting a CSI sequence, rewrites the line it is printed on — so a name could
+ *    forge the confirmation line that follows it, or erase it. A control character
+ *    arriving here is also the signature of a value pasted with its newline attached,
+ *    which is the accident `normalizeSecretInput` refuses on the value side for its own
+ *    reasons.
+ *  - **`__proto__`.** It does not survive the file. `localConfigSchema` parses `secrets`
+ *    through `z.record`, which does not carry that key onto the parsed object, so the
+ *    value would be written to `config.json` now and silently dropped by the next command
+ *    that writes it — a secret that works today and is gone on Tuesday, with nothing
+ *    anywhere connecting the two. `constructor` and `toString` are fine and are stored:
+ *    the hazard there was `entries[name]` walking the prototype chain, which is fixed in
+ *    `setProjectSecret` and `clearProjectSecret` where it belongs.
+ *
+ * Considered and rejected: a **length cap**. Every number was arbitrary — 64 refused
+ * nothing a person types and admitted every API key anyway — and nothing downstream has a
+ * limit, since a JSON key and an argv word both hold far more than a terminal will ever
+ * show. Considered and rejected: **sniffing for a pasted credential** and warning. Any
+ * test that catches `lin_api_9f3…` catches `AWS_SECRET_ACCESS_KEY`, which is the whole
+ * reason the format rule died; a warning that fires on the normal case is one people learn
+ * to scroll past.
+ *
+ * ### The refusal still does not repeat what was typed
+ *
+ * ADR-0012's rule outlives the shape rule that shared its paragraph. A key really can end
+ * up in this position — the invocation above is legal, so a *mistyped* one is reachable —
+ * and quoting the argument back would write a live credential to stderr on top of the
+ * shell history and the `ps` window it is already in. The message names the rule that was
+ * broken and never the string that broke it, exactly as `normalizeSecretInput` does.
  */
 function requireSecretName(name: string | undefined): string {
   if (name === undefined) fail(`usage: ${USAGE_SET}`)
-  if (NAME_SHAPE.test(name)) return name
+  const broken = whyNotAName(name)
+  if (broken === undefined) return name
   return fail(
-    'that is not a secret name. Names are lowercase letters, digits, dots and dashes, up\n' +
-      '  to 64 characters — `linear`, `stripe-webhook`. Nothing was stored.\n' +
+    `${broken} Nothing was stored.\n` +
       `    ${USAGE_SET}\n` +
-      '  What you typed is not repeated back, because the thing most likely to be in that\n' +
-      '  position by mistake is the key itself. If it was: treat it as compromised, and\n' +
-      '  clear your shell history.',
+      '  What you typed is not repeated back, because a key can end up in that position.\n' +
+      '  If one did: treat it as compromised, and clear your shell history.',
   )
+}
+
+/** Written as escapes rather than literal bytes: a source file holding a real NUL is one
+ *  that editors, diffs and terminals each mangle differently. */
+const CONTROL = /[\u0000-\u001f\u007f-\u009f]/
+const WHITESPACE = /\s/
+
+/**
+ * Whitespace is tested before the control characters it overlaps with, so that a tab or a
+ * newline is reported as the thing a person can picture rather than as a byte range.
+ */
+function whyNotAName(name: string): string | undefined {
+  if (name === '') return 'a secret name cannot be empty.'
+  if (WHITESPACE.test(name)) {
+    return (
+      'a secret name cannot contain whitespace.\n' +
+      '  `ogun secret rm` takes exactly one word, so a name with a space in it could be\n' +
+      '  stored and never removed, and `ogun secret list` separates its columns with\n' +
+      '  spaces. A newline or a tab in an argument is usually a value that arrived with\n' +
+      '  its line ending still attached. Dashes and underscores are both fine —\n' +
+      '  `stripe-webhook`, `DATABASE_URL`.'
+    )
+  }
+  if (CONTROL.test(name)) {
+    return (
+      'a secret name cannot contain a control character.\n' +
+      '  Names are printed back to this terminal, where an escape sequence rewrites or\n' +
+      '  erases the line it lands on — including the confirmation printed after it.'
+    )
+  }
+  if (name === '__proto__') {
+    return (
+      'a secret cannot be named `__proto__`.\n' +
+      '  It is the one name that does not survive this file: the config is read back\n' +
+      '  through a schema that drops that key, so the value would be stored now and gone\n' +
+      '  the next time any command writes config.json.'
+    )
+  }
+  return undefined
 }
 
 // ── listing ────────────────────────────────────────────────────────────────
@@ -346,27 +446,107 @@ export async function refuseShadowedKey(
 }
 
 /**
- * At a terminal, say there is already one there *before* asking for the new one.
+ * A name that is already taken is settled **before** the value is collected: asked about
+ * at a terminal, refused without `--replace` anywhere else.
  *
- * Advisory rather than authoritative — it is a second read of the store and the fact it
- * reports could change before the write takes the lock. That is fine for what it is for: a
- * person one keystroke from pasting a key over a working one who does not know it. The
- * line printed *afterwards* is the one taken under the lock.
+ * ### One rule, two places, and what each of them is for
  *
- * Only at a TTY, and only when the value was not already on the command line. A pipe is a
- * rotation somebody wrote down on purpose, and a warning it cannot act on is noise in a
- * script's output.
+ * Overwriting is unrecoverable. ADR-0012 chose that deliberately — a rotation window
+ * belongs to whoever issued the value, and two live values in one store means a 401 cannot
+ * be attributed — so there is no history and no second slot, and the previous value is
+ * simply gone. The question this function answers is who is allowed to do that silently,
+ * and the answer is nobody:
+ *
+ *  - **At a terminal there is somebody to ask**, so it asks, and it asks before the key is
+ *    prompted for. Declining costs nothing and leaves the working value in place.
+ *  - **Off a terminal there is nobody to ask**, so it refuses and names the flag. A script
+ *    that destroys a credential it did not know was there fails loudly instead, and the
+ *    author adds `--replace` when they mean it — which is a sentence about intent that
+ *    reads correctly in a diff a year later.
+ *
+ * The two behaviours are one rule seen from two rooms, which is why they are in one
+ * function called by both `ogun secret set` and `ogun connect <integration> --api-key`.
+ * Two doors onto one row that disagreed about overwriting would be worse than either rule
+ * alone.
+ *
+ * ### This reverses ADR-0012, which considered a gate and rejected it
+ *
+ * > *"Considered and rejected: a `[y/N]` gate on a replace. It needs a `--yes` for the
+ * > non-interactive path; every script would set that flag once and never remove it; the
+ * > gate would then guard nobody while costing everybody a keystroke — on the operation
+ * > this record settled as the intended one."*
+ *
+ * That was right about the world it was written in and the world changed underneath it.
+ * When it was written, `secret set` took a name from a **closed set of one**, on a project
+ * that had to already exist — so every replace *was* the intended operation, a rotation of
+ * a credential the operator was holding a new copy of. A name collision was not
+ * expressible. It is now: names are free-form, and free-form names collide. `token`,
+ * `api-key` and `DATABASE_URL` are names two different values both plausibly want, and the
+ * store answers to whichever was written last with no way to notice.
+ *
+ * The rest of the objection survives and is answered rather than dismissed. `--replace` in
+ * a rotation script does become permanent furniture — but it is furniture that says what
+ * the script does, where `--yes` would only say that somebody was tired of being asked.
+ * And the gate is not on the happy path: it fires only when there is a value to destroy.
+ *
+ * `flyctl` is the same shape read twice. `fly secrets set` silently replaces, with no
+ * confirmation and no `--force`, and there is an open pull request against it from an
+ * operator who overwrote production's secrets because they forgot `--app` — which is
+ * exactly this command's `--project` inference. Meanwhile `fly secrets keys set`, for the
+ * values Fly treats as unrecoverable, refuses with *"refusing to overwrite existing key"*
+ * unless `--force` is given. The tool models both answers and disagrees with itself; the
+ * half it applies to values that cannot be got back again is the half taken here.
+ *
+ * ### What it does not do
+ *
+ * It does not fire on an `empty` entry. A blank is only reachable by hand-editing the
+ * file, `writeProjectKey` calls filling one in a repair rather than a replace, and there
+ * is no value there to protect.
+ *
+ * It is **advisory with respect to the lock**: this is a second read of the store, and
+ * what it saw could change before `setProjectSecret` takes `updateLocalConfig`'s lock. It
+ * is not trying to be a mutex — it is trying to stop a person, and a person is not racing
+ * themselves. The `stored`/`replaced` line printed afterwards is the authoritative one and
+ * is decided inside the lock.
  */
-export async function warnAboutReplacing(
+export async function settleReplacement(
   project: ResolvedProject,
   name: string,
-  inline: string | undefined,
+  { replace, what, usage }: { replace: boolean; what: string; usage: string },
 ): Promise<void> {
-  if (!process.stdin.isTTY || inline !== undefined) return
+  // Said on the command line: there is nothing to ask about, at a terminal or anywhere
+  // else. `--replace` with nothing there is a no-op rather than an error, for the reason
+  // `rm -f` is: a script that has to know the answer in advance is a script with a race
+  // in it, and the confirmation still says `stored` rather than `replaced`.
+  if (replace) return
+
   const stored = await listProjectSecrets().catch(() => [])
-  if (!stored.some((e) => e.project === project.slug && e.name === name)) return
-  console.log(yellow(`  ${project.slug} already has a ${name} secret on this machine.`))
-  console.log(dim('  Storing replaces it, and there is no history. Ctrl-C to stop.'))
+  const held = stored.some(
+    (e) => e.project === project.slug && e.name === name && e.state === 'present',
+  )
+  if (!held) return
+
+  const gone =
+    '  There is no history and no second slot: the value there now cannot be\n' +
+    '  recovered from this machine once it is gone.'
+
+  if (!process.stdin.isTTY) {
+    fail(
+      `${project.slug} already has a ${name} ${what} on this machine, and stdin is not a\n` +
+        '  terminal, so there is nobody to ask. Nothing was stored.\n' +
+        `${gone}\n` +
+        '  Say it on the command line if that is what you mean:\n' +
+        `    ${usage}`,
+    )
+  }
+
+  console.log(yellow(`  ${project.slug} already has a ${name} ${what} on this machine.`))
+  console.log(dim(gone))
+  if (!(await confirm(dim('  Replace it? [y/N] ')))) {
+    // Exit 1: nothing was stored, and a caller who asked for a set and did not get one
+    // should hear about it in `$?` as well as on the screen.
+    fail(`nothing was stored — ${project.slug} keeps the ${name} ${what} it already had.`)
+  }
 }
 
 /**

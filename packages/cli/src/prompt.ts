@@ -77,6 +77,23 @@ export function promptHidden(label: string): Promise<string> {
   })
 }
 
+/**
+ * A yes-or-no question, defaulting to **no**.
+ *
+ * Only `y` or `yes` agrees. Enter, anything else, and an empty line all decline, because
+ * the one call site is a question about destroying a credential that cannot be recovered:
+ * the answer somebody gives by holding Enter through a command they were not reading has
+ * to be the one that changes nothing.
+ *
+ * The question goes to stderr beside the prompts above, so `ogun … > file` neither hides
+ * it nor writes it into whatever is being captured. Callers must check `process.stdin.isTTY`
+ * first — off a terminal this reads a line of the *pipe*, which is usually the credential.
+ */
+export async function confirm(question: string): Promise<boolean> {
+  const answer = (await prompt(question)).trim().toLowerCase()
+  return answer === 'y' || answer === 'yes'
+}
+
 /** A visible line, for the values that are not secrets — a client id, a project slug. */
 export function prompt(label: string): Promise<string> {
   return new Promise<string>((resolve) => {

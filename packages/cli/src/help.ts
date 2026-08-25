@@ -375,7 +375,7 @@ const topics: Record<string, Topic> = {
     usage: [
       'ogun connect <integration> --client-id <id> --client-secret <secret> [--project <slug>]',
       'ogun connect <integration> --consent --client-id <id> --client-secret <secret>',
-      'ogun connect <integration> --api-key [<key>] [--project <slug>]',
+      'ogun connect <integration> --api-key [<key>] [--replace] [--project <slug>]',
       'ogun connect list [--project <slug>]',
     ],
     notes: [
@@ -477,6 +477,16 @@ const topics: Record<string, Topic> = {
           'match the name the control plane polls the project under, exactly, and nothing ' +
           'here can check that',
       ],
+      [
+        '--replace',
+        'with --api-key only: this project already has a key stored under that name and ' +
+          'destroying it is what you mean. Without it, a terminal is asked and a script ' +
+          'is REFUSED, because there is no history and the value being overwritten cannot ' +
+          'be recovered from this machine. The same flag `ogun secret set` takes, for the ' +
+          'same row. It is refused beside --oauth, which destroys nothing that cannot be ' +
+          'got again: the application stays registered and the token it replaces was going ' +
+          'to expire anyway',
+      ],
     ],
     env: [
       [
@@ -574,7 +584,7 @@ const topics: Record<string, Topic> = {
   secret: {
     summary: 'a value a project needs, kept on the machine that polls',
     usage: [
-      'ogun secret set <name> <key> [--project <slug>]',
+      'ogun secret set <name> <key> [--replace] [--project <slug>]',
       'ogun secret list [--project <slug>]',
       'ogun secret rm <name> [--project <slug>]',
     ],
@@ -592,11 +602,16 @@ const topics: Record<string, Topic> = {
         '<key>` and `ogun connect linear --api-key <key>` write the same slot, through the ' +
         'same function, under the same lock — so a key stored by one is the key the other ' +
         'reports, and a key that a grant has taken over is refused by BOTH.',
-      'Names are free-form, unlike the integration `connect` takes. What replaces the ' +
-        'protection a closed set gave: a name must be lowercase letters, digits, dots and ' +
-        'dashes up to 64 characters, which a pasted API key cannot be — and `set` says out ' +
-        'loud when nothing in this build reads the name you just stored, which is the fact ' +
-        'the closed set existed to prevent you from discovering at 2am.',
+      'Names are free-form and are whatever your project calls the thing — ' +
+        '`DATABASE_URL`, `stripe-webhook`, `my_api_key`. Only what cannot work is refused: ' +
+        'empty, whitespace, a control character, and `__proto__`. What replaces the ' +
+        'protection a closed set gave is that `set` says out loud when nothing in this ' +
+        'build reads the name you just stored, which is the fact the closed set existed to ' +
+        'prevent you from discovering at 2am.',
+      'A name that is already taken is settled BEFORE the value is asked for: at a ' +
+        'terminal you are asked, and off one it is refused unless you pass --replace. ' +
+        'There is no history, so an overwrite cannot be undone — and the same rule holds ' +
+        'at `ogun connect <integration> --api-key`, which writes the same row.',
     ],
     subcommands: [
       ['set <name> <key>', 'store one value under one name for one project'],
@@ -614,12 +629,16 @@ const topics: Record<string, Topic> = {
      * values of the same shape must be named.** There is nothing here for it to be
      * confused with — `<name>` is not a credential and does not look like one.
      */
-    usage: ['ogun secret set <name> <key> [--project <slug>]'],
+    usage: ['ogun secret set <name> <key> [--replace] [--project <slug>]'],
     notes: [
-      '<name> — free-form: lowercase letters, digits, dots and dashes, up to 64 ' +
-        'characters. `linear`, `stripe-webhook`. The shape is deliberate — it is what ' +
-        'stops a pasted API key being accepted as a name by a command that would otherwise ' +
-        'have no way to tell.',
+      '<name> — whatever your project calls it. `DATABASE_URL`, `STRIPE_SECRET_KEY`, ' +
+        '`stripe-webhook`, `my_api_key`: case is kept, and dashes and underscores are ' +
+        'both fine. Only what cannot work is refused — an empty name; whitespace, because ' +
+        '`ogun secret rm` takes one word and `list` separates its columns with spaces; a ' +
+        'control character, because names are printed back to this terminal; and ' +
+        '`__proto__`, which the config file cannot hold — the schema it is read back ' +
+        'through drops that key, so the value would vanish on the next write. An earlier ' +
+        'build refused underscores and capitals. It should not have, and does not.',
       '<key> — the value. Leave it off and it is prompted for with the echo off at a ' +
         'terminal, or read from stdin when stdin is a pipe:\n' +
         '    ogun secret set stripe-webhook                         prompts\n' +
@@ -628,11 +647,12 @@ const topics: Record<string, Topic> = {
         'user on the box through /proc/<pid>/cmdline while the command runs, and your shell ' +
         'writes the whole line into ~/.zsh_history or ~/.bash_history where nothing cleans ' +
         'it up. Prefer the prompt or the pipe.',
-      'Storing replaces what was there and there is no history and no second slot: a ' +
-        'rotation window belongs to whoever issued the value, and two live values in one ' +
-        'store means that when something 401s nothing can say which one it used. The ' +
-        'confirmation says whether it stored or REPLACED, and a replace says the old value ' +
-        'cannot be recovered from this machine.',
+      'A NAME THAT IS ALREADY TAKEN IS SETTLED FIRST, before the value is asked for. At ' +
+        'a terminal you are asked; off one — a pipe, a script, CI — it is REFUSED unless ' +
+        'you pass --replace. There is no history and no second slot, so the value being ' +
+        'overwritten is gone: a rotation window belongs to whoever issued the value, and ' +
+        'two live values in one store means that when something 401s nothing can say which ' +
+        'one it used. The confirmation still says whether it stored or REPLACED.',
       'If nothing in this build reads the name, it says so — after storing it, not instead ' +
         'of storing it. Ogun polls under: linear. Anything else is stored for whatever ' +
         'reads it, and the line is there so "nothing reads this" is something you are told ' +
@@ -657,6 +677,14 @@ const topics: Record<string, Topic> = {
         'store under a slug this machine has no record of — for a control plane whose ' +
           'repositories are checked out somewhere else. It warns, because a slug nothing ' +
           'here can confirm is a typo until something fails',
+      ],
+      [
+        '--replace',
+        'there is already a value under this name and destroying it is what you mean. ' +
+          'This is how a script says so, and a script without it fails rather than ' +
+          'overwriting something it did not know was there. Passing it when nothing is ' +
+          'stored is fine and does nothing. `ogun connect <integration> --api-key` takes ' +
+          'the same flag for the same row',
       ],
     ],
     touches: [[LOCAL_CONFIG, 'the secrets block for that project, mode 0600']],
