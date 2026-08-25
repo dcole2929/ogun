@@ -4,7 +4,7 @@ import { helpFor, isHelpFlag, usage } from './help.ts'
 import { doctor } from './commands/doctor.ts'
 import { projectAdd, projectList, projectSync } from './commands/project.ts'
 import { secret } from './commands/secrets.ts'
-import { projectLinear } from './commands/linear.ts'
+import { linear } from './commands/linear.ts'
 import { coverage, runsList, trigger } from './commands/runs.ts'
 import {
   checkCitations,
@@ -98,10 +98,21 @@ try {
             '    ogun secret set linear --project other-repo < key.txt',
         )
       }
-      // `linear` does reach the server, unlike `secret` did, and the asymmetry is
-      // explained where the command lives: the CSRF nonce that protects an authorization
-      // and the callback that consumes it both live in the control-plane process.
-      else if (sub === 'linear') await projectLinear(rest, serverUrl)
+      /**
+       * `ogun project linear` moved out to `ogun linear`, for the reason above and one
+       * more: `project linear app <project>` put four words in front of a verb, three of
+       * which were nouns and one of which was the positional now inferred from the
+       * directory. `linear` is the only noun in that chain worth keeping — it names which
+       * integration, which starts mattering the moment a `github` source sits beside it.
+       */
+      else if (sub === 'linear') {
+        fail(
+          '`ogun project linear` is now `ogun linear`.\n' +
+            '  The project comes from the directory you are in, or from --project <slug>:\n' +
+            '    ogun linear app          (asks for a Client ID and Client Secret)\n' +
+            '    ogun linear connect --project other-repo',
+        )
+      }
       else if (sub === 'list' || sub === undefined) await projectList(serverUrl)
       else unknownSub('project', sub)
       break
@@ -119,6 +130,21 @@ try {
     case 'secret':
     case 'secrets':
       await secret([sub, ...rest].filter(Boolean) as string[])
+      break
+
+    /**
+     * `linear` reaches the server, unlike `secret` beside it, and the asymmetry is
+     * explained where the command lives: the CSRF nonce that protects an authorization and
+     * the callback that consumes it both live in the control-plane process. `status` is the
+     * exception and reads this machine directly, which is what lets it answer while the
+     * thing it is reporting on is down.
+     *
+     * Top-level rather than under `project`, and named for the integration rather than for
+     * the act, so that `ogun github` can sit beside it without either of them growing a
+     * disambiguating word.
+     */
+    case 'linear':
+      await linear([sub, ...rest].filter(Boolean) as string[], serverUrl)
       break
 
     case 'init':

@@ -224,7 +224,7 @@ test('a control plane that cannot carry a secret offers the CLI for linear too',
     qc.setQueryData(['linearOauth'], linearOauth({ writesAllowed: false }))
   })
 
-  assert.match(html, /ogun project linear app/, 'the refusal has to name the path that works')
+  assert.match(html, /ogun linear app/, 'the refusal has to name the path that works')
 })
 
 test('SKILL.md renders every block type it uses', () => {

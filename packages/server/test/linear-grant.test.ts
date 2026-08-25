@@ -177,7 +177,7 @@ test('a revoked grant refuses the poll, names the fix, and deletes nothing', asy
   if (result.state !== 'refused') return
   assert.equal(wrote, 0)
   assert.match(result.detail, /Nothing was deleted/)
-  assert.match(result.detail, /ogun project linear connect ogun/)
+  assert.match(result.detail, /ogun linear connect --project ogun/)
 })
 
 /**

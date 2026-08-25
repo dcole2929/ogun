@@ -209,7 +209,7 @@ async function refreshOnce(
       detail: permanent
         ? `the ${provider} connection for "${projectSlug}" could not be renewed: ` +
           `${err.message}. Nothing was deleted — reconnect from Settings, or ` +
-          `\`ogun project linear connect ${projectSlug}\``
+          `\`ogun linear connect --project ${projectSlug}\``
         : `could not renew the ${provider} access token for "${projectSlug}": ${err.message}. ` +
           'The refresh token was kept; the next poll tries again',
     }

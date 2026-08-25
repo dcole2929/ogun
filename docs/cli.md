@@ -21,7 +21,7 @@ reach it. Four groups cannot:
 
 | | run it on |
 |---|---|
-| `server`, `db *`, `token *`, `runner invite`, `secret *` | the control-plane machine |
+| `server`, `db *`, `token *`, `runner invite`, `secret *`, `linear *` | the control-plane machine |
 | `runner init`, `runner join`, `runner start`, `runner doctor`, `image build` | the runner machine |
 | `project add`, `project sync`, `skill new`, `skill link` | a machine with the repo checked out |
 | `findings write`, `validate-findings`, `check-citations` | inside the sandbox, by a skill |
@@ -404,6 +404,64 @@ gate would need a `--yes` that every script would set once and forever.
   reads.
 
 Touches: `~/.ogun/config.json` (the secrets block, on this machine only).
+
+### `ogun linear app | connect | status | disconnect`
+
+```
+ogun linear app        [--project <slug>]     asks for a Client ID and Client Secret
+ogun linear connect    [--project <slug>]     prints a URL to approve
+ogun linear status     [--project <slug>]
+ogun linear disconnect [--project <slug>] [--forget-app]
+```
+
+Connect a project to Linear **as an application** rather than as you (ADR-0014). A personal
+API key makes every request Ogun sends appear as the person whose key it is, on a board
+other people read; an application acts as itself. This is the preferred path, and the
+personal key stays supported for anyone who is not an admin of their workspace, because
+`actor=app` is a workspace-level install Linear requires an admin to approve.
+
+It was `ogun project linear …` for two days, which put four words in front of a verb: a
+`project` namespace whose only cargo was the slug, `linear`, `app`, and then the slug again.
+The project now comes from the directory you are standing in, so the outer level is gone.
+`linear` stays, because it names *which* integration — a distinction that starts earning its
+keep the moment a `github` source sits beside it. The old spelling answers with a line naming
+the new one.
+
+**The usage lines say what each command asks for**, because `ogun linear app` reads as a
+complete command and is not: the two things it exists to collect are a Client ID and a Client
+Secret, and neither appears in its name. Ogun ships no client id — it is self-hosted, so each
+workspace registers its own application at
+<https://linear.app/settings/api/applications/new>. `app` prints the exact redirect callback
+URL to paste into that form before it asks for anything; a mismatch there is the classic
+failure of this flow and the error Linear gives for it says nothing useful.
+
+**Neither the client secret nor a URL containing an authorization code goes on the command
+line.** argv is readable by `ps` while the command runs and lands in your shell history; both
+are read from prompts with the echo off. The Client ID is prompted for *visibly*, which is
+the honest split: it is in every authorization URL a browser visits and on Linear's own
+settings page, and hiding it would mean you cannot check you pasted the right one.
+
+**The project comes from the directory**, resolved exactly as `ogun project add` and
+`ogun secret` resolve it, with `--project` to override. `app` and `connect` refuse a slug the
+control plane does not know — before the first prompt, and listing the ones that would have
+worked — because an application filed under a project nothing polls reports as configured and
+is read by nothing. There is no `--allow-unregistered` here, unlike `ogun secret set`: these
+commands cannot work without the control plane at all, so the database is available, and the
+database is the thing that decides which slugs get polled. Each command checks against the
+best oracle it already depends on.
+
+`disconnect` refuses nothing, for the same reason `ogun secret rm` does: `status` prints
+whatever the store holds, so a row you can see has to be a row you can remove. Its no-op
+answer names the project it looked in and where that name came from, since a `disconnect` run
+one directory too high is the way to reach it.
+
+Run `app`, `connect` and `disconnect` on the **control-plane machine** — it is what polls and
+what receives Linear's callback. `status` reads `~/.ogun/config.json` directly and answers
+with the control plane down, which is when the question is usually asked; it lists the whole
+machine and does not narrow to the current directory, for the same reason `ogun secret list`
+does not.
+
+Touches: `~/.ogun/config.json` (the oauth block, on this machine only).
 
 ---
 

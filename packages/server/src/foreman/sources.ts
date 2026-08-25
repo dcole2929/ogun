@@ -514,7 +514,7 @@ function missingKey(
       return (
         `"${slug}" has a linear oauth application registered (client ${key.clientId}) and ` +
         'nobody has finished the authorization, so there is nothing to poll with. Connect ' +
-        `it from Settings, or run \`ogun project linear connect ${slug}\``
+        `it from Settings, or run \`ogun linear connect --project ${slug}\``
       )
     case 'malformed':
       return (

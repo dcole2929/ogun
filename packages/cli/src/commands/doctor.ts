@@ -163,7 +163,7 @@ export async function linearGrants(path = localConfigPath(), now = Date.now()): 
         ? `${health.detail}${where}${asWhom ? `, ${asWhom}` : ''}` +
           `${app.scopes.length > 0 ? `, scopes: ${app.scopes.join(' ')}` : ''}${shadowed}`
         : `application ${app.clientId} registered, never connected — ` +
-          `\`ogun project linear connect ${app.project}\``,
+          `\`ogun linear connect --project ${app.project}\``,
       fatal: false,
     }
   })

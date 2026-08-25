@@ -444,7 +444,7 @@ describe('a source', () => {
 
     assert.equal(result.outcome, 'refused')
     assert.match(result.detail ?? '', /nobody has finished the authorization/)
-    assert.match(result.detail ?? '', /ogun project linear connect sources/)
+    assert.match(result.detail ?? '', /ogun linear connect --project sources/)
   })
 
   test('records a linear failure as failed, distinct from a local refusal', async () => {
