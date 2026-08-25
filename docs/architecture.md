@@ -355,6 +355,10 @@ nothing for a file no one opens.
   // Generated on first start; never typed in.
   "server": { "token": "ogun_…" },
 
+  // A project's own API keys — the ones no machine already has because nobody
+  // logged in with them. Present once one has been set on this box.
+  "secrets": { "ogun": { "linear": "lin_api_…" } },
+
   // Present once this machine is a runner.
   "runner": {
     "id": "wsl-desktop",
@@ -366,6 +370,27 @@ nothing for a file no one opens.
   }
 }
 ```
+
+**A project's own API keys live here too.** [settled — ADR-0012] The one thing in that file
+that is not a fact about this machine, and it is there because the machine running the
+control plane is the machine that polls (§4.13). Everything Ogun authenticated with until
+now was already on the host because a human logged in with it; a Linear key is issued per
+workspace, so nobody's home directory has one and it has to be typed in and kept.
+
+Never in `.ogun/config.yaml`, which is committed. Never in postgres, because a column on a
+row that already travels — `projects` is returned by `/api/projects` — is a value that
+leaves by being attached to something else. Never in a sandbox: it is not on
+`claimedJobSchema`, so it cannot reach a runner, and `~/.ogun/config.json` is not among the
+paths a container is mounted. Set with `ogun project secret set <project> <name>`, which
+reads the value from stdin or a hidden prompt and refuses one passed as an argument,
+because argv is readable by `ps` and lands in shell history.
+
+Reading it is `readProjectSecret(slug, name)`, which answers `present | absent | empty |
+unreadable` — four states because they have four fixes (principle 6) — and hands back a
+sealed value that prints as `[redacted]` through `console.log`, `JSON.stringify` and string
+interpolation. Rotation is setting it again; nothing keeps a history. `ogun runner doctor`,
+`GET /api/system` and the Settings page report *presence*, through a type with no field a
+value would fit in.
 
 ### 4.6 Sandbox
 
@@ -1241,6 +1266,10 @@ picture, and "three of four reviewers ran" is not derivable from findings alone.
   one implementation; the PR cap is a live `gh pr list` and is written down nowhere.
 - **Linear** — poll every N minutes with a *deterministic* filter (status, label,
   not-blocked) before any AI sees a ticket. Sources emit jobs; they are not workers.
+  The API key is per workspace, so it is the first credential Ogun stores rather than
+  borrows: `~/.ogun/config.json` on the control-plane machine, host-side only, and
+  structurally unable to reach a container (§4.5, ADR-0012). An agent never sees one —
+  the filter runs before the prompt is built, which is what makes that possible.
 
 **[open]** How PR lifecycle state is represented once modifier workers exist —
 GitHub is authoritative per §4.4, but the specific mechanism (labels, checks,

@@ -20,7 +20,7 @@ export function SettingsPage() {
   if (error) return <p className="error">{String(error)}</p>
   if (isLoading || !data) return <Empty>loading…</Empty>
 
-  const { controlPlane, host, checkouts } = data
+  const { controlPlane, host, checkouts, projectSecrets } = data
   const localOnly = ['127.0.0.1', 'localhost', '::1'].includes(controlPlane.bind)
 
   return (
@@ -162,6 +162,61 @@ export function SettingsPage() {
                     ) : (
                       <span className="pill red" title="not a git repository">
                         missing
+                      </span>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      <h2>Project secrets</h2>
+      <div className="card">
+        <p className="muted" style={{ marginTop: 0, fontSize: 12 }}>
+          API keys a project needs that this machine did not already have. A Linear key is
+          issued per workspace, so — unlike the credentials above — nobody&rsquo;s home
+          directory has one. Stored in <span className="mono">~/.ogun/config.json</span> on
+          the control-plane machine, never in the repository and never in the database.
+        </p>
+        {/*
+          Presence, by name. The value is not in this response and there is no field for
+          one, which is the point: a page that renders a secret is a secret in a
+          screenshot. Setting one is `ogun project secret set` on that machine — there is
+          deliberately no form here, because a value typed into a browser is a value in a
+          request body and in an access log.
+        */}
+        {projectSecrets.length === 0 ? (
+          <p className="muted" style={{ fontSize: 13, marginBottom: 0 }}>
+            None stored. Run{' '}
+            <span className="mono">ogun project secret set &lt;project&gt; linear</span> on
+            this machine. Which projects need one is declared in each repository, so this
+            list cannot say what is missing — only what is here.
+          </p>
+        ) : (
+          <table>
+            <thead>
+              <tr>
+                <th>Project</th>
+                <th>Secret</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {projectSecrets.map((s) => (
+                <tr key={`${s.project}/${s.name}`}>
+                  <td>{s.project}</td>
+                  <td className="mono">{s.name}</td>
+                  <td>
+                    {s.state === 'present' ? (
+                      <span className="pill green">set</span>
+                    ) : (
+                      <span
+                        className="pill red"
+                        title="stored but blank — a poller reads this as a key that exists and does not work"
+                      >
+                        empty
                       </span>
                     )}
                   </td>

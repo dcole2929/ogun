@@ -330,11 +330,12 @@ const topics: Record<string, Topic> = {
 
   project: {
     summary: 'the repositories the factory works on',
-    usage: ['ogun project add [dir] | sync [dir] | list'],
+    usage: ['ogun project add [dir] | sync [dir] | list | secret …'],
     subcommands: [
       ['add [dir]', 'tell this machine where a repo is checked out'],
       ['sync [dir]', "read the repo's .ogun/config.yaml and register it"],
       ['list', 'every project the control plane knows about (the default)'],
+      ['secret …', "an API key for this project, kept out of the repo"],
     ],
   },
 
@@ -389,6 +390,37 @@ const topics: Record<string, Topic> = {
   'project list': {
     summary: 'every project the control plane knows about',
     usage: ['ogun project list'],
+  },
+
+  'project secret': {
+    summary: "an API key this project needs, kept out of the repo and off the wire",
+    usage: [
+      'ogun project secret set <project> <name>',
+      'ogun project secret list [project]',
+      'ogun project secret rm <project> <name>',
+    ],
+    where:
+      'On the control-plane machine. The control plane is what polls an integration, so ' +
+      'this is where the key has to be — and it is stored in this machine\'s ' +
+      'config.json, not in the database and never in the repository.',
+    notes: [
+      'The value is never a command-line argument, and passing one is refused rather ' +
+        'than accepted. Anything in argv is readable by every user on the box through ' +
+        '`ps` while the command runs, and your shell writes it into its history file, ' +
+        'where nothing ever cleans it up.',
+      'So it comes from stdin when stdin is a pipe — `… set ogun linear < key.txt`, or ' +
+        'straight out of a password manager — and from a prompt with the echo off when ' +
+        'stdin is a terminal. Nothing chooses between them; the shape of stdin already has.',
+      'Known secrets: linear. A name Ogun does not read is refused, because a secret ' +
+        'nothing reads looks exactly like one that works until the night it mattered.',
+      'Rotation is setting it again. There is no history and no second slot: the next ' +
+        'poll reads the new value with no restart, and two live keys would mean nobody ' +
+        'could say which one a 401 came from.',
+      'Nothing prints a stored value back — not this command, not `runner doctor`, not ' +
+        'the UI, and not any endpoint. `list` reports presence only.',
+    ],
+    touches: [[LOCAL_CONFIG, 'the secrets block, mode 0600, on this machine only']],
+    see: ['ogun runner doctor', 'ogun project sync'],
   },
 
   skill: {
@@ -759,6 +791,8 @@ ${bold('projects')}
   ogun project add [dir] [--name]  tell this machine where a repo is checked out
   ogun project sync [dir]          read .ogun/config.yaml and register it
   ogun project list
+  ogun project secret set <p> <n>  an API key for a project, read from stdin
+  ogun project secret list         which projects have one — never the value
 
 ${bold('what can run')}
   ogun skill new <name>            scaffold .agents/skills/<name>/

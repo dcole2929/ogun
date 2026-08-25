@@ -4,7 +4,7 @@ import { stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
-import { imageState, loadLocalConfig, localConfigPath } from '@ogun/core'
+import { imageState, listProjectSecrets, loadLocalConfig, localConfigPath } from '@ogun/core'
 import { caState, credentialStatuses, readCredentials } from '@ogun/gateway'
 import { bold, cyan, dim, green, red, yellow } from '../output.ts'
 import { authHeaders } from '../auth.ts'
@@ -40,6 +40,58 @@ export async function configPermissions(path = localConfigPath()): Promise<Check
     detail: shared
       ? `${path} is 0${mode.toString(8)} — it holds this machine's tokens. \`chmod 600 ${path}\``
       : `${path} is 0${mode.toString(8)}`,
+    fatal: false,
+  }
+}
+
+/**
+ * Which project secrets this machine holds — by name, never by value.
+ *
+ * `doctor` answers "can this box actually run a job" and this is the polling half of it:
+ * a control plane that is about to poll Linear every few minutes needs a key, and the key
+ * lives in this machine's config.json rather than in the database (ADR-0012), so this is
+ * the only place that can see it at all.
+ *
+ * **It reports what is stored, never what is missing**, and that limit is stated on the
+ * line rather than left to be inferred. Which projects need a Linear key is a fact in each
+ * repository's `.ogun/config.yaml`, and `doctor` reads no repositories — so a green line
+ * here means "these exist", and the absence of a line means nothing at all. Printing
+ * "linear: missing" for every project the control plane knows about would be the
+ * absence-of-evidence mistake the credential preflight was careful about from the start
+ * (principle 6).
+ *
+ * The one state worth degrading on is `empty`, which is only reachable by hand-editing the
+ * file: a poller reads it as a key that exists and does not work, and the symptom is a
+ * 401 that looks like a revoked key rather than a blank one.
+ *
+ * Never fatal. A runner-only machine holds none of these and is not broken; polling is
+ * not something it does.
+ */
+export async function projectSecrets(path = localConfigPath()): Promise<Check> {
+  const stored = await listProjectSecrets(path).catch((err: Error) => err)
+  if (stored instanceof Error) {
+    return { name: 'project secrets', ok: false, detail: stored.message, fatal: false }
+  }
+  if (stored.length === 0) {
+    return {
+      name: 'project secrets',
+      ok: true,
+      detail: 'none stored here — `ogun project secret set <project> <name>`',
+      fatal: false,
+    }
+  }
+  const blank = stored.filter((s) => s.state === 'empty')
+  // `slug/name` and a state. There is no branch of this function that could print a
+  // value: `listProjectSecrets` does not return one.
+  const summary = stored.map((s) => `${s.project}/${s.name}`).join(', ')
+  return {
+    name: 'project secrets',
+    ok: blank.length === 0,
+    detail:
+      blank.length === 0
+        ? `${summary} — set (this machine only; what a project *needs* is not checked here)`
+        : `${blank.map((s) => `${s.project}/${s.name}`).join(', ')} present but empty — ` +
+          'a poller reads that as a key that exists and does not work. Set it again',
     fatal: false,
   }
 }
@@ -215,6 +267,9 @@ export async function doctor(serverUrl: string): Promise<void> {
   // token in it and a mode.
   const permissions = await configPermissions()
   if (permissions) checks.push(permissions)
+  // Same file, different question: the mode above is who can read it, this is what is in
+  // it for a project rather than for this machine.
+  checks.push(await projectSecrets())
   checks.push(await sandboxImage())
 
   // The gateway is what a sandbox authenticates through, so "can this box run a job" now

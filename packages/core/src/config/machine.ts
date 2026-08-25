@@ -30,6 +30,25 @@ export const localConfigSchema = z.object({
     })
     .default({ token: undefined }),
 
+  /**
+   * A project's own API keys, keyed by project slug and then by secret name (ADR-0012).
+   *
+   * The one thing in this file that is *not* a fact about this machine, and it is here
+   * because the machine that runs the control plane is the machine that polls (§4.13) —
+   * so a per-project polling secret and a per-machine admin token have the same lifetime,
+   * the same 0600 file, and the same "never leaves this box" rule. `secrets.ts` is the
+   * only module that reads or writes it; nothing here should be reached through
+   * `loadLocalConfig` directly.
+   *
+   * **It has to be declared here even though nothing else in this file uses it.** Zod
+   * strips what a schema does not name, and `updateLocalConfig` is a read-modify-write
+   * through this schema — so an undeclared `secrets` block would be silently deleted by
+   * the next `ogun project add`, `ogun runner join` or admin-token rotation. The failure
+   * would be a Linear key that stopped working on the day someone registered an unrelated
+   * repository, with nothing connecting the two.
+   */
+  secrets: z.record(z.string(), z.record(z.string(), z.string())).default({}),
+
   /** Present once this machine has joined a control plane as a runner. */
   runner: z
     .object({
@@ -84,23 +103,63 @@ const expandPaths = (config: LocalConfig): LocalConfig => ({
 export async function loadLocalConfig(path = localConfigPath()): Promise<LocalConfig> {
   const text = await readFile(path, 'utf8').catch(() => null)
   if (text === null) return localConfigSchema.parse({})
+  return parseLocalConfig(text, path)
+}
 
+/**
+ * The parsing half of `loadLocalConfig`, separated so a caller that needs to tell "no
+ * file" apart from "I could not read the file" can do its own read.
+ *
+ * `loadLocalConfig` deliberately cannot: it swallows every read error and returns an empty
+ * config, which is right for the projects map and wrong for a credential (`secrets.ts`
+ * explains which). One parser either way, so the two agree about what the file means.
+ */
+export function parseLocalConfig(text: string, path = localConfigPath()): LocalConfig {
   let raw: unknown
   try {
     raw = JSON.parse(text)
   } catch (err) {
-    throw new LocalConfigError(`${path} is not valid JSON: ${(err as Error).message}`)
+    throw new LocalConfigError(
+      `${path} is not valid JSON ${faultLocation((err as Error).message)}`,
+    )
   }
   const parsed = localConfigSchema.safeParse(raw)
   if (!parsed.success) {
     // This file is hand-edited — you add repository paths to it — so name the field
-    // rather than showing a parser's stack.
+    // rather than showing a parser's stack. The path is a key name (`secrets.ogun.linear`)
+    // and zod's message states the expected and received *types*, so neither half of this
+    // can carry a value.
     throw new LocalConfigError(
       `${path} is not valid:\n` +
         parsed.error.issues.map((i) => `  ${i.path.join('.') || '(root)'}: ${i.message}`).join('\n'),
     )
   }
   return expandPaths(parsed.data)
+}
+
+/**
+ * Keep where the JSON went wrong; throw the parser's own words away.
+ *
+ * V8 builds `JSON.parse`'s message out of the source it choked on — `Unexpected token 'x',
+ * ..."token": "ogun_liv...` — quoting a window of characters around the fault. This file
+ * now holds an admin token, a runner credential, and a project's API keys (ADR-0012), and
+ * this message is printed by `ogun runner start` on a bad config and forwarded by `fail()`
+ * from every CLI command. That is the same leak `redactUrlCredentials` was merged for: a
+ * secret ending up inside an error string, which then spreads into consoles, transcripts
+ * and whatever someone pastes when asking why a command failed.
+ *
+ * The location is the half that helps and the only half that is safe, so it is the half
+ * that is kept. A message with no location at all is not a mystery worth creating — the
+ * file is small and `python -m json.tool` names the line — but "line 4 column 12" is what
+ * turns this from a puzzle into an edit.
+ */
+const faultLocation = (message: string): string => {
+  const at = /at position \d+(?: \(line \d+ column \d+\))?/.exec(message)
+  return at
+    ? `— ${at[0]}. The parser's own message is withheld because it quotes the surrounding ` +
+        'source, and this file holds credentials'
+    : '— the parser could not say where, and its message is withheld because it quotes ' +
+        'the surrounding source, and this file holds credentials'
 }
 
 /**
