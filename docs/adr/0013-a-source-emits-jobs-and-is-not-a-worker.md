@@ -29,8 +29,11 @@ every other definition becomes a row: the foreman cannot open a YAML file (§5.1
 
 **It runs in the control-plane process, on the host, holding the credential.** The API key
 comes from the per-project secret store (ADR-0012, `readProjectSecret`) and is used in one
-header, in one file, by the one function in the tree that opens a socket to Linear. Nothing about Linear reaches a sandbox. The ticket reaches an agent as **prompt
-text** and nothing else.
+header, in one file, by the one function in the tree that opens a socket to Linear. The
+poll's credential never reaches a sandbox and the ticket reaches an agent as **prompt
+text**. *(A later slice lets a skill call Linear about a ticket it was already given, over
+the gateway, holding a placeholder — see the amendment in Consequences. Selection is still
+host-side and still enforced by the brand.)*
 
 **What it emits is a `CycleRun`, through `startCycleRun` — the same function cron and the
 manual trigger call.** There is no second path into the queue. Admission, the failure
@@ -94,7 +97,10 @@ mutation. A human moves the ticket.
   sentence exists to reject. It puts a Linear API key inside a container that ADR-0010 says
   holds no credential, puts `api.linear.app` on a sandbox's egress allowlist, and spends a
   container, a workspace clone and an agent round on a filter that is forty lines of
-  deterministic code. It also makes the filter unauditable: a rule enforced by a prompt is a
+  deterministic code. *(The allowlist half of that objection was later answered rather than
+  waived — a sandbox reaches Linear through the gateway, holding a placeholder, and only
+  when its worker asked. The part that stays rejected is running the filter in there at all;
+  see the amendment in Consequences.)* It also makes the filter unauditable: a rule enforced by a prompt is a
   rule that holds most nights.
 
 - **A source as a new queue of "emitted work" that the foreman later converts into jobs.**
@@ -173,6 +179,62 @@ mutation. A human moves the ticket.
   three as the first would send somebody to overwrite a config file that is already failing
   to parse. `expose()` is called once, at the wire, into the header — the value is never in
   a variable this code logs or records.
+
+- **[amended] A sandbox can now reach `api.linear.app`, and the rule above is intact.**
+  This record says of the rejected "source as a worker" option that it "puts
+  `api.linear.app` on a sandbox's egress allowlist", and that sentence was written as a
+  reason to reject a shape. A later slice put the host within reach of a sandbox
+  deliberately, and the two are about different things — so this note exists to stop the
+  next reader concluding the rule was quietly abandoned.
+
+  What was rejected, and stays rejected, is **selection inside a sandbox**: a container
+  asking Linear which tickets to work on. That is not enforced by an allowlist and never
+  was. `admitsTicket` is a pure function in `@ogun/core` returning a branded
+  `AdmittedTicket` that only the filter can mint, and `ticketBrief` and the emitter take
+  the brand — so a container with unrestricted access to Linear's API still cannot produce
+  a job, because it cannot produce the brand. `packages/core/test/ticket-filter.test.ts`
+  holds a `@ts-expect-error` asserting that an unbranded ticket does not compile. That is
+  the guarantee, and nothing about connections touches it.
+
+  What is new is **acting on a ticket that was already selected**. A skill handed a ticket
+  may need to read its comments, follow a linked issue, or post its result. That is a
+  runtime API call from inside a sandbox, which is what ADR-0010's gateway is for: the
+  container holds a placeholder, the real credential is spliced in at the wire on the host,
+  and there is nothing in the container to steal. The mechanism is deliberately the same
+  one `api.anthropic.com` already uses rather than a second path.
+
+  Four things bound it, and each one is a decision rather than an implementation detail:
+
+  - **It is off by default and per worker.** `connections: [linear]` on the worker, absent
+    everywhere else. The obvious implementation — the host on `DEFAULT_ALLOWED_HOSTS` —
+    would have given `adversarial-review` a credentialed path to the project's issue
+    tracker, and that worker is aimed at untrusted repository content on purpose. The grant
+    lives on the gateway *session*, which is per job, so no worker inherits another's.
+  - **Only `POST /graphql`.** `api.linear.app` also serves `/oauth/revoke`, and a sandbox
+    that could reach it would end the project's connection using the credential the gateway
+    had just attached — reconnecting needs a workspace admin. That is a destructive
+    capability no allowlist entry expresses.
+  - **Only an OAuth grant; a personal API key is refused.** A personal key is everything
+    its owner can do in that workspace, forever, and Linear attributes every write to them
+    by name (ADR-0014). The poll may authenticate with one; a sandbox may not. The refusal
+    names the fix rather than falling back.
+  - **`egress: open`, `egress: none` and `sandbox: worktree` refuse the declaration at
+    parse.** All three would mean a connection with no gateway between the agent and the
+    credential, and all three fail silently if allowed: the agent reaches Linear with a
+    placeholder and reports that Linear rejected the credential.
+
+  **The cost, stated rather than mitigated.** A worker with `connections: [linear]` can
+  issue arbitrary GraphQL reads against the whole workspace the grant covers — every issue,
+  comment, document and attachment in every team it can see, plus the member list — not
+  just the ticket it was given. Linear has no per-ticket or per-team scope on an access
+  token, so nothing below Linear can narrow this, and a gateway that told a query from a
+  mutation by parsing the document would be a policy engine (rejected in ADR-0010) one
+  alias away from being wrong while claiming a guarantee. Because `api.anthropic.com` is on
+  every allowlist, anything the agent can read it can also put in a prompt and send out;
+  ADR-0005 and ADR-0010 both name that as a different and harder problem, and it is still
+  open. **A finding that `connections:` is too coarse a grant is a real finding.** The
+  answer would be a narrower Linear scope, or write-back performed host-side from a
+  structured request the agent produces — not a check in the gateway that cannot hold.
 
 - Nothing here has been run against a live Linear workspace. The client is built against
   recorded responses whose every field, nullability and enum value was taken from Linear's

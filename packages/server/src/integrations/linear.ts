@@ -22,17 +22,25 @@ import type { Ticket } from '@ogun/core'
  * plan, and a client that takes a document string is one refactor away from a slice that
  * does. A human moves the ticket.
  *
- * **The credential never leaves the host.** It is read from the per-project store by the
- * poll, handed to this function, and used in one header. Nothing about Linear is ever
- * mounted into, injected into, or reachable from a sandbox: the ticket reaches an agent as
- * prompt text and nothing else (ADR-0010, principle 3). If a worker in this pipeline ever
- * appears to need `api.linear.app` on its egress allowlist, the allowlist is not the fix.
+ * **The credential never leaves the host, and this file is not how a sandbox reaches
+ * Linear.** The key is read from the per-project store by the poll, handed to this
+ * function, and used in one header. Nothing about the *poll* is mounted into or reachable
+ * from a sandbox: the ticket reaches an agent as prompt text and nothing else (ADR-0010,
+ * principle 3). **If a worker in this pipeline appears to need `api.linear.app` in order to
+ * decide what to work on, the allowlist is not the fix** — selection is enforced by
+ * `admitsTicket`'s brand, which nothing in a container can mint however much of Linear's
+ * API it can reach.
  *
- * That holds for the OAuth grant added by ADR-0014 with no change and one extra reason.
- * The grant is refreshed on the host, by the control plane, out of the same config.json —
- * so the *only* process that has ever held a Linear token is this one, and the gateway
- * (which splices credentials for three model providers into sandbox traffic) knows nothing
- * about Linear and must not learn.
+ * **[amended]** A skill acting on a ticket it was *already* given can now call Linear, over
+ * the egress gateway, with `connections: [linear]` on its worker (ADR-0013, Consequences).
+ * That is a different request at a different time and it does not go through this file: the
+ * container holds a placeholder, `packages/gateway` splices the grant in at the wire, and
+ * only `POST /graphql` is carried. This paragraph used to say the gateway "knows nothing
+ * about Linear and must not learn", which was a claim about the poll dressed as a claim
+ * about the system. What stays true of this module is narrower and still worth having: it
+ * is the only thing in the tree that opens a socket to Linear *from the control plane*, its
+ * document is a module constant so it cannot be asked to mutate, and the grant is refreshed
+ * here and nowhere else.
  */
 
 export const LINEAR_ENDPOINT = 'https://api.linear.app/graphql'

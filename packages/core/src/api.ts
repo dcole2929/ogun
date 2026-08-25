@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { CONNECTED_APPS } from './connections.ts'
 import type { CredentialOutlook } from './credentials.ts'
 import { egressSchema } from './config/egress.ts'
 import { runEventSchema } from './events.ts'
@@ -101,6 +102,20 @@ export const claimedJobSchema = z.object({
    * what a container may reach.
    */
   egress: egressSchema.optional(),
+  /**
+   * Which connected applications this job's sandbox may call (§4.13). Absent means none,
+   * which is what every worker gets unless it wrote the field — and what every job claimed
+   * by a runner older than this field gets, in the one direction that is safe to be wrong
+   * about.
+   *
+   * Validated with the closed set rather than `z.array(z.string())`, for the reason
+   * `egress` gives one field up: a name this build does not recognise has no safe
+   * interpretation. `linear-staging` would either be dropped (a worker that silently loses
+   * its connection) or honoured as an unknown app (a host table lookup that returns
+   * nothing, one refactor away from returning something). A closed set refuses the claim
+   * and says which names exist.
+   */
+  connections: z.array(z.enum(CONNECTED_APPS)).min(1).optional(),
   timeoutMs: z.number().int().positive(),
   skillRef: z.string(),
   verify: z.unknown().optional(),

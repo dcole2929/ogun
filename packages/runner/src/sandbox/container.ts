@@ -2,14 +2,18 @@ import { existsSync } from 'node:fs'
 import { chmod, mkdir, rm, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
-import { resolveEgressAllow, type EgressPolicy } from '@ogun/core'
+import { resolveEgressAllow, type ConnectedApp, type EgressPolicy } from '@ogun/core'
 import {
   CA_CONTAINER_PATH,
+  connectionStubs,
   credentialStubs,
+  sandboxConnectionEnv,
   sandboxProxyEnv,
   type Gateway,
   type GatewaySession,
+  type SessionConnections,
 } from '@ogun/gateway'
+import { connectionReader } from './connections.ts'
 import { spawnJsonl } from './exec.ts'
 import { GUEST_EGRESS_SOCKET, GUEST_PROXY_AUTHORITY, GUEST_PROXY_PORT } from './egress.ts'
 import { readContained } from './paths.ts'
@@ -34,6 +38,17 @@ export type SandboxEgress = {
   proxyUrl: string
   /** Placeholder credential files on the host, and the paths they mount at. */
   stubs: ReadonlyArray<{ hostPath: string; containerPath: string }>
+  /**
+   * Which connected applications this job was granted (§4.13), for the environment the
+   * container is given.
+   *
+   * The *credential* is not here and never crosses this type. What a container is told is
+   * the roster, the endpoint and a placeholder; the real token is read on the host, per
+   * request, behind the session `provision()` minted. Putting a credential in
+   * `SandboxEgress` would put it in `docker run`'s argv, which is the one place ADR-0010
+   * spent a whole component keeping it out of.
+   */
+  connections: readonly ConnectedApp[]
 }
 
 export type ContainerOptions = SandboxSpec & {
@@ -56,6 +71,22 @@ export type ContainerOptions = SandboxSpec & {
    * credential, precisely so that the opt-out is the one place to look.
    */
   egress?: EgressPolicy
+  /**
+   * Which connected applications this worker declared (§4.13). Absent means none, which is
+   * what every worker gets unless it wrote `connections:`.
+   *
+   * Read in `provision()` and turned into a per-session grant on the gateway, never into a
+   * value this container can see. `projectSlug` is what says *whose* connection: a grant
+   * is per project (ADR-0012), so a runner serving two projects must not hand one's Linear
+   * token to the other's job — which is exactly what a runner-level credential would do.
+   */
+  connections?: readonly ConnectedApp[]
+  /**
+   * Which project this job belongs to, for looking that grant up. Required whenever
+   * `connections` is non-empty and useless otherwise, so it is not made mandatory: every
+   * existing caller has no connections and no reason to learn a new field.
+   */
+  projectSlug?: string
   /**
    * The runner's gateway, if there is one. Read in `provision()`, never in
    * `buildRunArgs`.
@@ -119,6 +150,7 @@ const stubStagingDir = (containerName: string): string =>
 export function createContainerSandbox(opts: ContainerOptions): Sandbox {
   const image = opts.image ?? 'ogun/base:latest'
   const allow = resolveEgressAllow(opts.egress, opts.runtime)
+  const connections = opts.connections ?? []
   let session: GatewaySession | undefined
   let egressSession: SandboxEgress | undefined
   let stubDir: string | undefined
@@ -152,6 +184,25 @@ export function createContainerSandbox(opts: ContainerOptions): Sandbox {
           `[runner] ${opts.name}: egress is \`open\` — this container has unrestricted ` +
             'internet and a real mounted credential it can read, because there is no ' +
             'gateway on that path (§4.6, ADR-0010)',
+        )
+      }
+      /**
+       * A connection needs the gateway, and `open`/`none` have none.
+       *
+       * `workerSchema` already refuses this combination where it is written, which is the
+       * right place for it — but the config that produced this job may have been indexed
+       * by an older build, and a job arrives here through a database row rather than
+       * through the parser. So the check is here too, and it fails the run rather than
+       * dropping the connection quietly: a worker that asked for Linear and silently did
+       * not get it reports "linear rejected the credential" from inside a container, which
+       * sends an operator to rotate a credential that was never sent.
+       */
+      if (connections.length > 0 && !allow) {
+        throw new Error(
+          `${opts.name}: this worker declares \`connections: [${connections.join(', ')}]\` ` +
+            `and \`egress: ${opts.egress}\`, which have no gateway between them — \`open\` ` +
+            'bypasses it and `none` is an airgap, and a connected application is reached by ' +
+            'the gateway splicing this project\'s credential in at the wire (ADR-0010)',
         )
       }
       if (!allow) return
@@ -214,7 +265,28 @@ export function createContainerSandbox(opts: ContainerOptions): Sandbox {
        * `egress: [docs.example.com]` inheriting a modifier's reach. That regression never
        * fails a test; it just stops refusing things.
        */
-      session = opts.gateway.open(GUEST_PROXY_AUTHORITY, allow)
+      /**
+       * The grant, read once here and re-read per request behind a five-second memo.
+       *
+       * Awaited, so that the agent's first Linear call does not race a cold cache and
+       * collect a 502 for a credential that was on disk all along — see `connectionReader`.
+       * A project slug is required to look one up at all; a caller that declared
+       * connections without one has not finished wiring the job, and guessing would mean
+       * reading some *other* project's credential.
+       */
+      let granted: SessionConnections | undefined
+      if (connections.length > 0) {
+        if (!opts.projectSlug) {
+          throw new Error(
+            `${opts.name}: this worker declares \`connections:\` and the sandbox was given ` +
+              'no project slug — a connection is stored per project (ADR-0012), so there is ' +
+              'nothing to look one up by. This is a runner wiring bug',
+          )
+        }
+        granted = await connectionReader(opts.projectSlug, connections)
+      }
+
+      session = opts.gateway.open(GUEST_PROXY_AUTHORITY, allow, granted)
 
       /**
        * Written in `provision`, which runs ONCE per job (§5.2), so every file exists
@@ -227,7 +299,20 @@ export function createContainerSandbox(opts: ContainerOptions): Sandbox {
       stubDir = stubStagingDir(opts.name)
       await mkdir(stubDir, { recursive: true, mode: 0o700 })
       const stubs: Array<{ hostPath: string; containerPath: string }> = []
-      for (const stub of credentialStubs(opts.runtime)) {
+      /**
+       * The connection stubs ride the same list as the credential stubs, which is what
+       * makes the verification container inherit the right posture for free:
+       * `verificationOptions` empties `stubs`, so a test suite gets no connection
+       * description either. A separate list here would have been a second thing to
+       * remember to empty, and the one that got forgotten would be the one that mattered.
+       *
+       * `basename` is what flattens `/etc/ogun/connections/linear.json` and
+       * `/host-credentials/claude/.credentials.json` into one staging directory. Two stubs
+       * whose basenames collided would silently overwrite each other — `linear.json`,
+       * `auth.json` and `.credentials.json` do not, and any future pair that does is a bug
+       * worth noticing here rather than inside a container.
+       */
+      for (const stub of [...credentialStubs(opts.runtime), ...connectionStubs(connections)]) {
         const hostPath = join(stubDir, basename(stub.containerPath))
         await writeFile(hostPath, stub.content)
         // chmod separately: `writeFile`'s mode is masked by the process umask on create
@@ -244,6 +329,7 @@ export function createContainerSandbox(opts: ContainerOptions): Sandbox {
         caCertificatePath: opts.gateway.caCertificatePath,
         proxyUrl: session.proxyUrl,
         stubs,
+        connections,
       }
     },
     exec: (argv, exec = {}) =>
@@ -378,13 +464,22 @@ const lastLine = (stderr: string): string =>
  * It keeps the agent's gateway session — the same socket, the same CA, the same
  * allowlist — and loses every credential file, real or placeholder. A test suite does not
  * authenticate to a model API, and the residual exposure of `settings.json` is not one
- * worth carrying into a container that has no use for it (§3.6).
+ * worth carrying into a container that has no use for it (docs/gateway.md §3.8).
  */
 const verificationOptions = (opts: ContainerOptions): ContainerOptions => ({
   ...opts,
   name: verificationName(opts.name),
   credentials: 'none',
-  ...(opts.egressSession ? { egressSession: { ...opts.egressSession, stubs: [] } } : {}),
+  /**
+   * No stubs, and no connections either. A test suite does not authenticate to a model API
+   * and has no business calling a project's issue tracker — and unlike the agent container,
+   * nothing here was even asked to. Dropping the roster as well as the files is what stops
+   * `OGUN_CONNECTIONS=linear` reaching a container with no stub to go with it, which reads
+   * as a connection that exists and is broken.
+   */
+  ...(opts.egressSession
+    ? { egressSession: { ...opts.egressSession, stubs: [], connections: [] } }
+    : {}),
   env: { CI: '1', ...opts.env },
 })
 
@@ -587,6 +682,22 @@ function egressArgs(opts: ContainerOptions): string[] {
      * with.
      */
     ...Object.entries(sandboxProxyEnv(session.proxyUrl)).flatMap(([k, v]) => [
+      '--env',
+      `${k}=${v}`,
+    ]),
+    /**
+     * What the agent is told about the applications it may call (§4.13).
+     *
+     * Every value here is a placeholder or a public endpoint, which is why it is safe in a
+     * `docker run` argv at all — `LINEAR_API_KEY=ogun-gateway-placeholder` is a string whose
+     * whole purpose is to be worthless. The real token is read on the host, per request, and
+     * never appears in this process's arguments, this container's environment, or any file
+     * inside it.
+     *
+     * Empty when nothing was granted, so a container that asked for no connection has no
+     * variable suggesting it might have one.
+     */
+    ...Object.entries(sandboxConnectionEnv(session.connections)).flatMap(([k, v]) => [
       '--env',
       `${k}=${v}`,
     ]),

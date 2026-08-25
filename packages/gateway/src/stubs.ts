@@ -1,3 +1,5 @@
+import type { ConnectedApp } from '@ogun/core/connections'
+
 /**
  * The placeholder credentials a sandbox gets instead of the real ones, and the
  * environment that points it at the gateway.
@@ -8,6 +10,12 @@
  * its own credential, concludes it is expired or unusable, and either refuses to start or
  * tries to refresh it against a token endpoint that will reject a placeholder. Either way
  * the run dies before a single request reaches the gateway, and the error blames auth.
+ *
+ * A third kind lives here too: what a container is told about a *connected application* it
+ * was granted (§4.13). Same property, different audience — the reader is an agent rather
+ * than a CLI, so the stub carries a sentence saying it is a placeholder, which is the
+ * natural-language form of the same failure. See `connections.ts` for what decides whether
+ * a sandbox gets one at all.
  */
 
 /** Where the runner bind-mounts the gateway's CA certificate, read-only. */
@@ -114,6 +122,113 @@ function placeholderIdToken(): string {
     }),
     Buffer.from(PLACEHOLDER, 'utf8').toString('base64url'),
   ].join('.')
+}
+
+/**
+ * Where a connected application's description is mounted, read-only.
+ *
+ * Under `/etc/ogun/` beside the CA rather than under `/host-credentials/`, and the reason
+ * is `entrypoint.sh`: it *copies* `/host-credentials/...` into a writable home, because
+ * both CLIs rewrite their own credential files. Nothing rewrites this one, and a copy step
+ * would mean the image had to learn about connections — a change to a shell script that
+ * ships inside every project image, for a file that wants to be read where it lands. The
+ * mount point is created by docker, so no image rebuild is needed to gain a connection.
+ */
+export const CONNECTIONS_CONTAINER_DIR = '/etc/ogun/connections'
+
+export const connectionStubPath = (app: ConnectedApp): string =>
+  `${CONNECTIONS_CONTAINER_DIR}/${app}.json`
+
+/**
+ * What the container is told about a connection it has been granted.
+ *
+ * The agent has to know three things and none of them is a credential: that the
+ * application is reachable at all, the endpoint, and what to put in `Authorization` so
+ * that the *shape* of its request is right. The last one is the placeholder, and it is the
+ * same `PLACEHOLDER` every other stub uses — worthless if exfiltrated, recognisable in a
+ * transcript, and swapped out at the wire by `connectionInjections`.
+ *
+ * `note` is in the file on purpose. This is a document an agent reads, and an agent that
+ * knows the token is a placeholder does not waste a turn deciding it is unauthenticated
+ * and looking for the real one — which is the failure both credential stubs above are
+ * shaped against, arriving here in its natural-language form. It also states the two
+ * limits, because the alternative is discovering them as a 403 with no context: only
+ * `POST /graphql`, and the scope is whatever the workspace admin approved.
+ *
+ * Deliberately not a `.env`, a `settings.json`, or anything a library auto-discovers. A
+ * format nothing parses by convention is a format nothing can be tricked into re-emitting.
+ */
+export function connectionStub(app: ConnectedApp): string {
+  if (app === 'linear') {
+    return `${JSON.stringify(
+      {
+        app: 'linear',
+        endpoint: 'https://api.linear.app/graphql',
+        method: 'POST',
+        authorization: PLACEHOLDER,
+        note:
+          'This is a placeholder, not a credential. Send it; the Ogun gateway replaces it ' +
+          'with the project\'s real Linear token on the host, outside this container. Only ' +
+          'POST /graphql on this host is reachable — every other path, including the OAuth ' +
+          'endpoints, is refused. What the token may do is whatever scope the workspace ' +
+          'admin approved for this application.',
+      },
+      null,
+      2,
+    )}\n`
+  }
+  // Exhaustive rather than a fallthrough: the second application must be a compile error
+  // in the function that decides what its container is told, not a missing file at 3am.
+  const exhaustive: never = app
+  return exhaustive
+}
+
+/**
+ * The stub files for a set of granted applications.
+ *
+ * 0644, unlike `credentialStubs`' 0600, and the difference is deliberate rather than an
+ * oversight. Those files are credential-*shaped* and sit at the paths real credentials
+ * used to occupy, so their mode has to already be right on the day somebody reaches for
+ * that code for something that is not a placeholder. This file is a *description of a
+ * connection* — an endpoint, a method, a sentence — and can never hold a credential,
+ * because the credential is spliced in at the wire and has no path through this function.
+ * A 0600 file mounted into a container that runs as uid 1000 would also be unreadable the
+ * first time somebody ran a container as a different user, which is a support ticket
+ * bought for a secret that is not there.
+ */
+export function connectionStubs(apps: readonly ConnectedApp[]): CredentialStub[] {
+  return apps.map((app) => ({
+    containerPath: connectionStubPath(app),
+    content: connectionStub(app),
+    mode: 0o644,
+  }))
+}
+
+/**
+ * The environment that tells an agent a connection exists, without it having to find a
+ * file first.
+ *
+ * `OGUN_CONNECTIONS` is the roster — the one variable a skill can read to branch on
+ * "may I call Linear?" without guessing at a path. The per-app variables are the values a
+ * conventional client already looks for, so a skill that reaches for a Linear SDK gets a
+ * working call rather than an unauthenticated one; the value is the placeholder, which is
+ * the whole point of it being safe to put in a `docker run` argv.
+ *
+ * Absent when nothing was granted, rather than set to an empty string. `OGUN_CONNECTIONS=`
+ * and no `OGUN_CONNECTIONS` are the same to a shell test and different to anything that
+ * splits on commas, and "granted nothing" is the state that must never read as "granted
+ * something I could not name".
+ */
+export function sandboxConnectionEnv(apps: readonly ConnectedApp[]): Record<string, string> {
+  if (apps.length === 0) return {}
+  const env: Record<string, string> = { OGUN_CONNECTIONS: apps.join(',') }
+  for (const app of apps) {
+    if (app === 'linear') {
+      env.OGUN_LINEAR_ENDPOINT = 'https://api.linear.app/graphql'
+      env.LINEAR_API_KEY = PLACEHOLDER
+    }
+  }
+  return env
 }
 
 export function credentialStubs(runtime: 'claude' | 'codex', now = new Date()): CredentialStub[] {

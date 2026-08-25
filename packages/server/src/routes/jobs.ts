@@ -253,6 +253,10 @@ jobsRoutes.post('/claim', async (c) => {
         // whole parsed worker, so a new field needs no migration and a worker indexed
         // before this existed simply has none.
         ...(config.egress === undefined ? {} : { egress: config.egress }),
+        // Same door, same reasoning: `connections:` is part of the parsed worker, so a
+        // worker indexed before this field existed simply has none — which is also what a
+        // worker that never declared one has, and is the safe direction to be wrong in.
+        ...(config.connections === undefined ? {} : { connections: config.connections }),
         timeoutMs: Number(config.timeoutMs ?? 30 * 60_000),
         skillRef: found.worker.skillRef,
         verify: config.verify,

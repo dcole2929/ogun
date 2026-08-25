@@ -73,10 +73,16 @@ than used and lost between page two and page three of a paged read.
 
 **How this sits with the credential preflight.** It does not, and that is deliberate.
 `fleetCredentials` and admission refuse a *job* whose model-provider credential will not
-outlive it. A Linear grant is not part of that and must not become part of it: nothing
-about Linear reaches a sandbox, so a job emitted from a ticket never authenticates to
-Linear, and refusing one over a Linear token would be refusing work for a credential it
-does not use. What is shared is the *vocabulary* — `CredentialExpiry`, `credentialHealth`,
+outlive it. A Linear grant is not part of that and must not become part of it: refusing a
+job over a Linear token would be refusing work for a credential most jobs do not use.
+**[amended]** The original reason given — that nothing about Linear reaches a sandbox —
+stopped being true when a worker gained `connections: [linear]` (ADR-0013, Consequences),
+and the decision survives the reason changing. A job that *was* granted a connection and
+finds no live grant is answered by the gateway with a `502` naming the cause, at the moment
+it asks, rather than being refused before it starts; the alternative is a preflight that
+refuses a whole job because one optional call would have failed. Whether a granted job
+should be preflighted like a model credential is an open edge and would be a real finding.
+What is shared is the *vocabulary* — `CredentialExpiry`, `credentialHealth`,
 `humanDuration`, and now `GRANT_REFRESH_HORIZON_MS` and `describeGrant`, all in
 `credentials.ts` — so "expires in 42 minutes" means the same thing in `doctor` whether it
 is about Anthropic or about a workspace. **The grant gates the poll; the preflight gates
@@ -328,11 +334,16 @@ use is how someone spends an hour debugging the wrong one:
   `expose()` a token to read the number beside it, and ADR-0012's "expose() appears once per
   consumer, at the wire" would be false by construction.
 
-- **Refreshing in the gateway, the way ADR-0010 discussed.** Not applicable and worth saying
-  so, because the shape looks familiar. The gateway splices credentials for three model
-  providers into *sandbox* traffic. Nothing about Linear reaches a sandbox — the host polls
-  and only ticket text becomes prompt content — so a gateway that knew about
-  `api.linear.app` would be the symptom ADR-0012 and §4.13 both name, not a feature.
+- **Refreshing in the gateway, the way ADR-0010 discussed.** Rejected, and still rejected —
+  the gateway does not refresh anything, here or for the model providers. **[amended]** The
+  reason originally given was wider than the decision: it said a gateway that knew about
+  `api.linear.app` at all would be a symptom rather than a feature. A later slice made the
+  gateway splice this grant into *sandbox* traffic on purpose, so that a skill can act on a
+  ticket it was already given (ADR-0013, Consequences). What that changes is who may send a
+  request; what it does not change is who renews the token. The renewal stays where this
+  record puts it — on the control plane, on demand, immediately before the poll that needs
+  one — and the gateway re-reads the store through `readProjectSecret` exactly as it
+  re-reads `~/.claude/.credentials.json` for Anthropic. One writer, one refresh path.
 
 ## Consequences
 
