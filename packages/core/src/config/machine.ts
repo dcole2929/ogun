@@ -368,6 +368,22 @@ async function breakAbandonedLock(lockPath: string): Promise<boolean> {
   // Gone underneath us: the holder finished, so there is nothing to break and retrying is
   // the whole answer.
   if (age < 0) return false
+  /**
+   * An owner we cannot read is a lock being *written*, not one abandoned.
+   *
+   * `claimLock` creates the file and writes the pid in one `writeFile`, but a reader that
+   * arrives between those two things sees an empty file. `Number.parseInt('')` is `NaN`,
+   * `alive(NaN)` is false, and without this the next two lines delete a lock whose holder
+   * is very much alive — both writers then proceed and one silently loses its edit, which
+   * is the exact failure this lock exists to prevent, reachable only while it is being
+   * taken.
+   *
+   * It cost a test that failed roughly one run in eight with `edits dropped: p1` and
+   * passed in isolation every time. Age is the tiebreak rather than a retry: a file that
+   * has been unreadable for longer than the stale window is a crash between `open` and
+   * `write`, and that one really is abandoned.
+   */
+  if (!Number.isInteger(owner) && age < CONFIG_LOCK_STALE_MS) return false
   if (alive(owner) && age < CONFIG_LOCK_STALE_MS) return false
   await rm(lockPath, { force: true })
   return true
