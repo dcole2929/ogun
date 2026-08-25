@@ -18,6 +18,11 @@ import { connectionReader, linearConnection } from '../src/sandbox/connections.t
 
 const grant = (over: Partial<OAuthGrant> = {}): OAuthGrant => ({
   clientId: 'client-abc',
+  // `grantType` became required while this file was being written: a grant renews by
+  // branching on it rather than on whether a refresh token happens to be present, so a
+  // fixture without one describes a grant nothing could renew. `authorization_code` here
+  // because this fixture carries a refresh token, which only that grant issues.
+  grantType: 'authorization_code',
   access: sealSecret('lin_oauth_real_token'),
   refresh: sealSecret('lin_refresh_real'),
   expiresAt: Date.UTC(2030, 0, 1),

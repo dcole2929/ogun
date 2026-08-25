@@ -165,12 +165,12 @@ export function secretWriteTransport(
   return {
     allowed: false,
     reason:
-      `this control plane is bound to ${bind} and serves plain HTTP, so a key typed into ` +
-      'a browser would cross the network in cleartext — and Ogun cannot tell from inside ' +
-      'whether anything in front of it terminates TLS. Set it with `ogun secret set ' +
-      '<name>` on the control-plane machine — in the project\'s directory, or with ' +
-      '`--project <slug>` — which writes the file directly and sends nothing anywhere. If ' +
-      'TLS is terminated in front of this process, say so ' +
+      `this control plane is bound to ${bind} and serves plain HTTP, so a credential typed ` +
+      'into a browser would cross the network in cleartext — and Ogun cannot tell from ' +
+      'inside whether anything in front of it terminates TLS. Connect it with `ogun ' +
+      'connect <integration>` on the control-plane machine — in the project\'s directory, ' +
+      'or with `--project <slug>` — which writes the file directly and sends nothing ' +
+      'anywhere. If TLS is terminated in front of this process, say so ' +
       `by starting the server with ${TLS_PROXY_ENV}=1.`,
   }
 }

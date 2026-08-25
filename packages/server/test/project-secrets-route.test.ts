@@ -46,7 +46,7 @@ test('loopback can carry a secret; a wider bind cannot', () => {
     // The refusal has to name the path that always works, or it is a wall with no door.
     assert.match(
       transport.allowed ? '' : transport.reason,
-      /ogun secret set/,
+      /ogun connect <integration>/,
       'a refusal that does not name the CLI leaves the operator with nothing to do',
     )
   }
@@ -289,7 +289,7 @@ describe('a project secret can be set over HTTP, and only when the wire can carr
     setEnv('OGUN_BIND', '0.0.0.0')
     const res = await setSecret(slug, 'linear', 'lin_api_NEVER_STORED_XXXXXXXXXXXXXXXX')
     assert.equal(res.status, 403)
-    assert.match(await res.text(), /cleartext[\s\S]*ogun secret set/)
+    assert.match(await res.text(), /cleartext[\s\S]*ogun connect <integration>/)
 
     const forged = await put(slug, 'linear', JSON.stringify({ value: 'lin_api_ALSO_NEVER' }), {
       headers: { 'content-type': 'application/json', 'x-forwarded-proto': 'https' },
@@ -308,7 +308,7 @@ describe('a project secret can be set over HTTP, and only when the wire can carr
       projectSecretWrites: { allowed: boolean; reason: string | null; names: string[] }
     }
     assert.equal(system.projectSecretWrites.allowed, false)
-    assert.match(system.projectSecretWrites.reason ?? '', /ogun secret set/)
+    assert.match(system.projectSecretWrites.reason ?? '', /ogun connect <integration>/)
     assert.deepEqual(system.projectSecretWrites.names, ['linear'])
 
     // Declared TLS in front, and the same request is fine.

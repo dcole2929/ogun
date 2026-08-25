@@ -83,7 +83,7 @@ export async function projectSecrets(path = localConfigPath()): Promise<Check> {
     return {
       name: 'project secrets',
       ok: true,
-      detail: 'none stored here — `ogun secret set <name>` in the project directory',
+      detail: 'none stored here — `ogun connect <integration>` in the project directory',
       fatal: false,
     }
   }
@@ -156,14 +156,23 @@ export async function linearGrants(path = localConfigPath(), now = Date.now()): 
     const shadowed = keyed.has(`${app.project}/${app.provider}`)
       ? ' — an api key is also stored for this project and is NOT being used'
       : ''
+    // Which grant, because the two differ in what they can SEE: a client-credentials
+    // token reaches the workspace's public teams and no others, which is the difference
+    // between "connected" and "connected and finding nothing".
+    const how =
+      app.grantType === 'client_credentials'
+        ? ', app token (public teams)'
+        : app.grantType === 'authorization_code'
+          ? ', by consent'
+          : ''
     return {
       name: `${app.provider} ${app.project}`,
       ok: app.connected,
       detail: app.connected
-        ? `${health.detail}${where}${asWhom ? `, ${asWhom}` : ''}` +
+        ? `${health.detail}${where}${asWhom ? `, ${asWhom}` : ''}${how}` +
           `${app.scopes.length > 0 ? `, scopes: ${app.scopes.join(' ')}` : ''}${shadowed}`
         : `application ${app.clientId} registered, never connected — ` +
-          `\`ogun linear connect --project ${app.project}\``,
+          `\`ogun connect ${app.provider} --project ${app.project}\``,
       fatal: false,
     }
   })

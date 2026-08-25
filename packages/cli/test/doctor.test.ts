@@ -214,7 +214,7 @@ test('an application nobody connected warns, and names the command that finishes
   const [check] = await linearGrants(store, now)
   assert.equal(check?.ok, false)
   assert.match(check!.detail, /never connected/)
-  assert.match(check!.detail, /ogun linear connect --project ogun/)
+  assert.match(check!.detail, /ogun connect linear --project ogun/)
 })
 
 /**

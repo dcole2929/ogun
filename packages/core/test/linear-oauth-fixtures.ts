@@ -27,8 +27,19 @@
  *  - `actor=app` takes `user` (default) or `app`; the docs say `app` "should be used for
  *    agents and service accounts". It cannot be combined with the `admin` scope, and
  *    installing that way is workspace-level and needs an admin to approve.
- *  - `client_credentials` returns a 30-day token with **no** refresh token. Ogun refuses
- *    that shape rather than storing an unrenewable connection.
+ *  - `client_credentials` returns a 30-day token (`expires_in: 2591999`) with **no**
+ *    refresh token, and its `scope` parameter is **required** and **comma-separated**. The
+ *    token "will be an `app` actor token that has access to all public teams in the
+ *    workspace" — the actor is implicit, so there is no `actor` parameter on that request.
+ *    Linear's instruction for renewing it is "your server is expected to fetch a new token
+ *    if it receives a 401 error", which is to say: ask again. **This is now the grant Ogun
+ *    connects with by default.** The earlier note here said Ogun refused that shape rather
+ *    than storing an unrenewable connection; the premise — that a refresh token is the only
+ *    renewal there is — is what changed.
+ *  - `teams(first: 50) { nodes { id key name } }` is the probe run once at connect to show
+ *    which teams a new token can actually read. The field names come from the schema their
+ *    SDK is generated from. **Nothing here has observed what a `read`-only app-actor token
+ *    returns from it**, and that is the same honest gap named below rather than a new one.
  *  - The only documented error body is `{ "error": …, "error_description": … }`, and it is
  *    documented only for the client-credentials grant, where `error` is the literal string
  *    `"Error"` rather than an RFC 6749 code. There is no documented error table for the
@@ -86,5 +97,35 @@ export const identityResponse = (over: { app?: boolean } = {}): string =>
     data: {
       viewer: { id: 'app-user-1', name: 'Ogun', app: over.app ?? true },
       organization: { id: 'org-1', name: 'Acme', urlKey: 'acme' },
+    },
+  })
+
+/**
+ * The documented success body for a `client_credentials` grant.
+ *
+ * No `refresh_token`, and `expires_in: 2591999` — one second under 30 days, the same way
+ * the authorization-code example is one second under 24 hours. Both oddities are Linear's
+ * and are reproduced rather than rounded, because a fixture that tidies its source is a
+ * fixture that proves the author and the parser agree.
+ */
+export const appTokenResponse = (over: Record<string, unknown> = {}): string =>
+  JSON.stringify({
+    access_token: 'cccc1111dddd2222eeee3333ffff4444aaaa5555bbbb6666cccc7777dddd8888',
+    token_type: 'Bearer',
+    expires_in: 2591999,
+    scope: 'read',
+    ...over,
+  })
+
+/** What the teams probe reads. `HEI` is the team this feature was built against. */
+export const teamsResponse = (): string =>
+  JSON.stringify({
+    data: {
+      teams: {
+        nodes: [
+          { id: 'team-1', key: 'ENG', name: 'Engineering' },
+          { id: 'team-2', key: 'HEI', name: 'Heirchive' },
+        ],
+      },
     },
   })

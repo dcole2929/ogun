@@ -123,7 +123,17 @@ test('a control plane that cannot carry a secret offers the CLI, not a form', ()
   )
 
   assert.ok(!html.includes('type="password"'), 'a key field was rendered on a refusing bind')
-  assert.match(html, /ogun secret set/, 'the refusal has to name the path that works')
+  // React splits the interpolated secret name with a comment node, so this matches the
+  // two halves rather than the rendered string.
+  assert.match(html, /ogun connect .*linear.* --api-key/, 'the refusal has to name the path that works')
+  /**
+   * The usage line the refusal prints has to name the value, not only the command.
+   *
+   * This is the fault the whole `connect` change is about, arriving on the surface where it
+   * costs the most: an operator being sent from a browser to a terminal on another machine
+   * has one chance to be told what the command will ask for.
+   */
+  assert.match(html, /&lt;key&gt;|<key>/, 'the usage line has to name the key it needs')
   assert.match(html, /plain HTTP/, "the server's reason should be shown, not paraphrased")
 })
 
@@ -224,7 +234,12 @@ test('a control plane that cannot carry a secret offers the CLI for linear too',
     qc.setQueryData(['linearOauth'], linearOauth({ writesAllowed: false }))
   })
 
-  assert.match(html, /ogun linear app/, 'the refusal has to name the path that works')
+  assert.match(html, /ogun connect linear/, 'the refusal has to name the path that works')
+  assert.match(
+    html,
+    /client-id/,
+    'the usage line has to name the two values the command will ask for',
+  )
 })
 
 test('SKILL.md renders every block type it uses', () => {

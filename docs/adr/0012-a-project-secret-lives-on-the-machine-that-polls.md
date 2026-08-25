@@ -145,7 +145,9 @@ behaviour for a credential anyway: a secret that migrates itself is a secret in 
   doing; it is not possible now, and guessing would be the absence-of-evidence mistake the
   credential preflight was built to avoid.
 
-- **Setting is `ogun secret set <name>`, on the control-plane machine.** There is no route that accepts a
+- **Setting is `ogun connect <integration>`, on the control-plane machine.** [amended —
+  ADR-0014: this bullet said `ogun secret set <name>`; the namespace was subsumed, see the
+  amendment above.] There is no route that accepts a
   secret, because a value in a request body is a value in a reverse proxy's access log and
   in a browser's network panel. The UI shows presence and points at the command. **This is
   a real gap for a remote control plane** — the operator has to reach a shell on that
@@ -291,6 +293,54 @@ behaviour for a credential anyway: a secret that migrates itself is a secret in 
   `ogun secret set lin_api_…` — someone who remembered that the key does not go in argv and
   forgot that the name does. So the CLI now withholds it too, and says instead that if that
   is what happened, the key should be treated as compromised.
+
+  [amended — ADR-0014] **The command is now `ogun connect linear --api-key`.** The
+  namespace is gone rather than renamed: setting a personal key and connecting an OAuth
+  application were two vocabularies for "give Ogun access to Linear", and having two was
+  the fault. Every rule in this bullet survives the move — the value stays out of the store
+  unless the project checks out, the rejected name is still withheld, the confirmation
+  still reports what it displaced, and `rm` — now `ogun disconnect linear` — still checks
+  nothing, because a row the listing shows has to be a row you can remove. ADR-0014's
+  amendment argues the subsumption; what belongs here is that nothing about *where the
+  value lives* changed.
+
+  [amended] **A value passed as an argument is now accepted with a warning, where it used
+  to be refused.** This reverses a decision this record made deliberately and tested, so it
+  is recorded rather than quietly dropped. The superseded sentence:
+
+  > *"So a second positional is **refused** rather than accepted, and the refusal says both
+  > of the above. Silently ignoring it would be worse than taking it: the operator would
+  > believe the secret was stored and would still have leaked it."*
+
+  Both halves of the hazard it names are unchanged and still true: `/proc/<pid>/cmdline` is
+  world-readable while the process runs, and the shell writes the whole line into a history
+  file nobody audits. What the argument did not weigh is the cost of the refusal itself,
+  which the product owner did:
+
+  - **A usage line that hides an input is the fault this whole change is about.** The
+    signature must read `ogun connect linear --api-key <key>` — naming the value where a
+    reader of `--help` will see it. Naming it and then refusing it teaches the reader that
+    the documentation lies, which is worse than either alternative on its own.
+  - **Refusing does not un-leak anything.** By the time the process can refuse, argv has
+    already been in `/proc` and the history file has already been written. The refusal
+    withholds the store and nothing else — and the operator, having leaked the key, now
+    also does not have it configured.
+  - **The convention is to warn.** `docker login -p` prints *"WARNING! Using --password via
+    the CLI is insecure"* and proceeds. Somebody who has met that convention reads a hard
+    refusal as a bug and works around it, and the workaround is usually worse than the
+    thing being prevented.
+
+  So: the value is accepted, the warning is unconditional and goes to stderr where a
+  redirect cannot swallow it, and it carries the same *"treat it as compromised"* advice
+  the refusal used to. **Nothing else about containment moved.** The value is normalised
+  and sealed into a `Secret` exactly as a prompted one is, it is never echoed — not in the
+  warning and not in the confirmation — and it never appears in an error message. The
+  prompt and the pipe stay the recommended paths and every usage line says so underneath
+  itself: omit the value and it prompts with the echo off at a terminal, and reads stdin
+  when stdin is a pipe.
+
+  The test that asserted the refusal is gone, replaced by one asserting the warning fires,
+  the value is stored, and no surface repeats it back.
 
 - **The value cannot enter a sandbox, and it is a test rather than a promise.** The wire
   has no field for it (`claimedJobSchema` strips one), so it cannot reach a runner; the

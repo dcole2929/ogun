@@ -277,10 +277,12 @@ function ProjectSecrets({
         the control-plane machine, never in the repository and never in the database.
       </p>
       <p className="muted" style={{ marginTop: 0, fontSize: 12 }}>
-        For Linear this is now the <em>fallback</em>. A personal key makes everything Ogun
-        does appear as you, so connecting an application above is preferred — and a project
-        that has connected ignores any key stored here. The key stays supported for a
-        workspace where you are not an admin, since installing an application needs one.
+        For Linear this is the <em>fallback</em>. A personal key makes everything Ogun does
+        appear as you — and once write-back lands, every comment it posts carries your name
+        on a board other people make decisions from. Connecting an application above is
+        preferred and, since it needs nobody&rsquo;s approval, is no longer harder. A
+        project that connects has any key stored here removed with it; one that was left
+        behind by an older build is shown below as not being used.
       </p>
 
       {secrets.length === 0 ? (
@@ -437,14 +439,21 @@ function ProjectSecrets({
                 key anyway, which is the one thing this refusal is preventing. */}
             {writes.reason}
           </p>
-          {/* The whole command, redirection included. `ogun secret set linear` on its own
-              reads as complete and is not — the key arrives on stdin, and an operator who
-              copies a line that does not say so gets a hung terminal at a machine they had
-              to SSH into. --project rather than the directory default, because the control
-              plane that refused this write is the one least likely to have the repo on it. */}
+          {/* Every input in the line, including the one that is not an argument. A usage
+              line that reads as complete and is not is how an operator who had to SSH into
+              a machine ends up at a hung terminal. --project rather than the directory
+              default, because the control plane that refused this write is the one least
+              likely to have the repo checked out on it. */}
           <pre className="md-code" style={{ fontSize: 11, marginBottom: 0 }}>
-            ogun secret set {writes.names[0] ?? 'linear'} --project &lt;slug&gt; &lt; key.txt
+            ogun connect {writes.names[0] ?? 'linear'} --api-key &lt;key&gt; --project
+            &lt;slug&gt;
           </pre>
+          <p className="muted" style={{ fontSize: 11, marginTop: 4, marginBottom: 0 }}>
+            Leave &lt;key&gt; off and it prompts with the echo off, or pipe it on stdin.
+            Passing it inline works and warns: argv is readable through{' '}
+            <span className="mono">/proc</span> while the command runs, and your shell
+            writes the whole line to its history.
+          </p>
         </>
       )}
     </div>
@@ -611,8 +620,17 @@ function LinearConnection() {
   const [copied, setCopied] = useState(false)
   const [confirming, setConfirming] = useState<string | null>(null)
 
-  const register = useMutation({
-    mutationFn: () => api.setLinearApp(project, clientId, clientSecret),
+  /**
+   * The default: register and take a token in one request, with no browser anywhere in it.
+   *
+   * Called with credentials from the form, and with none at all from the table's Connect
+   * button — where the application is already registered on the control-plane machine and
+   * asking somebody to paste a client secret they already gave us would be how a trailing
+   * space gets into a credential.
+   */
+  const connectApp = useMutation({
+    mutationFn: (input: { project: string; credentials?: { clientId: string; clientSecret: string } }) =>
+      api.connectLinear(input.project, input.credentials),
     onSuccess: () => {
       // Cleared first. Everything after this line is presentation, and the field must not
       // still hold the secret while any of it runs.
@@ -622,9 +640,27 @@ function LinearConnection() {
     },
   })
 
-  const connect = useMutation({
-    mutationFn: (slug: string) => api.startLinearConnect(slug),
+  /**
+   * The consent flow: register the application, then navigate to Linear's consent screen.
+   *
+   * Two requests because it genuinely is two acts — the second one leaves this page. It is
+   * the secondary button rather than the primary one because it needs a workspace admin and
+   * reaches nothing the default cannot, *unless* the teams being polled are private, which
+   * is the sentence beside it.
+   */
+  const consent = useMutation({
+    mutationFn: async (input: {
+      project: string
+      credentials?: { clientId: string; clientSecret: string }
+    }) => {
+      if (input.credentials) {
+        await api.setLinearApp(input.project, input.credentials.clientId, input.credentials.clientSecret)
+      }
+      return api.startLinearConnect(input.project)
+    },
     onSuccess: (result) => {
+      setClientSecret('')
+      setClientId('')
       /**
        * A full navigation rather than a new tab. `window.open` is what a popup blocker
        * eats, and the flow ends with Linear redirecting back to this same origin — so a
@@ -636,8 +672,7 @@ function LinearConnection() {
   })
 
   const disconnect = useMutation({
-    mutationFn: (input: { project: string; forgetApp: boolean }) =>
-      api.disconnectLinear(input.project, input.forgetApp),
+    mutationFn: (slug: string) => api.disconnectLinear(slug),
     onSuccess: () => {
       setConfirming(null)
       void qc.invalidateQueries({ queryKey: ['linearOauth'] })
@@ -653,7 +688,19 @@ function LinearConnection() {
       <p className="muted" style={{ marginTop: 0, fontSize: 12 }}>
         The preferred way to authenticate. A personal API key makes everything Ogun does
         appear as <em>you</em> on a board other people read; an application acts as itself.
-        Ogun ships no client id — it is self-hosted, so each workspace registers its own.
+        Ogun ships no client id — it is self-hosted, so each workspace registers its own at{' '}
+        <a href={data.registerUrl} target="_blank" rel="noreferrer">
+          linear.app/settings/api/applications/new
+        </a>
+        .
+      </p>
+      <p className="muted" style={{ marginTop: 0, fontSize: 12 }}>
+        <strong>Connect</strong> asks Linear for a token in Ogun&rsquo;s own name — no
+        browser, no consent screen, nobody to approve it. That token reaches the
+        workspace&rsquo;s <strong>public teams only</strong>.{' '}
+        <strong>Connect with consent</strong> sends you to Linear to approve an install
+        instead, which is what reaches <strong>private teams</strong> and needs a workspace
+        admin.
       </p>
 
       {/* The result of a redirect back from Linear. A reason code, mapped to a sentence
@@ -691,12 +738,14 @@ function LinearConnection() {
             {copied ? 'copied' : 'copy'}
           </button>
           <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
-            Paste this into <span className="mono">Redirect callback URLs</span> at{' '}
+            <strong>Only needed for the consent flow.</strong> Paste it into{' '}
+            <span className="mono">Redirect callback URLs</span> at{' '}
             <a href={data.registerUrl} target="_blank" rel="noreferrer">
               linear.app/settings/api/applications/new
             </a>
             . Linear matches it exactly — scheme, host, port and trailing slash — and its
-            error for a mismatch does not say so.
+            error for a mismatch does not say so. The plain Connect button has no browser
+            round trip, so it has no redirect URI at all.
           </div>
         </dd>
 
@@ -704,9 +753,10 @@ function LinearConnection() {
         <dd>
           <span className="mono">{data.scopes.join(', ')}</span>
           <span className="muted" style={{ marginLeft: 8, fontSize: 12 }}>
-            as <span className="mono">actor={data.actor}</span> — a workspace-level install,
-            so Linear needs a workspace admin to approve it. If you are not one, a personal
-            key below still works.
+            as <span className="mono">actor={data.actor}</span> — implicit on the plain
+            Connect, and a workspace-level install on the consent flow, where Linear needs a
+            workspace admin to approve it. Write scopes are added when the code that needs
+            them lands, not before.
           </span>
         </dd>
       </dl>
@@ -718,6 +768,7 @@ function LinearConnection() {
               <th>Project</th>
               <th>Workspace</th>
               <th>Acting as</th>
+              <th>How</th>
               <th>Scopes</th>
               <th>Token</th>
               <th />
@@ -742,20 +793,37 @@ function LinearConnection() {
                     <span className="muted">—</span>
                   )}
                 </td>
+                {/* Which grant, because the two differ in what they can SEE. A row that
+                    says "connected" and nothing else cannot explain a source that polls
+                    successfully and finds no tickets in a workspace of private teams. */}
+                <td className="muted" style={{ fontSize: 12 }}>
+                  {app.grantType === 'client_credentials' ? (
+                    <span title="reaches the workspace's public teams only">
+                      app token
+                    </span>
+                  ) : app.grantType === 'authorization_code' ? (
+                    <span title="reaches whatever the approver could see">by consent</span>
+                  ) : (
+                    '—'
+                  )}
+                </td>
                 <td className="mono muted">{app.scopes.join(' ') || '—'}</td>
                 <td>{tokenState(app)}</td>
                 <td>
                   {confirming === app.project ? (
                     <span className="row">
+                      {/* Says what goes, because the default now takes the client id and
+                          secret with it: under the app-token grant those two ARE the
+                          credential, so leaving them would be a disconnection the next
+                          poll undoes. */}
                       <span className="muted" style={{ fontSize: 12 }}>
-                        the next poll authenticates with nothing — sure?
+                        every credential for this project goes, client id and secret
+                        included — the next poll authenticates with nothing. Sure?
                       </span>
                       <button
                         className="danger"
                         disabled={disconnect.isPending}
-                        onClick={() =>
-                          disconnect.mutate({ project: app.project, forgetApp: false })
-                        }
+                        onClick={() => disconnect.mutate(app.project)}
                       >
                         Disconnect
                       </button>
@@ -766,10 +834,13 @@ function LinearConnection() {
                       Disconnect
                     </button>
                   ) : (
+                    // No credentials sent: the application is already on the control-plane
+                    // machine, and asking for a client secret we are holding is how a
+                    // trailing space gets into one.
                     <button
                       className="primary"
-                      disabled={connect.isPending}
-                      onClick={() => connect.mutate(app.project)}
+                      disabled={connectApp.isPending}
+                      onClick={() => connectApp.mutate({ project: app.project })}
                     >
                       Connect
                     </button>
@@ -780,7 +851,8 @@ function LinearConnection() {
           </tbody>
         </table>
       )}
-      {connect.error && <p className="error">{String(connect.error)}</p>}
+      {connectApp.error && <p className="error">{String(connectApp.error)}</p>}
+      {consent.error && <p className="error">{String(consent.error)}</p>}
       {disconnect.error && <p className="error">{String(disconnect.error)}</p>}
 
       {data.writesAllowed ? (
@@ -830,13 +902,36 @@ function LinearConnection() {
           <div className="row" style={{ marginTop: 10 }}>
             <button
               className="primary"
-              disabled={project === '' || clientId.trim() === '' || clientSecret.trim() === '' || register.isPending}
-              onClick={() => register.mutate()}
+              disabled={
+                project === '' ||
+                clientId.trim() === '' ||
+                clientSecret.trim() === '' ||
+                connectApp.isPending
+              }
+              onClick={() =>
+                connectApp.mutate({ project, credentials: { clientId, clientSecret } })
+              }
             >
-              {register.isPending ? 'storing…' : 'Register application'}
+              {connectApp.isPending ? 'connecting…' : 'Connect'}
+            </button>
+            <button
+              disabled={
+                project === '' ||
+                clientId.trim() === '' ||
+                clientSecret.trim() === '' ||
+                consent.isPending
+              }
+              onClick={() =>
+                consent.mutate({ project, credentials: { clientId, clientSecret } })
+              }
+            >
+              {consent.isPending ? 'starting…' : 'Connect with consent'}
             </button>
           </div>
-          {register.error && <p className="error">{String(register.error)}</p>}
+          <p className="muted" style={{ fontSize: 11, marginTop: 6, marginBottom: 0 }}>
+            Connecting removes any personal API key stored for this project: a grant wins
+            over a key, so leaving one would leave a credential nothing reads.
+          </p>
         </>
       ) : (
         <>
@@ -847,17 +942,18 @@ function LinearConnection() {
             This control plane will not accept a client secret over this transport. The CLI
             writes it to this machine directly and sends nothing anywhere.
           </p>
-          {/* What the command asks for, said here rather than discovered by running it.
-              `ogun linear app` reads as complete and is not: it prompts for a Client ID and
-              a Client Secret, which is the whole reason an operator is being sent to a
-              terminal. --project rather than the directory default, because the control
-              plane that refused this write is the one least likely to have the repo on it. */}
+          {/* The usage line names every input, including the ones that are not arguments —
+              which is the whole reason an operator being sent to a terminal should not be
+              surprised when they get there. --project rather than the directory default,
+              because the control plane that refused this write is the one least likely to
+              have the repo checked out on it. */}
           <pre className="md-code" style={{ fontSize: 11, marginBottom: 0 }}>
-            ogun linear app --project &lt;slug&gt;
+            ogun connect linear &lt;client-id&gt; &lt;client-secret&gt; --project &lt;slug&gt;
           </pre>
           <p className="muted" style={{ fontSize: 11, marginTop: 4, marginBottom: 0 }}>
-            It asks for the Client ID and the Client Secret, and prints the callback URL to
-            register in Linear first.
+            Leave both off and it prompts — the Client ID visibly, the Client Secret with the
+            echo off. Passing the secret inline works and warns, because argv is readable
+            through <span className="mono">/proc</span> and your shell writes it to history.
           </p>
         </>
       )}

@@ -508,13 +508,13 @@ function missingKey(
   slug: string,
   key: Exclude<ProjectSecret, { state: 'present' } | { state: 'granted' }>,
 ): string {
-  const set = `\`ogun secret set linear --project ${slug}\``
+  const set = `\`ogun connect linear --project ${slug}\``
   switch (key.state) {
     case 'unconnected':
       return (
         `"${slug}" has a linear oauth application registered (client ${key.clientId}) and ` +
         'nobody has finished the authorization, so there is nothing to poll with. Connect ' +
-        `it from Settings, or run \`ogun linear connect --project ${slug}\``
+        `it from Settings, or run \`ogun connect linear --project ${slug}\``
       )
     case 'malformed':
       return (
@@ -522,11 +522,11 @@ function missingKey(
         `(${key.reason}). The store itself is fine — this one project needs reconnecting`
       )
     case 'absent':
-      return `no linear api key for "${slug}" on this machine — run ${set}`
+      return `"${slug}" is not connected to linear on this machine — run ${set}`
     case 'empty':
       return (
         `the linear api key for "${slug}" is set to an empty value, which the write path ` +
-        `refuses to create — something wrote a blank over it. Run ${set} again`
+        `refuses to create — something wrote a blank over it. Run ${set} --api-key again`
       )
     case 'unreadable':
       return (

@@ -2,38 +2,39 @@ import { Hono } from 'hono'
 import { randomBytes } from 'node:crypto'
 import { eq } from 'drizzle-orm'
 import {
-  clearOAuthApp,
-  clearOAuthGrant,
+  authorizationUrl,
+  connectWithAppToken,
+  disconnectProject,
+  exchangeCode,
+  finishConnection,
   InvalidSecret,
+  LinearOAuthError,
+  LINEAR_ACTOR,
+  LINEAR_SCOPES,
   listOAuthApps,
   normalizeSecretInput,
   readOAuthApp,
+  registeredApplication,
   sealSecret,
   setOAuthApp,
-  storeOAuthGrant,
+  type LinearConnection,
   type Secret,
 } from '@ogun/core'
 import { schema } from '@ogun/core/db'
 import type { Env } from '../context.ts'
 import { secretWriteTransport } from '../auth.ts'
-import {
-  authorizationUrl,
-  exchangeCode,
-  identify,
-  LinearOAuthError,
-  LINEAR_ACTOR,
-  LINEAR_SCOPES,
-  revokeToken,
-  type LinearIdentity,
-} from '../integrations/linear-oauth.ts'
 
 const { projects } = schema
 
 /**
- * Connecting a project to Linear as an application (ADR-0014).
+ * Connecting a project to Linear as an application (ADR-0014, amended).
  *
- * Four surfaces, and each one exists because of a specific way this flow goes wrong:
+ * Five surfaces, and each one exists because of a specific way this goes wrong:
  *
+ *  - `POST /api/oauth/linear/connect/:project` — **the default.** Register the client id
+ *    and secret and immediately exchange them for an app-actor token, in one request,
+ *    because `client_credentials` needs no browser and therefore no second step. Everything
+ *    below this line exists for the other grant.
  *  - `PUT  /api/oauth/linear/app/:project` — register the client id and secret the
  *    operator created at `linear.app/settings/api/applications/new`, and answer with the
  *    **exact redirect URI** to paste back into that form. A mismatch there is the classic
@@ -43,6 +44,15 @@ const { projects } = schema
  *  - `GET  /api/oauth/linear/callback` — where Linear sends the browser back.
  *  - `POST /api/oauth/linear/exchange` — the same thing for a headless control plane,
  *    where the operator pastes the URL they landed on into the CLI.
+ *
+ * ### Why the default path is four fewer surfaces
+ *
+ * The `state` nonce, the redirect-URI matching, the callback exemption from the admin
+ * token and the authorization-code-in-a-query-string problem are, between them, most of
+ * this file — and every one of them is a defence the browser step makes necessary. A grant
+ * that needs no browser needs none of them. They stay because private teams and
+ * user-scoped access still need the consent flow (ADR-0014's amendment), not because the
+ * ordinary connect touches them.
  *
  * ### The authorization code in the callback URL
  *
@@ -213,7 +223,129 @@ export function callbackUri(requestUrl: string, env: NodeJS.ProcessEnv = process
   return new URL(LINEAR_CALLBACK_PATH, new URL(requestUrl).origin).toString()
 }
 
-// ── registering the application ────────────────────────────────────────────
+// ── connecting, the way that needs no browser ──────────────────────────────
+
+/**
+ * The one sentence for a slug the control plane does not know, used by every route here
+ * that writes. One string because the refusal is one fact, and three near-identical
+ * paraphrases of it is how a reader learns that the differences must mean something.
+ */
+const UNKNOWN_PROJECT =
+  'no project with that slug. Nothing was stored — a credential filed under a slug ' +
+  'nothing polls is one that reports as configured and is read by nothing.'
+
+/**
+ * `POST /api/oauth/linear/connect/:project` — register the application and take a token,
+ * in one request.
+ *
+ * The default mechanism, and the reason it can be one request is that `client_credentials`
+ * has nothing in it for a human to do. There is no consent screen to visit, so there is no
+ * second step for the operator to be sent away and come back from — which was the whole
+ * reason `app` and `connect` were ever two commands.
+ *
+ * ### The client secret may be omitted, and that is the interesting case
+ *
+ * A body of `{}` reuses the client id and secret already in the store. That covers three
+ * things at once: retrying after a token request that failed on the network, reconnecting
+ * a project whose 30-day token lapsed with nothing to renew it from, and the Settings
+ * card's connect button on an application somebody registered earlier. All three would
+ * otherwise send a person back to Linear's settings page for a value this machine already
+ * holds — and a value re-pasted is a value re-typed, which is how a trailing space gets
+ * into a credential.
+ *
+ * ### The transport gate, and when it does not apply
+ *
+ * Gated by `secretWriteTransport` **only when the request carries a client secret**, which
+ * is ADR-0012's rule rather than a new one: the gate follows the value, not the endpoint.
+ * A reconnect that sends `{}` puts nothing on the wire that a leaked request would give an
+ * attacker, so refusing it would deny a remote operator the one action that repairs a
+ * lapsed connection, over a hazard that request does not have.
+ */
+oauthRoutes.post('/linear/connect/:project', async (c) => {
+  const project = c.req.param('project')
+  const known = await c.var.ctx.db.query.projects.findFirst({
+    where: eq(projects.slug, project),
+    columns: { id: true },
+  })
+  if (!known) return c.json({ error: UNKNOWN_PROJECT }, 404)
+
+  const raw = await c.req.text()
+  let body: unknown
+  try {
+    body = raw.trim() === '' ? {} : JSON.parse(raw)
+  } catch {
+    // The parser quotes a window of its source, and the source is a client secret.
+    return c.json({ error: 'the request body was not valid JSON. Nothing was stored.' }, 400)
+  }
+  const fields = (body ?? {}) as { clientId?: unknown; clientSecret?: unknown }
+  const supplied = fields.clientId !== undefined || fields.clientSecret !== undefined
+
+  let credentials: { clientId: string; clientSecret: string; redirectUri: string }
+  if (supplied) {
+    if (typeof fields.clientId !== 'string' || typeof fields.clientSecret !== 'string') {
+      return c.json(
+        {
+          error:
+            'expected a JSON body of {"clientId": "…", "clientSecret": "…"}, or {} to ' +
+            'reuse the one already stored.',
+        },
+        400,
+      )
+    }
+    const transport = secretWriteTransport()
+    if (!transport.allowed) return c.json({ error: transport.reason }, 403)
+    try {
+      // The same validator the CLI uses, so a trailing newline off a paste is caught here
+      // rather than as an `ERR_INVALID_CHAR` inside undici, hours from anything that names
+      // the application.
+      const clientSecret: Secret = sealSecret(normalizeSecretInput(fields.clientSecret))
+      credentials = {
+        clientId: normalizeSecretInput(fields.clientId),
+        clientSecret: clientSecret.expose(),
+        redirectUri: callbackUri(c.req.url),
+      }
+    } catch (err) {
+      if (!(err instanceof InvalidSecret)) throw err
+      // Safe to forward: it names the rule that was broken, never the input that broke it.
+      return c.json({ error: err.message }, 400)
+    }
+  } else {
+    const stored = await registeredApplication(project, 'linear')
+    if (!stored) {
+      return c.json(
+        {
+          error:
+            'no linear application is registered for this project on this machine, so ' +
+            'there is nothing to connect with. Create one at ' +
+            'https://linear.app/settings/api/applications/new and send its client id and ' +
+            'secret.',
+        },
+        409,
+      )
+    }
+    credentials = stored
+  }
+
+  let connection: LinearConnection
+  try {
+    connection = await connectWithAppToken(project, 'linear', credentials)
+  } catch (err) {
+    if (!(err instanceof LinearOAuthError)) throw err
+    /**
+     * `err.message` has already been through `scrubSecrets` where it was built, so it
+     * cannot carry the client secret even if Linear echoed one back. It is forwarded whole
+     * because it is a sentence meant for a person — and unlike the callback, this response
+     * is read by the caller that made the request rather than by a browser that would put
+     * it in an address bar.
+     */
+    remember(project, err.kind, err.message)
+    return c.json({ error: err.message, reason: err.kind }, 400)
+  }
+  lastFailure.delete(project)
+  return c.json({ connected: connection })
+})
+
+// ── registering the application, for the flow that has a browser in it ─────
 
 /**
  * `PUT /api/oauth/linear/app/:project` — the client id and secret from Linear's form.
@@ -237,16 +369,7 @@ oauthRoutes.put('/linear/app/:project', async (c) => {
     where: eq(projects.slug, project),
     columns: { id: true },
   })
-  if (!known) {
-    return c.json(
-      {
-        error:
-          'no project with that slug. Nothing was stored — an application filed under a ' +
-          'slug nothing polls is one that reports as configured and is read by nothing.',
-      },
-      404,
-    )
-  }
+  if (!known) return c.json({ error: UNKNOWN_PROJECT }, 404)
 
   const raw = await c.req.text()
   let body: unknown
@@ -333,6 +456,26 @@ oauthRoutes.post('/linear/start/:project', async (c) => {
    * a mystery.
    */
   const current = callbackUri(c.req.url)
+  /**
+   * An application with no callback URL recorded was registered by the browserless path,
+   * where there is no browser round trip to have one. Adopting the current address here
+   * would authorize against a URI Linear was never told about and get an error that names
+   * nothing — the exact failure the stored value exists to prevent — so the operator is
+   * sent to the command that registers one instead.
+   */
+  if (app.app.redirectUri === '') {
+    return c.json(
+      {
+        error:
+          "this project's linear application was registered without a callback URL, which " +
+          'is what connecting without a browser does. The consent flow needs one, and ' +
+          'Linear matches it exactly. Register it from this control plane — ' +
+          `\`ogun connect linear --consent --project ${project}\` — which stores ${current} ` +
+          'and prints it to paste into Linear.',
+      },
+      409,
+    )
+  }
   if (current !== app.app.redirectUri) {
     return c.json(
       {
@@ -517,7 +660,36 @@ oauthRoutes.get('/linear', async (c) => {
 })
 
 /**
- * `DELETE /api/oauth/linear/:project` — disconnect, keeping the application registered.
+ * `DELETE /api/oauth/linear/:project` — disconnect: remove every credential this project
+ * has for Linear.
+ *
+ * ### Why the default is now "remove everything", where ADR-0014's was "keep the
+ * application"
+ *
+ * Because under `client_credentials` **the client id and secret *are* the credential.**
+ * ADR-0014 could treat an application registration as inert — a client secret alone
+ * authenticated nothing without a browser, a workspace admin and a consent screen behind
+ * it, so leaving one in place cost nothing and saved a reconnect. That is no longer true
+ * of the default grant: the pair can be exchanged for a live token by anybody holding it,
+ * including the next poll. A disconnect that left them behind would be a disconnect the
+ * machine undoes by itself, which is not a disconnect.
+ *
+ * ADR-0012 already settled the general form of this — *"a superseded key is gone from the
+ * file rather than kept, because one that is still accepted is a live credential nobody is
+ * watching, and it would be in every backup of the machine"*. This is that rule reaching a
+ * value that only just became a credential.
+ *
+ * `?keep=application` is the opt-out, and it is **refused for a `client_credentials`
+ * connection** rather than honoured with a warning. Honouring it would leave a project one
+ * scheduled poll away from being connected again, which is worse than a refusal that says
+ * why in a sentence. It exists for the consent grant, where the client secret genuinely
+ * cannot mint anything on its own and keeping it makes reconnecting one command instead of
+ * a trip to Linear's settings page.
+ *
+ * A personal API key goes too. `ogun connect linear --api-key` is how one is stored now, so
+ * this is the inverse of the same command — and a `disconnect` that removed a grant and
+ * silently left a key behind would leave the project *still connected*, by the credential
+ * the operator was least likely to be thinking about.
  *
  * **No transport check**, for the reason the secrets route's delete gives: the guard on a
  * write is about what a request *carries*, and this one carries nothing towards the
@@ -530,29 +702,25 @@ oauthRoutes.get('/linear', async (c) => {
  */
 oauthRoutes.delete('/linear/:project', async (c) => {
   const project = c.req.param('project')
-  const forgetApp = c.req.query('app') === 'true'
+  const keepApplication = c.req.query('keep') === 'application'
 
-  const app = await readOAuthApp(project, 'linear')
-  let revoked = false
-  if (app.state === 'present' && app.app.grant) {
-    revoked = (await revokeToken({ token: app.app.grant.access.expose() })).revoked
-  }
-
-  const removed = forgetApp
-    ? await clearOAuthApp(project, 'linear')
-    : await clearOAuthGrant(project, 'linear')
+  // The same function `ogun disconnect` calls, for the reason `connect` shares one: a
+  // credential removed from the UI and a credential removed from a terminal must leave the
+  // store in the same state, and the way to guarantee that is for there to be one removal.
+  const outcome = await disconnectProject(project, 'linear', { keepApplication })
+  if (!outcome.ok) return c.json({ error: outcome.detail, reason: outcome.reason }, 409)
   lastFailure.delete(project)
 
   // "removed" and "there was nothing here" are different answers all the way out to the
   // browser, and `revoked` is a third fact: the local credential is gone either way, and
   // whether Linear was told is something the operator may want to follow up on.
-  return c.json({ removed, revoked, appForgotten: forgetApp && removed })
+  return c.json(outcome)
 })
 
 // ── the shared completion ──────────────────────────────────────────────────
 
 type Completion =
-  | { ok: true; summary: { project: string; workspace?: string; scopes: string[]; actor: string } }
+  | { ok: true; summary: LinearConnection }
   | { ok: false; reason: string; detail: string }
 
 /**
@@ -564,6 +732,12 @@ type Completion =
  * upstream server said, which is the category of string this repository has leaked
  * credentials through four times. The detail is kept server-side in `lastFailure` and
  * fetched by an authenticated request.
+ *
+ * Everything after the exchange is `finishConnection` in core — identity, teams, the
+ * write, and retiring a personal key the connection now supersedes. It is shared with the
+ * default grant on purpose: a project connected through a browser and a project connected
+ * without one must be the same row in the store, or `connections` grows a case for each
+ * and the two drift.
  */
 async function completeAuthorization(input: {
   project: string
@@ -590,46 +764,9 @@ async function completeAuthorization(input: {
     return fail(input.project, err.kind, err.message)
   }
 
-  /**
-   * Who the token belongs to, asked once, while it is fresh.
-   *
-   * A failure here does **not** fail the connection. The tokens are valid — Linear just
-   * issued them — and refusing to store a working grant because a cosmetic query timed out
-   * would turn a display problem into a broken connect, with the added insult that the
-   * authorization code is now spent and the operator has to start over.
-   */
-  const identity: LinearIdentity = await identify({ accessToken: tokens.accessToken }).catch(
-    () => ({ actorIsApp: false }),
-  )
-
-  const now = Date.now()
-  await storeOAuthGrant(input.project, 'linear', {
-    accessToken: tokens.accessToken,
-    refreshToken: tokens.refreshToken,
-    expiresAt: tokens.expiresAt,
-    obtainedAt: now,
-    scopes: tokens.scopes,
-    /**
-     * What Linear says it is, not what was asked for. `actor` is a request parameter and
-     * the response does not echo it, so `viewer.app` is the only evidence that the grant
-     * actually came back as an application rather than as the person who approved it — and
-     * the difference is invisible until something writes under the wrong name.
-     */
-    actor: identity.actorIsApp ? LINEAR_ACTOR : 'user',
-    ...(identity.workspace ? { workspace: identity.workspace } : {}),
-    ...(identity.appUserId ? { appUserId: identity.appUserId } : {}),
-  })
+  const summary = await finishConnection(input.project, 'linear', app.app.clientId, tokens)
   lastFailure.delete(input.project)
-
-  return {
-    ok: true,
-    summary: {
-      project: input.project,
-      ...(identity.workspace ? { workspace: identity.workspace.name } : {}),
-      scopes: tokens.scopes,
-      actor: identity.actorIsApp ? LINEAR_ACTOR : 'user',
-    },
-  }
+  return { ok: true, summary }
 }
 
 function fail(project: string, reason: string, detail: string): Completion {

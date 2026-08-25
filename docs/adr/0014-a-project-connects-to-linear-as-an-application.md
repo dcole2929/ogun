@@ -21,6 +21,14 @@ rather than to whoever authorized it, and their documentation says the mode is f
 and service accounts". **A personal API key cannot do this at all.** There is no header, no
 parameter, and no setting; the key *is* a person.
 
+[amended] **The default grant is now `client_credentials`, and the command is now `ogun
+connect`.** Two changes, recorded in place below rather than as a new record, because
+neither touches the decision this ADR exists for: a project still connects as an
+application rather than as a person, still asks for `read` and nothing else, and still
+keeps the personal API key as a documented fallback. What changed is *which* OAuth grant
+gets it there and *what an operator types*. Every superseded sentence is quoted where it is
+amended.
+
 **So a project connects through an OAuth 2.0 application, and the personal API key remains
 supported as a documented fallback.** The operator registers an application in their own
 workspace, Ogun stores the client id and secret beside the key it already stores, and the
@@ -70,6 +78,30 @@ than used and lost between page two and page three of a paged read.
   reactive path cannot tell "renew this" from "this connection is over" without trying.
   ADR-0010 already declined this shape for the model providers, where the answer was to
   catch the lapse before it costs a night.
+
+  [amended] **The ambiguity this rejection rested on does not exist under the default
+  grant, and the decision survives on a narrower argument.** The sentence above — *"the
+  reactive path cannot tell 'renew this' from 'this connection is over' without trying"* —
+  was a fact about a refresh token, which is spendable and losable. A `client_credentials`
+  renewal is asking again with a client id and secret already on disk: idempotent, costing
+  nothing, and a connection that is genuinely over fails the renewal too and says so.
+  Linear's own guidance for that grant is exactly the design rejected here — *"your server
+  is expected to fetch a new token if it receives a 401 error"*.
+
+  Refresh-before-poll is kept anyway, for the half of the original argument that still
+  holds: **a reactive renewal spends a poll.** The request has gone out, the page it was
+  fetching is lost, and `source_polls` records a failure for a poll that was always going
+  to need one round trip — a row an operator reads at breakfast as a Linear outage. What
+  has changed is that this is now a preference about legibility rather than a defence
+  against an ambiguity. A finding that the 401 path should exist *as a safety net beneath*
+  the proactive one is a real finding.
+
+[amended] **A 30-day token makes the problem above worse, not better.** The reasoning
+starts from "a token that lasts 24 hours and a poller that wakes at 3am never coincide by
+accident", and the instinct is that thirty days removes the pressure. It does the opposite:
+a fuse long enough that nobody has ever seen it burn is a fuse nobody recognises when it
+does. `credentialHealth` against `GRANT_REFRESH_HORIZON_MS` is unchanged and covers both,
+because it compares an expiry to a horizon and does not care how the number got there.
 
 **How this sits with the credential preflight.** It does not, and that is deliberate.
 `fleetCredentials` and admission refuse a *job* whose model-provider credential will not
@@ -220,6 +252,41 @@ block would be silently deleted by the next `ogun project add`, and the symptom 
 Linear connection that stopped working on the day somebody registered an unrelated
 repository.
 
+[amended] **The grant gains `grantType`, and `refreshToken` becomes required only for
+`authorization_code`.** The record said a refresh token was required outright, and the
+client refused a response without one:
+
+> *"A token with no way to renew it is refused explicitly rather than falling through, in
+> both the client and the store, because it is the shape a plausible future edit would
+> produce."*
+
+The prediction was right and the conclusion is now wrong. That edit landed deliberately,
+and the premise underneath it — that a refresh token is the only renewal Ogun has — is what
+changed: a `client_credentials` token is renewed from the client id and secret stored two
+fields away. The refusal survives, narrowed to the grant it was ever about; an
+`authorization_code` entry with no refresh token is still `malformed`, because that grant
+rotates and there would be nothing to rotate.
+
+`grantType` is a stored field rather than an inference from "is there a refresh token".
+The two carry the same information today and a mode read backwards out of a nullable field
+is a mode that changes silently when the field does — a truncated write, an older build, a
+hand-edit. Reading the recorded intent instead means a damaged entry stops at the parser
+and says so. An entry with **no** `grantType` is read as `authorization_code`, which is not
+a guess: it is the only thing the build before this one could have written. There is no
+migration for `~/.ogun/config.json`, so that default *is* the migration. A `grantType` this
+build does not recognise is `malformed` rather than defaulted, because a future third grant
+would have renewal rules this one has never heard of.
+
+[amended] **`redirectUri` may now be empty.** It was required to be a non-empty string,
+which was right while every connection had a browser in it. The default grant has none — so
+`ogun connect linear` on a machine with no control plane running has no address to record,
+and inventing a plausible `http://localhost:7777/…` would put a string in the store that
+Linear was never told about. That is the mismatch the field exists to make visible,
+manufactured, and it would surface as an authorization Linear refuses without saying why.
+Empty means "there was no browser", which is true and is what `ogun connections` prints.
+`POST /api/oauth/linear/start` refuses an application with an empty one and names the
+command that registers a real one.
+
 **`readProjectSecret`'s union grows instead of a second function appearing.** It returns
 `granted | present | unconnected | absent | empty | malformed | unreadable` — seven states,
 because each has a different remedy, which is principle 6's actual rule rather than a
@@ -261,13 +328,36 @@ An application that is registered and *never connected* does **not** shadow a wo
 That is the ordinary state of a project halfway through the migration, and refusing it
 would break a working poll to make a point.
 
+[amended] **Connecting now removes a personal API key, so the shadowed state stops arising
+from the ordinary path.** The precedence rule above is unchanged and every surface that
+reports the shadow is unchanged — config.json gets hand-edited and an older build may have
+written one, so it stays readable and reportable. What changed is that the key used to be
+written by a *different command*, so an operator could have one without ever having asked
+for it in the same breath as a grant. Under one `ogun connect` there is one place to give
+Ogun access to Linear, and leaving a second credential behind is leaving exactly the
+ambiguity that vocabulary exists to end: a credential that reports as set, is read by
+nothing, and is the first thing somebody rotates when a poll fails.
+
+Nothing recoverable is destroyed. A personal key lives in Linear, where the person minted
+it; Ogun has never displayed a stored value and never will, so a copy it keeps but cannot
+show and does not read has no content to lose. The removal happens *after* the grant is on
+disk, so a failed write trades a shadowed key for nothing rather than for no credential at
+all.
+
+The mirror of it is a refusal rather than a silent replacement: `ogun connect linear
+--api-key` on a project that already has a working grant **fails**, and names `ogun
+disconnect linear`. Storing one there would write a live credential the precedence rule
+guarantees nothing will read.
+
 **And the operator can tell**, in four places, because silence about which credential is in
 use is how someone spends an hour debugging the wrong one:
 
 - `ogun runner doctor` prints the workspace, the actor, the scopes and the remaining life,
   and says in as many words when a stored API key is not being used.
-- `ogun linear status` says the same from the store, without needing the server —
-  which is when the question is usually asked.
+- `ogun connections` says the same from the store, without needing the server —
+  which is when the question is usually asked. [amended: it was `ogun linear status`, and
+  it now shows keys and grants in one table, because two listings that could not see each
+  other made the answer to "is this connected" depend on which command you ran.]
 - The Settings card shows the same row.
 - A `401` from Linear now names the credential — "linear rejected the oauth access token
   for Acme" versus "the personal api key" — because the client is built from a
@@ -305,6 +395,42 @@ use is how someone spends an hour debugging the wrong one:
   rather than what a person approved. A token with no way to renew it is refused explicitly
   rather than falling through, in both the client and the store, because it is the shape a
   plausible future edit would produce.
+
+  [amended] **This is now the default, and the authorization-code flow is what stays
+  reachable beside it.** The rejection above rests on three claims, and two of them do not
+  survive being checked:
+
+  - *"a token with no way to renew it"* — it has one. Renewal is a second
+    `client_credentials` request with the client id and secret already in
+    `~/.ogun/config.json`. The absence of a *refresh token* was read as the absence of
+    *renewal*, and those are only the same thing for a grant that rotates.
+  - *"which is the reactive design rejected in decision 1"* — only if renewal is reactive,
+    and it is not. Decision 1's refresh-before-poll is unchanged; the horizon check does not
+    care which request produces the new token. Linear's advice to react to a 401 is what
+    they document for clients that have no expiry to look at, and Ogun records one.
+  - *"it also grants access to all public teams rather than what a person approved"* —
+    **this one stands, and it is the reason the other flow is kept rather than removed.**
+
+  What tips the balance is what the browser step costs. The `state` nonce, the redirect-URI
+  matching, the callback's exemption from the admin token, and the
+  authorization-code-in-a-query-string problem are between them most of this record and
+  most of `routes/oauth.ts` — and every one of them is a defence that exists *because* a
+  browser is involved. A grant that needs none of them is not a shortcut past those
+  defences; it is a smaller surface for them to defend. It also removes the one step this
+  design could never automate: `actor=app` is a workspace-level install and Linear requires
+  an **admin** to approve it, so the preferred credential was, until now, the one an
+  operator might simply be unable to obtain.
+
+  **The cost is named rather than absorbed.** A `client_credentials` token reaches the
+  workspace's *public* teams and no others, so a workspace of private teams gets a token
+  that authenticates perfectly and reads nothing — a source that polls every five minutes,
+  records `ok`, sees zero tickets and emits no jobs, forever, while every surface reports a
+  healthy connection. That is the worst failure shape in this whole feature, because
+  nothing is wrong anywhere. Three things answer it: `ogun connect` asks Linear which teams
+  the new token can see and prints them at the moment a person is watching; `ogun
+  connections` and `doctor` say which grant a project uses, because "connected" alone
+  cannot explain an empty poll; and `--consent` is the documented way through, in the same
+  sentence.
 
 - **`actor=user`, or making the actor configurable.** The default, and it needs no
   workspace admin — which is a real advantage, because `actor=app` is a workspace-level
@@ -387,6 +513,14 @@ use is how someone spends an hour debugging the wrong one:
   `actor=app` install can read issues at all — which the documentation implies and nothing
   here has observed.
 
+  [amended] **The gap is unchanged and one of its two halves moved.** The token endpoint's
+  error body is now documented for the grant Ogun *does* use, which is a small improvement
+  and not an observation. The second half is answered differently rather than closed: `ogun
+  connect` asks Linear which teams the new token can read and prints them, so the first
+  real application registered against this project observes it at the moment of connecting
+  rather than a fortnight later through an empty poll. What that query returns for a
+  `read`-only app-actor token is itself unobserved, and `linear-oauth-fixtures.ts` says so.
+
 - **`hono/logger`'s behaviour is now a test rather than a comment.** A unit test asserts that
   it writes the query string, so that if a future version stops, the exemption in `app.ts`
   becomes visibly unnecessary rather than invisibly load-bearing.
@@ -396,7 +530,91 @@ use is how someone spends an hour debugging the wrong one:
   and the transport gate is unchanged. Removing it would strand any operator who is not an
   admin of their workspace, which is not a rare configuration.
 
-- **The command is `ogun linear`, and its usage lines say what it asks for.** It shipped as
+  [amended] **The spelling is `ogun connect linear --api-key`, and the reason for keeping
+  it is narrower than it was.** Every rule in ADR-0012 still holds, the write still reaches
+  no server, and the transport gate is unchanged. What weakened is the justification quoted
+  above: the default grant needs no workspace admin either, so "not an admin of their
+  workspace" is no longer a reason to reach for a personal key. What is left is the case
+  where somebody cannot register an application in that workspace *at all*, which is real
+  and rarer — and that is why it is kept rather than removed.
+
+- [amended] **The command is `ogun connect <integration>`, and `linear` is a value rather
+  than a word in the command path.** The bullet below settled `ogun linear` and made this
+  argument for keeping the vendor's name where it was:
+
+  > *"`linear` stays, and is the one noun in that chain that earns its place: it says
+  > *which* integration, which becomes a real distinction the first time a `github` source
+  > sits beside it."*
+
+  It says which integration, and putting it in the *path* is what makes a GitHub or Jira
+  integration a whole new command tree rather than a new value. `ogun github app`, `ogun
+  github connect`, `ogun github status`, `ogun github disconnect` — four commands per
+  vendor, each with its own copy of the project inference, the slug check and the
+  hidden-prompt handling, and each free to drift. The distinction was real; the command
+  path was the wrong place to record it.
+
+  So the vocabulary is:
+
+  ```
+  ogun connect <integration> <client-id> <client-secret> [--project <slug>]
+  ogun connect <integration> --consent <client-id> <client-secret> [--project <slug>]
+  ogun connect <integration> --api-key <key> [--project <slug>]
+  ogun connections [--project <slug>]
+  ogun disconnect <integration> [--project <slug>] [--keep-application]
+  ```
+
+  **`app` is gone as a separate step**, and that is `client_credentials` paying for itself
+  rather than a tidying. `ogun linear app` existed because the authorization needed a
+  browser and a person, so there had to be a place to stop between "here are the
+  credentials" and "go and approve this". There is nothing to stop for now. A connect with
+  no positionals reuses an application already registered on the machine, which covers the
+  reconnect after a 30-day token lapses and the retry after a token request that failed on
+  the network — both of which would otherwise send somebody back to Linear's settings page
+  for a value this machine is holding.
+
+  **`ogun secret` is gone, subsumed rather than left beside it.** This was the question
+  worth arguing, and the argument is that two vocabularies for "give Ogun access to Linear"
+  was the fault being fixed, so landing on two again would miss the point. Every name in
+  `SECRET_NAMES` today *is* an integration credential, so the `secret` namespace held
+  exactly one kind of thing and called it something else. A `--api-key` mechanism inside
+  `connect` puts the choice where the operator is making it — *how* should Ogun get in —
+  instead of in the choice of which command to reach for. If a secret ever appears that is
+  not a connection, `ogun secret` comes back for it and `connect` keeps the connections;
+  building that namespace now, for nothing that exists, is the mistake this record already
+  refused to make about write scopes.
+
+  All four dropped spellings — `ogun secret`, `ogun linear`, and both under `ogun project`
+  — answer with a line naming `ogun connect` rather than "unknown command", and their
+  `--help` prints the page that replaced them.
+
+  **The slug asymmetry does not survive, and it should not.** This record stated the rule
+  as *"each command checks the slug against the best oracle it already depends on"*, which
+  was sound while `ogun secret set` and `ogun linear app` were separate commands with
+  separate dependencies. Under one `connect` it would become "each *mechanism* checks
+  against a different oracle" — the same words, the same slug, two different refusals, and
+  a `--allow-unregistered` that works in one of them. So `connect` checks **this machine's
+  own evidence, in every mechanism, before it asks for anything**: the projects map, or a
+  `.ogun/config.yaml` in the directory it was run from. That is available everywhere, costs
+  no network, and arrives *before the prompts*, which was the property that made the
+  control-plane check worth having. The database is still checked by the routes that reach
+  one; that is the server refusing a write it should not accept, not a second rule for an
+  operator to learn. `--allow-unregistered` keeps its meaning and its warning.
+
+  **`disconnect` now removes the client id and secret by default**, where this record's
+  `--forget-app` kept them. Under the authorization-code flow a client secret alone
+  authenticated nothing — it needed a browser, a consent screen and a workspace admin — so
+  keeping it cost nothing and saved a reconnect a non-admin could not perform. Under
+  `client_credentials` **the pair is the credential**: anyone holding it can mint a live
+  token and the next poll would, so a disconnect that left it behind is one the machine
+  undoes by itself. ADR-0012 had already written this rule for keys — *"a superseded key is
+  gone from the file rather than kept, because one that is still accepted is a live
+  credential nobody is watching, and it would be in every backup of the machine"* — and this
+  is that rule reaching a value that only just became one. `--keep-application` survives for
+  the consent grant and is **refused** on a client-credentials connection, because a warning
+  about a state that reverts itself within one poll interval is a warning nobody can act
+  on.
+
+- **The command was `ogun linear`, and its usage lines say what it asks for.** It shipped as
   `ogun project linear app <project>`, which is four words in front of a verb: `project` was
   a namespace whose only cargo was the `<project>` positional, `linear` names the
   integration, `app` names the thing being registered, and then the slug again. Inferring

@@ -48,12 +48,135 @@ const app = (over: Record<string, string> = {}) => ({
 const grant = (over: Record<string, unknown> = {}) => ({
   accessToken: 'access-abcdefghijklmnop',
   refreshToken: 'refresh-abcdefghijklmnop',
+  grantType: 'authorization_code' as const,
   expiresAt: Date.now() + 86_399_000,
   obtainedAt: Date.now(),
   scopes: ['read'],
   actor: 'app',
   workspace: { id: 'org-1', name: 'Acme', urlKey: 'acme' },
   ...over,
+})
+
+/** The default grant: a 30-day app-actor token with nothing to refresh it from. */
+const appGrant = (over: Record<string, unknown> = {}) =>
+  grant({
+    grantType: 'client_credentials' as const,
+    refreshToken: undefined,
+    expiresAt: Date.now() + 2_591_999_000,
+    ...over,
+  })
+
+// ── the two grants ─────────────────────────────────────────────────────────
+
+/**
+ * The property: a `client_credentials` grant **round-trips with no refresh token**, and an
+ * `authorization_code` grant without one is still `malformed`.
+ *
+ * The check used to be unconditional and its reasoning is worth carrying rather than
+ * deleting: *"a grant that cannot be refreshed is a connection with a 24-hour life and no
+ * symptom until it ends — and Linear's client-credentials flow does return a token with no
+ * refresh token beside it, so this is the shape a plausible future edit would write."* The
+ * prediction was right. The premise — that a refresh token is the only renewal Ogun has —
+ * is what stopped being true, because a client-credentials token is renewed from the client
+ * id and secret two fields up.
+ *
+ * Both halves are asserted because they fail in opposite directions. A build that kept the
+ * old blanket rule makes the default mechanism impossible; a build that dropped it entirely
+ * stores a rotating grant with nothing to rotate, which reports as healthy for a day.
+ */
+test('a client-credentials grant needs no refresh token, and the other still does', async () => {
+  await setOAuthApp('ogun', 'linear', app(), store)
+  await storeOAuthGrant('ogun', 'linear', appGrant(), store)
+
+  const read = await readProjectSecret('ogun', 'linear', store)
+  assert.equal(read.state, 'granted')
+  if (read.state !== 'granted') return
+  assert.equal(read.grant.grantType, 'client_credentials')
+  assert.equal(read.grant.refresh, undefined)
+
+  // The rotating grant, with its refresh token hand-edited out of the file — which is how
+  // this shape actually arrives, since the write path will not create it.
+  const config = JSON.parse(await readFile(store, 'utf8'))
+  config.oauth.ogun.linear.grant = {
+    accessToken: 'access-abcdefghijklmnop',
+    grantType: 'authorization_code',
+    expiresAt: Date.now() + 86_399_000,
+  }
+  await writeFile(store, JSON.stringify(config))
+  assert.equal((await readProjectSecret('ogun', 'linear', store)).state, 'malformed')
+})
+
+/**
+ * The property: **a grant written before `grantType` existed is read as
+ * `authorization_code`**, and keeps working.
+ *
+ * Not a guess dressed as a default. The build that wrote those entries refused a token with
+ * no refresh token in two places, so an authorization-code grant is the only thing it could
+ * have produced — which is what makes the absence readable rather than ambiguous.
+ *
+ * The cost of getting it wrong is a live connection: defaulting the other way would send a
+ * `client_credentials` request for a grant whose renewal is a refresh token, at 3am, and
+ * report the failure as a connection that is over. There is no migration for this file, so
+ * this default *is* the migration.
+ */
+test('a grant stored before grantType existed still reads, as authorization_code', async () => {
+  await setOAuthApp('ogun', 'linear', app(), store)
+  await storeOAuthGrant('ogun', 'linear', grant(), store)
+
+  const config = JSON.parse(await readFile(store, 'utf8'))
+  delete config.oauth.ogun.linear.grant.grantType
+  await writeFile(store, JSON.stringify(config))
+
+  const read = await readProjectSecret('ogun', 'linear', store)
+  assert.equal(read.state, 'granted')
+  if (read.state !== 'granted') return
+  assert.equal(read.grant.grantType, 'authorization_code')
+  assert.equal(read.grant.refresh?.expose(), 'refresh-abcdefghijklmnop')
+})
+
+/**
+ * The property: a `grantType` this build does not know is `malformed`, not defaulted.
+ *
+ * A future build's third grant would have renewal rules this one has never heard of.
+ * Quietly treating it as an authorization-code grant means spending a refresh token that is
+ * not there and reporting the result as a dead connection — a newer build's working
+ * credential broken by an older one that assumed. Every *other* unknown field in the entry
+ * is ignored on purpose, and this one is not, because this is the field that decides what
+ * happens to the credential.
+ */
+test('a grant type this build does not know is malformed rather than assumed', async () => {
+  await setOAuthApp('ogun', 'linear', app(), store)
+  await storeOAuthGrant('ogun', 'linear', grant(), store)
+
+  const config = JSON.parse(await readFile(store, 'utf8'))
+  config.oauth.ogun.linear.grant.grantType = 'device_code'
+  config.oauth.ogun.linear.grant.somethingNewer = { ignored: true }
+  await writeFile(store, JSON.stringify(config))
+
+  const read = await readProjectSecret('ogun', 'linear', store)
+  assert.equal(read.state, 'malformed')
+  if (read.state !== 'malformed') return
+  assert.match(read.reason, /grantType/)
+})
+
+/**
+ * The property: an application registered with **no callback URL** is readable.
+ *
+ * `redirectUri` used to be required to be non-empty, which was right while every connection
+ * had a browser in it. The default grant has none — so a CLI on a machine with no control
+ * plane running has no address to record, and inventing a plausible one would put a string
+ * in the store that Linear was never told about. That is the mismatch the field exists to
+ * make visible, manufactured, and it would surface as an authorization Linear refuses
+ * without saying why.
+ */
+test('an application connected without a browser has no redirect uri, and reads fine', async () => {
+  await setOAuthApp('ogun', 'linear', app({ redirectUri: '' }), store)
+  await storeOAuthGrant('ogun', 'linear', appGrant(), store)
+
+  const [row] = await listOAuthApps(store)
+  assert.equal(row?.redirectUri, '')
+  assert.equal(row?.connected, true)
+  assert.equal(row?.grantType, 'client_credentials')
 })
 
 // ── precedence ─────────────────────────────────────────────────────────────
@@ -108,7 +231,7 @@ test('an application with no grant does not shadow a working api key', async () 
 /**
  * The property: with no key behind it, an unconnected application is its own state.
  *
- * Reported as `absent`, the remedy printed to the operator is "run `ogun secret set`" —
+ * Reported as `absent`, the remedy printed to the operator is "run `ogun connect`" —
  * which sends somebody who has done most of the work of connecting an application
  * back to the credential they were migrating away from. Principle 6: one state per remedy,
  * and this remedy is a browser rather than a terminal.
@@ -358,6 +481,7 @@ test('the tokens on a grant are sealed, not strings', async () => {
     clientId: 'client-1',
     access: '[redacted]',
     refresh: '[redacted]',
+    grantType: 'authorization_code',
     expiresAt: read.grant.expiresAt,
     obtainedAt: read.grant.obtainedAt,
     scopes: ['read'],
