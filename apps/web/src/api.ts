@@ -18,6 +18,14 @@ export type SystemInfo = {
     isRunner: boolean
     runnerName: string | null
   }
+  /**
+   * Which projects have an API key on the control-plane machine, by name.
+   *
+   * Presence only, and there is no field for a value — the server's type has none either
+   * (ADR-0012). The browser is never handed a secret, so there is nothing here for a
+   * screenshot, a devtools network panel, or a bug report to carry away.
+   */
+  projectSecrets: Array<{ project: string; name: string; state: 'present' | 'empty' }>
   checkouts: Array<{ slug: string; path: string; present: boolean }>
   counts: { projects: number; runs: number; openFindings: number; queuedJobs: number }
 }

@@ -4,7 +4,7 @@ import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { count, eq, sql } from 'drizzle-orm'
-import { loadLocalConfig, localConfigPath } from '@ogun/core'
+import { listProjectSecrets, loadLocalConfig, localConfigPath } from '@ogun/core'
 import { schema } from '@ogun/core/db'
 import type { Env } from '../context.ts'
 import { mintToken } from '../auth.ts'
@@ -123,6 +123,25 @@ systemRoutes.get('/', async (c) => {
       isRunner: Boolean(local?.runner),
       runnerName: local?.runner?.name ?? null,
     },
+    /**
+     * Which projects have an API key on this machine — the name and nothing else.
+     *
+     * The value is not here and cannot be: `listProjectSecrets` returns
+     * `ProjectSecretPresence`, which has no field one would fit in (ADR-0012). That is the
+     * whole design of this line. A list endpoint is where secrets leak, and the way to
+     * make that impossible is for the listing type to be unable to carry one, rather than
+     * for every future editor of this route to remember not to add it.
+     *
+     * There is deliberately no route that *sets* one. A secret in a request body is a
+     * secret in a reverse proxy's access log and in a browser's network panel; setting is
+     * `ogun project secret set` on this machine, which writes the file directly.
+     *
+     * A config.json too broken to read shows as none here. `ogun runner doctor` is the
+     * surface that tells those two apart, and the `host` block above already degrades the
+     * same way on the same file.
+     */
+    projectSecrets: await listProjectSecrets().catch(() => []),
+
     /** Where this machine has repos checked out. Absent ones clone from their remote. */
     checkouts: Object.entries(local?.projects ?? {}).map(([slug, path]) => ({
       slug,

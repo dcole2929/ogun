@@ -3,6 +3,7 @@ import { cyan, fail, red } from './output.ts'
 import { helpFor, isHelpFlag, usage } from './help.ts'
 import { doctor } from './commands/doctor.ts'
 import { projectAdd, projectList, projectSync } from './commands/project.ts'
+import { projectSecret } from './commands/secrets.ts'
 import { coverage, runsList, trigger } from './commands/runs.ts'
 import {
   checkCitations,
@@ -77,6 +78,9 @@ try {
     case 'project':
       if (sub === 'add') await projectAdd(rest, serverUrl)
       else if (sub === 'sync') await projectSync(rest, serverUrl)
+      // `secret` reaches no server: the store is this machine's config.json, and there is
+      // no route that takes a secret in a request body (ADR-0012).
+      else if (sub === 'secret' || sub === 'secrets') await projectSecret(rest)
       else if (sub === 'list' || sub === undefined) await projectList(serverUrl)
       else unknownSub('project', sub)
       break

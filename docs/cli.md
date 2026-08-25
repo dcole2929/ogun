@@ -21,7 +21,7 @@ reach it. Four groups cannot:
 
 | | run it on |
 |---|---|
-| `server`, `db *`, `token *`, `runner invite` | the control-plane machine |
+| `server`, `db *`, `token *`, `runner invite`, `project secret *` | the control-plane machine |
 | `runner init`, `runner join`, `runner start`, `runner doctor`, `image build` | the runner machine |
 | `project add`, `project sync`, `skill new`, `skill link` | a machine with the repo checked out |
 | `findings write`, `validate-findings`, `check-citations` | inside the sandbox, by a skill |
@@ -30,7 +30,7 @@ reach it. Four groups cannot:
 
 | | holds |
 |---|---|
-| `~/.ogun/config.json` | machine-local facts: this runner's name and token, the admin token, and where repos are checked out on this disk. A path is a fact about one machine, so it never travels the wire |
+| `~/.ogun/config.json` | machine-local facts: this runner's name and token, the admin token, and where repos are checked out on this disk. A path is a fact about one machine, so it never travels the wire. Also a project's own API keys, which are not a machine fact and are here because the control plane is what polls (ADR-0012) |
 | the repo's `.ogun/config.yaml` | workers, policies, schedules. The one definition of a worker, in git |
 | the database | projects, workers, skills, runs, findings, coverage. An index of what git already says, not a second source of truth |
 | Docker | the postgres container, and the image each job runs inside |
@@ -214,6 +214,11 @@ that says how long ago and what to type. Never fatal: a dead Anthropic token doe
 this box running its codex workers. On a runner nobody logs into, the fix that lasts is an
 API key, which does not expire (`docs/setup.md`).
 
+Project secrets are reported by name — `ogun/linear — set` — and never by value. It says
+what is stored, not what is missing: which projects need a key is declared in each
+repository, and `doctor` reads none. A key stored but blank degrades the check, because a
+poller reads that as one that exists and does not work.
+
 Run it on the machine in question — the toolchain and the map of local checkouts are
 per-machine, so this is the only honest place to ask. It exits non-zero when something
 blocking is wrong, so it works as a check in a script.
@@ -282,6 +287,46 @@ skills).
 
 Every project the control plane knows about, with its default branch and remote. The
 default when `ogun project` is given no subcommand.
+
+### `ogun project secret set | list | rm`
+
+An API key a project needs that this machine did not already have. Everything else Ogun
+authenticates with is on the host because a human logged in with it; a Linear key is issued
+per workspace, so it has to be entered once and kept.
+
+Run it on the **control-plane machine** — that is what polls an integration, so that is
+where the key has to be. It stores into `~/.ogun/config.json` at mode 0600 and talks to no
+server: there is deliberately no route that accepts a secret, because a value in a request
+body is a value in a reverse proxy's access log. Never in the repository, never in the
+database, and never in a container (ADR-0012).
+
+```
+ogun project secret set ogun linear < key.txt
+op read op://vault/linear/key | ogun project secret set ogun linear
+ogun project secret set ogun linear        # prompts, with the echo off
+```
+
+**The value is never a command-line argument**, and passing one is refused rather than
+accepted. Anything in argv is readable by every account on the box through `ps` while the
+command runs, and your shell writes the whole line into its history file. So it comes from
+stdin when stdin is a pipe and from a hidden prompt when it is a terminal; nothing chooses
+between them, because the shape of stdin already has.
+
+Known names: `linear`. A name Ogun does not read is refused — a secret nothing reads looks
+exactly like one that works, until the night it mattered.
+
+Rotation is setting it again. There is no history and no second slot: the next poll reads
+the new value with no restart, and two live keys would mean nobody could say which one a
+401 came from.
+
+- `ogun project secret list [project]` — which projects have one, by name. Presence only.
+  Nothing anywhere prints a stored value back — not this command, not `runner doctor`, not
+  the UI, and no endpoint. It cannot say what is *missing*, either: which projects need a
+  key is declared in each repository, and this command reads no repositories.
+- `ogun project secret rm <project> <name>` — forget one. Says whether there was anything
+  to forget, because "removed" and "there was nothing here" are different answers.
+
+Touches: `~/.ogun/config.json` (the secrets block, on this machine only).
 
 ---
 
