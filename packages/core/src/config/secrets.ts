@@ -39,8 +39,8 @@ import type { LinearGrantType } from '../integrations/linear-oauth.ts'
  *
  *  1. **Never in `.ogun/config.yaml`.** That file is committed. There is no code path
  *     from here to it — `projectConfigSchema` has no field a secret could land in, and the
- *     two things that write one, `ogun secret set` and the Settings page's route, both
- *     go through this module and therefore only into the machine file.
+ *     three things that write one — `ogun connect`, `ogun secret set`, and the Settings
+ *     page's route — all go through this module and therefore only into the machine file.
  *  2. **Never in a sandbox.** Nothing on the runner reads this module. The value is not on
  *     `claimedJobSchema`, so it cannot cross the wire to a runner; the runner is the only
  *     thing that builds `docker run`, so there is no route to a container's argv; and
@@ -56,15 +56,29 @@ import type { LinearGrantType } from '../integrations/linear-oauth.ts'
  */
 
 /**
- * The secrets Ogun knows how to use, as a closed set.
+ * The **integrations** Ogun knows how to authenticate, as a closed set.
  *
  * Closed rather than free-form because of the failure `inertPolicies` exists for
  * elsewhere: a key that nothing reads is indistinguishable from a key that works, right
- * up until the night it mattered. `ogun secret set linaer` typed at 1am would otherwise
+ * up until the night it mattered. `ogun connect linaer` typed at 1am would otherwise
  * store a secret, print success, and leave the poller unauthenticated with no evidence
  * anywhere connecting the two.
  *
  * A name is added here when the code that reads it lands, not before.
+ *
+ * ### What this set is *not*, since `ogun secret` came back
+ *
+ * It is not the set of things `~/.ogun/config.json`'s `secrets` block may hold. That was
+ * true for two days, while every name in here was an integration credential and `ogun
+ * secret` had been folded into `ogun connect` on that observation. **A secret is not
+ * guaranteed to be an integration** — a webhook signing key, a shared HMAC, a token for
+ * something Ogun hands to a skill rather than polls itself — and a closed set would refuse
+ * every one of them for the sole reason that nothing here *polls* under that name.
+ *
+ * So the set belongs to `connect`, where the argument for it is exact, and `secret set`
+ * takes free-form names under a different protection: see `setProjectSecret`.
+ * `readProjectSecret` still takes a `SecretName`, because it answers "what does a poll
+ * authenticate with", and only these are polled.
  *
  * ### Why the OAuth client secret is *not* a name here
  *
@@ -151,7 +165,7 @@ export function sealSecret(value: string): Secret {
  *    apart from `unreadable` below because the fix is to reconnect one project, where
  *    `unreadable` means a config.json that is currently failing to parse for everything
  *    on the machine.
- *  - `absent` — nobody has set one. The fix is `ogun secret set`.
+ *  - `absent` — nobody has set one. The fix is `ogun connect <integration>`.
  *  - `empty` — an entry exists and holds nothing. Only reachable by hand-editing the
  *    file, which §4.5 says people do, and the write path here refuses to create it. It is
  *    kept apart from `absent` because the fixes differ: one is "set it", the other is
@@ -205,7 +219,7 @@ export type ProjectSecret =
  * `catch` would report a failed token exchange as "Linear is unreachable" — the exact
  * misnaming the four states existed to prevent.
  *
- * Async and unmemoised on purpose. A rotation is a file write (`ogun secret set` again),
+ * Async and unmemoised on purpose. A rotation is a file write (`ogun connect` again),
  * and the whole point of rotating in place is that the next poll picks it up
  * without restarting the control plane. Against a poll interval of minutes, re-reading a
  * small file costs nothing; the gateway's five-second credential memo exists because it
@@ -326,12 +340,29 @@ export async function listProjectSecrets(
  * has live secrets in it, and a caller who logged the result of "set" would be logging the
  * thing it just set. A three-state enum has no field a value fits in — the same property
  * `ProjectSecretPresence` is built on, for the same reason.
+ *
+ * ### `name` is a plain string, and the closed set moved up to the callers
+ *
+ * It was `SecretName`, which made the type system the guard. That was right while this
+ * store held nothing but integration credentials, and it stopped being right when `ogun
+ * secret set <name>` came back as a general per-project store: **a secret is not
+ * guaranteed to be an integration**, and arbitrary names are the point of a store like
+ * that. A closed set here would refuse a webhook signing key on the grounds that Ogun does
+ * not poll one.
+ *
+ * The protection `SECRET_NAMES` gave is not abandoned, it is applied where it is true.
+ * `connect` still validates the integration against the closed set, because there the
+ * failure is exact: a name Ogun polls under, misspelled, is a live credential nothing ever
+ * reads. `secret set` cannot borrow that argument, so it replaces it with the two things
+ * that survive without a closed set — a name shape that a pasted API key cannot satisfy,
+ * and a line at the moment of storing that says in as many words when nothing in this
+ * build reads the name just written. See `requireSecretName` in the CLI.
  */
 export type DisplacedSecret = 'absent' | 'present' | 'empty'
 
 export async function setProjectSecret(
   projectSlug: string,
-  name: SecretName,
+  name: string,
   value: string,
   path = localConfigPath(),
 ): Promise<DisplacedSecret> {
@@ -368,13 +399,13 @@ export async function setProjectSecret(
  * subsequent read is `absent` — the state that means nobody set one — rather than a
  * project that exists in the store holding nothing.
  *
- * `name` is a plain string here where `setProjectSecret` takes a `SecretName`, and the
- * asymmetry is deliberate. The closed set exists to stop a *write* creating a key nothing
- * reads; removal creates nothing. What it has to cover is everything the store can
- * actually hold, and that is wider than `SECRET_NAMES`: §4.5 says `~/.ogun/config.json`
- * gets hand-edited, `listProjectSecrets` reports whatever it finds, and the Settings page
- * renders that. A row a person can see and cannot remove is a live credential stranded in
- * the file by a validator meant to protect it.
+ * `name` is a plain string, as it always was, and the asymmetry it used to have with
+ * `setProjectSecret` is gone now that writes take one too. The reason it was never
+ * narrowed here still holds and is the stronger half of the argument: removal creates
+ * nothing, and what it has to cover is everything the store can actually hold — §4.5 says
+ * `~/.ogun/config.json` gets hand-edited, `listProjectSecrets` reports whatever it finds,
+ * and the Settings page renders that. A row a person can see and cannot remove is a live
+ * credential stranded in the file by a validator meant to protect it.
  */
 export async function clearProjectSecret(
   projectSlug: string,

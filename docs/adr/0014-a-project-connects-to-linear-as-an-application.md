@@ -283,7 +283,7 @@ which was right while every connection had a browser in it. The default grant ha
 and inventing a plausible `http://localhost:7777/…` would put a string in the store that
 Linear was never told about. That is the mismatch the field exists to make visible,
 manufactured, and it would surface as an authorization Linear refuses without saying why.
-Empty means "there was no browser", which is true and is what `ogun connections` prints.
+Empty means "there was no browser", which is true and is what `ogun connect list` prints.
 `POST /api/oauth/linear/start` refuses an application with an empty one and names the
 command that registers a real one.
 
@@ -354,7 +354,7 @@ use is how someone spends an hour debugging the wrong one:
 
 - `ogun runner doctor` prints the workspace, the actor, the scopes and the remaining life,
   and says in as many words when a stored API key is not being used.
-- `ogun connections` says the same from the store, without needing the server —
+- `ogun connect list` says the same from the store, without needing the server —
   which is when the question is usually asked. [amended: it was `ogun linear status`, and
   it now shows keys and grants in one table, because two listings that could not see each
   other made the answer to "is this connected" depend on which command you ran.]
@@ -563,6 +563,10 @@ use is how someone spends an hour debugging the wrong one:
   ogun disconnect <integration> [--project <slug>] [--keep-application]
   ```
 
+  [amended — superseded by the block further down this bullet: the credentials became
+  named flags, `--oauth` came back, `connections` became `connect list`, and `ogun secret`
+  returned beside all of it.]
+
   **`app` is gone as a separate step**, and that is `client_credentials` paying for itself
   rather than a tidying. `ogun linear app` existed because the authorization needed a
   browser and a person, so there had to be a place to stop between "here are the
@@ -586,6 +590,84 @@ use is how someone spends an hour debugging the wrong one:
   All four dropped spellings — `ogun secret`, `ogun linear`, and both under `ogun project`
   — answer with a line naming `ogun connect` rather than "unknown command", and their
   `--help` prints the page that replaced them.
+
+  [amended] **Two of the three sentences above are reversed, by the product owner, and
+  the reversal is recorded rather than quietly applied.** The vocabulary is now:
+
+  ```
+  ogun connect <integration> --client-id <id> --client-secret <secret> [--project <slug>]
+  ogun connect <integration> --consent --client-id <id> --client-secret <secret>
+  ogun connect <integration> --api-key [<key>] [--project <slug>]
+  ogun connect list [--project <slug>]
+  ogun disconnect <integration> [--project <slug>] [--keep-application]
+
+  ogun secret set <name> <key> [--project <slug>]
+  ogun secret list [--project <slug>]
+  ogun secret rm <name> [--project <slug>]
+  ```
+
+  - **`--oauth` is back, and `--consent` is a modifier inside it rather than a peer of
+    it.** The superseded reasoning, which was a correct description of the shape it was
+    describing:
+
+    > *"The names describe what the credential is, because that is what an operator is
+    > choosing between, and none of them is `--oauth`: two of the three are OAuth, so a
+    > flag by that name would be the ambiguity this change exists to remove, one level
+    > down."*
+
+    "Two of the three are OAuth" is only a problem while the three are treated as peers,
+    and treating them as peers was the fault. **Two of them name a kind of integration and
+    the third names a grant inside one of those kinds.** Flattening that put a fork in the
+    road where there is no fork: somebody choosing between `--app-token` and `--consent`
+    has already decided they are connecting an application, and somebody choosing
+    `--api-key` has decided something else entirely.
+
+    So the flag names *what you are connecting*, and the kind decides what else is
+    required — `--oauth` always means a client id and a client secret, `--api-key` never
+    does. `--consent` selects the authorization-code grant, **implies `--oauth`** so that
+    nobody has to type both, and is refused beside `--api-key`, which has nobody to approve
+    anything. `--app-token` is dropped and refuses with a line naming `--oauth`.
+
+    Considered and rejected for the modifier: `--grant
+    <client-credentials|authorization-code>`, which names exactly what is being selected
+    and matches this record's own `grantType` and RFC 6749. It loses on what an operator is
+    actually deciding — nobody reaches for it because they want a different grant, they
+    reach for it because their teams are private — and it costs two long values to spell at
+    the moment somebody is already lost.
+
+  - **The client id and secret are named flags, not positionals.** They were positionals
+    for one commit, which does put them in the usage line and still gets it wrong: both are
+    opaque strings from the same page of Linear's settings, so a fixed order between them
+    is a coin flip, and getting it wrong produces a token error that names the *client*
+    rather than the order. The rule, stated once so the rest of the CLI can be held to it:
+    **a lone value can be positional; several credential values of the same shape must be
+    named.** `ogun secret set <name> <key>` keeps `<key>` positional under that rule, and
+    `--api-key [<key>]` carries its own.
+
+    Nothing about how a value arrives changed. Omitting a flag prompts (the Client ID
+    visibly, the secret with the echo off) or reads stdin when stdin is a pipe, and an
+    inline value is accepted with the warning this record's amendment above argues for.
+
+  - **`ogun secret` is back, and is not integration-scoped.** The paragraph above deleted
+    it on the observation that every name in `SECRET_NAMES` was an integration credential,
+    and promised it would return "if a secret ever appears that is not a connection". The
+    observation was true and the inference from it was not: the reason nothing else was in
+    that set is that the set refused everything else, so *"no counter-example exists"* was
+    a fact about the validator rather than about the world. The product owner's line is the
+    whole of it — **a secret is not guaranteed to be an integration** — and building the
+    general store only after one appears gets the order backwards, because a per-project
+    value that is not a connection has nowhere to live until it does.
+
+    `SECRET_NAMES` stays closed and belongs to `connect`, where the argument for it is
+    exact. `secret set` takes free-form names, and what replaces the protection it loses is
+    written up in ADR-0012's amendment.
+
+  - **`ogun connections` is `ogun connect list`.** A listing was a top-level noun sitting
+    beside the verbs, and with `secret list` back that would have been two conventions for
+    "show me what is stored". `disconnect` stays a top-level verb rather than becoming
+    `connect rm`: it revokes a token at Linear, which is an act on the outside world rather
+    than the removal of a row from a listing. The old spelling refuses with a line naming
+    the new one.
 
   **The slug asymmetry does not survive, and it should not.** This record stated the rule
   as *"each command checks the slug against the best oracle it already depends on"*, which

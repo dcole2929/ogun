@@ -21,6 +21,17 @@ type Topic = {
   where?: string
   notes?: string[]
   subcommands?: Array<[string, string]>
+  /**
+   * Definition lists with their own headings, for a command whose options are not one
+   * flat set.
+   *
+   * `ogun connect` is the reason. Its flags come in two levels — *which kind of thing you
+   * are connecting*, and then *how* — and rendering them as one alphabetical block is
+   * exactly the flattening the command was reshaped to undo: `--api-key` and `--consent`
+   * side by side read as alternatives, when one names a kind of integration and the other
+   * selects a grant inside the other kind.
+   */
+  groups?: Array<{ heading: string; rows: Array<[string, string]> }>
   flags?: Array<[string, string]>
   /** Environment, for the two commands configured that way rather than by flag. */
   env?: Array<[string, string]>
@@ -337,13 +348,12 @@ const topics: Record<string, Topic> = {
       ['list', 'every project the control plane knows about (the default)'],
     ],
     notes: [
-      "A project's credentials are `ogun connect`, not `ogun project secret` or `ogun " +
-        'project linear`. Both of those moved out of this namespace when the project ' +
-        'stopped being a positional and started coming from the directory you are standing ' +
-        'in, as `add` and `sync` always have — and then merged, because "a personal API ' +
-        'key" and "an OAuth application" were two vocabularies for one act.',
+      "A project's credentials are `ogun connect` (an integration) or `ogun secret` (any " +
+        'other value it needs). Both moved out of this namespace when the project stopped ' +
+        'being a positional and started coming from the directory you are standing in, as ' +
+        '`add` and `sync` always have.',
     ],
-    see: ['ogun connect', 'ogun connections'],
+    see: ['ogun connect', 'ogun secret'],
   },
 
   connect: {
@@ -351,79 +361,109 @@ const topics: Record<string, Topic> = {
     /**
      * **The usage lines name every input, including the ones that are not arguments.**
      *
-     * This is the third time the point has been made about this CLI and it is the
+     * This is the fourth time the point has been made about this CLI and it is the
      * acceptance bar for the change that produced this page. `ogun linear app [--project
      * <slug>]` read as a complete command that takes nothing; the two values it exists to
      * collect appeared nowhere in it, so the only way to discover that it prompts was to
-     * run it. A usage line that hides the input a command exists for is wrong, and it is
-     * wrong in the one place a person goes to find out.
+     * run it.
      *
-     * So the credentials are positionals in the signature, and the block below says what
-     * each one is and where it comes from when it is left out. Leaving them out is the
-     * recommended path — a prompt at a terminal, stdin in a pipe — and passing one inline
-     * works and prints a warning rather than being refused. See `warnInlineSecret` for why
-     * that reversed.
+     * The credentials were positionals for one commit, which put them in the signature
+     * and still got it wrong: a client id and a client secret are two opaque strings from
+     * the same page of Linear's settings, and a fixed order between them is a coin flip.
+     * They are named flags now, and the flag names are the part a reader has to see.
      */
     usage: [
-      'ogun connect <integration> <client-id> <client-secret> [--project <slug>]',
-      'ogun connect <integration> --consent <client-id> <client-secret> [--project <slug>]',
-      'ogun connect <integration> --api-key <key> [--project <slug>]',
+      'ogun connect <integration> --client-id <id> --client-secret <secret> [--project <slug>]',
+      'ogun connect <integration> --consent --client-id <id> --client-secret <secret>',
+      'ogun connect <integration> --api-key [<key>] [--project <slug>]',
+      'ogun connect list [--project <slug>]',
     ],
     notes: [
       '<integration> — which product. One of: linear. It is an argument rather than a word ' +
         'in the command path, so github and jira become values here rather than whole new ' +
         'command trees.',
-      '<client-id> — the Client ID of the OAuth application you registered at ' +
-        'https://linear.app/settings/api/applications/new. Not a secret: it is in every ' +
-        'authorization URL a browser visits and on Linear\'s own settings page. Omit it to ' +
-        'be prompted, visibly, so you can check what you pasted.',
-      '<client-secret> — the Client Secret from that same page. Omit it and you are ' +
-        'prompted with the echo off; pipe it and it is read from stdin:\n' +
+      'The FLAG NAMES WHAT YOU ARE CONNECTING, and that decides what else is required. ' +
+        '--oauth is an application you registered, which always means a client id and a ' +
+        'client secret; --api-key is one key and has neither. --oauth is the default, so ' +
+        'the first line above is what most people type:\n' +
         '    ogun connect linear                                    prompts for both\n' +
-        '    op read op://vault/linear/secret | ogun connect linear <client-id>\n' +
+        '    ogun connect linear --client-id abc123                 prompts for the secret\n' +
+        '    ogun connect linear --api-key                          prompts for the key',
+      '--client-id <id> — the Client ID of the OAuth application you registered at ' +
+        'https://linear.app/settings/api/applications/new. Not a secret: it is in every ' +
+        "authorization URL a browser visits and on Linear's own settings page. Omit the " +
+        'flag to be prompted, VISIBLY, so you can check what you pasted — or to keep the ' +
+        'one already registered here.',
+      '--client-secret <secret> — the Client Secret from that same page. Omit the flag and ' +
+        'you are prompted with the echo off; pipe it and it is read from stdin:\n' +
+        '    op read op://vault/linear/secret | ogun connect linear --client-id abc123\n' +
         '  Passing it inline works and prints a warning, because argv is readable by every ' +
-        'user on the box through /proc/<pid>/cmdline while the command runs, and your ' +
-        'shell writes the whole line into ~/.zsh_history or ~/.bash_history where nothing ' +
-        'cleans it up. Prefer the prompt or the pipe.',
-      '<key> — with --api-key, the personal API key, on exactly the same terms: omit it to ' +
-        'be prompted with the echo off, pipe it, or pass it inline and be warned.\n' +
-        '    ogun connect linear --api-key                          prompts\n' +
-        "    printf 'lin_api_…' | ogun connect linear --api-key",
-      'With no positionals at all, an application already registered on this machine is ' +
-        'reused and nothing is asked for. That is the reconnect after a token lapses, and ' +
-        'the retry after one that failed on the network.',
+        'user on the box through /proc/<pid>/cmdline while the command runs, and your shell ' +
+        'writes the whole line into ~/.zsh_history or ~/.bash_history where nothing cleans ' +
+        'it up. Prefer the prompt or the pipe.',
+      '--api-key [<key>] — the personal API key, on exactly the same terms: leave the ' +
+        'value off to be prompted with the echo off, pipe it, or pass it inline and be ' +
+        'warned.\n' +
+        "    printf 'lin_api_…' | ogun connect linear --api-key\n" +
+        '    ogun connect linear --api-key=lin_api_…                 works, and warns',
+      'With no --client-id and no --client-secret, an application already registered on ' +
+        'this machine is reused and nothing is asked for. That is the reconnect after a ' +
+        'token lapses and the retry after one that failed on the network. Giving only ' +
+        '--client-secret rotates the secret and keeps the registered client id; giving a ' +
+        'NEW --client-id always asks for its own secret, because a secret belongs to the ' +
+        'application it was issued for.',
+      'A per-project value that is NOT an integration — a webhook signing key, a token a ' +
+        'skill is handed — is `ogun secret set <name> <key>`. That command and ' +
+        '`connect --api-key` write the same row for the same name, through the same lock, ' +
+        'so they cannot disagree about what is stored.',
     ],
     where:
       'On the control-plane machine, because the control plane is what polls and that is ' +
       'where the credential has to be. Only --consent needs the server to be running: its ' +
-      'CSRF nonce and its callback both live in that process. The default and --api-key ' +
-      'write config.json directly, so they work before `ogun init`, with the database ' +
-      'down, and over SSH.',
-    subcommands: [
-      [
-        '(default)',
-        "Ogun asks Linear for a token in its own name — the client-credentials grant. No " +
-          'browser, no consent screen, nobody to approve it. The token is an app-actor ' +
-          'token that lasts 30 days and is renewed by asking again. It reaches the ' +
-          "workspace's PUBLIC teams and no others",
-      ],
-      [
-        '--app-token',
-        'the explicit spelling of the default, for a script that must keep meaning this ' +
-          'even if the default changes',
-      ],
-      [
-        '--consent',
-        'the authorization-code flow: prints a URL for somebody to approve in a browser. ' +
-          'What you need for PRIVATE teams, and for user-scoped access. It installs at the ' +
-          'workspace level, so Linear needs a workspace admin to approve it',
-      ],
-      [
-        '--api-key',
-        'a personal API key. Everything Ogun does, it does as you — and once write-back ' +
-          'lands, every comment it posts appears under your name on a board other people ' +
-          'read. The fallback for a workspace where you cannot register an application',
-      ],
+      'CSRF nonce and its callback both live in that process. Everything else writes ' +
+      'config.json directly, so it works before `ogun init`, with the database down, and ' +
+      'over SSH.',
+    subcommands: [['list', 'what this machine is connected to, how, and how healthy each one is']],
+    groups: [
+      {
+        heading: 'what you are connecting',
+        rows: [
+          [
+            '--oauth',
+            'an OAuth application you registered in the provider. THE DEFAULT, so no flag ' +
+              'is needed; the explicit spelling is for a script that must keep meaning ' +
+              'this even if the default changes. Requires --client-id and --client-secret. ' +
+              "Ogun asks Linear for a token in its OWN name — no browser, no consent " +
+              'screen, nobody to approve it. The token lasts 30 days and is renewed by ' +
+              "asking again, and it reaches the workspace's PUBLIC teams and no others",
+          ],
+          [
+            '--api-key <key>',
+            'one personal API key, and no application. Everything Ogun does, it does AS ' +
+              'YOU — and once write-back lands, every comment it posts appears under your ' +
+              'name on a board other people read. The fallback for a workspace where you ' +
+              'cannot register an application at all',
+          ],
+        ],
+      },
+      {
+        heading: 'which OAuth grant (only with --oauth, which it implies)',
+        rows: [
+          [
+            '--consent',
+            'the authorization-code grant instead of client-credentials: Ogun prints a URL, ' +
+              'somebody opens it and approves the installation, and the token that comes ' +
+              'back sees what THEY can see. YOU NEED THIS IF YOUR TEAMS ARE PRIVATE — a ' +
+              'client-credentials token reaches public teams only, so a private workspace ' +
+              'polls successfully and finds nothing, forever. Also what to use when Ogun ' +
+              'should see one person\'s view rather than the workspace\'s. The cost: it ' +
+              'installs at the workspace level, so Linear needs a workspace ADMIN to ' +
+              'approve it, and it is the one shape that needs the control plane running. ' +
+              'You do not also pass --oauth; --consent already means it. It is refused ' +
+              'beside --api-key, which has nobody to approve anything',
+          ],
+        ],
+      },
     ],
     flags: [
       [
@@ -443,22 +483,25 @@ const topics: Record<string, Topic> = {
         'OGUN_PUBLIC_URL',
         'with --consent only: the address a browser reaches this control plane at, when it ' +
           'is not the one this process sees — a reverse proxy terminating TLS. The redirect ' +
-          'URI is built from it and Linear matches that string exactly. The default ' +
-          'mechanism has no redirect URI at all, because it has no browser',
+          'URI is built from it and Linear matches that string exactly. The default grant ' +
+          'has no redirect URI at all, because it has no browser',
       ],
     ],
     touches: [[LOCAL_CONFIG, 'the oauth block (or secrets, with --api-key), mode 0600']],
-    see: ['ogun connections', 'ogun disconnect', 'ogun runner doctor'],
+    see: ['ogun connect list', 'ogun disconnect', 'ogun secret', 'ogun runner doctor'],
   },
 
-  connections: {
+  'connect list': {
     summary: 'what this machine is connected to, how, and how healthy each one is',
-    usage: ['ogun connections [--project <slug>]'],
+    usage: ['ogun connect list [--project <slug>]'],
     where:
       "On the control-plane machine. It reads this machine's config.json directly rather " +
       'than asking the server, so it answers when the server is down — which is when the ' +
       'question is usually asked.',
     notes: [
+      'It was `ogun connections`, a top-level noun beside three verbs. A listing is now a ' +
+        'subcommand — `connect list`, mirroring `secret list` — and the old spelling is ' +
+        'refused with a line naming this one.',
       'One table where there used to be two. `ogun linear status` showed grants and `ogun ' +
         'secret list` showed keys, and neither could see the other, so a project with both ' +
         'appeared twice with no indication that only one of them was being read.',
@@ -468,7 +511,12 @@ const topics: Record<string, Topic> = {
         '"connected" alone cannot explain a source that finds no tickets.',
       'A key stored behind a working grant is reported in red as NOT used. An OAuth grant ' +
         'wins over a personal key, so rotating that key would be changing something nothing ' +
-        'reads — an evening gone.',
+        'reads — an evening gone. `ogun secret list` says the same thing about the same ' +
+        'row, in the same words.',
+      'It shows KEYS ONLY WHERE THE NAME IS AN INTEGRATION. `ogun secret set` stores ' +
+        'free-form names now, and a webhook signing key is not something a project can ' +
+        'reach anything with. Anything left out is counted in the last line, so a short ' +
+        'table never quietly implies an empty store.',
       'It does not narrow to the current directory the way `connect` and `disconnect` do. ' +
         'Those act on exactly one project, so naming the wrong one is their whole failure ' +
         'mode; this acts on none, and a listing that answered for wherever the shell was ' +
@@ -479,7 +527,7 @@ const topics: Record<string, Topic> = {
       'It cannot say what is MISSING: which projects need a credential is a fact in each ' +
         "repository's .ogun/config.yaml, and this reads no repositories.",
     ],
-    see: ['ogun connect', 'ogun runner doctor'],
+    see: ['ogun connect', 'ogun secret list', 'ogun runner doctor'],
   },
 
   disconnect: {
@@ -492,6 +540,9 @@ const topics: Record<string, Topic> = {
     notes: [
       'It removes the access token, the client id and secret, and any personal API key ' +
         'stored for that project — everything `connect` could have written.',
+      'A top-level verb rather than `connect rm`, and that is not an oversight: it revokes ' +
+        'a token at Linear, which is an act on the outside world rather than the removal of ' +
+        'a row from a listing.',
       'The client id and secret go by default because under the default grant they ARE the ' +
         'credential: anyone holding them can mint a live token, and the next poll would. A ' +
         'disconnect that left them behind is one the machine undoes by itself.',
@@ -503,9 +554,11 @@ const topics: Record<string, Topic> = {
         'Linear being reachable would leave you unable to remove a credential from your own ' +
         'machine during an outage. Whether it worked is reported as its own line.',
       'Neither the integration nor the project is checked against anything, where `connect` ' +
-        'checks both. config.json gets hand-edited and `connections` prints whatever it ' +
+        'checks both. config.json gets hand-edited and `connect list` prints whatever it ' +
         'finds, so a row you can see has to be a row you can remove. Validation guards ' +
         'writes, which is where an unknown name or slug creates a credential nothing reads.',
+      'To remove a value that is not an integration credential, that is `ogun secret rm ' +
+        '<name>`.',
     ],
     flags: [
       ['--project <slug>', 'which project, instead of the one this directory belongs to'],
@@ -515,7 +568,136 @@ const topics: Record<string, Topic> = {
       ],
     ],
     touches: [[LOCAL_CONFIG, 'the oauth and secrets blocks for that project']],
-    see: ['ogun connect', 'ogun connections'],
+    see: ['ogun connect', 'ogun connect list'],
+  },
+
+  secret: {
+    summary: 'a value a project needs, kept on the machine that polls',
+    usage: [
+      'ogun secret set <name> <key> [--project <slug>]',
+      'ogun secret list [--project <slug>]',
+      'ogun secret rm <name> [--project <slug>]',
+    ],
+    where:
+      'On the control-plane machine — that is what reads these. It reaches no server: the ' +
+      'store is this machine\'s ' + LOCAL_CONFIG + ' at mode 0600, written directly, so it ' +
+      'works before `ogun init`, with the database down, and over SSH.',
+    notes: [
+      'This and `ogun connect` are not two spellings of one act. `connect` is ACCESS — ' +
+        'which product, and how Ogun gets in; it knows what a grant is, what a client id ' +
+        'is, and refuses an integration it cannot poll. This is STORAGE — one free-form ' +
+        'name, one value, for anything at all. A secret is not guaranteed to be an ' +
+        'integration.',
+      'They overlap on exactly one thing and it is the same row: `ogun secret set linear ' +
+        '<key>` and `ogun connect linear --api-key <key>` write the same slot, through the ' +
+        'same function, under the same lock — so a key stored by one is the key the other ' +
+        'reports, and a key that a grant has taken over is refused by BOTH.',
+      'Names are free-form, unlike the integration `connect` takes. What replaces the ' +
+        'protection a closed set gave: a name must be lowercase letters, digits, dots and ' +
+        'dashes up to 64 characters, which a pasted API key cannot be — and `set` says out ' +
+        'loud when nothing in this build reads the name you just stored, which is the fact ' +
+        'the closed set existed to prevent you from discovering at 2am.',
+    ],
+    subcommands: [
+      ['set <name> <key>', 'store one value under one name for one project'],
+      ['list', 'every value stored on this machine, and what reads each one (the default)'],
+      ['rm <name>', 'forget one'],
+    ],
+    see: ['ogun secret set', 'ogun connect', 'ogun connect list'],
+  },
+
+  'secret set': {
+    summary: 'store one value under one name for one project',
+    /**
+     * `<key>` is a positional where `connect` names its credentials as flags, and the rule
+     * behind both is one sentence: **a lone value can be positional; several credential
+     * values of the same shape must be named.** There is nothing here for it to be
+     * confused with — `<name>` is not a credential and does not look like one.
+     */
+    usage: ['ogun secret set <name> <key> [--project <slug>]'],
+    notes: [
+      '<name> — free-form: lowercase letters, digits, dots and dashes, up to 64 ' +
+        'characters. `linear`, `stripe-webhook`. The shape is deliberate — it is what ' +
+        'stops a pasted API key being accepted as a name by a command that would otherwise ' +
+        'have no way to tell.',
+      '<key> — the value. Leave it off and it is prompted for with the echo off at a ' +
+        'terminal, or read from stdin when stdin is a pipe:\n' +
+        '    ogun secret set stripe-webhook                         prompts\n' +
+        "    op read op://vault/stripe/whsec | ogun secret set stripe-webhook\n" +
+        '  Passing it inline works and prints a warning, because argv is readable by every ' +
+        'user on the box through /proc/<pid>/cmdline while the command runs, and your shell ' +
+        'writes the whole line into ~/.zsh_history or ~/.bash_history where nothing cleans ' +
+        'it up. Prefer the prompt or the pipe.',
+      'Storing replaces what was there and there is no history and no second slot: a ' +
+        'rotation window belongs to whoever issued the value, and two live values in one ' +
+        'store means that when something 401s nothing can say which one it used. The ' +
+        'confirmation says whether it stored or REPLACED, and a replace says the old value ' +
+        'cannot be recovered from this machine.',
+      'If nothing in this build reads the name, it says so — after storing it, not instead ' +
+        'of storing it. Ogun polls under: linear. Anything else is stored for whatever ' +
+        'reads it, and the line is there so "nothing reads this" is something you are told ' +
+        'now rather than something you infer from a failure later.',
+      'A name that IS an integration is refused when that project already has a working ' +
+        'OAuth grant, because a grant wins over a key and the value would sit in the file ' +
+        'being read by nothing. `ogun disconnect <name>` first. This is the same refusal ' +
+        '`ogun connect --api-key` gives, from the same function.',
+      'The value never crosses a network, never enters the database, never reaches a ' +
+        'sandbox, and is never printed back — not by this command, not by `list`, not by ' +
+        'any endpoint. The confirmation gives a character count and nothing else, not even ' +
+        'the last four characters.',
+    ],
+    flags: [
+      [
+        '--project <slug>',
+        'which project, instead of the one this directory belongs to. The directory is ' +
+          'resolved exactly as `ogun project add` and `ogun project sync` resolve it',
+      ],
+      [
+        '--allow-unregistered',
+        'store under a slug this machine has no record of — for a control plane whose ' +
+          'repositories are checked out somewhere else. It warns, because a slug nothing ' +
+          'here can confirm is a typo until something fails',
+      ],
+    ],
+    touches: [[LOCAL_CONFIG, 'the secrets block for that project, mode 0600']],
+    see: ['ogun secret list', 'ogun connect'],
+  },
+
+  'secret list': {
+    summary: 'every value stored on this machine, and what reads each one',
+    usage: ['ogun secret list [--project <slug>]'],
+    notes: [
+      'The READ BY column is the point. `the linear poll` is a value something in this ' +
+        'build actually authenticates with; `nothing in this build` is a value stored under ' +
+        'a name nothing reads — which is fine for a secret some other tool consumes, and is ' +
+        'a typo the rest of the time; `nothing — the linear grant wins` is a key sitting ' +
+        'behind an OAuth grant, in red, because rotating it would change something nothing ' +
+        'reads. `ogun connect list` says the same about the same row.',
+      'It lists the whole machine unless --project narrows it, for the reason `connect ' +
+        'list` does: a listing that answered for wherever the shell was standing would ' +
+        'report an empty store on a machine holding four projects\' credentials.',
+      'Values are never printed, and there is no field in what this reads that one would ' +
+        'fit in. Grants are not secrets and are not here — `ogun connect list`.',
+    ],
+    see: ['ogun secret set', 'ogun connect list'],
+  },
+
+  'secret rm': {
+    summary: 'forget one stored value',
+    usage: ['ogun secret rm <name> [--project <slug>]'],
+    notes: [
+      'Nothing is checked — not the name, not the project — where `set` checks both. ' +
+        LOCAL_CONFIG + ' gets hand-edited and `list` prints whatever it finds, so a row you ' +
+        'can see has to be a row you can remove; refusing would strand a live credential in ' +
+        'the file with the listing still advertising it.',
+      'Finding nothing to remove is its own answer, said in a colour and naming the project ' +
+        'it looked in, because the project is inferred from the directory and an `rm` run ' +
+        'one level too high is a plausible way to reach it. It still exits 0: a removal that ' +
+        'finds nothing has reached the state it was asked for.',
+      'It cannot touch an OAuth grant, so a project that is still connected is told it is ' +
+        'still connected. `ogun disconnect <integration>` is what removes one.',
+    ],
+    see: ['ogun secret list', 'ogun disconnect'],
   },
 
   'project add': {
@@ -849,24 +1031,25 @@ const topics: Record<string, Topic> = {
 // `ogun skill show` and `ogun skills show` are the same command, so they are the same page.
 topics['skill show'] = topics['skills show']!
 
-// The singular is what somebody types after reading the top-level listing's plural, and a
-// `--help` that answers "no help for: connection" after the command itself worked is worse
-// than no alias at all.
-topics['connection'] = topics['connections']!
-
 /**
  * The dropped spellings still answer `--help`, and answer it with the page that replaced
  * them.
  *
- * `main.ts` refuses the commands themselves with a line naming `ogun connect`. That covers
- * somebody who ran the old command; it does not cover somebody who read an old README and
- * typed `ogun secret --help` first, whose reward would otherwise be "no help for: secret"
- * — which reads as "that does not exist" rather than "that moved". These are pointers, not
- * an alias: the commands are gone.
+ * `main.ts` refuses the commands themselves with a line naming the replacement. That
+ * covers somebody who ran the old command; it does not cover somebody who read an old
+ * README and typed `ogun connections --help` first, whose reward would otherwise be "no
+ * help for: connections" — which reads as "that does not exist" rather than "that moved".
+ * These are pointers, not aliases: the commands are gone.
  */
-topics['secret'] = topics['connect']!
-topics['secrets'] = topics['connect']!
+topics['connections'] = topics['connect list']!
+topics['connection'] = topics['connect list']!
 topics['linear'] = topics['connect']!
+
+// `ogun secrets list` is what somebody types after reading the plural everywhere else.
+topics['secrets'] = topics['secret']!
+topics['secrets set'] = topics['secret set']!
+topics['secrets list'] = topics['secret list']!
+topics['secrets rm'] = topics['secret rm']!
 
 /**
  * `ogun <command> --help` before `ogun --help`: a two-word path wins over its parent, so
@@ -892,6 +1075,7 @@ function render(name: string, t: Topic): string {
     out.push('', bold(heading), definitions(rows))
   }
   if (t.subcommands) section('commands', t.subcommands)
+  for (const group of t.groups ?? []) section(group.heading, group.rows)
   if (t.flags) section('flags', t.flags)
   if (t.env) section('environment', t.env)
   if (t.touches) section('touches', t.touches)
@@ -987,8 +1171,10 @@ ${bold('projects')}
   ogun project sync [dir]          read .ogun/config.yaml and register it
   ogun project list
   ogun connect <integration>       give this project access to Linear (or the next one)
-  ogun connections                 what is connected, how, and how healthy
+  ogun connect list                what is connected, how, and how healthy
   ogun disconnect <integration>    remove every credential for it
+  ogun secret set <name> <key>     any other value a project needs, on this machine
+  ogun secret list | rm <name>
 
 ${bold('what can run')}
   ogun skill new <name>            scaffold .agents/skills/<name>/

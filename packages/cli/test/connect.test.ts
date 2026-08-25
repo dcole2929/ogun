@@ -9,8 +9,8 @@ import { fileURLToPath } from 'node:url'
 import { projectSecrets } from '../src/commands/doctor.ts'
 
 /**
- * `ogun connect | connections | disconnect` — the one vocabulary for giving a project
- * access to an integration.
+ * `ogun connect | connect list | disconnect` — the one vocabulary for giving a project
+ * *access* to an integration. `ogun secret` is the store beside it, in `secret.test.ts`.
  *
  * ### What is tested here, and what is not
  *
@@ -35,11 +35,22 @@ type Ctx = { after: (fn: () => unknown) => void }
 /** What the stub control plane was asked for, in order. */
 type Seen = string[]
 
+/**
+ * What was *sent*, keyed by route, for the tests about which credential arrived.
+ *
+ * `seen` answers ordering questions — "was anything registered before the refusal" — and
+ * cannot answer "which client id did it register", which is the whole of the per-field
+ * fallback. Bodies are parsed here rather than in each test so nothing has to remember to
+ * drain the request.
+ */
+type Sent = Record<string, Record<string, unknown>>
+
 const stub = async (
   t: Ctx,
   routes: Record<string, (seen: Seen) => [number, unknown]>,
-): Promise<{ url: string; seen: Seen }> => {
+): Promise<{ url: string; seen: Seen; sent: Sent }> => {
   const seen: Seen = []
+  const sent: Sent = {}
   const server: Server = createServer((req, res) => {
     const key = `${req.method} ${(req.url ?? '').split('?')[0]}`
     seen.push(key)
@@ -48,13 +59,23 @@ const stub = async (
     res.writeHead(status, { 'content-type': 'application/json' })
     // The body is drained first: an unconsumed request body makes the client see a socket
     // hang up rather than the status this test is about.
-    req.resume()
-    req.on('end', () => res.end(JSON.stringify(body)))
+    let raw = ''
+    req.on('data', (chunk) => (raw += String(chunk)))
+    req.on('end', () => {
+      if (raw !== '') {
+        try {
+          sent[key] = JSON.parse(raw) as Record<string, unknown>
+        } catch {
+          // A body this suite does not send as JSON is not a body it asserts on.
+        }
+      }
+      res.end(JSON.stringify(body))
+    })
   })
   await new Promise<void>((done) => server.listen(0, '127.0.0.1', done))
   t.after(() => new Promise<void>((done) => server.close(() => done())))
   const port = (server.address() as { port: number }).port
-  return { url: `http://127.0.0.1:${port}`, seen }
+  return { url: `http://127.0.0.1:${port}`, seen, sent }
 }
 
 const ogun = (
@@ -198,11 +219,18 @@ test('the usage lines name every input, including the ones that are not argument
    * The property: **no usage line for `connect` reads as complete without its credentials
    * in it**, and the line says where each one comes from when it is left out.
    *
-   * This has been raised three times about this CLI and it is the acceptance bar. `ogun
+   * This has been raised four times about this CLI and it is the acceptance bar. `ogun
    * linear app [--project <slug>]` was a whole sentence and a lie: the two values it
    * existed to collect appeared nowhere, so the only way to learn that it prompts was to
    * run it — and a *script* that ran it got a process blocking on an empty stdin with
    * nothing on screen explaining why.
+   *
+   * The credentials are **named flags** here, where the previous build had them as
+   * positionals. That version did put them in the usage line and still got it wrong: a
+   * client id and a client secret are two opaque strings from the same page of Linear's
+   * settings, and a fixed order between two values of the same shape is a coin flip at the
+   * keyboard. So the assertion is on the flag names, not merely on the presence of two
+   * angle-bracketed words.
    *
    * Checked against `--help` and against the usage printed on a bad invocation, because
    * those are two different strings and only one of them is ever read deliberately.
@@ -211,19 +239,67 @@ test('the usage lines name every input, including the ones that are not argument
 
   const help = await ogun(['connect', '--help'], { config })
   assert.equal(help.code, 0, help.stderr)
-  assert.match(help.stdout, /ogun connect <integration> <client-id> <client-secret>/)
-  assert.match(help.stdout, /ogun connect <integration> --api-key <key>/)
+  assert.match(help.stdout, /ogun connect <integration> --client-id <id> --client-secret <secret>/)
+  assert.match(help.stdout, /ogun connect <integration> --consent --client-id <id>/)
+  assert.match(help.stdout, /ogun connect <integration> --api-key \[<key>\]/)
+  assert.match(help.stdout, /ogun connect list/)
   // And where each value comes from when it is omitted, which is the recommended path.
   assert.match(help.stdout, /prompt/)
   assert.match(help.stdout, /stdin/)
   // And why passing one inline is worse, where somebody reading `--help` will see it.
   assert.match(help.stdout, /proc/)
   assert.match(help.stdout, /history/)
+  // The kind flag, and the fact that consent is not a third kind but a grant inside one.
+  assert.match(help.stdout, /--oauth/)
+  assert.match(help.stdout, /which OAuth grant/)
 
   const bare = await ogun(['connect'], { config })
   assert.equal(bare.code, 1)
-  assert.match(bare.stderr, /<client-secret>/)
-  assert.match(bare.stderr, /--api-key <key>/)
+  assert.match(bare.stderr, /--client-id <id> --client-secret <secret>/)
+  assert.match(bare.stderr, /--api-key \[<key>\]/)
+})
+
+test('the credentials are flags, and a leftover positional is refused unspoken', async (t) => {
+  /**
+   * The property: `ogun connect linear <secret>` fails, names the flags, and **does not
+   * echo what it was given**.
+   *
+   * The positional shape existed for one commit, so the plausible second positional here
+   * is a client secret. Quoting it back would write a live credential to stderr on top of
+   * the shell history and the `ps` window it is already in — the same rule that stops the
+   * integration name being echoed one function over, arriving through the other argument.
+   */
+  const config = await scratch(t)
+  await machineKnowing(config, { ogun: '/does/not/matter' })
+
+  const set = await ogun(['connect', 'linear', SECRET, '--project', 'ogun'], { config })
+
+  assert.equal(set.code, 1)
+  assert.ok(!`${set.stdout}${set.stderr}`.includes(SECRET), set.stderr)
+  assert.match(set.stderr, /--client-secret <secret>/)
+  assert.match(set.stderr, /compromised/)
+  assert.deepEqual(await secretsIn(config), {})
+})
+
+test('--app-token is dropped, and says which flag replaced it', async (t) => {
+  /**
+   * The property: a flag that existed for one commit answers with its replacement rather
+   * than with "Unknown option".
+   *
+   * `--app-token` named the token that came back; `--oauth` names what is being connected,
+   * which is the distinction the whole reshape turns on. Muscle memory outlives a commit
+   * even when nothing outside this repository ever ran it, and a parser error naming an
+   * option is a dead end where one sentence is not.
+   */
+  const config = await scratch(t)
+  await machineKnowing(config, { ogun: '/does/not/matter' })
+
+  const set = await ogun(['connect', 'linear', '--app-token', '--project', 'ogun'], { config })
+
+  assert.equal(set.code, 1)
+  assert.match(set.stderr, /--oauth/)
+  assert.ok(!/Unknown option/.test(set.stderr), set.stderr)
+  assert.deepEqual(await secretsIn(config), {})
 })
 
 test('an empty pipe is refused, not stored as a credential that does not work', async (t) => {
@@ -278,26 +354,78 @@ test('a rejected integration is not quoted back, because it may be the credentia
   await assert.rejects(() => readFile(config, 'utf8'))
 })
 
-test('two mechanisms at once are refused rather than arbitrated', async (t) => {
+test('two kinds at once are refused, and consent is not a third kind', async (t) => {
   /**
-   * The property: `--api-key --consent` fails, and the failure lists what each one means.
+   * The property: `--oauth --api-key` fails naming both kinds, and `--api-key --consent`
+   * fails with a *different* sentence, because it is a different mistake.
    *
    * Not a preference to be resolved by precedence. Somebody who typed both believes one of
    * those words means something other than what it does, and silently honouring the winner
    * would store a credential of a kind they did not ask for — with a different attribution
    * in Linear — and tell them it worked.
+   *
+   * The second half is the one this shape exists for. `--consent` is a **modifier inside
+   * the OAuth kind**: it selects the authorization-code grant, implies `--oauth`, and has
+   * no meaning beside an api key, which has nobody to approve it. The previous build made
+   * all three peers, which put a fork in the road where there is none — and then had to
+   * reject `--oauth` on the grounds that two of its three flags were OAuth.
    */
   const config = await scratch(t)
   await machineKnowing(config, { ogun: '/does/not/matter' })
-  const set = await ogun(
+
+  const kinds = await ogun(
+    ['connect', 'linear', '--api-key', '--oauth', '--project', 'ogun'],
+    { config },
+    `${KEY}\n`,
+  )
+  assert.equal(kinds.code, 1)
+  assert.match(kinds.stderr, /--oauth and --api-key are different kinds/)
+
+  const grant = await ogun(
     ['connect', 'linear', '--api-key', '--consent', '--project', 'ogun'],
     { config },
     `${KEY}\n`,
   )
+  assert.equal(grant.code, 1)
+  assert.match(grant.stderr, /--consent is an OAuth grant, not a kind/)
 
-  assert.equal(set.code, 1)
-  assert.match(set.stderr, /--consent and --api-key/)
+  // And an application's credentials handed to the kind that has no application.
+  const mixed = await ogun(
+    ['connect', 'linear', '--api-key', '--client-id', 'abc123', '--project', 'ogun'],
+    { config },
+    `${KEY}\n`,
+  )
+  assert.equal(mixed.code, 1)
+  assert.match(mixed.stderr, /--api-key takes one key and no application/)
+
   assert.deepEqual(await secretsIn(config), {})
+})
+
+test('--consent needs no --oauth beside it, and both together is not an error', async (t) => {
+  /**
+   * The property: `--consent` alone reaches the consent flow, and `--oauth --consent` does
+   * the same thing rather than being refused as two kinds.
+   *
+   * That is what makes `--consent` a modifier rather than a peer. `--oauth --consent` was
+   * the clunky spelling the brief asked to be improved on; the improvement is that the
+   * implication runs one way, so the redundant form is accepted and nobody has to type it.
+   *
+   * Both invocations are checked by where they *stop* — the control plane is asked which
+   * projects it knows, which only the consent path does.
+   */
+  const dir = await box(t)
+  const config = join(dir, 'config.json')
+  await machineKnowing(config, { 'heirchive-api': '/does/not/matter' })
+  const server = await stub(t, { 'GET /api/projects': projectsAre('ogun') })
+
+  for (const argv of [
+    ['connect', 'linear', '--consent', '--project', 'heirchive-api'],
+    ['connect', 'linear', '--oauth', '--consent', '--project', 'heirchive-api'],
+  ]) {
+    const set = await ogun(argv, { config, server: server.url }, '')
+    assert.equal(set.code, 1, argv.join(' '))
+    assert.match(set.stderr, /not a project this control plane knows/, argv.join(' '))
+  }
 })
 
 test('a project this machine has never heard of is refused, and nothing is stored', async (t) => {
@@ -585,11 +713,96 @@ test('--consent refuses an unknown slug before it asks for anything', async (t) 
   assert.deepEqual(server.seen, ['GET /api/projects'])
 })
 
+test('a rotated client secret keeps the registered client id, and a new one does not', async (t) => {
+  /**
+   * The property: `--client-secret <new>` on an application already registered here sends
+   * the **stored** client id back with it, and `--client-id <other>` never inherits the
+   * stored secret.
+   *
+   * Two positionals could not express a rotation at all — you had to re-paste both, and a
+   * value re-pasted is a value re-typed, which is how a trailing space gets into a
+   * credential. Named flags make "the secret changed and nothing else did" sayable, so
+   * each half falls back to the store on its own.
+   *
+   * The asymmetry is the load-bearing part. A stored client secret belongs to a stored
+   * client id: pairing it with an id the operator just typed would authenticate an
+   * application it was never issued for, and Linear's answer to that names the *client*
+   * rather than the mismatch. So a new id asks for its own secret — which, with stdin a
+   * pipe, is the value on stdin.
+   *
+   * Driven through `--consent`, because that is the one shape where the registration
+   * crosses a wire this test can watch. The default grant posts straight to Linear.
+   */
+  const dir = await box(t)
+  const config = join(dir, 'config.json')
+  await writeFile(
+    config,
+    JSON.stringify({
+      projects: { ogun: '/does/not/matter' },
+      oauth: {
+        ogun: {
+          linear: {
+            clientId: 'client-1',
+            clientSecret: 'lin_secret_ORIGINALORIGINALORIG',
+            redirectUri: 'http://127.0.0.1:1/api/oauth/linear/callback',
+          },
+        },
+      },
+    }),
+    { mode: 0o600 },
+  )
+
+  const routes = {
+    'GET /api/projects': projectsAre('ogun'),
+    'GET /api/oauth/linear': (): [number, unknown] => [
+      200,
+      { redirectUri: 'http://127.0.0.1:1/api/oauth/linear/callback' },
+    ],
+    'PUT /api/oauth/linear/app/ogun': (): [number, unknown] => [200, { ok: true }],
+    'POST /api/oauth/linear/start/ogun': (): [number, unknown] => [
+      200,
+      {
+        authorizeUrl: 'https://linear.app/oauth/authorize?x=1',
+        redirectUri: 'http://127.0.0.1:1/api/oauth/linear/callback',
+        scopes: ['read'],
+        actor: 'app',
+      },
+    ],
+  }
+
+  const rotated = await stub(t, routes)
+  const one = await ogun(
+    ['connect', 'linear', '--consent', '--client-secret', SECRET, '--project', 'ogun'],
+    { config, server: rotated.url },
+    '',
+  )
+  assert.equal(one.code, 0, one.stderr)
+  assert.deepEqual(rotated.sent['PUT /api/oauth/linear/app/ogun'], {
+    clientId: 'client-1',
+    clientSecret: SECRET,
+  })
+
+  const replaced = await stub(t, routes)
+  const two = await ogun(
+    ['connect', 'linear', '--consent', '--client-id', 'client-2', '--project', 'ogun'],
+    { config, server: replaced.url },
+    // stdin is a pipe, so the secret this application needs is read from it rather than
+    // taken from the one belonging to client-1.
+    `${KEY}\n`,
+  )
+  assert.equal(two.code, 0, two.stderr)
+  assert.deepEqual(replaced.sent['PUT /api/oauth/linear/app/ogun'], {
+    clientId: 'client-2',
+    clientSecret: KEY,
+  })
+  assert.ok(!`${two.stdout}${two.stderr}`.includes('ORIGINAL'), two.stdout)
+})
+
 // ── the listing ───────────────────────────────────────────────────────────
 
-test('connections is the machine inventory and does not narrow to the current directory', async (t) => {
+test('connect list is the machine inventory and does not narrow to the directory', async (t) => {
   /**
-   * The property: `ogun connections` answers for the machine wherever it is run from, and
+   * The property: `ogun connect list` answers for the machine wherever it is run from, and
    * shows keys and grants in one table.
    *
    * `connect` and `disconnect` infer a project from the directory because they act on
@@ -609,7 +822,7 @@ test('connections is the machine inventory and does not narrow to the current di
 
   const elsewhere = join(dir, 'Downloads')
   await mkdir(elsewhere, { recursive: true })
-  const listed = await ogun(['connections'], { config }, '', elsewhere)
+  const listed = await ogun(['connect', 'list'], { config }, '', elsewhere)
   assert.equal(listed.code, 0, listed.stderr)
   assert.match(listed.stdout, /ogun/)
   assert.match(listed.stdout, /api key/)
@@ -617,21 +830,53 @@ test('connections is the machine inventory and does not narrow to the current di
 
   // And the filter is a flag rather than a positional, so it cannot be confused with an
   // integration name.
-  const filtered = await ogun(['connections', '--project', 'nobody'], { config }, '', elsewhere)
+  const filtered = await ogun(['connect', 'list', '--project', 'nobody'], { config }, '', elsewhere)
   assert.match(filtered.stdout, /nobody is not connected/)
+})
+
+test('connect list omits secrets that are not integrations, and says how many', async (t) => {
+  /**
+   * The property: a webhook signing key does not appear as a *connection*, and the listing
+   * says out loud that it left something out.
+   *
+   * `ogun secret set` stores free-form names now, and "what can this project reach" is not
+   * a question a shared HMAC answers — listing one under INTEGRATION would be inventing a
+   * connection that does not exist. The counted footer is the other half and is the part
+   * that keeps the two commands honest: a listing that silently drops rows is how `connect
+   * list` and `secret list` start disagreeing about what is stored.
+   */
+  const dir = await box(t)
+  const config = join(dir, 'config.json')
+  await writeFile(
+    config,
+    JSON.stringify({
+      projects: { ogun: '/does/not/matter' },
+      secrets: { ogun: { linear: KEY, 'stripe-webhook': 'whsec_QQQQQQQQQQQQ' } },
+    }),
+    { mode: 0o600 },
+  )
+
+  const listed = await ogun(['connect', 'list'], { config })
+  assert.equal(listed.code, 0, listed.stderr)
+  assert.match(listed.stdout, /linear/)
+  assert.ok(!listed.stdout.includes('stripe-webhook'), listed.stdout)
+  assert.match(listed.stdout, /1 other stored secret is not an integration/)
+  assert.match(listed.stdout, /ogun secret list/)
 })
 
 test('a key sitting behind a grant is reported as not being used', async (t) => {
   /**
    * The property: the listing says, in as many words, that a stored key is **not** the
-   * credential a poll would use.
+   * credential a poll would use — and `ogun secret list` says it about the same row.
    *
    * This is the line that earns the command. A grant wins over a key, so an operator
    * debugging a poll failure by rotating that key is changing something nothing reads —
-   * and nothing else in the system is in a position to tell them. The state should not
-   * arise from the ordinary path any more, since connecting removes the key; it survives a
-   * hand-edited config.json and an entry written by an older build, which §4.5 says is a
-   * real thing rather than a hypothetical.
+   * and nothing else in the system is in a position to tell them. Two listings that
+   * disagreed about it would be worse than one, which is why both read the same function.
+   *
+   * The state should not arise from the ordinary path any more, since connecting removes
+   * the key; it survives a hand-edited config.json and an entry written by an older build,
+   * which §4.5 says is a real thing rather than a hypothetical.
    */
   const dir = await box(t)
   const config = join(dir, 'config.json')
@@ -660,12 +905,17 @@ test('a key sitting behind a grant is reported as not being used', async (t) => 
     { mode: 0o600 },
   )
 
-  const listed = await ogun(['connections'], { config })
+  const listed = await ogun(['connect', 'list'], { config })
   assert.equal(listed.code, 0, listed.stderr)
   assert.match(listed.stdout, /NOT used/)
   // And which grant, because the two differ in what they can see.
   assert.match(listed.stdout, /app token/)
   assert.ok(!listed.stdout.includes(KEY), listed.stdout)
+
+  const secrets = await ogun(['secret', 'list'], { config })
+  assert.equal(secrets.code, 0, secrets.stderr)
+  assert.match(secrets.stdout, /the linear grant wins/)
+  assert.ok(!secrets.stdout.includes(KEY), secrets.stdout)
 })
 
 // ── disconnecting ─────────────────────────────────────────────────────────
@@ -771,26 +1021,31 @@ test('disconnect checks nothing, and a no-op says which project it looked in', a
 
 test('the dropped spellings are signposts, not dead ends', async (t) => {
   /**
-   * The property: `ogun secret`, `ogun linear` and both under `ogun project` answer with a
-   * line naming `ogun connect`, and store nothing.
+   * The property: `ogun linear`, `ogun project linear`, `ogun project secret` and `ogun
+   * connections` each answer with a line naming what replaced them, and store nothing.
    *
    * They are dropped rather than aliased: an alias is a second shape that has to keep
-   * working forever, and having two spellings of "let Ogun into this workspace" is the
-   * thing `connect` exists to end. But muscle memory outlives a release, and "unknown
-   * command" followed by a listing that no longer mentions secrets is a worse answer than
-   * the command not existing at all.
+   * working forever. But muscle memory outlives a release, and "unknown command" followed
+   * by a listing that no longer mentions the word is a worse answer than the command not
+   * existing at all.
+   *
+   * `ogun secret` is deliberately **not** in this list any more. It was here for one
+   * commit, on the reasoning that every name in `SECRET_NAMES` was an integration
+   * credential — which described the validator rather than the world. A secret is not
+   * guaranteed to be an integration, so the namespace came back; `secret.test.ts` owns it.
    */
   const config = await scratch(t)
 
-  for (const argv of [
-    ['secret', 'set', 'linear', KEY],
-    ['linear', 'app'],
-    ['project', 'secret', 'set', 'ogun', 'linear'],
-    ['project', 'linear', 'connect'],
-  ]) {
+  for (const [argv, expected] of [
+    [['linear', 'app'], /ogun connect/],
+    [['project', 'linear', 'connect'], /ogun connect/],
+    [['project', 'secret', 'set', 'ogun', 'linear'], /ogun secret set/],
+    [['connections'], /ogun connect list/],
+    [['connection', '--project', 'ogun'], /ogun connect list/],
+  ] as Array<[string[], RegExp]>) {
     const old = await ogun(argv, { config }, `${KEY}\n`)
     assert.equal(old.code, 1, `${argv.join(' ')} should have failed`)
-    assert.match(old.stderr, /ogun connect linear/, argv.join(' '))
+    assert.match(old.stderr, expected, argv.join(' '))
     assert.ok(!old.stderr.includes(KEY), argv.join(' '))
   }
   await assert.rejects(() => readFile(config, 'utf8'))
@@ -798,18 +1053,22 @@ test('the dropped spellings are signposts, not dead ends', async (t) => {
 
 test('the dropped spellings still answer --help, with the page that replaced them', async (t) => {
   /**
-   * The property: `ogun secret --help` prints the `connect` page rather than "no help for:
-   * secret".
+   * The property: `ogun connections --help` prints the `connect list` page rather than "no
+   * help for: connections".
    *
    * The refusal above covers somebody who ran the old command. It does not cover somebody
    * who read an older README and reached for `--help` first, whose reward would otherwise
    * be a sentence that reads as "that does not exist" rather than "that moved".
    */
   const config = await scratch(t)
-  for (const word of ['secret', 'secrets', 'linear']) {
+  for (const [word, expected] of [
+    ['connections', /ogun connect list/],
+    ['connection', /ogun connect list/],
+    ['linear', /ogun connect <integration>/],
+  ] as Array<[string, RegExp]>) {
     const help = await ogun([word, '--help'], { config })
     assert.equal(help.code, 0, help.stderr)
-    assert.match(help.stdout, /ogun connect <integration>/, word)
+    assert.match(help.stdout, expected, word)
   }
 })
 

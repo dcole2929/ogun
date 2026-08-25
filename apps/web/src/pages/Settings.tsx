@@ -948,12 +948,15 @@ function LinearConnection() {
               because the control plane that refused this write is the one least likely to
               have the repo checked out on it. */}
           <pre className="md-code" style={{ fontSize: 11, marginBottom: 0 }}>
-            ogun connect linear &lt;client-id&gt; &lt;client-secret&gt; --project &lt;slug&gt;
+            ogun connect linear --client-id &lt;id&gt; --client-secret &lt;secret&gt; --project
+            &lt;slug&gt;
           </pre>
           <p className="muted" style={{ fontSize: 11, marginTop: 4, marginBottom: 0 }}>
-            Leave both off and it prompts — the Client ID visibly, the Client Secret with the
-            echo off. Passing the secret inline works and warns, because argv is readable
-            through <span className="mono">/proc</span> and your shell writes it to history.
+            Named flags rather than two positionals: both values are opaque strings from the
+            same page, so a fixed order between them is a coin flip. Leave either flag off
+            and it prompts — the Client ID visibly, the Client Secret with the echo off.
+            Passing the secret inline works and warns, because argv is readable through{' '}
+            <span className="mono">/proc</span> and your shell writes it to history.
           </p>
         </>
       )}

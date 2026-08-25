@@ -3,7 +3,8 @@ import { cyan, fail, red } from './output.ts'
 import { helpFor, isHelpFlag, usage } from './help.ts'
 import { doctor } from './commands/doctor.ts'
 import { projectAdd, projectList, projectSync } from './commands/project.ts'
-import { connect, connections, disconnect } from './commands/connect.ts'
+import { connect, connectList, disconnect } from './commands/connect.ts'
+import { secretList, secretRm, secretSet } from './commands/secret.ts'
 import { coverage, runsList, trigger } from './commands/runs.ts'
 import {
   checkCitations,
@@ -48,20 +49,37 @@ if (command === undefined || argv.some(isHelpFlag)) {
 }
 
 /**
- * What a dropped spelling answers with. One sentence, because all four of them — `ogun
- * secret`, `ogun linear`, and both under `ogun project` — were dropped for the same reason
- * and land in the same place.
+ * What a dropped spelling answers with.
+ *
+ * Three of these moved for one reason — the vendor's name left the command path, and the
+ * project stopped being a positional — so they land in the same place. `ogun secret` is
+ * **not** among them any more: it came back as a general per-project store beside
+ * `connect` rather than inside it, because a secret is not guaranteed to be an
+ * integration. See `commands/secret.ts`.
  */
 const oldSpelling = (was: string): string =>
   `\`${was}\` is now \`ogun connect\`.\n` +
   '  The integration is an argument, not a command, and one command covers every way of\n' +
   '  giving a project access to it:\n' +
-  '    ogun connect linear                      Ogun takes a token in its own name\n' +
-  '    ogun connect linear --consent            somebody approves it in a browser\n' +
+  '    ogun connect linear --client-id <id> --client-secret <secret>\n' +
+  '                                             an application, in Ogun\'s own name\n' +
+  '    ogun connect linear --consent …          somebody approves it in a browser\n' +
   '    ogun connect linear --api-key            a personal API key\n' +
-  '    ogun connections                         what is connected, and how healthy\n' +
+  '    ogun connect list                        what is connected, and how healthy\n' +
   '    ogun disconnect linear                   remove every credential for it\n' +
-  '  The project comes from the directory you are in, or from --project <slug>.'
+  '  The project comes from the directory you are in, or from --project <slug>.\n' +
+  '  For a per-project value that is not an integration: `ogun secret set <name> <key>`.'
+
+/**
+ * `ogun connections` became `ogun connect list`, and is refused rather than aliased.
+ *
+ * A listing was a top-level noun sitting beside three verbs, and `ogun secret list` coming
+ * back would have made that two conventions for "show me what is stored". An alias is a
+ * second shape that has to keep working forever; muscle memory only needs a signpost.
+ */
+const droppedListing = (was: string): string =>
+  `\`ogun ${was}\` is now \`ogun connect list\`, which mirrors \`ogun secret list\`.\n` +
+  '  The verbs stay at the top level: `ogun connect`, `ogun disconnect`.'
 
 /**
  * There is one usage text per command and it lives in help.ts, so an unknown subcommand
@@ -94,35 +112,49 @@ try {
     case 'project':
       if (sub === 'add') await projectAdd(rest, serverUrl)
       else if (sub === 'sync') await projectSync(rest, serverUrl)
-      else if (sub === 'secret' || sub === 'secrets' || sub === 'linear') {
-        fail(oldSpelling(`ogun project ${sub}`))
-      }
+      else if (sub === 'secret' || sub === 'secrets') {
+        fail(
+          `\`ogun project ${sub}\` is now \`ogun secret\`, and the project comes from the\n` +
+            '  directory you are standing in — as `project add` and `project sync` always\n' +
+            '  have — or from --project <slug>.\n' +
+            '    ogun secret set <name> <key>\n' +
+            '    ogun secret list\n' +
+            '    ogun secret rm <name>\n' +
+            '  For an integration credential, `ogun connect <integration>` knows about ' +
+            'grants.',
+        )
+      } else if (sub === 'linear') fail(oldSpelling(`ogun project ${sub}`))
       else if (sub === 'list' || sub === undefined) await projectList(serverUrl)
       else unknownSub('project', sub)
       break
 
     /**
-     * The one vocabulary for giving a project access to an integration.
+     * The one vocabulary for giving a project *access* to an integration.
      *
      * The integration is a **value** rather than a word in the command path, which is what
      * makes `ogun connect github` a new argument instead of a new command tree. `connect`,
-     * `connections` and `disconnect` reach no server in their default shapes — the store is
-     * this machine's config.json, written directly (ADR-0012) — so they work before `ogun
-     * init`, with the database down, and over SSH. `--consent` is the exception, because
-     * its CSRF nonce and its callback both live in the control-plane process.
+     * `connect list` and `disconnect` reach no server in their default shapes — the store
+     * is this machine's config.json, written directly (ADR-0012) — so they work before
+     * `ogun init`, with the database down, and over SSH. `--consent` is the exception,
+     * because its CSRF nonce and its callback both live in the control-plane process.
      *
-     * Three top-level verbs rather than one noun with subcommands, because they are three
-     * different acts on the same thing and `ogun connection connect` is a word too many.
-     * The machine's own credentials remain `ogun token`, which is what keeps this
-     * unambiguous.
+     * Two top-level verbs, because they are two different *acts*; the listing is a
+     * subcommand, `ogun connect list`, mirroring `ogun secret list`. `disconnect` stays a
+     * verb rather than becoming `connect rm`: it revokes a token at Linear, which is not
+     * the same as removing a row from a listing, and it is the one somebody reaches for
+     * during an incident. The machine's own credentials remain `ogun token`.
      */
     case 'connect':
-      await connect([sub, ...rest].filter(Boolean) as string[], serverUrl)
+      // `list` is not an integration name and cannot become one: `SECRET_NAMES` is a
+      // closed set, so adding one called `list` would be a compile-visible decision here
+      // rather than a subcommand that silently stopped working.
+      if (sub === 'list') await connectList(rest)
+      else await connect([sub, ...rest].filter(Boolean) as string[], serverUrl)
       break
 
     case 'connections':
     case 'connection':
-      await connections([sub, ...rest].filter(Boolean) as string[])
+      fail(droppedListing(command))
       break
 
     case 'disconnect':
@@ -130,17 +162,32 @@ try {
       break
 
     /**
-     * `ogun secret` and `ogun linear` are gone, and these are signposts rather than
-     * aliases.
+     * `ogun secret` — one value under one name, for a project, on this machine.
      *
-     * Both were a second spelling of "let Ogun into this workspace" — one filed under
-     * storage, one with the vendor's name in the command path — and having two is the thing
-     * `connect` exists to end, so keeping either as an alias would be keeping the problem
-     * with better documentation. Nothing outside this repository calls them. What survives a
-     * release is muscle memory, and for that a bare "unknown command" is a dead end.
+     * Beside `connect` rather than inside it. `connect` is *access* and knows what a grant
+     * is; this is *storage* and takes a free-form name, because a secret is not guaranteed
+     * to be an integration. They overlap on one slot — a `linear` key — and write it
+     * through the same function under the same lock, so the overlap cannot become a
+     * disagreement. `commands/secret.ts` carries the argument.
      */
     case 'secret':
     case 'secrets':
+      if (sub === 'set') await secretSet(rest)
+      else if (sub === 'rm' || sub === 'remove') await secretRm(rest)
+      // `ogun secret --project x` is a list with a filter, not a subcommand called
+      // "--project" — the same rule `ogun skills` follows.
+      else if (sub === undefined || sub === 'list' || sub.startsWith('-')) {
+        await secretList([sub, ...rest].filter((a): a is string => a !== undefined && a !== 'list'))
+      } else unknownSub('secret', sub)
+      break
+
+    /**
+     * `ogun linear` is gone, and this is a signpost rather than an alias.
+     *
+     * The vendor's name in the command path made a GitHub integration a whole new command
+     * tree. Nothing outside this repository calls it; what survives a release is muscle
+     * memory, and for that a bare "unknown command" is a dead end.
+     */
     case 'linear':
       fail(oldSpelling(`ogun ${command}`))
       break
