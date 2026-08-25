@@ -419,8 +419,12 @@ The project comes from the directory the command is run in, or from `--project <
 slug this machine has no record of is refused rather than stored: a key filed under a project
 nothing polls reports as set and is read by nothing, which is the failure the closed set of
 secret *names* already existed to prevent. That closed set stays with `connect`, where a
-misspelled integration is exactly that failure; `secret set` takes free-form names and says
-out loud when nothing in the build reads the one just stored.
+misspelled integration is exactly that failure; `secret set` takes free-form names — a name
+is whatever the project calls it, `DATABASE_URL` included, and only what cannot round-trip
+through the file, a shell and a terminal is refused — and says out loud when nothing in the
+build reads the one just stored. Storing over a name that already holds a value destroys it,
+so that is settled before the value is collected: asked about at a terminal, refused without
+`--replace` off one, identically at both doors.
 
 The Settings page can set one too, through the same function and the same lockfile — and
 only when the transport can carry it. Ogun serves plain HTTP, so a loopback bind is allowed

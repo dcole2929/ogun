@@ -353,10 +353,19 @@ export async function listProjectSecrets(
  * The protection `SECRET_NAMES` gave is not abandoned, it is applied where it is true.
  * `connect` still validates the integration against the closed set, because there the
  * failure is exact: a name Ogun polls under, misspelled, is a live credential nothing ever
- * reads. `secret set` cannot borrow that argument, so it replaces it with the two things
- * that survive without a closed set — a name shape that a pasted API key cannot satisfy,
- * and a line at the moment of storing that says in as many words when nothing in this
- * build reads the name just written. See `requireSecretName` in the CLI.
+ * reads. `secret set` cannot borrow that argument, so what survives without a closed set
+ * is a line at the moment of storing that says in as many words when nothing in this build
+ * reads the name just written. See `requireSecretName` in the CLI, which also carries why
+ * the *shape* rule that briefly sat beside it is gone.
+ *
+ * ### A name is a key in a plain object, so it can be `constructor`
+ *
+ * `entries[name]` is a lookup that walks the prototype chain, and every object has an
+ * inherited `constructor`. `ogun secret set constructor` therefore read a *function* out of
+ * an object that held no such secret and died on `previous.trim is not a function` — a
+ * stack trace, from a name the CLI's own validator accepted. `Object.hasOwn` is the fix
+ * and it belongs here rather than in a name rule: the store's own lookups have to be
+ * honest about what the store contains, whatever the callers let through.
  */
 export type DisplacedSecret = 'absent' | 'present' | 'empty'
 
@@ -369,7 +378,10 @@ export async function setProjectSecret(
   let displaced: DisplacedSecret = 'absent'
   await updateLocalConfig(
     (config) => {
-      const previous = config.secrets[projectSlug]?.[name]
+      const entries = config.secrets[projectSlug]
+      // `Object.hasOwn` and not `entries?.[name]`: `constructor` is inherited by every
+      // object, so the plain lookup answered with a function for a secret nobody had set.
+      const previous = entries && Object.hasOwn(entries, name) ? entries[name] : undefined
       // `empty` is worth keeping apart from `absent`: a blank entry is only reachable by
       // hand-editing the file, and a poller reads it as a key that exists and does not
       // work. "replaced" is a misleading word for it and "stored" is a wrong one.
@@ -415,7 +427,10 @@ export async function clearProjectSecret(
   let existed = false
   await updateLocalConfig((config) => {
     const entries = config.secrets[projectSlug]
-    if (!entries || !(name in entries)) return config
+    // `Object.hasOwn` and not `name in entries`, which is true of `constructor` and
+    // `toString` for every object alive: `ogun secret rm constructor` reported a removal
+    // that had not happened, which is the one answer this function exists to get right.
+    if (!entries || !Object.hasOwn(entries, name)) return config
     existed = true
     const { [name]: _removed, ...rest } = entries
     const { [projectSlug]: _project, ...others } = config.secrets
@@ -790,7 +805,10 @@ export async function clearOAuthApp(
   let existed = false
   await updateLocalConfig((config) => {
     const entries = config.oauth[projectSlug]
-    if (!entries || !(provider in entries)) return config
+    // `Object.hasOwn` for the reason `clearProjectSecret` uses it: `in` is true of every
+    // object's inherited `constructor`, and this function's whole job is to answer
+    // "was there one?" correctly.
+    if (!entries || !Object.hasOwn(entries, provider)) return config
     existed = true
     const { [provider]: _removed, ...rest } = entries
     const { [projectSlug]: _project, ...others } = config.oauth

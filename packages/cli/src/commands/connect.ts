@@ -28,8 +28,8 @@ import {
 import { prompt, promptHidden, readSecretValue } from '../prompt.ts'
 import {
   refuseShadowedKey,
+  settleReplacement,
   shadowedKeys,
-  warnAboutReplacing,
   writeProjectKey,
 } from './secret.ts'
 
@@ -71,8 +71,10 @@ import {
  *
  * `connect <integration> --api-key` and `secret set <integration> <key>` write the same
  * row through the same function under the same lock, and share `refuseShadowedKey`,
- * `warnAboutReplacing` and `writeProjectKey` so neither door can enforce a rule the other
- * does not. `commands/secret.ts` carries the full argument.
+ * `settleReplacement` and `writeProjectKey` so neither door can enforce a rule the other
+ * does not — including the one about overwriting, which is asked about at a terminal and
+ * refused without `--replace` off one, identically here and there. `commands/secret.ts`
+ * carries the full argument.
  *
  * ### Which of these need the control plane
  *
@@ -127,7 +129,8 @@ const USAGE_OAUTH =
   'ogun connect <integration> --client-id <id> --client-secret <secret> [--project <slug>]'
 const USAGE_CONSENT =
   'ogun connect <integration> --consent --client-id <id> --client-secret <secret>'
-const USAGE_KEY = 'ogun connect <integration> --api-key [<key>] [--project <slug>]'
+const USAGE_KEY =
+  'ogun connect <integration> --api-key [<key>] [--replace] [--project <slug>]'
 const USAGE_LIST = 'ogun connect list [--project <slug>]'
 const USAGE_DISCONNECT = 'ogun disconnect <integration> [--project <slug>] [--keep-application]'
 
@@ -196,6 +199,12 @@ const CONNECT_FLAGS = {
   '--project': 'string',
   '--allow-unregistered': 'boolean',
   /**
+   * The same flag `ogun secret set` takes, for the same row, meaning the same thing:
+   * there is already a key stored under this name and destroying it is intended. Both
+   * doors go through `settleReplacement`, so a rule enforced at one is enforced at both.
+   */
+  '--replace': 'boolean',
+  /**
    * Declared so it can be refused by name. It was the explicit spelling of the default for
    * one commit and `--oauth` replaces it; "Unknown option '--app-token'" is a dead end for
    * anybody who copied a line out of that commit's help.
@@ -213,6 +222,7 @@ type ConnectFlags = {
   'client-secret'?: string
   project?: string
   'allow-unregistered'?: boolean
+  replace?: boolean
   'app-token'?: boolean
 }
 
@@ -233,7 +243,9 @@ export async function connect(args: string[], serverUrl: string): Promise<void> 
    */
   requireKnownProject(project, config, flags['allow-unregistered'] === true)
 
-  if (kind === 'api-key') return connectApiKey(integration, project, flags['api-key'] ?? '')
+  if (kind === 'api-key') {
+    return connectApiKey(integration, project, flags['api-key'] ?? '', flags.replace === true)
+  }
   if (flags.consent === true) return connectConsent(integration, project, flags, serverUrl)
   return connectAppToken(integration, project, flags)
 }
@@ -286,6 +298,27 @@ function chooseKind(flags: ConnectFlags): Kind {
         '  to an OAuth application, which is what --oauth connects. Nothing was stored.\n' +
         `    ${USAGE_OAUTH}\n` +
         `    ${USAGE_KEY}`,
+    )
+  }
+  /**
+   * `--replace` is about the stored key, so it is refused rather than ignored beside the
+   * OAuth kind — an operator who typed it there believes a reconnect is gated, and finding
+   * out that it never was is the kind of thing found out afterwards.
+   *
+   * And it is not gated, deliberately. The line `settleReplacement` draws is *what cannot
+   * be got back*: an api key is minted once and this store is the only copy Ogun has, while
+   * an OAuth reconnect spends a client id and secret that stay registered in the provider
+   * to fetch a token that was going to expire in thirty days anyway. Asking somebody to
+   * confirm the renewal that fixes their expired connection, on the night it expired, would
+   * be a gate on the repair.
+   */
+  if (!key && flags.replace === true) {
+    fail(
+      '--replace is about a stored api key, and an OAuth connection has none to destroy:\n' +
+        '  reconnecting reuses the application registered here and takes a fresh token, and\n' +
+        '  the token it replaces was going to expire on its own. Nothing was changed.\n' +
+        `    replace a stored key:  ${USAGE_KEY}\n` +
+        `    reconnect:             ${USAGE_OAUTH}`,
     )
   }
   return key ? 'api-key' : 'oauth'
@@ -618,7 +651,7 @@ async function connectConsent(
  * ### It is `ogun secret set <integration>` wearing this command's vocabulary
  *
  * The same slot, the same lock, the same three shared rules — `refuseShadowedKey`,
- * `warnAboutReplacing`, `writeProjectKey` are called from both doors rather than copied
+ * `settleReplacement`, `writeProjectKey` are called from both doors rather than copied
  * into each. What is different is what surrounds them: this one knows the name is an
  * integration, so it can say what connecting by key *means* for attribution and name the
  * application flow that avoids it. `ogun secret set linear <key>` reaches the identical
@@ -633,12 +666,17 @@ async function connectApiKey(
   integration: SecretName,
   project: ResolvedProject,
   inline: string,
+  replace: boolean,
 ): Promise<void> {
   // `''` is `--api-key` with no value: prompt at a terminal, read the pipe otherwise.
   const inlineKey = inline === '' ? undefined : inline
 
   await refuseShadowedKey(project, integration)
-  await warnAboutReplacing(project, integration, inlineKey)
+  await settleReplacement(project, integration, {
+    replace,
+    what: 'api key',
+    usage: USAGE_KEY,
+  })
 
   const value = await readSecretValue(inlineKey, 'an api key', () =>
     promptHidden(`  ${integration} key for ${project.slug} (not echoed): `),

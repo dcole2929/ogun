@@ -311,7 +311,7 @@ default when `ogun project` is given no subcommand.
 ```
 ogun connect <integration> --client-id <id> --client-secret <secret> [--project <slug>]
 ogun connect <integration> --consent --client-id <id> --client-secret <secret>
-ogun connect <integration> --api-key [<key>] [--project <slug>]
+ogun connect <integration> --api-key [<key>] [--replace] [--project <slug>]
 ogun connect list [--project <slug>]
 ogun disconnect <integration> [--project <slug>] [--keep-application]
 ```
@@ -430,7 +430,7 @@ Touches: `~/.ogun/config.json` (the `oauth` block, or `secrets` with `--api-key`
 ### `ogun secret set | list | rm`
 
 ```
-ogun secret set <name> <key> [--project <slug>] [--allow-unregistered]
+ogun secret set <name> <key> [--replace] [--project <slug>] [--allow-unregistered]
 ogun secret list [--project <slug>]
 ogun secret rm <name> [--project <slug>]
 ```
@@ -458,29 +458,55 @@ can disagree" shape ADR-0012 rejected when it refused a second secrets file, and
 worse here because the disagreement would be between two commands the same operator runs.
 
 So the rules about that row live in one place and both doors call them: a key is refused
-behind a working OAuth grant either way, the "you already have one" warning fires either
-way, and the confirmation reports `stored` or `replaced` from inside the same
-read-modify-write. The listings then agree by construction — `connect list` shows what a
+behind a working OAuth grant either way, a name that is already taken is settled the same
+way either way — asked about at a terminal, refused without `--replace` off one — and the
+confirmation reports `stored` or `replaced` from inside the same read-modify-write. The listings then agree by construction — `connect list` shows what a
 project can *reach* (grants, plus keys whose name is an integration) and `secret list` shows
 what is *stored* under a name, marking a row a grant has taken over with the same red **NOT
 used** the other one prints.
 
-#### free-form names, and what replaces the closed set
+#### a name is whatever the project calls it
 
 `connect` still validates the integration against `SECRET_NAMES`, because there a
 misspelling is exact: `ogun connect linaer` would be a live credential filed under a name
 nothing polls. `secret set` cannot borrow that argument — arbitrary names are the point — so
-it replaces the protection with two things:
+**only what cannot work is refused**: an empty name, whitespace (`ogun secret rm` takes one
+word, and `list` separates its columns with spaces), a control character (names are printed
+back to a terminal, where an escape sequence rewrites the line it lands on), and
+`__proto__` (the config file is read back through a schema that drops that key, so the value
+would be stored now and gone on the next write). Case is kept. `DATABASE_URL`,
+`STRIPE_SECRET_KEY`, `stripe-webhook`, `my_api_key`.
 
-- **A name shape.** Lowercase letters, digits, dots and dashes, up to 64 characters. A
-  pasted API key cannot satisfy it: `lin_api_…` has underscores, and the plausible accident
-  this catches is somebody who remembered that the key does not go in argv and forgot that
-  the *name* does. The refusal does **not** repeat the argument back, for that exact reason.
-- **A line that says nothing reads it.** After storing a name that is not in `SECRET_NAMES`,
-  it says so and lists the names Ogun does poll under. The closed set existed to stop "a
-  secret nothing reads looks exactly like one that works, right up until the night it
-  mattered"; a free-form store cannot refuse, so it moves that fact from a refusal to a
-  statement at the one moment somebody is looking.
+There was a format rule here — lowercase, dots and dashes, no underscores — and it was
+wrong. It refused the conventional spelling of a secret name in order to catch a key pasted
+into the name slot, which is not even a mistake: `ogun secret set lin_api_9f3…` names a
+secret `lin_api_9f3…` and then prompts for its value. No rule admits
+`AWS_SECRET_ACCESS_KEY` and refuses `lin_api_9f3…`; they are the same shape.
+
+What replaces the closed set is the line that was already beside it: **after storing a name
+that is not in `SECRET_NAMES`, it says so** and lists the names Ogun does poll under. The
+closed set existed to stop "a secret nothing reads looks exactly like one that works, right
+up until the night it mattered"; a free-form store cannot refuse, so it moves that fact from
+a refusal to a statement at the one moment somebody is looking — and for a key in the wrong
+position, *"nothing in this build reads a secret named `lin_api_9f3…`"* is exactly the
+sentence that catches it. A refusal still never repeats the argument back, because a key can
+land there and stderr is not where it should be quoted.
+
+#### an overwrite is settled before the value is collected
+
+There is no history and no second slot, so replacing a value destroys it. `secret set` on a
+name that already holds one **asks at a terminal** and **refuses off one** unless
+`--replace` is passed — one rule that behaves sensibly in both places: a person gets asked
+before they paste anything, and a script fails loudly rather than destroying a credential it
+did not know was there. `--replace` is how a script says it means it, and it reads as that a
+year later where a `--yes` would only say somebody was tired of being asked.
+
+It fires only when there is a value to destroy: not on a first set, and not on a blank entry,
+which is a repair rather than a replace. `ogun connect <integration> --api-key` takes the
+same flag and calls the same function, because two doors onto one row that disagreed about
+overwriting would be worse than either rule. `--replace` is refused beside `--oauth`: a
+reconnect reuses the application registered here and replaces a token that was going to
+expire anyway, so nothing there cannot be got again.
 
 `<key>` is a positional where `connect`'s credentials are flags, and the rule behind both is
 one sentence: a lone value can be positional; several credential values of the same shape
