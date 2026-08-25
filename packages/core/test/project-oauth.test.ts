@@ -108,8 +108,8 @@ test('an application with no grant does not shadow a working api key', async () 
 /**
  * The property: with no key behind it, an unconnected application is its own state.
  *
- * Reported as `absent`, the remedy printed to the operator is "run `ogun project secret
- * set`" — which sends somebody who has done most of the work of connecting an application
+ * Reported as `absent`, the remedy printed to the operator is "run `ogun secret set`" —
+ * which sends somebody who has done most of the work of connecting an application
  * back to the credential they were migrating away from. Principle 6: one state per remedy,
  * and this remedy is a browser rather than a terminal.
  */

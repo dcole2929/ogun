@@ -189,7 +189,7 @@ test('an expired access token is reported as renewable, not as a problem', async
  * `readProjectSecret` decides, once — so an operator debugging a poll failure by rotating
  * the key is changing something nothing reads, and every observation afterwards confirms
  * the wrong theory. Nothing else in the system is in a position to say it: the poll's
- * error names a credential, and `project secret list` only knows about keys.
+ * error names a credential, and `ogun secret list` only knows about keys.
  */
 test('an api key behind a live grant is reported as not being used', async () => {
   const store = await storeWith({
@@ -214,7 +214,7 @@ test('an application nobody connected warns, and names the command that finishes
   const [check] = await linearGrants(store, now)
   assert.equal(check?.ok, false)
   assert.match(check!.detail, /never connected/)
-  assert.match(check!.detail, /ogun project linear connect ogun/)
+  assert.match(check!.detail, /ogun linear connect --project ogun/)
 })
 
 /**

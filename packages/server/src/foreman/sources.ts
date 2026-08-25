@@ -508,13 +508,13 @@ function missingKey(
   slug: string,
   key: Exclude<ProjectSecret, { state: 'present' } | { state: 'granted' }>,
 ): string {
-  const set = `\`ogun project secret set ${slug} linear\``
+  const set = `\`ogun secret set linear --project ${slug}\``
   switch (key.state) {
     case 'unconnected':
       return (
         `"${slug}" has a linear oauth application registered (client ${key.clientId}) and ` +
         'nobody has finished the authorization, so there is nothing to poll with. Connect ' +
-        `it from Settings, or run \`ogun project linear connect ${slug}\``
+        `it from Settings, or run \`ogun linear connect --project ${slug}\``
       )
     case 'malformed':
       return (

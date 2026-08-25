@@ -330,23 +330,57 @@ const topics: Record<string, Topic> = {
 
   project: {
     summary: 'the repositories the factory works on',
-    usage: ['ogun project add [dir] | sync [dir] | list | secret …'],
+    usage: ['ogun project add [dir] | sync [dir] | list'],
     subcommands: [
       ['add [dir]', 'tell this machine where a repo is checked out'],
       ['sync [dir]', "read the repo's .ogun/config.yaml and register it"],
       ['list', 'every project the control plane knows about (the default)'],
-      ['linear …', 'connect this project to Linear as an application (preferred)'],
-      ['secret …', "an API key for this project, kept out of the repo"],
     ],
+    notes: [
+      "A project's credentials are `ogun secret` and `ogun linear`, not `ogun project " +
+        'secret` and `ogun project linear`. Both moved out of this namespace when the ' +
+        'project stopped being a positional and started coming from the directory you are ' +
+        'standing in, as `add` and `sync` always have — which left `project` in front of ' +
+        'them carrying nothing.',
+    ],
+    see: ['ogun secret', 'ogun linear'],
   },
 
-  'project linear': {
+  linear: {
     summary: 'connect a project to Linear as an application, rather than as you',
+    /**
+     * The inputs are in the usage lines, not only in the notes.
+     *
+     * `ogun linear app` names the noun and not the two values it exists to collect, so a
+     * reader of this page saw a complete-looking command that takes nothing and had no way
+     * to learn otherwise but to run it. The same fault `ogun secret set <name>` had, and
+     * worse here: two values, one a credential, and an application that has to exist in
+     * Linear's web UI before the first prompt is any use.
+     */
     usage: [
-      'ogun project linear app <project>',
-      'ogun project linear connect <project>',
-      'ogun project linear status [project]',
-      'ogun project linear disconnect <project> [--forget-app]',
+      'ogun linear app [--project <slug>]      — asks for a Client ID and Client Secret',
+      'ogun linear connect [--project <slug>]  — prints a URL to approve',
+      'ogun linear status [--project <slug>]',
+      'ogun linear disconnect [--project <slug>] [--forget-app]',
+    ],
+    subcommands: [
+      [
+        'app',
+        'register the OAuth application. Prints the exact redirect callback URL to paste ' +
+          'into Linear, then asks for the Client ID and the Client Secret it gives you ' +
+          'back — the ID visibly, the secret with the echo off. Neither is an argument',
+      ],
+      [
+        'connect',
+        'obtain the grant. Prints a URL to approve, and takes back the URL your browser ' +
+          'landed on when it could not reach this control plane',
+      ],
+      [
+        'status',
+        'which projects have an application and whether it is connected (the default). ' +
+          'Reads this machine, so it answers with the control plane down',
+      ],
+      ['disconnect', 'forget the tokens. The application stays registered unless --forget-app'],
     ],
     where:
       'On the control-plane machine, because the control plane is what polls and what ' +
@@ -365,8 +399,8 @@ const topics: Record<string, Topic> = {
         'needs them lands, not before, because a scope is approved by somebody reading a ' +
         'consent screen.',
       'It installs with `actor=app`, which is a workspace-level install Linear requires a ' +
-        'workspace admin to approve. If you are not an admin there, `ogun project secret ' +
-        'set <project> linear` still works and is still supported.',
+        'workspace admin to approve. If you are not an admin there, `ogun secret set ' +
+        'linear` still works and is still supported.',
       'A connected project ignores any personal key it also has, and both `status` and ' +
         '`runner doctor` say so — a key nothing reads is an evening spent rotating it.',
       'Access tokens last 24 hours and are renewed by the poll that needs one, from a ' +
@@ -374,9 +408,22 @@ const topics: Record<string, Topic> = {
         'particular time for that to work.',
       'Neither the client secret nor a URL containing an authorization code goes on the ' +
         'command line. argv is readable by `ps` and lands in your shell history; both are ' +
-        'read from prompts with the echo off.',
+        'read from prompts with the echo off, which is why the usage lines above name what ' +
+        'each command asks for rather than reading as complete commands that take nothing.',
+      'The project comes from the directory you are standing in — the name in ' +
+        '.ogun/config.yaml, else the registered project this directory sits inside — ' +
+        'exactly as `ogun project add` and `ogun secret` resolve it. --project is for a ' +
+        'repo that is not checked out on this machine. `app` and `connect` refuse a slug ' +
+        'the control plane does not know, before the first prompt, and list the ones it ' +
+        'does; `disconnect` refuses nothing, because a row `status` shows has to be a row ' +
+        'you can remove.',
     ],
     flags: [
+      [
+        '--project <slug>',
+        'which project, instead of the one this directory belongs to. For a control plane ' +
+          'that polls a repo it has no copy of',
+      ],
       [
         '--forget-app',
         'on `disconnect`, also remove the client id and secret. Without it the ' +
@@ -392,7 +439,7 @@ const topics: Record<string, Topic> = {
       ],
     ],
     touches: [[LOCAL_CONFIG, 'the oauth block, mode 0600, on this machine only']],
-    see: ['ogun project secret', 'ogun runner doctor'],
+    see: ['ogun secret', 'ogun runner doctor'],
   },
 
   'project add': {
@@ -448,35 +495,72 @@ const topics: Record<string, Topic> = {
     usage: ['ogun project list'],
   },
 
-  'project secret': {
+  secret: {
     summary: "an API key this project needs, kept out of the repo and off the wire",
     usage: [
-      'ogun project secret set <project> <name>',
-      'ogun project secret list [project]',
-      'ogun project secret rm <project> <name>',
+      'ogun secret set <name> < key.txt',
+      'op read op://vault/linear/key | ogun secret set <name>',
+      'ogun secret set <name>                    # no pipe: prompts, with the echo off',
+      'ogun secret list [--project <slug>]',
+      'ogun secret rm <name> [--project <slug>]',
     ],
     where:
       'On the control-plane machine. The control plane is what polls an integration, so ' +
-      'this is where the key has to be — and it is stored in this machine\'s ' +
+      "this is where the key has to be — and it is stored in this machine's " +
       'config.json, not in the database and never in the repository.',
     notes: [
-      'The value is never a command-line argument, and passing one is refused rather ' +
-        'than accepted. Anything in argv is readable by every user on the box through ' +
-        '`ps` while the command runs, and your shell writes it into its history file, ' +
-        'where nothing ever cleans it up.',
-      'So it comes from stdin when stdin is a pipe — `… set ogun linear < key.txt`, or ' +
-        'straight out of a password manager — and from a prompt with the echo off when ' +
-        'stdin is a terminal. Nothing chooses between them; the shape of stdin already has.',
+      'The key is on **stdin**, which is why the usage lines above show a redirection ' +
+        'rather than a third word. It is not an argument, and passing one is refused ' +
+        'rather than accepted: anything in argv is readable by every user on the box ' +
+        'through `ps` while the command runs (/proc/<pid>/cmdline is world-readable), and ' +
+        'your shell writes the whole line into ~/.zsh_history or ~/.bash_history, where ' +
+        'nothing ever cleans it up.',
+      'So it comes from stdin when stdin is a pipe and from a prompt with the echo off ' +
+        'when stdin is a terminal. Nothing chooses between them; the shape of stdin ' +
+        'already has, and a --stdin flag would mostly be discovered by pasting a key into ' +
+        'a hung command.',
+      'The project defaults to the one you are standing in — the name in .ogun/config.yaml, ' +
+        'else the registered project this directory sits inside — exactly as `ogun project ' +
+        'add` and `ogun project sync` resolve it. --project is for a repo that is not ' +
+        'checked out on this machine at all.',
+      'A slug this machine has never heard of is refused, and nothing is stored: a key ' +
+        'filed under a project nothing polls reports as set and is read by nothing. ' +
+        '--allow-unregistered is the way through for a control plane whose repos live ' +
+        'elsewhere, and it warns.',
       'Known secrets: linear. A name Ogun does not read is refused, because a secret ' +
-        'nothing reads looks exactly like one that works until the night it mattered.',
+        'nothing reads looks exactly like one that works until the night it mattered. The ' +
+        'rejected name is not echoed back — with the value on stdin, the one positional ' +
+        'this command takes is where a mistyped invocation puts the key.',
       'Rotation is setting it again. There is no history and no second slot: the next ' +
         'poll reads the new value with no restart, and two live keys would mean nobody ' +
-        'could say which one a 401 came from.',
+        'could say which one a 401 came from. The confirmation says `stored` or ' +
+        '`replaced`, because those are different events and the line used to be identical ' +
+        'for both; at a terminal it warns before asking for the value, while a pipe — ' +
+        'which is usually a rotation somebody wrote down on purpose — is never blocked.',
       'Nothing prints a stored value back — not this command, not `runner doctor`, not ' +
-        'the UI, and not any endpoint. `list` reports presence only.',
+        'the UI, and not any endpoint. `list` reports presence only, and does not narrow ' +
+        'to the current directory the way `set` does: an inventory that answered for ' +
+        'wherever the shell was standing would say "none" on a machine holding four.',
+      '`rm` checks neither the name nor the project, where `set` checks both. config.json ' +
+        'gets hand-edited and `list` prints whatever it finds, so a row you can see has to ' +
+        'be a row you can remove. Validation guards writes, which is where an unknown name ' +
+        'or slug creates a key nothing reads.',
+    ],
+    flags: [
+      [
+        '--project <slug>',
+        'the project to set it for, instead of the one this directory belongs to. For a ' +
+          'control plane that polls a repo it has no copy of',
+      ],
+      [
+        '--allow-unregistered',
+        'store it for a slug this machine has no record of. Only for the case above: it ' +
+          'has to match the name the control plane polls the project under, exactly, and ' +
+          'nothing here can check that',
+      ],
     ],
     touches: [[LOCAL_CONFIG, 'the secrets block, mode 0600, on this machine only']],
-    see: ['ogun runner doctor', 'ogun project sync'],
+    see: ['ogun runner doctor', 'ogun project sync', 'ogun linear'],
   },
 
   skill: {
@@ -757,6 +841,10 @@ const topics: Record<string, Topic> = {
 // `ogun skill show` and `ogun skills show` are the same command, so they are the same page.
 topics['skill show'] = topics['skills show']!
 
+// The plural is what people reach for, and a `--help` that answers "no help for: secrets"
+// after the command itself worked is worse than no alias at all.
+topics['secrets'] = topics['secret']!
+
 /**
  * `ogun <command> --help` before `ogun --help`: a two-word path wins over its parent, so
  * `runner join` gets its own page while `runner frobnicate` still lands on `runner`.
@@ -847,9 +935,9 @@ ${bold('projects')}
   ogun project add [dir] [--name]  tell this machine where a repo is checked out
   ogun project sync [dir]          read .ogun/config.yaml and register it
   ogun project list
-  ogun project linear <project>    connect a project to Linear as an application
-  ogun project secret set <p> <n>  an API key for a project, read from stdin
-  ogun project secret list         which projects have one — never the value
+  ogun linear app | connect        connect this project to Linear as an application
+  ogun secret set <name>           an API key for this project — value on stdin
+  ogun secret list                 which projects have one — never the value
 
 ${bold('what can run')}
   ogun skill new <name>            scaffold .agents/skills/<name>/

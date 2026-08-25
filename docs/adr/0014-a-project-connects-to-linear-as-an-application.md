@@ -260,7 +260,7 @@ use is how someone spends an hour debugging the wrong one:
 
 - `ogun runner doctor` prints the workspace, the actor, the scopes and the remaining life,
   and says in as many words when a stored API key is not being used.
-- `ogun project linear status` says the same from the store, without needing the server —
+- `ogun linear status` says the same from the store, without needing the server —
   which is when the question is usually asked.
 - The Settings card shows the same row.
 - A `401` from Linear now names the credential — "linear rejected the oauth access token
@@ -381,9 +381,45 @@ use is how someone spends an hour debugging the wrong one:
   becomes visibly unnecessary rather than invisibly load-bearing.
 
 - **The personal API key path is untouched and stays supported.** Every rule in ADR-0012
-  still holds for it, `ogun project secret set` still writes the file with no server running,
+  still holds for it, `ogun secret set linear` still writes the file with no server running,
   and the transport gate is unchanged. Removing it would strand any operator who is not an
   admin of their workspace, which is not a rare configuration.
+
+- **The command is `ogun linear`, and its usage lines say what it asks for.** It shipped as
+  `ogun project linear app <project>`, which is four words in front of a verb: `project` was
+  a namespace whose only cargo was the `<project>` positional, `linear` names the
+  integration, `app` names the thing being registered, and then the slug again. Inferring
+  the project from the directory — as `ogun project add` and `ogun project sync` always
+  have, and as `ogun secret` now does — empties the outer level, so the outer level is gone.
+  `linear` stays, and is the one noun in that chain that earns its place: it says *which*
+  integration, which becomes a real distinction the first time a `github` source sits beside
+  it. The old spelling is dropped rather than aliased and answers with a line naming the new
+  one.
+
+  The second half matters more. `ogun project linear app <project>` read as a complete
+  command and was not: the two things it exists to collect — a Client ID and a Client Secret
+  — appeared nowhere in it, so the only way to find out that it prompts was to run it. That
+  is the same fault `ogun secret set <name>` had and it lands harder here, because there are
+  two values, one of them is a credential, and the application has to have been created in
+  Linear's web UI before the first prompt is any use. The usage lines and the per-subcommand
+  help now name the inputs, and the Settings page's refusal says so too, since a command an
+  operator is sent to a terminal to run should not surprise them when they get there.
+
+  `app` and `connect` refuse a slug the control plane does not know — before the first
+  prompt — and list the ones that would have worked. `ogun secret set` acquired the same
+  check against weaker evidence, with an `--allow-unregistered` escape, because it reaches
+  no server by design; these two cannot run without the control plane at all, so the
+  database is available and no escape is needed. The rule, stated once so the asymmetry does
+  not read as an accident: **each command checks the slug against the best oracle it already
+  depends on.** `disconnect` checks nothing, exactly as `ogun secret rm` checks nothing — a
+  row `status` shows has to be a row you can remove, or a stranded refresh token stays in
+  the file with the listing still advertising it.
+
+  Nothing about the shape assumes a browser. `connect` prints consent instructions because
+  `/api/oauth/linear/start` answered with an `authorizeUrl`, not because the command is
+  built around one, and a start that comes back already connected is reported as such. If
+  the `client_credentials` grant rejected above is ever adopted as the default, it is a
+  server-side change and an operator types the same words.
 
 - **Write scopes are the open edge, named on purpose.** This ADR settles that Ogun connects
   as an application and asks for `read`. It does **not** settle what write-back looks like:

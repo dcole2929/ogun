@@ -437,8 +437,13 @@ function ProjectSecrets({
                 key anyway, which is the one thing this refusal is preventing. */}
             {writes.reason}
           </p>
+          {/* The whole command, redirection included. `ogun secret set linear` on its own
+              reads as complete and is not — the key arrives on stdin, and an operator who
+              copies a line that does not say so gets a hung terminal at a machine they had
+              to SSH into. --project rather than the directory default, because the control
+              plane that refused this write is the one least likely to have the repo on it. */}
           <pre className="md-code" style={{ fontSize: 11, marginBottom: 0 }}>
-            ogun project secret set &lt;project&gt; {writes.names[0] ?? 'linear'}
+            ogun secret set {writes.names[0] ?? 'linear'} --project &lt;slug&gt; &lt; key.txt
           </pre>
         </>
       )}
@@ -842,9 +847,18 @@ function LinearConnection() {
             This control plane will not accept a client secret over this transport. The CLI
             writes it to this machine directly and sends nothing anywhere.
           </p>
+          {/* What the command asks for, said here rather than discovered by running it.
+              `ogun linear app` reads as complete and is not: it prompts for a Client ID and
+              a Client Secret, which is the whole reason an operator is being sent to a
+              terminal. --project rather than the directory default, because the control
+              plane that refused this write is the one least likely to have the repo on it. */}
           <pre className="md-code" style={{ fontSize: 11, marginBottom: 0 }}>
-            ogun project linear app &lt;project&gt;
+            ogun linear app --project &lt;slug&gt;
           </pre>
+          <p className="muted" style={{ fontSize: 11, marginTop: 4, marginBottom: 0 }}>
+            It asks for the Client ID and the Client Secret, and prints the callback URL to
+            register in Linear first.
+          </p>
         </>
       )}
     </div>
