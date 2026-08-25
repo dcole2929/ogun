@@ -1,0 +1,99 @@
+{
+  "data": {
+    "issues": {
+      "pageInfo": {
+        "hasNextPage": true,
+        "endCursor": "YXJyYXljb25uZWN0aW9uOjE="
+      },
+      "nodes": [
+        {
+          "id": "b2f9a1c4-4c37-4d3e-9a41-1f6f0b6c2d10",
+          "identifier": "ENG-101",
+          "title": "Rate limiter drops the first request after a restart",
+          "description": "The token bucket is initialised empty, so the first request after a\nprocess restart is rejected with a 429.\n\nRepro: restart the api and curl it immediately.",
+          "url": "https://linear.app/acme/issue/ENG-101/rate-limiter-drops-the-first-request-after-a-restart",
+          "updatedAt": "2026-08-19T09:14:22.401Z",
+          "team": { "key": "ENG" },
+          "state": { "name": "Todo", "type": "unstarted" },
+          "labels": { "nodes": [{ "name": "bug" }, { "name": "ogun" }] },
+          "inverseRelations": { "nodes": [] }
+        },
+        {
+          "id": "0c1d7e55-8a2b-4f61-b0a7-64c2f4d9e3aa",
+          "identifier": "ENG-102",
+          "title": "Add a dark theme to the settings page",
+          "description": null,
+          "url": "https://linear.app/acme/issue/ENG-102/add-a-dark-theme-to-the-settings-page",
+          "updatedAt": "2026-08-19T08:02:10.117Z",
+          "team": { "key": "ENG" },
+          "state": { "name": "In Progress", "type": "started" },
+          "labels": { "nodes": [{ "name": "ogun" }] },
+          "inverseRelations": { "nodes": [] }
+        },
+        {
+          "id": "7a3e2b19-5d64-4c02-8e11-9b7c5f0a4d33",
+          "identifier": "ENG-103",
+          "title": "Retry the webhook delivery on a 5xx",
+          "description": "Deliveries that fail with a 5xx are dropped. They should be retried with\nbackoff for up to an hour.",
+          "url": "https://linear.app/acme/issue/ENG-103/retry-the-webhook-delivery-on-a-5xx",
+          "updatedAt": "2026-08-18T16:44:03.882Z",
+          "team": { "key": "ENG" },
+          "state": { "name": "Todo", "type": "unstarted" },
+          "labels": { "nodes": [{ "name": "bug" }] },
+          "inverseRelations": { "nodes": [] }
+        },
+        {
+          "id": "e58c9d02-3f17-4a8d-93b6-2c0e7a115f4b",
+          "identifier": "ENG-104",
+          "title": "Move the queue onto the new scheduler",
+          "description": "Blocked until the scheduler lands.",
+          "url": "https://linear.app/acme/issue/ENG-104/move-the-queue-onto-the-new-scheduler",
+          "updatedAt": "2026-08-18T11:20:55.006Z",
+          "team": { "key": "ENG" },
+          "state": { "name": "Todo", "type": "unstarted" },
+          "labels": { "nodes": [{ "name": "ogun" }] },
+          "inverseRelations": {
+            "nodes": [
+              {
+                "type": "blocks",
+                "issue": {
+                  "identifier": "ENG-90",
+                  "state": { "type": "started" }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "id": "1d4b6f83-91ca-4d75-a2e8-5c3907ba62df",
+          "identifier": "ENG-105",
+          "title": "Delete the legacy importer",
+          "description": "The importer was superseded by the sync job and nothing calls it.",
+          "url": "https://linear.app/acme/issue/ENG-105/delete-the-legacy-importer",
+          "updatedAt": "2026-08-17T19:38:41.229Z",
+          "team": { "key": "ENG" },
+          "state": { "name": "Todo", "type": "unstarted" },
+          "labels": { "nodes": [{ "name": "ogun" }, { "name": "chore" }] },
+          "inverseRelations": {
+            "nodes": [
+              {
+                "type": "blocks",
+                "issue": {
+                  "identifier": "ENG-77",
+                  "state": { "type": "completed" }
+                }
+              },
+              {
+                "type": "related",
+                "issue": {
+                  "identifier": "ENG-12",
+                  "state": { "type": "started" }
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

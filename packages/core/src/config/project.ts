@@ -1,6 +1,7 @@
 import { parse as parseYaml } from 'yaml'
 import { z } from 'zod'
 import { cycleConfigSchema } from './cycle.ts'
+import { sourceSchema } from './source.ts'
 import { egressSchema } from './egress.ts'
 
 export const RUNTIMES = ['claude', 'codex'] as const
@@ -358,6 +359,12 @@ export const projectConfigSchema = z.object({
   workers: z.record(z.string(), workerSchema).default({}),
   /** Multi-worker graphs. A single worker needs none — it is already a one-node cycle. */
   cycles: z.record(z.string(), cycleConfigSchema).default({}),
+  /**
+   * Where work comes *from* the outside world (§4.13). A peer of `workers:` and `cycles:`
+   * rather than a member of either, because a source emits jobs and is not a worker: it
+   * runs on the host, holds the credential, and never executes anything itself.
+   */
+  sources: z.record(z.string(), sourceSchema).default({}),
   tests: testsSchema.prefault({}),
   policies: policiesSchema.prefault({}),
 })

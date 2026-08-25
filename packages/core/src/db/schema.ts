@@ -622,3 +622,187 @@ export const breakers = pgTable(
   },
   (t) => [uniqueIndex('breakers_worker_idx').on(t.workerId)],
 )
+
+/**
+ * A **source**: a configured connection to an outside system that turns tickets into jobs
+ * (§4.13, ADR-0013). Written by `ogun project sync` from `sources:` in config.yaml.
+ *
+ * A row rather than a read of the file, for the reason §5.1 gives for every other
+ * definition: the foreman cannot open a YAML file. It has no absolute path to a checkout
+ * (§4.5) and a hosted control plane has no checkout at all, so the database is the only
+ * thing it can always reach. `config.yaml` is the definition; this is what polls.
+ *
+ * Note what is *not* here: the API key. A source's credential is per project and belongs
+ * in the machine's secret store (ADR-0012), fetched at poll time by slug. A column
+ * for it would be a secret sitting in the same database the UI reads — and a `sources` row
+ * is rewritten wholesale on every sync, so the key would also have to survive a sync,
+ * which means it would have to be in the file, which is the thing being avoided.
+ */
+export const sources = pgTable(
+  'sources',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    projectId: uuid('project_id')
+      .notNull()
+      .references(() => projects.id, { onDelete: 'cascade' }),
+    name: text('name').notNull(),
+    /** `linear` today. Text rather than a pg enum, for the reason at the top of this file. */
+    kind: text('kind').notNull(),
+    /**
+     * The cycle an admitted ticket starts, by name rather than by id.
+     *
+     * `ogun project sync` deletes and recreates cycle rows as config.yaml changes, so an
+     * FK here would be nulled by an ordinary edit and the source would quietly stop
+     * emitting. The name is what the file says and what a person would look for.
+     */
+    cycleName: text('cycle_name').notNull(),
+    /** The parsed `SourceConfig` — filter, team, caps. jsonb for `workers.config` reasons. */
+    config: jsonb('config').notNull().$type<Record<string, unknown>>(),
+    enabled: boolean('enabled').notNull().default(true),
+    /**
+     * When this source last *looked*, whatever came of it — the cursor `pollMinutes` is
+     * measured from, and the claim two overlapping ticks compete for.
+     *
+     * Advanced before the poll rather than after, the same way `schedules.lastRunAt` is
+     * and for the same reason: it is what makes the decision to poll a claim rather than
+     * an opinion a second tick can hold at the same time. Null means never polled, which
+     * is not the same as polled and found nothing.
+     */
+    lastPolledAt: timestamp('last_polled_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [uniqueIndex('sources_project_name_idx').on(t.projectId, t.name)],
+)
+
+/**
+ * That Ogun has already emitted work for a ticket. The whole of idempotency (ADR-0013).
+ *
+ * A poll every five minutes sees the same ticket every time, and Ogun writes nothing back
+ * to Linear (ADR-0004) — so nothing about the ticket ever changes to say "this one has
+ * been dealt with". Without this table a source emits a job per ticket per poll, forever:
+ * 288 cycle runs a day for one card nobody moved.
+ *
+ * **Identity is (project, external id), not (source, external id).** A ticket is one piece
+ * of work for one repository however Ogun came to notice it, so two sources whose filters
+ * overlap emit once between them rather than once each — and renaming or deleting a source
+ * in config.yaml does not re-emit its whole backlog, which is what a source-scoped key
+ * would do on the day somebody tidies their yaml.
+ *
+ * **This is not a mirror of ticket state** (ADR-0004). Every column records what *Ogun
+ * did*: which ticket, when, into which cycle run, and a hash of what the ticket said at the
+ * time. Nothing here answers "what is this ticket's status now" — that is still a live
+ * read, and a caller tempted to answer it from this table finds nothing to answer it with.
+ *
+ * **Only admitted tickets get a row.** A ticket the deterministic filter refused is
+ * deliberately not recorded here: it may be admitted next week when somebody adds the
+ * label, and a row saying "seen" would make that ticket permanently invisible. The refusal
+ * is recorded on the poll instead, where it decays.
+ */
+export const sourceEmissions = pgTable(
+  'source_emissions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    projectId: uuid('project_id')
+      .notNull()
+      .references(() => projects.id, { onDelete: 'cascade' }),
+    /** Null once that source leaves config.yaml; `sourceName` below survives it (§4.4). */
+    sourceId: uuid('source_id').references(() => sources.id, { onDelete: 'set null' }),
+    /** Snapshot, so the ledger stays readable after a rename or a removal. */
+    sourceName: text('source_name').notNull(),
+    /** Linear's issue UUID. The identity, and the only thing that must never change. */
+    externalId: text('external_id').notNull(),
+    /** `ENG-123` — the handle a person searches for. Not the key; the key is the UUID. */
+    externalKey: text('external_key').notNull(),
+    /**
+     * `ticketDigest` at the moment of emission: title, status and description, hashed.
+     *
+     * A hash and not the text, which is the ADR-0004 line rather than a space saving — a
+     * column holding a ticket's body is a copy of Linear's content sitting where a later
+     * caller can read it and believe it current. This answers one question and no others:
+     * has what we acted on changed since we acted.
+     */
+    digest: text('digest').notNull(),
+    /** The run this ticket became. Null when creating it failed — see `outcome`. */
+    cycleRunId: uuid('cycle_run_id').references(() => cycleRuns.id, { onDelete: 'set null' }),
+    /**
+     * `emitted` | `failed`.
+     *
+     * The row is written *before* the cycle run is created, so two overlapping polls
+     * cannot both emit for one ticket — the unique index is the claim. Which means a
+     * `startCycleRun` that throws leaves the claim behind, and that is deliberate and is
+     * the same call `scheduler.tick` makes: at most once. The alternative retries every
+     * five minutes forever, so a ticket that cannot be turned into a run — a cycle naming
+     * a worker that is gone, a definition that will not parse — would spend the night
+     * half-creating one. `failed` with the error in `detail` is a fact somebody can act
+     * on; a retry loop at 3am is not.
+     */
+    outcome: text('outcome').notNull().default('emitted'),
+    detail: text('detail'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    /** The claim, and the dedupe. One emission per ticket per project, enforced by pg. */
+    uniqueIndex('source_emissions_project_external_idx').on(t.projectId, t.externalId),
+    index('source_emissions_cycle_run_idx').on(t.cycleRunId),
+  ],
+)
+
+/**
+ * One look at the outside world, and what came of it — the coverage ledger for a trigger
+ * (principle 6).
+ *
+ * A source that stops working stops doing *nothing visible*. The key expired, the team key
+ * was renamed, the status list has a typo, Linear returned a rate-limit error at 3am: every
+ * one of those looks identical from outside to a quiet week, and identical to a poll loop
+ * that was never started. Those are different facts, and this is where they stop sharing a
+ * name — the argument the `coverage` table makes about workers, applied to the thing
+ * upstream of them.
+ *
+ * A row per poll, always, including the ones that found nothing: "looked and nothing
+ * matched" is the fact worth being able to prove. At the default cadence that is ~288 rows
+ * a day per source, which is less than one run's events and is the price of being able to
+ * answer the question at all. Nothing prunes it yet, which it shares with `run_events`.
+ */
+export const sourcePolls = pgTable(
+  'source_polls',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    projectId: uuid('project_id')
+      .notNull()
+      .references(() => projects.id, { onDelete: 'cascade' }),
+    /** Null once that source leaves config.yaml; the name survives it. */
+    sourceId: uuid('source_id').references(() => sources.id, { onDelete: 'set null' }),
+    sourceName: text('source_name').notNull(),
+    startedAt: timestamp('started_at', { withTimezone: true }).notNull().defaultNow(),
+    endedAt: timestamp('ended_at', { withTimezone: true }),
+    /**
+     * `ok` | `refused` | `failed`, and the three are not degrees of one thing.
+     *
+     * `refused` is a poll that never reached Linear because something local was missing —
+     * no API key for this project, a `cycle:` naming a cycle that does not exist. The fix
+     * is on this machine and the detail names it. `failed` is a poll that asked and did
+     * not get an answer: an expired key, a rate limit, a network. `ok` covers everything
+     * else, including finding nothing.
+     */
+    outcome: text('outcome').notNull(),
+    /** Tickets the poll read. */
+    seen: integer('seen').notNull().default(0),
+    /** Tickets the deterministic filter admitted. */
+    admitted: integer('admitted').notNull().default(0),
+    /** Admitted tickets that became a cycle run in this poll. */
+    emitted: integer('emitted').notNull().default(0),
+    /** Admitted tickets left for the next poll by `maxPerPoll`. */
+    trimmed: integer('trimmed').notNull().default(0),
+    /** Whether `maxPages` stopped the read before the end of the list. */
+    truncated: boolean('truncated').notNull().default(false),
+    /**
+     * The sentence a person needs: the error, or — when nothing was admitted — the
+     * statuses that were actually on the tickets it read. A `status: [To Do]` against a
+     * workflow state called `Todo` is otherwise a source that polls forever, matches
+     * nothing, and reports success.
+     */
+    detail: text('detail'),
+  },
+  (t) => [index('source_polls_source_started_idx').on(t.sourceId, t.startedAt)],
+)

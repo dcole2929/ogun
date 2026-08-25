@@ -1,0 +1,36 @@
+{
+  "data": {
+    "issues": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": "YXJyYXljb25uZWN0aW9uOjM="
+      },
+      "nodes": [
+        {
+          "id": "9f0a4c6d-2b58-4e19-84f3-7d5b1e0c8a27",
+          "identifier": "ENG-106",
+          "title": "Log the request id on every error",
+          "description": "Errors are unattributable without it.",
+          "url": "https://linear.app/acme/issue/ENG-106/log-the-request-id-on-every-error",
+          "updatedAt": "2026-08-16T07:11:59.470Z",
+          "team": { "key": "ENG" },
+          "state": { "name": "todo", "type": "unstarted" },
+          "labels": { "nodes": [{ "name": "OGUN" }] },
+          "inverseRelations": { "nodes": [] }
+        },
+        {
+          "id": "44b7e310-6d92-4c8f-ae05-3b19f7c2065e",
+          "identifier": "ENG-107",
+          "title": "Rewrite the billing exporter",
+          "description": "Needs a design review before anyone starts.",
+          "url": "https://linear.app/acme/issue/ENG-107/rewrite-the-billing-exporter",
+          "updatedAt": "2026-08-15T13:27:04.913Z",
+          "team": { "key": "ENG" },
+          "state": { "name": "Todo", "type": "unstarted" },
+          "labels": { "nodes": [{ "name": "ogun" }, { "name": "needs-design" }] },
+          "inverseRelations": { "nodes": [] }
+        }
+      ]
+    }
+  }
+}

@@ -3,7 +3,12 @@ import { and, desc, eq, inArray } from 'drizzle-orm'
 import { z } from 'zod'
 import { schema } from '@ogun/core/db'
 import type { Db } from '@ogun/core/db'
-import { controlPlanePoliciesSchema, cycleDefinitionSchema, workerSchema } from '@ogun/core'
+import {
+  controlPlanePoliciesSchema,
+  cycleDefinitionSchema,
+  sourceSchema,
+  workerSchema,
+} from '@ogun/core'
 import { discoverSkills, expandCycle, hashSkillSet, loadProjectConfig } from '@ogun/core'
 import { builtinSkillsRoot, driftAcross } from '../drift.ts'
 import { reindexProject } from '../reindex.ts'
@@ -54,6 +59,12 @@ const syncSchema = z.object({
     )
     .default([]),
   cycles: z.record(z.string(), cycleDefinitionSchema).default({}),
+  /**
+   * Integration triggers (§4.13, ADR-0013). Defaulted rather than required, so a CLI that
+   * predates sources keeps syncing — an older client posting nothing means "this project
+   * has no sources", which is true of every project that has not written the block.
+   */
+  sources: z.record(z.string(), sourceSchema).default({}),
 })
 
 export const projectsRoutes = new Hono<Env>()
@@ -162,12 +173,19 @@ async function applySync(db: Db, body: SyncPayload) {
     .set({ skillsHash: hashSkillSet(body.skills) })
     .where(eq(projects.id, project.id))
 
-  const { workers: indexed, removed, overriddenSchedules, unmetRequirements, registeredRunners } =
-    await reindexProject(db, project.slug, {
-      hash: body.configHash,
-      workers: body.workers,
-      cycles: body.cycles,
-    })
+  const {
+    workers: indexed,
+    removed,
+    overriddenSchedules,
+    unmetRequirements,
+    registeredRunners,
+    sources: indexedSources,
+  } = await reindexProject(db, project.slug, {
+    hash: body.configHash,
+    workers: body.workers,
+    cycles: body.cycles,
+    sources: body.sources,
+  })
 
   return {
     project: { id: project.id, slug: project.slug },
@@ -182,6 +200,7 @@ async function applySync(db: Db, body: SyncPayload) {
      */
     unmetRequirements,
     registeredRunners,
+    sources: indexedSources,
   }
 }
 
@@ -235,6 +254,7 @@ projectsRoutes.post('/:slug/sync-local', async (c) => {
     workers: loaded.config.workers,
     policies: loaded.config.policies,
     cycles,
+    sources: loaded.config.sources,
     skills: discovered.map((s) => ({
       name: s.name,
       sourcePath: s.sourcePath,

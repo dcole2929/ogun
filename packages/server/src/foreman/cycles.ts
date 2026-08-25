@@ -26,6 +26,22 @@ export type StartCycleRunInput = {
   /** Per-node prompt override, keyed by node key. Used by a manual trigger. */
   promptOverrides?: Record<string, string>
   /**
+   * Per-node text *appended* to whatever the prompt layers resolved to, keyed by node key.
+   * What a source hands the entry node: the ticket (§4.13, ADR-0013).
+   *
+   * §5.1 says a source "may override" the prompt, and this is the one place the
+   * implementation deliberately does not do what that sentence says. The resolved prompt
+   * is the sentence naming the skill — *"Use the scope-evaluation skill."* — and replacing
+   * it with ticket text leaves the agent holding a feature request and no idea what it has
+   * been asked to do about it. Rebuilding that sentence inside the source would put a
+   * second copy of the layering rule somewhere it can drift from this one.
+   *
+   * So the layers decide *what to do* and this decides *what to do it to*, and the job's
+   * prompt is the two concatenated. A manual trigger still overrides outright, which is
+   * what a person typing a prompt means.
+   */
+  promptContext?: Record<string, string>
+  /**
    * What the project can offer a modifier (§4.3). Established by this function from the
    * disk when omitted; a seam, because a test that has to lay out a real repository to
    * assert an admission rule is a test about filesystems.
@@ -151,12 +167,17 @@ export async function startCycleRun(
        * read, so a skill that declared anything other than the obvious one-liner had it
        * silently ignored.
        */
-      const prompt =
+      const resolved =
         input.promptOverrides?.[node.key] ??
         node.prompt ??
         (worker.config as { prompt?: string }).prompt ??
         skillPrompts.get(worker.skillRef) ??
         `Use the ${worker.skillRef} skill.`
+      // Appended, never substituted — see `promptContext`. Blank line between, because the
+      // two halves are written by different authors and run together they read as one
+      // sentence that trails off.
+      const context = input.promptContext?.[node.key]
+      const prompt = context ? `${resolved}\n\n${context}` : resolved
 
       const [job] = await tx
         .insert(jobs)

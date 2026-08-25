@@ -6,6 +6,7 @@ export * from './findings.ts'
 export * from './evidence.ts'
 export * from './credentials.ts'
 export * from './config/index.ts'
+export * from './sources/index.ts'
 export * from './api.ts'
 export * from './image.ts'
 
