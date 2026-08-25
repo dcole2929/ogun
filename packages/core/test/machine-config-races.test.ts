@@ -209,3 +209,51 @@ test('nothing is left beside the config once the writes are done', async (t) => 
   assert.deepEqual(await readdir(dir), ['config.json'])
   assert.ok(JSON.parse(await readFile(path, 'utf8')))
 })
+
+/**
+ * The window while a lock is being *taken*, which is the one place the lock could break
+ * itself.
+ *
+ * `claimLock` creates the file and writes the pid in a single `writeFile`, but those are
+ * not one event to a reader: a waiter arriving between them sees an empty file.
+ * `Number.parseInt('')` is `NaN` and `alive(NaN)` is false, so `breakAbandonedLock` used
+ * to conclude the holder was gone, delete a live lock, and let both writers through —
+ * precisely the lost update the lock exists to prevent.
+ *
+ * The concurrent-writers test above catches this about one run in eight, which is a test
+ * that reports a real defect as flakiness. This one asks the question directly, and the
+ * two halves are the whole rule: an unreadable owner is *waited* for while it is fresh,
+ * and broken once it is older than a process could plausibly be mid-`writeFile`.
+ */
+test('a lock with no owner written yet is waited for, not broken', async (t) => {
+  const { path, cleanup } = await withConfig({})
+  t.after(cleanup)
+  const { writeFile: write, rm: remove } = await import('node:fs/promises')
+  const lockPath = `${path}.lock`
+
+  // Exactly what a half-taken lock looks like: created, pid not yet landed.
+  await write(lockPath, '')
+
+  await assert.rejects(
+    () => updateLocalConfig((c) => ({ ...c, projects: { taken: '/tmp/x' } }), path),
+    /still held/,
+    'an empty lock is a lock mid-write; breaking it lets two writers into one file',
+  )
+
+  await remove(lockPath, { force: true })
+})
+
+test('a lock with no owner written yet is broken once it is stale', async (t) => {
+  const { path, cleanup } = await withConfig({})
+  t.after(cleanup)
+  const { writeFile: write, utimes } = await import('node:fs/promises')
+  const lockPath = `${path}.lock`
+
+  await write(lockPath, '')
+  // Older than any `writeFile` could still be in flight: a crash between open and write.
+  const longAgo = new Date(Date.now() - 120_000)
+  await utimes(lockPath, longAgo, longAgo)
+
+  const next = await updateLocalConfig((c) => ({ ...c, projects: { taken: '/tmp/x' } }), path)
+  assert.equal(next.projects.taken, '/tmp/x', 'a genuinely abandoned lock must not wedge the file')
+})
