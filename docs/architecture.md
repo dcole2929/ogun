@@ -147,8 +147,18 @@ raw model output beyond structured records + log refs.
 
 - `cron` — evaluated in-process by croner, not system cron
 - `manual` — a button in the UI, a CLI command
-- `integration` — GitHub push, Linear poll (phase 3+)
+- `integration` — a **source**: Linear poll, built (§4.13, ADR-0013). GitHub push, not yet
 - `chained` — a DAG edge inside a cycle
+
+**A poll is not a schedule, and has no `onMissed`.** [settled — ADR-0013] The missed-run
+policy below exists because a schedule has *occurrences*: a machine that slept through six
+of them has six facts to decide about. A poll has none — it asks what matches *now*, so six
+missed polls collapse into one question with one answer, and a source that had an
+`onMissed:` key would be a source that had stopped being level-triggered somewhere. That
+property is bought rather than free: it is why there is no "issues updated since
+`last_polled_at`" cursor, which would be smaller, faster, and wrong in both directions —
+re-emitting everything a downtime spans, and never seeing a ticket that reached the trigger
+status without being updated.
 
 **Missed-run policy is load-bearing.** WSL2 stops when Windows sleeps, hibernates, or
 reboots for updates. On startup, Foreman asks per schedule: was an occurrence due
@@ -1266,10 +1276,89 @@ picture, and "three of four reviewers ran" is not derivable from findings alone.
   one implementation; the PR cap is a live `gh pr list` and is written down nowhere.
 - **Linear** — poll every N minutes with a *deterministic* filter (status, label,
   not-blocked) before any AI sees a ticket. Sources emit jobs; they are not workers.
+  **Built** (ADR-0013), read-only, and unwired until a project has a key.
   The API key is per workspace, so it is the first credential Ogun stores rather than
   borrows: `~/.ogun/config.json` on the control-plane machine, host-side only, and
   structurally unable to reach a container (§4.5, ADR-0012). An agent never sees one —
   the filter runs before the prompt is built, which is what makes that possible.
+
+#### What a source is
+
+[settled — ADR-0013] A **source** is a trigger, not a worker. It declares itself in
+`.ogun/config.yaml` beside `workers:` and `cycles:`, runs in the control-plane process on
+the host, holds the credential, and never executes anything:
+
+```yaml
+sources:
+  tickets:
+    kind: linear
+    cycle: ticket-pipeline   # the cycle each admitted ticket starts
+    team: ENG
+    pollMinutes: 5
+    maxPerPoll: 3
+    filter:
+      status: [Todo]
+      labels: [ogun]         # all of them, not any
+      excludeLabels: [needs-design]
+      notBlocked: true
+```
+
+What it emits is a `CycleRun`, created through the same `startCycleRun` that cron and the
+manual trigger call — so admission, the breaker, `maxConcurrentModifiers`, the credential
+preflight and the coverage ledger apply to a ticket without a line being written for it.
+There is no second path into the queue.
+
+Five things about it are decisions rather than details:
+
+- **The filter is code, and the type system enforces that it runs first.** `admitsTicket`
+  is a pure total function in `@ogun/core` — no client, no database — and it returns a
+  branded `AdmittedTicket` that nothing else can mint. The emitter and the prompt brief take
+  that brand, so "before any AI sees a ticket" is checked by `tsc` rather than by the order
+  of statements. The way this rule actually breaks is a caller added later that fetches a
+  ticket for some other purpose; a comment does not survive that.
+- **The remote query narrows on the team and nothing else.** Pushing status and labels into
+  Linear's `IssueFilter` moves the rule onto a server this repo cannot test against, and the
+  two implementations disagree exactly where it hurts: `StringComparator.in` is
+  case-sensitive where the local rule folds case, and `hasBlockedByRelations` counts a
+  relation to an issue that closed in March. Both disagreements *hide* tickets, which is
+  invisible forever. The cost — reading a team's issues every poll — is the ADR-0004 trade
+  again.
+- **Idempotency is a ledger, because nothing else can be one.** Ogun writes nothing back, so
+  the card sits in `Todo` until a person moves it and every poll admits it again.
+  `source_emissions` is unique on `(project, external id)`, the row is inserted *before* the
+  run is created, and the insert is the claim. A ticket edited afterwards is reported and
+  **not** re-emitted.
+- **A source that stops working leaves evidence.** `source_polls` records every look. An
+  expired key, a team key that was renamed, a `status:` with a typo and a genuinely quiet
+  week are otherwise the same observation — and identical to a poll loop that was never
+  started (principle 6).
+- **Nothing about Linear reaches a sandbox.** The key is fetched per project from the host's
+  secret store and used in one header in one file. The ticket reaches an agent as prompt
+  text. A worker in this pipeline needing `api.linear.app` on its egress allowlist is a
+  symptom, not a configuration (ADR-0010).
+
+#### The scope evaluator
+
+[settled — ADR-0013] §9 names it and nothing defined it. It is **a worker**, and it is the
+entry node of the cycle a source feeds. The deterministic filter answers everything code can
+answer; what is left is whether this is work Ogun should attempt at all, which is a
+judgement about *the codebase* rather than about the ticket text — so it needs the repo,
+which means a sandbox, which means a worker. Being a worker, it produces a run, an outcome
+and a coverage row, so a ticket that fails scope evaluation is a recorded fact rather than a
+silence.
+
+It is deliberately *not* part-deterministic. The evaluator is defined as exactly the residue
+the filter cannot decide; giving it rules of its own would create a second home for
+deterministic rules, and "the filter is the whole deterministic story" would stop being
+true.
+
+`ogun project sync` refuses a source whose cycle does not have exactly one entry node: the
+ticket has to arrive somewhere, and picking the first node in array order would be right
+most nights and wrong in a way nobody could see.
+
+**Not built in this slice:** the scope-evaluation skill itself and the
+*ticket → plan → implement → review → draft PR* graph behind it (§9). A source today emits
+into whatever cycle a project names.
 
 **[open]** How PR lifecycle state is represented once modifier workers exist —
 GitHub is authoritative per §4.4, but the specific mechanism (labels, checks,
@@ -1406,6 +1495,14 @@ Seven things that flow is deliberate about:
    literal text handed to the agent, often as short as *"Use the
    staging-error-reviews skill."* Layered like all config: the worker supplies a
    default, a cycle node or a source (a Linear ticket) may override it.
+
+   **A source appends rather than overrides.** [corrected] Taking "override" literally
+   deletes the sentence that names the skill, so the agent is handed a feature request and
+   no idea what it is being asked to do about it — and rebuilding that sentence inside the
+   source would put a second copy of this layering rule where it can drift from this one.
+   So the layers decide *what to do* and the source decides *what to do it to*, and the
+   job's prompt is the two concatenated (`promptContext` in `foreman/cycles.ts`). A manual
+   trigger still overrides outright, which is what a person typing a prompt means.
 3. **Skills usually need nothing done.** A skill in the repo's `.claude/skills/` or
    `.ogun/skills/` arrives with the workspace and the runtime discovers it natively.
    Injection applies only to a global or built-in skill that isn't already present.
@@ -1669,6 +1766,22 @@ artifacts           id, run_id, kind, ref
                     -- kind=transcript|patch|adr-draft; large blobs on disk, never inlined
 
 runners             id, name, labels[], last_seen_at, max_concurrency
+
+sources             id, project_id, name, kind, cycle_name, config (jsonb), enabled,
+                    last_polled_at
+                    -- an integration trigger (§4.13, ADR-0013). Emits jobs; runs nothing.
+                    -- no credential column: the api key is per project and lives in the
+                    -- host's secret store, fetched at poll time
+source_emissions    id, project_id, source_id?, source_name, external_id, external_key,
+                    digest, cycle_run_id?, outcome, detail
+                    -- the whole of idempotency. unique on (project_id, external_id), and
+                    -- the insert is the claim: written before the cycle run exists
+                    -- digest is a *hash* of title+status+description, never the text —
+                    -- a record of what Ogun did, not a copy of what Linear says (ADR-0004)
+source_polls        id, project_id, source_id?, source_name, started_at, ended_at,
+                    outcome, seen, admitted, emitted, trimmed, truncated, detail
+                    -- the coverage ledger for a trigger. "looked and nothing matched",
+                    -- "could not look" and "was never started" are three different facts
 ```
 
 `worker_version` and `skill_version` on every run answer the question that otherwise
@@ -1900,8 +2013,31 @@ project produces a patch it cannot publish, and nothing prunes `scratch/patches/
 patch is also an artefact the run page serves, so the publisher deliberately does not
 delete what it consumed.
 
-**Phase 4 — Linear.** Deterministic ticket filtering, scope evaluator, ticket →
-plan → implement → review → draft PR.
+**Phase 4 — Linear.** In progress.
+
+Done: **the source** (§4.13, ADR-0013) — the first `integration` trigger, and the answer to
+what a source *is*: a trigger that lives beside `workers:` and `cycles:`, runs on the host
+holding the credential, and emits `CycleRun`s through the same `startCycleRun` that cron and
+the manual trigger use. Deterministic ticket filtering is a pure function in `@ogun/core`
+whose output is a branded type nothing else can mint, so "before any AI sees a ticket" is a
+compile error rather than a convention. Idempotency is `source_emissions`, unique on
+`(project, ticket)`, claimed by the insert — which is the only thing that exists to stop one
+card in `Todo` becoming 288 cycle runs a day, since Ogun writes nothing back for the card to
+record. Read-only: the GraphQL document is a module constant, so the client cannot mutate.
+
+Also decided rather than built: **the scope evaluator is a worker**, and it is the entry
+node of the cycle a source feeds — which is what makes "this ticket was looked at and
+declined" a run with a coverage row instead of a silence (§4.13).
+
+Two things are honest gaps rather than oversights. **Nothing has run against a live Linear
+workspace** — there is no key on any machine here, so the client was built against responses
+recorded from Linear's published GraphQL schema and its developer documentation, and
+`test/linear-fixtures.ts` says exactly what that proves and what it does not. And the
+**pipeline is not built**: no scope-evaluation skill, and no ticket → plan → implement →
+review → draft PR graph. A source today emits into whatever cycle a project names it.
+
+Remaining: that pipeline, and the per-project secret store the source reads its key from —
+consumed here behind a one-function seam whose default holds nothing and says so.
 
 **Explicit non-goals:** Kubernetes, multi-tenancy, RBAC, billing, graphical workflow
 canvas, auto-merge, agent memory, model auto-selection, remote runner mesh.

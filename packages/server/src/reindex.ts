@@ -10,10 +10,11 @@ import {
   singleWorkerCycle,
   workerRequirements,
   type CycleDefinition,
+  type SourceConfig,
   type WorkerConfig,
 } from '@ogun/core'
 
-const { cycles, jobs, projects, schedules, skills, workers } = schema
+const { cycles, jobs, projects, schedules, skills, sources, workers } = schema
 
 /**
  * A refusal caused by what somebody wrote, not by anything going wrong in here.
@@ -79,6 +80,8 @@ export type ReindexResult = {
    * you see on a correct configuration is one you stop reading.
    */
   registeredRunners: number
+  /** Sources indexed from `sources:`, and the cycle each one feeds (§4.13, ADR-0013). */
+  sources: Array<{ name: string; cycle: string }>
 }
 
 /**
@@ -102,6 +105,8 @@ export async function reindexProject(
     workers: Record<string, WorkerConfig>
     /** Named multi-node cycles, already expanded from sugar. */
     cycles?: Record<string, CycleDefinition>
+    /** Integration triggers. A source emits jobs into a cycle; it is not a worker. */
+    sources?: Record<string, SourceConfig>
   },
 ): Promise<ReindexResult> {
   const project = await db.query.projects.findFirst({ where: eq(projects.slug, slug) })
@@ -146,6 +151,45 @@ export async function reindexProject(
           `cycle "${name}" refers to worker "${node.worker}", which is not defined`,
         )
       }
+    }
+  }
+
+  /**
+   * Everything about `sources:` that a person could have got wrong, checked here with the
+   * cycles for the same reason they are: `reindexProject` is not a transaction, so a
+   * refusal raised half way leaves behind the rows it had already written.
+   *
+   * Both failures are of the kind that produce *silence* rather than an error, which is
+   * why they are worth a refusal at the moment somebody wrote the line:
+   *
+   * - A `cycle:` naming nothing. The source polls Linear every five minutes, admits
+   *   tickets, and refuses each poll — work that looks like it is configured and is not.
+   * - A cycle with more than one entry node. The ticket has to be handed to *a* node, and
+   *   there is no principled way to choose between two; picking the first in array order
+   *   would be right most nights and wrong in a way nobody could see.
+   *
+   * A source is *not* refused for sharing a name with a worker or a cycle. They are
+   * different blocks answering different questions — `sources.tickets` and
+   * `workers.tickets` do not fight over a row the way a cycle and a worker do — and
+   * forbidding it would be a rule with no failure behind it.
+   */
+  for (const [name, source] of Object.entries(file.sources ?? {})) {
+    const target =
+      file.cycles?.[source.cycle] ??
+      (source.cycle in file.workers ? singleWorkerCycle(source.cycle) : undefined)
+    if (!target) {
+      throw new ConfigInvalid(
+        `source "${name}" feeds cycle "${source.cycle}", which is not a worker or a cycle ` +
+          'in this config',
+      )
+    }
+    const entries = target.nodes.filter((n) => !target.edges.some((e) => e.to === n.key))
+    if (entries.length !== 1) {
+      throw new ConfigInvalid(
+        `source "${name}" feeds "${source.cycle}", which has ${entries.length} nodes with ` +
+          `no dependencies (${entries.map((n) => n.key).join(', ') || 'none'}) — a source ` +
+          'hands its ticket to exactly one entry node, so the cycle needs exactly one',
+      )
     }
   }
 
@@ -287,8 +331,57 @@ export async function reindexProject(
     workers: out,
     removed: removed.map((r) => r.name),
     overriddenSchedules,
+    sources: await syncSources(db, project.id, file.sources ?? {}),
     ...(await requirementGaps(db, file.workers)),
   }
+}
+
+/**
+ * Sources, on the same terms as workers and cycles: the file is the definition, and a row
+ * that outlives its entry is a source nobody can find the source of.
+ *
+ * What survives a rewrite is `lastPolledAt` — the poll cursor — and it survives because it
+ * is not part of the definition. Resetting it on every sync would mean an edit to an
+ * unrelated key re-polls immediately, which is harmless once and a way to spend a rate
+ * limit when the UI is writing config on every keystroke. Same argument as
+ * `schedules.lastRunAt`.
+ *
+ * What does *not* survive is nothing at all: `source_emissions` is keyed on the project and
+ * the ticket rather than on the source (see the schema), precisely so that deleting or
+ * renaming a source here does not re-emit its entire backlog on the next poll.
+ */
+async function syncSources(
+  db: Db,
+  projectId: string,
+  defined: Record<string, SourceConfig>,
+): Promise<Array<{ name: string; cycle: string }>> {
+  for (const [name, source] of Object.entries(defined)) {
+    const values = {
+      projectId,
+      name,
+      kind: source.kind,
+      cycleName: source.cycle,
+      config: source as unknown as Record<string, unknown>,
+      enabled: source.enabled,
+      updatedAt: new Date(),
+    }
+    await db
+      .insert(sources)
+      .values(values)
+      .onConflictDoUpdate({ target: [sources.projectId, sources.name], set: values })
+  }
+
+  const names = Object.keys(defined)
+  await db
+    .delete(sources)
+    .where(
+      and(
+        eq(sources.projectId, projectId),
+        names.length > 0 ? not(inArray(sources.name, names)) : undefined,
+      ),
+    )
+
+  return Object.entries(defined).map(([name, source]) => ({ name, cycle: source.cycle }))
 }
 
 /**

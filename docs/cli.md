@@ -271,10 +271,18 @@ configuration with the control plane. Run it on a machine with the repo checked 
 CLI is the half with filesystem access to a project, and the server never touches one,
 which is what keeps absolute paths out of the database.
 
-It posts the project, its workers, its policies, and every skill it can discover, then
-prints the workers it registered. Workers that have gone from `config.yaml` are removed;
-workers created in the UI are left alone, because sync is not their source of truth. It
-also registers the local path, so there is no need to run `project add` as well.
+It posts the project, its workers, its cycles, its **sources**, its policies, and every
+skill it can discover, then prints the workers it registered. Workers that have gone from
+`config.yaml` are removed; workers created in the UI are left alone, because sync is not
+their source of truth. It also registers the local path, so there is no need to run
+`project add` as well.
+
+A `sources:` block is where a ticket becomes a job (§4.13, ADR-0013), and sync is where a
+source that could never fire is refused rather than left to poll quietly forever: a
+`cycle:` naming nothing, or naming a cycle with more than one entry node. Each source that
+does register prints the cycle it feeds. It does **not** print whether this machine holds
+the API key it will need — `ogun project secret list` answers that, and a source with no
+key polls, refuses, and records the command that fixes it.
 
 A skill or worker only reaches an automated run once it is **on the default branch** — the
 workspace is a clone at a pinned SHA, not your working copy. Sync says so when the tree is

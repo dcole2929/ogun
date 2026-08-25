@@ -1,0 +1,15 @@
+{
+  "errors": [
+    {
+      "message": "Authentication required, not authenticated",
+      "path": ["issues"],
+      "locations": [{ "line": 2, "column": 3 }],
+      "extensions": {
+        "type": "authentication error",
+        "code": "AUTHENTICATION_ERROR",
+        "userPresentableMessage": "Authentication required, not authenticated"
+      }
+    }
+  ],
+  "data": null
+}

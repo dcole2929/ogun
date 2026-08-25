@@ -6,6 +6,7 @@ import { localConfigPath } from '@ogun/core'
 import { assertBindIsSafe, InsecureBind, LOCAL_BINDS, resolveAuth } from './auth.ts'
 import { reconcileCoverage, sweepStaleClaims } from './foreman/sweep.ts'
 import { tick } from './foreman/scheduler.ts'
+import { pollSources } from './foreman/sources.ts'
 
 /**
  * `--port` beats `OGUN_PORT` beats 7777.
@@ -96,6 +97,47 @@ const scheduler = setInterval(() => {
 }, 30_000)
 scheduler.unref()
 
+/**
+ * Sources, on their own interval and deliberately not folded into the scheduler's.
+ *
+ * The two triggers answer different questions and fail differently. Cron asks "was an
+ * occurrence due", finishes in milliseconds, and is entirely local; a poll asks an
+ * external API over the network and can sit there for as long as Linear takes. Sharing one
+ * tick would mean a slow or hanging Linear delaying tonight's 3am review, which is a
+ * failure the review has no part in.
+ *
+ * A minute rather than five, because the cadence lives on each source (`pollMinutes`) and
+ * is enforced by the claim on `lastPolledAt`. This interval only decides the granularity
+ * at which a due source is noticed, so the query it runs on a machine with no sources —
+ * one `select` returning nothing — is the common case and costs nothing.
+ *
+ * No arguments: the defaults are the real ones. The key comes from `readProjectSecret`
+ * (ADR-0012) and the client from `linearHttp`; both are parameters of `pollSources` only
+ * so that the tests around them need neither a `~/.ogun/config.json` nor a socket. A
+ * project with no key set polls, refuses, and writes a row naming the command that fixes
+ * it — which is the same shape as every other missing-credential path here.
+ */
+let polling = false
+const sourcePoll = setInterval(() => {
+  if (polling) return
+  polling = true
+  pollSources(ctx.db)
+    .then((results) => {
+      for (const r of results) {
+        if (r.emitted.length > 0) {
+          console.log(`[foreman] source ${r.source} emitted ${r.emitted.join(', ')}`)
+        } else if (r.outcome !== 'ok') {
+          console.log(`[foreman] source ${r.source} ${r.outcome}: ${r.detail ?? ''}`)
+        }
+      }
+    })
+    .catch((err) => console.error('[foreman] source poll failed', err))
+    .finally(() => {
+      polling = false
+    })
+}, 60_000)
+sourcePoll.unref()
+
 const sweep = setInterval(() => {
   sweepStaleClaims(ctx.db, staleAfterMs)
     .then((n) => n > 0 && console.log(`[foreman] swept ${n} stale claim(s)`))
@@ -108,6 +150,7 @@ sweep.unref()
 
 const shutdown = async () => {
   clearInterval(scheduler)
+  clearInterval(sourcePoll)
   clearInterval(sweep)
   server.close()
   await ctx.close()

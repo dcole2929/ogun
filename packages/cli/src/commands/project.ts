@@ -60,6 +60,7 @@ export async function projectSync(args: string[], serverUrl: string): Promise<vo
     workers: loaded.config.workers,
     policies: loaded.config.policies,
     cycles,
+    sources: loaded.config.sources,
     skills: skills.map((s) => ({
       name: s.name,
       sourcePath: s.sourcePath,
@@ -99,6 +100,7 @@ export async function projectSync(args: string[], serverUrl: string): Promise<vo
     overriddenSchedules?: string[]
     unmetRequirements?: Array<{ worker: string; missing: string[] }>
     registeredRunners?: number
+    sources?: Array<{ name: string; cycle: string }>
   }
 
   console.log(green(`synced ${payload.slug}`))
@@ -129,6 +131,17 @@ export async function projectSync(args: string[], serverUrl: string): Promise<vo
     console.log(
       dim(`cycle ${cyan(name)}: ${[...shape, ...standalone].join(', ') || 'no nodes'}`),
     )
+  }
+  /**
+   * What each source will turn into, and the credential it will need.
+   *
+   * Said here because a source is the one definition whose *only* other feedback is a
+   * `source_polls` row somebody has to go and look for. It is also the moment the key
+   * becomes relevant: sync is when the source starts existing, and a source with no key
+   * polls, refuses, and does it again in five minutes.
+   */
+  for (const source of result.sources ?? []) {
+    console.log(dim(`source ${cyan(source.name)}: linear → ${source.cycle}`))
   }
   if (result.removed?.length) {
     console.log(dim(`removed (gone from config.yaml): ${result.removed.join(', ')}`))

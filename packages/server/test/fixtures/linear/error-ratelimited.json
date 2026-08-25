@@ -1,0 +1,15 @@
+{
+  "errors": [
+    {
+      "message": "Rate limit exceeded",
+      "path": ["issues"],
+      "locations": [{ "line": 2, "column": 3 }],
+      "extensions": {
+        "type": "ratelimited",
+        "code": "RATELIMITED",
+        "userPresentableMessage": "Too many requests. Please try again later."
+      }
+    }
+  ],
+  "data": null
+}
