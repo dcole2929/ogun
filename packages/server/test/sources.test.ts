@@ -312,8 +312,8 @@ describe('a source', () => {
     assert.equal(result.outcome, 'refused')
     const [poll] = await pollsFor('nokey')
     assert.equal(poll?.outcome, 'refused')
-    assert.match(poll?.detail ?? '', /no linear api key for "sources"/)
-    assert.match(poll?.detail ?? '', /ogun secret set linear --project sources/)
+    assert.match(poll?.detail ?? '', /"sources" is not connected to linear/)
+    assert.match(poll?.detail ?? '', /ogun connect linear --project sources/)
   })
 
   test('a store it could not read is not reported as a key nobody set', async () => {
@@ -360,6 +360,7 @@ describe('a source', () => {
           clientId: 'client-1',
           access: sealSecret('access-stale'),
           refresh: sealSecret('refresh-1'),
+          grantType: 'authorization_code' as const,
           // Already dead, which is the normal state of a token when a nightly poller wakes.
           expiresAt: Date.now() - 60 * 60 * 1000,
           obtainedAt: Date.now() - 25 * 60 * 60 * 1000,
@@ -405,6 +406,7 @@ describe('a source', () => {
           clientId: 'client-1',
           access: sealSecret('access-stale'),
           refresh: sealSecret('refresh-revoked'),
+          grantType: 'authorization_code' as const,
           expiresAt: Date.now() - 60 * 60 * 1000,
           obtainedAt: 0,
           scopes: ['read'],
@@ -428,7 +430,7 @@ describe('a source', () => {
   /**
    * The property: an application registered but never connected gets its own refusal.
    *
-   * Reported as `absent`, the message tells the operator to run `ogun secret set` —
+   * Reported as `absent`, the message tells the operator to run `ogun connect` —
    * sending somebody who has done most of the work of connecting an application back to
    * the credential they were migrating off. Principle 6 again: this remedy is a browser,
    * and no other state's sentence names one.
@@ -444,7 +446,7 @@ describe('a source', () => {
 
     assert.equal(result.outcome, 'refused')
     assert.match(result.detail ?? '', /nobody has finished the authorization/)
-    assert.match(result.detail ?? '', /ogun linear connect --project sources/)
+    assert.match(result.detail ?? '', /ogun connect linear --project sources/)
   })
 
   test('records a linear failure as failed, distinct from a local refusal', async () => {

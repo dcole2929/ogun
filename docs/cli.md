@@ -21,7 +21,7 @@ reach it. Four groups cannot:
 
 | | run it on |
 |---|---|
-| `server`, `db *`, `token *`, `runner invite`, `secret *`, `linear *` | the control-plane machine |
+| `server`, `db *`, `token *`, `runner invite`, `connect`, `connections`, `disconnect` | the control-plane machine |
 | `runner init`, `runner join`, `runner start`, `runner doctor`, `image build` | the runner machine |
 | `project add`, `project sync`, `skill new`, `skill link` | a machine with the repo checked out |
 | `findings write`, `validate-findings`, `check-citations` | inside the sandbox, by a skill |
@@ -146,7 +146,7 @@ unauthenticated.
 changes exactly one thing: whether the Settings page may accept a project's API key
 (ADR-0012). Ogun serves plain HTTP and cannot see past its own socket, so on a wider bind
 it assumes a key typed into a browser would cross the network in cleartext and refuses to
-store one, pointing at `ogun secret set` instead. This variable is how an operator
+store one, pointing at `ogun connect <integration>` instead. This variable is how an operator
 who has put nginx or Caddy in front says otherwise. It is not read as a header —
 `x-forwarded-proto` is written by whoever is talking to us, which on a plain-HTTP LAN is
 the client, and a guard a request can switch off is not a guard.
@@ -291,8 +291,8 @@ A `sources:` block is where a ticket becomes a job (§4.13, ADR-0013), and sync 
 source that could never fire is refused rather than left to poll quietly forever: a
 `cycle:` naming nothing, or naming a cycle with more than one entry node. Each source that
 does register prints the cycle it feeds. It does **not** print whether this machine holds
-the API key it will need — `ogun secret list` answers that, and a source with no
-key polls, refuses, and records the command that fixes it.
+the credential it will need — `ogun connections` answers that, and a source with none
+polls, refuses, and records the command that fixes it.
 
 A skill or worker only reaches an automated run once it is **on the default branch** — the
 workspace is a clone at a pinned SHA, not your working copy. Sync says so when the tree is
@@ -306,162 +306,103 @@ skills).
 Every project the control plane knows about, with its default branch and remote. The
 default when `ogun project` is given no subcommand.
 
-### `ogun secret set | list | rm`
+### `ogun connect | connections | disconnect`
 
 ```
-ogun secret set <name> [--project <slug>] [--allow-unregistered] < key.txt
-ogun secret list [--project <slug>]
-ogun secret rm <name> [--project <slug>]
+ogun connect <integration> <client-id> <client-secret> [--project <slug>]
+ogun connect <integration> --consent <client-id> <client-secret> [--project <slug>]
+ogun connect <integration> --api-key <key> [--project <slug>]
+ogun connections [--project <slug>]
+ogun disconnect <integration> [--project <slug>] [--keep-application]
 ```
 
-An API key a project needs that this machine did not already have. Everything else Ogun
-authenticates with is on the host because a human logged in with it; a Linear key is issued
-per workspace, so it has to be entered once and kept.
+One vocabulary for giving a project access to an integration. `<integration>` is a **value**
+— `linear` today — rather than a word in the command path, so a GitHub or Jira integration
+becomes a new argument rather than a whole new command tree.
 
-It was `ogun project secret …` for two days. The slug was a positional, the `project`
-namespace existed to hold it, and now that the project comes from the directory you are
-standing in — the way `project add` and `project sync` have always resolved one — there is
-nothing left for the namespace to carry. Machine-wide credentials are `ogun token`, so
-`ogun secret` is unambiguous. The old spelling is gone rather than aliased, and answers
-with a line naming the new one.
+It replaces three commands from two unrelated grammars: `ogun secret set linear` for a
+personal API key, and `ogun linear app` then `ogun linear connect` for an OAuth application.
+Somebody asking "how do I connect this project to Linear" had to already know which of the
+two the answer lived in. All four dropped spellings — including both under `ogun project` —
+answer with a line naming `ogun connect`, and their `--help` prints the page that replaced
+them.
 
-Run it on the **control-plane machine** — that is what polls an integration, so that is
-where the key has to be. It stores into `~/.ogun/config.json` at mode 0600 and talks to no
-server at all, which is why it works before `ogun init`, with the database down, and over
-SSH into a box with no browser on it. Never in the repository, never in the database, and
-never in a container (ADR-0012).
+**Every input is in the usage line, including the ones that are not arguments.** Leave a
+positional off and it is prompted for at a terminal or read from stdin when stdin is a pipe;
+that is the recommended path and the help says so underneath. Passing a credential inline
+**works and prints a warning** — argv is readable by every user on the box through
+`/proc/<pid>/cmdline` while the command runs, and your shell writes the whole line to its
+history — because a refusal cannot un-leak a value that is already in both, and a usage line
+that names an argument it then refuses teaches you the documentation lies. The Client ID is
+prompted for *visibly* and draws no warning: it is in every authorization URL a browser
+visits and on Linear's own settings page, and a warning that fires on a value that is not a
+secret is how people learn to scroll past warnings.
 
-The Settings page can also set one, and it writes through this same code and the same
-lockfile. It is allowed when the transport can carry a secret — a loopback bind, or a wider
-one where the operator has declared a TLS terminator in front with `OGUN_BEHIND_TLS_PROXY`
-— and refused otherwise, pointing back here. This command is the path that always works.
+#### the three mechanisms
 
-```
-ogun secret set linear < key.txt
-op read op://vault/linear/key | ogun secret set linear
-ogun secret set linear                     # no pipe: prompts, with the echo off
-ogun secret set linear --project heirchive-api < key.txt
-```
+- **(default), or `--app-token`** — Ogun asks Linear for a token in its own name, through
+  the `client_credentials` grant. No browser, no consent screen, nobody to approve it. The
+  token is an app-actor token lasting 30 days, renewed by asking again. **It reaches the
+  workspace's public teams and no others**, so `connect` prints the teams the new token can
+  actually read: a workspace of private teams would otherwise poll successfully and find
+  nothing, forever, with every surface reporting a healthy connection. `--app-token` is the
+  explicit spelling, for a script that must keep meaning this if the default changes.
+- **`--consent`** — the authorization-code flow. Prints a URL for somebody to approve in a
+  browser, and takes back the URL your browser landed on when it could not reach this
+  control plane. What you need for **private teams** and for user-scoped access. It installs
+  at the workspace level, so Linear needs a workspace admin to approve it. This is the one
+  mechanism that needs the control plane running: its CSRF nonce lives in that process and
+  its callback is delivered to it.
+- **`--api-key`** — a personal API key. Everything Ogun does, it does **as you**, and once
+  write-back lands every comment it posts appears under your name on a board other people
+  make decisions from. The fallback for a workspace where you cannot register an application
+  at all.
 
-**The value is never a command-line argument**, and passing one is refused rather than
-accepted. Anything in argv is readable by every account on the box through `ps` while the
-command runs, and your shell writes the whole line into its history file. So it comes from
-stdin when stdin is a pipe and from a hidden prompt when it is a terminal; nothing chooses
-between them, because the shape of stdin already has. The redirection is part of every
-usage line this command prints, because `ogun secret set <name>` reads as complete and is
-not — the value is the whole point of the command, and a script that runs it with no stdin
-blocks with nothing on screen saying why.
+Connecting one way retires the other: the default and `--consent` remove any personal key
+stored for that project, and `--api-key` is **refused** on a project that already has a
+working grant, because a grant wins over a key and storing one there would write a
+credential nothing reads. Switching a `--consent` connection to the default is refused too —
+it is a silent reduction in reach, from what an approver could see to public teams only.
 
-**The project defaults to the one you are in.** In order: `--project`, then the `name:` in
-this directory's `.ogun/config.yaml`, then the registered project whose root contains this
-directory, then the directory's own name. `--project` is for a repo that is not checked out
-on this machine at all.
+With no positionals at all, an application already registered on this machine is reused and
+nothing is asked for. That is the reconnect after a 30-day token lapses and the retry after
+one that failed on the network.
 
-**A slug this machine has never heard of is refused, and nothing is stored.** This is the
-rule the closed set of secret names exists for, applied to the other half of a key's
-address: a key filed under a project nothing polls reports as set and is read by nothing.
-The evidence is local, so no server is needed — the projects map in `~/.ogun/config.json`
-that `project add` and `project sync` write, or a `.ogun/config.yaml` in the current
-directory naming itself. `--allow-unregistered` is the way through, for a control plane
-that polls repositories it has no copy of; it warns, because the slug then has to match
-what the control plane polls under and nothing local can check that.
+**The project comes from the directory** you are standing in — the name in
+`.ogun/config.yaml`, else the registered project this directory sits inside — resolved
+exactly as `ogun project add` and `ogun project sync` resolve it, with `--project` to
+override. A slug this machine has no record of is refused **before anything is asked for**,
+because a credential filed under a project nothing polls reports as connected and is read by
+nothing; `--allow-unregistered` is the way through for a control plane whose repositories
+live elsewhere, and it warns. One rule for every mechanism: the same command, the same slug,
+the same refusal.
 
-Known names: `linear`. A name Ogun does not read is refused — a secret nothing reads looks
-exactly like one that works, until the night it mattered. The rejected name is **not**
-quoted back: with the value on stdin, the single positional this command takes is exactly
-where a mistyped invocation puts the key.
+`ogun connections` reads `~/.ogun/config.json` directly and answers with the control plane
+down, which is when the question is usually asked. One table for keys and grants — two
+listings that could not see each other made the answer to "is this connected" depend on
+which command you ran. The **VIA** column names the mechanism, because the two grants differ
+in what they can *see* and "connected" alone cannot explain a source finding no tickets. A
+key sitting behind a working grant is shown in red as **NOT used**. It lists the whole
+machine and does not narrow to the current directory: `connect` and `disconnect` act on
+exactly one project, so naming the wrong one is their whole failure mode, while a listing
+that answered for wherever the shell was standing would say "nothing connected" on a machine
+holding four. Nothing anywhere prints a stored value back.
 
-Rotation is setting it again. There is no history and no second slot: the next poll reads
-the new value with no restart, and two live keys would mean nobody could say which one a
-401 came from.
+`ogun disconnect` removes **every** credential that project has for the integration — the
+token, the client id and secret, and any personal key. The client id and secret go by
+default because under the default grant they *are* the credential: anyone holding them can
+mint a live token and the next poll would, so a disconnect that left them behind is one the
+machine undoes by itself. `--keep-application` keeps them so a `--consent` reconnect is one
+command, and is **refused** on a client-credentials connection. The token is revoked at
+Linear too, best-effort, and whether that worked is its own line. Neither the integration nor
+the project is checked, where `connect` checks both: `connections` prints whatever the file
+holds, that file gets hand-edited, and a row you can see has to be a row you can remove.
 
-**The confirmation says which of the two just happened.** `linear stored for ogun` and
-`linear replaced for ogun` are different events, and for two days the line was identical
-for both — the only mention of replacement was boilerplate that printed either way, so it
-described what the command generally does rather than what it had just done. A replace also
-says that the previous value is unrecoverable from this machine, because the recovery for a
-key you have overwritten is Linear's, not ours. At a terminal it says a key is already there
-*before* asking for the new one, where an operator can still stop; a pipe is never blocked,
-because a piped key is usually a rotation somebody wrote down deliberately, and a `[y/N]`
-gate would need a `--yes` that every script would set once and forever.
+Run these on the **control-plane machine** — it is what polls, so it is where the credential
+has to be. Only `--consent` needs the server up; the rest write the file directly, so they
+work before `ogun init`, with the database down, and over SSH.
 
-- `ogun secret list [--project <slug>]` — which projects have one, by name. Presence only.
-  Nothing anywhere prints a stored value back — not this command, not `runner doctor`, not
-  the UI, and no endpoint. It does **not** narrow to the current directory the way `set`
-  does: this is the machine's inventory, asked from a home directory over SSH, and a
-  listing that answered for wherever the shell happened to be would say "none" on a machine
-  holding four. It cannot say what is *missing*, either: which projects need a key is
-  declared in each repository, and this command reads no repositories.
-- `ogun secret rm <name> [--project <slug>]` — forget one. Says whether there was anything
-  to forget, because "removed" and "there was nothing here" are different answers — and the
-  second is now the interesting one, since the project is inferred from the directory and a
-  `rm` run one level too high finds nothing. It names the project it looked in and where
-  that name came from, and still exits 0, because a removal that finds nothing has reached
-  the state it was asked for. It
-  checks neither the name nor the project, where `set` checks both: `list` prints whatever
-  the file holds, that file gets hand-edited, and a row you can see has to be a row you can
-  remove. Validation guards writes, where an unknown name or slug creates a key nothing
-  reads.
-
-Touches: `~/.ogun/config.json` (the secrets block, on this machine only).
-
-### `ogun linear app | connect | status | disconnect`
-
-```
-ogun linear app        [--project <slug>]     asks for a Client ID and Client Secret
-ogun linear connect    [--project <slug>]     prints a URL to approve
-ogun linear status     [--project <slug>]
-ogun linear disconnect [--project <slug>] [--forget-app]
-```
-
-Connect a project to Linear **as an application** rather than as you (ADR-0014). A personal
-API key makes every request Ogun sends appear as the person whose key it is, on a board
-other people read; an application acts as itself. This is the preferred path, and the
-personal key stays supported for anyone who is not an admin of their workspace, because
-`actor=app` is a workspace-level install Linear requires an admin to approve.
-
-It was `ogun project linear …` for two days, which put four words in front of a verb: a
-`project` namespace whose only cargo was the slug, `linear`, `app`, and then the slug again.
-The project now comes from the directory you are standing in, so the outer level is gone.
-`linear` stays, because it names *which* integration — a distinction that starts earning its
-keep the moment a `github` source sits beside it. The old spelling answers with a line naming
-the new one.
-
-**The usage lines say what each command asks for**, because `ogun linear app` reads as a
-complete command and is not: the two things it exists to collect are a Client ID and a Client
-Secret, and neither appears in its name. Ogun ships no client id — it is self-hosted, so each
-workspace registers its own application at
-<https://linear.app/settings/api/applications/new>. `app` prints the exact redirect callback
-URL to paste into that form before it asks for anything; a mismatch there is the classic
-failure of this flow and the error Linear gives for it says nothing useful.
-
-**Neither the client secret nor a URL containing an authorization code goes on the command
-line.** argv is readable by `ps` while the command runs and lands in your shell history; both
-are read from prompts with the echo off. The Client ID is prompted for *visibly*, which is
-the honest split: it is in every authorization URL a browser visits and on Linear's own
-settings page, and hiding it would mean you cannot check you pasted the right one.
-
-**The project comes from the directory**, resolved exactly as `ogun project add` and
-`ogun secret` resolve it, with `--project` to override. `app` and `connect` refuse a slug the
-control plane does not know — before the first prompt, and listing the ones that would have
-worked — because an application filed under a project nothing polls reports as configured and
-is read by nothing. There is no `--allow-unregistered` here, unlike `ogun secret set`: these
-commands cannot work without the control plane at all, so the database is available, and the
-database is the thing that decides which slugs get polled. Each command checks against the
-best oracle it already depends on.
-
-`disconnect` refuses nothing, for the same reason `ogun secret rm` does: `status` prints
-whatever the store holds, so a row you can see has to be a row you can remove. Its no-op
-answer names the project it looked in and where that name came from, since a `disconnect` run
-one directory too high is the way to reach it.
-
-Run `app`, `connect` and `disconnect` on the **control-plane machine** — it is what polls and
-what receives Linear's callback. `status` reads `~/.ogun/config.json` directly and answers
-with the control plane down, which is when the question is usually asked; it lists the whole
-machine and does not narrow to the current directory, for the same reason `ogun secret list`
-does not.
-
-Touches: `~/.ogun/config.json` (the oauth block, on this machine only).
+Touches: `~/.ogun/config.json` (the `oauth` block, or `secrets` with `--api-key`), mode 0600.
 
 ---
 

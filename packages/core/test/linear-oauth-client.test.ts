@@ -1,6 +1,7 @@
 import { strict as assert } from 'node:assert'
 import { test } from 'node:test'
 import {
+  appTokenGrant,
   authorizationUrl,
   exchangeCode,
   identify,
@@ -8,10 +9,13 @@ import {
   refreshGrant,
   revokeToken,
   scrubSecrets,
+  visibleTeams,
 } from '../src/integrations/linear-oauth.ts'
 import {
+  appTokenResponse,
   identityResponse,
   refreshedResponse,
+  teamsResponse,
   tokenErrorResponse,
   tokenResponse,
 } from './linear-oauth-fixtures.ts'
@@ -128,27 +132,117 @@ test('the exchange posts a form, and turns expires_in seconds into an absolute e
 })
 
 /**
- * The property: a token with no refresh token beside it is refused rather than stored.
+ * The property: a missing refresh token is refused on the grant that **rotates**, and
+ * accepted on the grant that does not.
  *
- * This is exactly what Linear's `client_credentials` grant returns — a 30-day token their
- * own documentation says to replace by reacting to a 401. Accepting one would produce a
- * connection that reports as healthy, polls happily for a month, and then stops with an
- * authentication error that looks like a revoked grant. The naive implementation treats
- * `refresh_token` as optional because the type it lands in has it optional.
+ * This check used to be unconditional, and the reason it was is worth keeping in front of
+ * whoever reads this next: *"a token with no way to renew it is a connection that stops
+ * working in 30 days with no warning"*. That was true when a refresh token was the only
+ * renewal Ogun had. It is not true of `client_credentials`, where renewal is asking again
+ * with a client id and secret already on disk.
+ *
+ * So the narrowed check has to hold in both directions, and both are asserted here,
+ * because the failure modes are opposite. Refusing a client-credentials token would make
+ * the default mechanism impossible; accepting an authorization-code response without a
+ * refresh token would store a connection that dies in a day and reports as healthy until
+ * it does.
  */
-test('an access token with no refresh token is refused, not stored', async () => {
-  const { fn } = stub(200, tokenResponse({ refresh_token: undefined, expires_in: 2_591_999 }))
+test('a missing refresh token is refused on the rotating grant and fine on the other', async () => {
+  const withoutRefresh = stub(200, tokenResponse({ refresh_token: undefined }))
   const err = await exchangeCode({
     code: CODE,
     redirectUri: 'http://x/cb',
     clientId: 'client-1',
     clientSecret: CLIENT_SECRET,
-    fetch: fn,
+    fetch: withoutRefresh.fn,
   }).then(() => null, (e: unknown) => e)
 
   assert.ok(err instanceof LinearOAuthError)
   assert.equal(err.kind, 'config')
-  assert.match(err.message, /no way to renew/)
+  assert.match(err.message, /rotates/)
+
+  const appToken = stub(200, appTokenResponse())
+  const tokens = await appTokenGrant({
+    clientId: 'client-1',
+    clientSecret: CLIENT_SECRET,
+    fetch: appToken.fn,
+  })
+  assert.equal(tokens.refreshToken, undefined)
+  assert.equal(tokens.grantType, 'client_credentials')
+})
+
+/**
+ * The property: the client-credentials request sends **comma-separated** scopes, a
+ * `grant_type` of `client_credentials`, and **no `actor` parameter at all**.
+ *
+ * Each of the three is a way to get this silently wrong. Space-separated scopes ask for a
+ * single scope literally named `read write` — the same trap `authorizationUrl` has, in a
+ * second place, which is why it is asserted twice rather than once. And `actor` is
+ * *implicit* on this grant: Linear's documentation says the token "will be an `app` actor
+ * token", with no parameter to send, so a client that helpfully sent one would be sending a
+ * parameter the endpoint does not document accepting — and finding out by having a
+ * connection refused rather than by reading anything.
+ */
+test('the app-token request sends comma-separated scopes and no actor parameter', async () => {
+  const { fn, calls } = stub(200, appTokenResponse())
+  await appTokenGrant({
+    clientId: 'client-1',
+    clientSecret: CLIENT_SECRET,
+    scopes: ['read', 'comments:create'],
+    fetch: fn,
+  })
+
+  const body = new URLSearchParams(calls[0]!.body)
+  assert.equal(body.get('grant_type'), 'client_credentials')
+  assert.equal(body.get('scope'), 'read,comments:create')
+  assert.equal(body.get('actor'), null)
+  assert.equal(calls[0]!.contentType, 'application/x-www-form-urlencoded')
+})
+
+/**
+ * The property: `expires_in` is read as **seconds** on this grant too, so a 30-day token is
+ * recorded as thirty days rather than as thirty of anything else.
+ *
+ * The unit is the same as the other grant and the magnitude is not, which is what makes it
+ * worth its own test: a fallback tuned for a 24-hour token applied to a 30-day one would
+ * renew twenty-nine times for nothing, and a duration stored raw would report a month
+ * remaining forever.
+ */
+test('a 30-day app token is recorded as thirty days from now', async () => {
+  const before = Date.now()
+  const { fn } = stub(200, appTokenResponse())
+  const tokens = await appTokenGrant({
+    clientId: 'client-1',
+    clientSecret: CLIENT_SECRET,
+    fetch: fn,
+  })
+
+  assert.ok(tokens.expiresAt >= before + 2_591_998_000)
+  assert.ok(tokens.expiresAt <= Date.now() + 2_591_999_000)
+})
+
+/**
+ * The property: the teams probe answers with what the token can read, and **never throws**.
+ *
+ * It exists because a client-credentials token reaching none of the teams somebody wanted
+ * polled does not fail — it succeeds and returns nothing, forever, with every surface
+ * reporting a healthy connection. So the probe is run at the one moment a person is
+ * watching.
+ *
+ * Not throwing is the half that is easy to lose. The tokens are valid when this runs, and a
+ * connect that failed because a *reassurance* query failed would throw away a working
+ * credential over a display — so a broken response has to come back as "nothing to show"
+ * rather than as an exception the caller has to remember to catch.
+ */
+test('the teams probe reads what the token can see, and survives a broken answer', async () => {
+  const ok = stub(200, teamsResponse())
+  assert.deepEqual(
+    (await visibleTeams({ accessToken: 'tok', fetch: ok.fn })).map((t) => t.key),
+    ['ENG', 'HEI'],
+  )
+
+  const broken = stub(500, '<html>gateway timeout</html>')
+  assert.deepEqual(await visibleTeams({ accessToken: 'tok', fetch: broken.fn }), [])
 })
 
 // ── nothing leaks ──────────────────────────────────────────────────────────
@@ -314,7 +408,8 @@ test('a refresh takes the new refresh token as well as the new access token', as
 
   assert.equal(new URLSearchParams(calls[0]!.body).get('grant_type'), 'refresh_token')
   assert.notEqual(tokens.refreshToken, 'old-refresh-token')
-  assert.match(tokens.refreshToken, /^rrrr/)
+  assert.match(tokens.refreshToken ?? '', /^rrrr/)
+  assert.equal(tokens.grantType, 'authorization_code')
 })
 
 /**

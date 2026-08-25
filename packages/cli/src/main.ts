@@ -3,8 +3,7 @@ import { cyan, fail, red } from './output.ts'
 import { helpFor, isHelpFlag, usage } from './help.ts'
 import { doctor } from './commands/doctor.ts'
 import { projectAdd, projectList, projectSync } from './commands/project.ts'
-import { secret } from './commands/secrets.ts'
-import { linear } from './commands/linear.ts'
+import { connect, connections, disconnect } from './commands/connect.ts'
 import { coverage, runsList, trigger } from './commands/runs.ts'
 import {
   checkCitations,
@@ -49,6 +48,22 @@ if (command === undefined || argv.some(isHelpFlag)) {
 }
 
 /**
+ * What a dropped spelling answers with. One sentence, because all four of them — `ogun
+ * secret`, `ogun linear`, and both under `ogun project` — were dropped for the same reason
+ * and land in the same place.
+ */
+const oldSpelling = (was: string): string =>
+  `\`${was}\` is now \`ogun connect\`.\n` +
+  '  The integration is an argument, not a command, and one command covers every way of\n' +
+  '  giving a project access to it:\n' +
+  '    ogun connect linear                      Ogun takes a token in its own name\n' +
+  '    ogun connect linear --consent            somebody approves it in a browser\n' +
+  '    ogun connect linear --api-key            a personal API key\n' +
+  '    ogun connections                         what is connected, and how healthy\n' +
+  '    ogun disconnect linear                   remove every credential for it\n' +
+  '  The project comes from the directory you are in, or from --project <slug>.'
+
+/**
  * There is one usage text per command and it lives in help.ts, so an unknown subcommand
  * prints that command's page rather than a second, drifting summary of it.
  */
@@ -79,72 +94,55 @@ try {
     case 'project':
       if (sub === 'add') await projectAdd(rest, serverUrl)
       else if (sub === 'sync') await projectSync(rest, serverUrl)
-      /**
-       * `ogun project secret` moved out to `ogun secret`, and this is a signpost rather
-       * than an alias.
-       *
-       * The namespace only ever existed to hold the `<project>` positional, and that
-       * positional is now inferred from the directory you are standing in. Nothing outside
-       * this repository calls the old spelling — it is two days old — so there is no
-       * compatibility to keep, and an alias would be a second shape to keep working
-       * forever. What there is instead is muscle memory, which outlives a release, and for
-       * that a bare "unknown subcommand" is a dead end.
-       */
-      else if (sub === 'secret' || sub === 'secrets') {
-        fail(
-          '`ogun project secret` is now `ogun secret`.\n' +
-            '  The project comes from the directory you are in, or from --project <slug>:\n' +
-            '    ogun secret set linear < key.txt\n' +
-            '    ogun secret set linear --project other-repo < key.txt',
-        )
-      }
-      /**
-       * `ogun project linear` moved out to `ogun linear`, for the reason above and one
-       * more: `project linear app <project>` put four words in front of a verb, three of
-       * which were nouns and one of which was the positional now inferred from the
-       * directory. `linear` is the only noun in that chain worth keeping — it names which
-       * integration, which starts mattering the moment a `github` source sits beside it.
-       */
-      else if (sub === 'linear') {
-        fail(
-          '`ogun project linear` is now `ogun linear`.\n' +
-            '  The project comes from the directory you are in, or from --project <slug>:\n' +
-            '    ogun linear app          (asks for a Client ID and Client Secret)\n' +
-            '    ogun linear connect --project other-repo',
-        )
+      else if (sub === 'secret' || sub === 'secrets' || sub === 'linear') {
+        fail(oldSpelling(`ogun project ${sub}`))
       }
       else if (sub === 'list' || sub === undefined) await projectList(serverUrl)
       else unknownSub('project', sub)
       break
 
     /**
-     * `secret` reaches no server: the store is this machine's config.json, written
-     * directly (ADR-0012). The Settings page can write one too, through the same function,
-     * but only from a transport that can carry a key — so this path is the one that works
-     * with the database down, before `ogun init`, and over SSH.
+     * The one vocabulary for giving a project access to an integration.
      *
-     * Top-level rather than under `project`, and unambiguous there because the machine's
-     * own credentials are `ogun token`. `secrets` is accepted as the plural people reach
-     * for; `help.ts` aliases the topic so `ogun secrets --help` is not a dead end.
+     * The integration is a **value** rather than a word in the command path, which is what
+     * makes `ogun connect github` a new argument instead of a new command tree. `connect`,
+     * `connections` and `disconnect` reach no server in their default shapes — the store is
+     * this machine's config.json, written directly (ADR-0012) — so they work before `ogun
+     * init`, with the database down, and over SSH. `--consent` is the exception, because
+     * its CSRF nonce and its callback both live in the control-plane process.
+     *
+     * Three top-level verbs rather than one noun with subcommands, because they are three
+     * different acts on the same thing and `ogun connection connect` is a word too many.
+     * The machine's own credentials remain `ogun token`, which is what keeps this
+     * unambiguous.
      */
-    case 'secret':
-    case 'secrets':
-      await secret([sub, ...rest].filter(Boolean) as string[])
+    case 'connect':
+      await connect([sub, ...rest].filter(Boolean) as string[], serverUrl)
+      break
+
+    case 'connections':
+    case 'connection':
+      await connections([sub, ...rest].filter(Boolean) as string[])
+      break
+
+    case 'disconnect':
+      await disconnect([sub, ...rest].filter(Boolean) as string[])
       break
 
     /**
-     * `linear` reaches the server, unlike `secret` beside it, and the asymmetry is
-     * explained where the command lives: the CSRF nonce that protects an authorization and
-     * the callback that consumes it both live in the control-plane process. `status` is the
-     * exception and reads this machine directly, which is what lets it answer while the
-     * thing it is reporting on is down.
+     * `ogun secret` and `ogun linear` are gone, and these are signposts rather than
+     * aliases.
      *
-     * Top-level rather than under `project`, and named for the integration rather than for
-     * the act, so that `ogun github` can sit beside it without either of them growing a
-     * disambiguating word.
+     * Both were a second spelling of "let Ogun into this workspace" — one filed under
+     * storage, one with the vendor's name in the command path — and having two is the thing
+     * `connect` exists to end, so keeping either as an alias would be keeping the problem
+     * with better documentation. Nothing outside this repository calls them. What survives a
+     * release is muscle memory, and for that a bare "unknown command" is a dead end.
      */
+    case 'secret':
+    case 'secrets':
     case 'linear':
-      await linear([sub, ...rest].filter(Boolean) as string[], serverUrl)
+      fail(oldSpelling(`ogun ${command}`))
       break
 
     case 'init':

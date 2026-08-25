@@ -444,6 +444,86 @@ describe('a project can be connected to linear, and only through a flow it start
   })
 
   /**
+   * The property: the connect route refuses **before it reaches Linear** — for an unknown
+   * project, for a transport that cannot carry a client secret, and for a reconnect with
+   * nothing stored to reconnect with.
+   *
+   * Each refusal is one this route can make without spending a request, and the ordering
+   * matters for the same reason it does in the CLI: a route that registers an application,
+   * calls a token endpoint and *then* discovers the slug is wrong has written a client
+   * secret to disk for a project nothing polls.
+   *
+   * The transport gate is asserted on the credential-carrying shape only, which is ADR-0012's
+   * rule rather than a new one: **the gate follows the value, not the endpoint.** A body of
+   * `{}` reuses what is already on this machine and puts nothing on the wire, so refusing it
+   * would deny a remote operator the one action that repairs a lapsed connection, over a
+   * hazard that request does not have.
+   */
+  test('connect refuses an unknown project, a bare transport, and an empty store', async () => {
+    const unknown = await h.fetch('/api/oauth/linear/connect/not-a-project', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ clientId: 'client-1', clientSecret: CLIENT_SECRET }),
+    })
+    assert.equal(unknown.status, 404)
+    assert.ok(!(await unknown.text()).includes(CLIENT_SECRET))
+
+    setEnv('OGUN_BIND', '0.0.0.0')
+    const refused = await h.fetch(`/api/oauth/linear/connect/${slug}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ clientId: 'client-1', clientSecret: CLIENT_SECRET }),
+    })
+    assert.equal(refused.status, 403)
+    assert.match(await refused.text(), /cleartext/)
+
+    // The same wide bind, and a body carrying nothing: allowed through the gate, and it
+    // still has to fail — because there is no application on this machine to reuse.
+    await h.fetch(`/api/oauth/linear/${slug}`, { method: 'DELETE' })
+    const nothing = await h.fetch(`/api/oauth/linear/connect/${slug}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    })
+    assert.equal(nothing.status, 409)
+    assert.match(await nothing.text(), /no linear application is registered/)
+    setEnv('OGUN_BIND', '127.0.0.1')
+  })
+
+  /**
+   * The property: `?keep=application` is **refused** on a client-credentials connection,
+   * and nothing is removed.
+   *
+   * Under the default grant the client id and secret *are* the credential: anyone holding
+   * them can mint a live token, and the next poll would. Honouring the flag would produce a
+   * disconnection the machine undoes by itself — worse than a refusal, because the operator
+   * has been told it worked.
+   *
+   * The second assertion is the one that would catch a partial implementation: a route that
+   * revoked the token and *then* refused the rest would leave a project the next poll
+   * silently reconnects, which is the same end state with a spent token in front of it.
+   */
+  test('keeping the application is refused when the client credentials are the credential', async () => {
+    await registerApp(slug, { clientId: 'client-cc', clientSecret: CLIENT_SECRET })
+    const config = JSON.parse(await readFile(store, 'utf8'))
+    config.oauth[slug].linear.grant = {
+      accessToken: 'access-abcdefghijkl',
+      grantType: 'client_credentials',
+      expiresAt: Date.now() + 2_591_999_000,
+      scopes: ['read'],
+      actor: 'app',
+    }
+    await writeFile(store, JSON.stringify(config))
+
+    const res = await h.fetch(`/api/oauth/linear/${slug}?keep=application`, { method: 'DELETE' })
+    assert.equal(res.status, 409)
+    assert.match(await res.text(), /not a disconnection/)
+
+    const [row] = await listOAuthApps(store)
+    assert.equal(row?.connected, true, 'a refused disconnect removed the grant anyway')
+  })
+
+  /**
    * The property: disconnecting is not gated on the transport, and distinguishes "removed"
    * from "there was nothing here".
    *
@@ -453,7 +533,7 @@ describe('a project can be connected to linear, and only through a flow it start
    */
   test('an application can be disconnected and forgotten from any bind', async () => {
     setEnv('OGUN_BIND', '0.0.0.0')
-    const res = await h.fetch(`/api/oauth/linear/${slug}?app=true`, { method: 'DELETE' })
+    const res = await h.fetch(`/api/oauth/linear/${slug}`, { method: 'DELETE' })
     assert.equal(res.status, 200)
     assert.equal(((await res.json()) as { removed: boolean }).removed, true)
 

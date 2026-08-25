@@ -319,6 +319,12 @@ export type LinearApp = {
   connected: boolean
   scopes: string[]
   actor: string
+  /**
+   * Which grant, because the two differ in what they can SEE — a client-credentials token
+   * reaches the workspace's public teams and no others. "Connected" alone cannot explain a
+   * source that polls successfully and finds no tickets.
+   */
+  grantType?: 'client_credentials' | 'authorization_code'
   expiresAt?: number
   obtainedAt?: number
   workspace?: { id: string; name: string; urlKey: string }
@@ -433,6 +439,34 @@ export const api = {
       },
     ),
   /**
+   * Connect: register the application and take a token, in one request.
+   *
+   * The default, because `client_credentials` has no browser step and therefore no reason
+   * to be two requests. Sending no credentials reuses the ones already on the control-plane
+   * machine, which is what the table's Connect button does for an application somebody
+   * registered earlier — and what makes a reconnect after a lapsed token cost nobody a trip
+   * back to Linear's settings page.
+   */
+  connectLinear: (project: string, credentials?: { clientId: string; clientSecret: string }) =>
+    json<{
+      connected: {
+        project: string
+        clientId: string
+        grantType: string
+        expiresAt: number
+        scopes: string[]
+        actor: string
+        workspace?: string
+        teams: Array<{ id: string; key: string; name: string }>
+        teamsProbed: boolean
+        apiKeyRetired: boolean
+      }
+    }>(`/api/oauth/linear/connect/${encodeURIComponent(project)}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(credentials ?? {}),
+    }),
+  /**
    * Mint a `state` and get the URL to send the browser to.
    *
    * The state is created by the server and never by this page: it is a CSRF nonce, and one
@@ -444,10 +478,23 @@ export const api = {
       `/api/oauth/linear/start/${encodeURIComponent(project)}`,
       { method: 'POST' },
     ),
-  /** `removed: false` means there was nothing there. `revoked` is a separate fact. */
-  disconnectLinear: (project: string, forgetApp: boolean) =>
-    json<{ removed: boolean; revoked: boolean; appForgotten: boolean }>(
-      `/api/oauth/linear/${encodeURIComponent(project)}${forgetApp ? '?app=true' : ''}`,
+  /**
+   * `removed: false` means there was nothing there. `revoked` is a separate fact, and so is
+   * `apiKeyRemoved`.
+   *
+   * `keepApplication` leaves the client id and secret behind, and the server refuses it on
+   * a client-credentials connection: there the pair *is* the credential, so keeping it
+   * would be a disconnection the next poll undoes.
+   */
+  disconnectLinear: (project: string, keepApplication = false) =>
+    json<{
+      removed: boolean
+      revoked: boolean
+      apiKeyRemoved: boolean
+      applicationForgotten: boolean
+    }>(
+      `/api/oauth/linear/${encodeURIComponent(project)}` +
+        (keepApplication ? '?keep=application' : ''),
       { method: 'DELETE' },
     ),
   run: (id: string) => json<RunDetail>(`/api/runs/${id}`),

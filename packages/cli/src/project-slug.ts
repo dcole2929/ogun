@@ -5,15 +5,23 @@ import { loadProjectConfig, resolveProjectPath, type LocalConfig } from '@ogun/c
  * Which project a command acts on, when the command does not make you say.
  *
  * `ogun project add` and `ogun project sync` have always taken the current directory and
- * read the name out of its `.ogun/config.yaml`. Two commands did not — setting a secret and
- * registering a Linear application — and in both cases the `<project>` positional was the
- * only reason their namespace existed. This is that resolution, extracted once so the two
- * agree, and so the third command that needs it does not invent a third ladder.
+ * read the name out of its `.ogun/config.yaml`. Setting a credential did not, and the
+ * `<project>` positional was the only reason its namespace existed. This is that
+ * resolution, extracted once so every command agrees, and so the next one does not invent
+ * a second ladder.
  *
  * It reaches nothing. No server, no database, no network: every rung is a file on this
- * machine, which is what lets `ogun secret set` keep its promise of working before `ogun
- * init` and with the database down. What a caller then *checks* the slug against differs,
- * and deliberately: each command uses the best oracle it already depends on.
+ * machine, which is what lets `ogun connect` keep its promise of working before `ogun
+ * init` and with the database down.
+ *
+ * What a caller *checks* the resolved slug against used to differ per command — "each
+ * command checks against the best oracle it already depends on", which was true while
+ * `secret set` and `linear app` were separate commands with separate dependencies. They
+ * are one command now, and one command with two oracles is an asymmetry nobody can
+ * predict: the same words, the same slug, two different refusals. So `connect` checks the
+ * local evidence in every mechanism, before it asks for anything, and the control plane's
+ * own check on the routes that reach one is the server refusing a write rather than a
+ * second rule for an operator to learn.
  */
 
 /**
@@ -83,8 +91,8 @@ function registeredContaining(config: LocalConfig, cwd: string): string | undefi
 /**
  * How to spell this project in a command printed back to the operator.
  *
- * Empty when the slug came from the directory, because `ogun linear connect` is the command
- * they should actually run and `ogun linear connect --project ogun` reads as though the
+ * Empty when the slug came from the directory, because `ogun connect linear` is the command
+ * they should actually run and `ogun connect linear --project ogun` reads as though the
  * flag were required. Explicit when they typed the flag, because they are then somewhere
  * the inference would not have reached, and a hint that only works elsewhere is worse than
  * no hint.

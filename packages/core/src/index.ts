@@ -7,6 +7,14 @@ export * from './evidence.ts'
 export * from './credentials.ts'
 export * from './connections.ts'
 export * from './config/index.ts'
+/**
+ * The Linear OAuth grants and the connect operation built on them. In core rather than in
+ * the server because `ogun connect linear` performs it with nothing running — see the
+ * header of `integrations/linear-oauth.ts` for why that promise is the reason the module
+ * moved.
+ */
+export * from './integrations/linear-oauth.ts'
+export * from './integrations/linear-connect.ts'
 export * from './sources/index.ts'
 export * from './api.ts'
 export * from './image.ts'

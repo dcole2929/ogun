@@ -6,6 +6,14 @@ import {
   updateLocalConfig,
   type LocalConfig,
 } from './machine.ts'
+/**
+ * Type-only, and therefore not an edge at runtime: `import type` is erased, so `config/`
+ * still pulls nothing from `integrations/` when this module loads. The alternative was a
+ * second declaration of the same two string literals here, and two spellings of a value
+ * that is written into a credential file is exactly the drift that makes an old build read
+ * a new build's grant as malformed.
+ */
+import type { LinearGrantType } from '../integrations/linear-oauth.ts'
 
 /**
  * A project's own credentials — the ones nobody's machine already has.
@@ -524,7 +532,29 @@ export type OAuthApp = {
 export type OAuthGrant = {
   clientId: string
   access: Secret
-  refresh: Secret
+  /**
+   * **Absent for a `client_credentials` grant, and that is not a degraded state.**
+   *
+   * ADR-0014 refused to store a grant with no refresh token, on the grounds that a token
+   * with no way to renew it is a connection that dies without warning. That was true when
+   * the only renewal Ogun had was a refresh token. It is not true of the grant that is now
+   * the default: renewing a `client_credentials` token means asking again with the client
+   * id and secret that are already in this file, which needs no person, spends nothing,
+   * and can be repeated. Which is why `grantType` is beside this field rather than being
+   * inferred from whether it is set — the presence of a refresh token is a *consequence*
+   * of the grant, and reading the consequence backwards would make a truncated write look
+   * like a deliberate choice.
+   */
+  refresh?: Secret
+  /**
+   * Which grant produced this, in RFC 6749's names, which are also Linear's.
+   *
+   * It decides how the token is renewed and therefore what a renewal can cost, so it is
+   * recorded rather than guessed. A grant written by the build before this one has no such
+   * field and is read as `authorization_code`, because that is the only thing that build
+   * could have written — see `parseOAuthApp`.
+   */
+  grantType: LinearGrantType
   /** Absolute, ms since epoch. */
   expiresAt: number
   obtainedAt: number
@@ -628,16 +658,20 @@ export class NoOAuthApp extends Error {}
  * own, this file has exactly one writer, and that is the difference which makes refreshing
  * safe here and unsafe there.
  *
- * Refuses when no application is registered. A grant with no client id and secret beside
- * it can never be refreshed, so storing one would create a connection with a 24-hour
- * lifetime and no way to renew it — which looks identical to a healthy one until tomorrow.
+ * Refuses when no application is registered, and the refusal is now load-bearing for both
+ * grants rather than one. A grant with no client id and secret beside it can never be
+ * renewed — an `authorization_code` refresh needs the pair to authenticate the refresh
+ * token, and a `client_credentials` token *is* the pair, asked again. Either way, storing
+ * one would create a connection that looks identical to a healthy one until the day it
+ * expires.
  */
 export async function storeOAuthGrant(
   projectSlug: string,
   provider: SecretName,
   grant: {
     accessToken: string
-    refreshToken: string
+    refreshToken?: string
+    grantType: LinearGrantType
     expiresAt: number
     obtainedAt: number
     scopes: string[]
@@ -759,6 +793,16 @@ export type ProjectGrantPresence = {
   connected: boolean
   scopes: string[]
   actor: string
+  /**
+   * How this project is connected, so that every surface can say it in one word.
+   *
+   * Not a cosmetic column. The two grants differ in what they can *see* — a
+   * `client_credentials` token reaches the workspace's public teams and no others — so
+   * "connected" without it is an answer that cannot explain a source returning zero
+   * tickets. Absent until somebody connects, because an application that was registered
+   * and never used has not yet chosen.
+   */
+  grantType?: LinearGrantType
   expiresAt?: number
   obtainedAt?: number
   workspace?: { id: string; name: string; urlKey: string }
@@ -802,7 +846,11 @@ export async function listOAuthApps(path = localConfigPath()): Promise<ProjectGr
           scopes: app.grant?.scopes ?? [],
           actor: app.grant?.actor ?? '',
           ...(app.grant
-            ? { expiresAt: app.grant.expiresAt, obtainedAt: app.grant.obtainedAt }
+            ? {
+                grantType: app.grant.grantType,
+                expiresAt: app.grant.expiresAt,
+                obtainedAt: app.grant.obtainedAt,
+              }
             : {}),
           ...(app.grant?.workspace ? { workspace: app.grant.workspace } : {}),
         }
@@ -836,7 +884,21 @@ function parseOAuthApp(raw: unknown): ParsedApp {
   if (typeof clientSecret !== 'string') {
     return { ok: false, reason: 'clientSecret is missing or not a string' }
   }
-  if (typeof redirectUri !== 'string' || redirectUri.trim() === '') {
+  /**
+   * Required to be a string, **allowed to be empty**, which it was not before.
+   *
+   * A redirect URI is a fact about a browser round trip, and the default grant has no
+   * browser in it. An application registered by `ogun connect linear` on a machine with no
+   * control plane running does not know what address anybody would reach one at — and
+   * inventing a plausible `http://localhost:7777/…` would put a string in the store that
+   * Linear has never been told about, which is precisely the mismatch this field exists to
+   * make visible, manufactured. Empty says "there was no browser", which is true and is
+   * what `connections` prints.
+   *
+   * `ogun connect linear --consent` writes a real one, through the server, because the
+   * server that will receive the callback is the only thing that knows what it is.
+   */
+  if (typeof redirectUri !== 'string') {
     return { ok: false, reason: 'redirectUri is missing or not a string' }
   }
 
@@ -855,14 +917,43 @@ function parseOAuthApp(raw: unknown): ParsedApp {
     return { ok: false, reason: 'grant.accessToken is missing or not a string' }
   }
   /**
-   * A refresh token is required, not optional, even though the access token alone would
-   * authenticate a poll for the next few hours. A grant that cannot be refreshed is a
-   * connection with a 24-hour life and no symptom until it ends — and Linear's
-   * client-credentials flow does return a token with no refresh token beside it, so this
-   * is the shape a plausible future edit would write.
+   * Which grant this came from, defaulted rather than required.
+   *
+   * **An entry with no `grantType` is an `authorization_code` grant**, because that is the
+   * only kind the build before this one could write: `client_credentials` was refused, in
+   * this function and in the token client, on the grounds that a token with no refresh
+   * token could not be renewed. So the default is not a guess, it is the single fact the
+   * absence can mean — and reading it that way is what lets an existing connection survive
+   * this change with no migration and no reconnect.
+   *
+   * An unrecognised value is `malformed` rather than defaulted. A future build's third
+   * grant type would have renewal rules this one does not know, and quietly treating it as
+   * an authorization-code grant would mean spending a refresh token that is not there, at
+   * 3am, on a connection somebody else's build made.
    */
-  if (typeof refreshToken !== 'string' || refreshToken.trim() === '') {
-    return { ok: false, reason: 'grant.refreshToken is missing or not a string' }
+  const grantType = g.grantType === undefined ? 'authorization_code' : g.grantType
+  if (grantType !== 'authorization_code' && grantType !== 'client_credentials') {
+    return { ok: false, reason: 'grant.grantType is not one this build knows' }
+  }
+
+  /**
+   * A refresh token is required for the grant that rotates, and must be absent-tolerant for
+   * the one that does not.
+   *
+   * ADR-0014 required it unconditionally, with this reason: *"a grant that cannot be
+   * refreshed is a connection with a 24-hour life and no symptom until it ends — and
+   * Linear's client-credentials flow does return a token with no refresh token beside it,
+   * so this is the shape a plausible future edit would write."* The prediction was right
+   * and the conclusion is now wrong. That edit landed deliberately, and the premise it
+   * rested on — that a refresh token is the only renewal there is — was what changed: a
+   * `client_credentials` token is renewed from the client id and secret two fields up.
+   *
+   * The check survives, narrowed to the grant it protects. An `authorization_code` entry
+   * with no refresh token is still an unrenewable connection and is still `malformed`,
+   * which asks for a reconnect rather than letting a poll discover it tomorrow.
+   */
+  if (grantType === 'authorization_code' && (typeof refreshToken !== 'string' || refreshToken.trim() === '')) {
+    return { ok: false, reason: 'grant.refreshToken is missing on an authorization-code grant' }
   }
   /**
    * Required, and required to be finite. A grant whose expiry cannot be read is a token
@@ -881,7 +972,13 @@ function parseOAuthApp(raw: unknown): ParsedApp {
       grant: {
         clientId,
         access: sealSecret(accessToken),
-        refresh: sealSecret(refreshToken),
+        // Sealed only when there is one. A `client_credentials` grant has none, and an
+        // empty `Secret` would be a credential-shaped object holding nothing — which every
+        // caller would then have to check the *inside* of, with `expose()`, to find out.
+        ...(typeof refreshToken === 'string' && refreshToken.trim() !== ''
+          ? { refresh: sealSecret(refreshToken) }
+          : {}),
+        grantType,
         expiresAt,
         obtainedAt: typeof g.obtainedAt === 'number' ? g.obtainedAt : 0,
         // Tolerated rather than required: a grant with no recorded scopes came from a build

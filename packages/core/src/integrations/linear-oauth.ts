@@ -1,11 +1,27 @@
 /**
- * Linear's OAuth 2.0 flow, behind one seam (ADR-0014).
+ * Linear's OAuth 2.0 grants, behind one seam (ADR-0014, amended).
  *
- * The same shape as `linear.ts` beside it and for the same reason: there is no Linear
- * application registered to this project and no credential on any machine here, so
- * everything below was built against Linear's published documentation and is exercised by
- * fixtures. `test/linear-oauth-fixtures.ts` records exactly what that proves and what it
- * does not, the way `linear-fixtures.ts` does for the GraphQL client.
+ * The same shape as the server's `linear.ts` GraphQL client and for the same reason: there
+ * is no Linear application registered to this project and no credential on any machine
+ * here, so everything below was built against Linear's published documentation and is
+ * exercised by fixtures. `test/linear-oauth-fixtures.ts` records exactly what that proves
+ * and what it does not, the way `linear-fixtures.ts` does for the GraphQL client.
+ *
+ * ### Why this lives in core rather than in the server
+ *
+ * It used to live in `packages/server/src/integrations/`, because the only grant Ogun had
+ * needed a `state` nonce and an HTTP callback, and both of those are things only a running
+ * control plane can hold. `client_credentials` needs neither: a client id, a client secret
+ * and one POST are the whole of it, and every input is already in
+ * `~/.ogun/config.json` on the machine the operator is typing on.
+ *
+ * That matters because of a promise ADR-0012 made about the *fallback* credential —
+ * `ogun secret set` "works before `ogun init`, with the database down, and over SSH". If
+ * the preferred way to connect needed a control plane and the discouraged one did not,
+ * then every operator whose control plane was down would reach for the personal API key,
+ * which is exactly the attribution problem ADR-0014 exists to end. So the code that
+ * obtains a grant sits where **both** the CLI and the server can call it, and there is one
+ * implementation of it rather than two that can disagree about what gets stored.
  *
  * ### The one rule this file exists to keep
  *
@@ -77,6 +93,14 @@ export const LINEAR_SCOPES = ['read'] as const
  * is not an admin in their workspace cannot complete this flow, and for them the personal
  * API key remains supported and documented. That is the whole reason ADR-0012's key is
  * kept rather than removed.
+ *
+ * **This constant is now only sent on the authorization-code flow.** `client_credentials`
+ * returns an app-actor token *implicitly* — Linear's words are that the token "will be an
+ * `app` actor token that has access to all public teams in the workspace" — so there is no
+ * `actor` parameter on that request and sending one would be a parameter Linear does not
+ * document accepting. The recorded actor is still `app` for both, because it describes the
+ * same thing: who Linear attributes a write to. Which is why it goes on the grant as an
+ * observed fact rather than being assumed from the request that asked for it.
  */
 export const LINEAR_ACTOR = 'app'
 
@@ -112,13 +136,44 @@ export class LinearOAuthError extends Error {
   }
 }
 
+/**
+ * Which of Linear's two grants a token came from, carried with the token.
+ *
+ * Not derived from "is there a refresh token beside it", which is the shape the same
+ * information happens to take today. A mode inferred from a nullable field is a mode that
+ * silently changes when the field does — and the field here is the one Linear omits, so
+ * the inference would read a truncated response as a deliberate choice. It is written
+ * down instead, in Linear's own vocabulary, so that a reader with their documentation open
+ * is looking at the same word.
+ *
+ * The two differ in every way that matters to renewal, and that is the whole reason this
+ * exists:
+ *
+ *  - `client_credentials` — Ogun's own client id and secret, exchanged for a 30-day
+ *    **app-actor** token with **no refresh token**. Renewal is *asking again*, which is
+ *    idempotent, needs nobody, and cannot lose anything. Reaches the workspace's **public
+ *    teams only**.
+ *  - `authorization_code` — a person approved an install in a browser, and the pair that
+ *    came back **rotates on use**. Renewal spends a credential, so it has to be written
+ *    before it is relied on. Reaches whatever the approver could see, private teams
+ *    included.
+ */
+export type LinearGrantType = 'client_credentials' | 'authorization_code'
+
 /** What a successful token call yields, in Ogun's units rather than Linear's. */
 export type LinearTokens = {
   accessToken: string
-  refreshToken: string
+  /**
+   * Absent for `client_credentials`, which Linear documents as returning none: "your
+   * server is expected to fetch a new token if it receives a 401 error". Required for
+   * `authorization_code`, and `tokenCall` refuses a response that omits it there — a
+   * rotating grant with no refresh token is a connection that ends silently in a day.
+   */
+  refreshToken?: string
   /** Absolute ms. Converted here, once, from Linear's `expires_in` seconds. */
   expiresAt: number
   scopes: string[]
+  grantType: LinearGrantType
 }
 
 export type Fetch = typeof globalThis.fetch
@@ -179,6 +234,7 @@ export function exchangeCode(input: {
   return tokenCall({
     fetch: input.fetch,
     tokenUrl: input.tokenUrl,
+    grantType: 'authorization_code',
     // Order matters to nothing on the wire; it matters here because this array is also
     // the scrub list, and it must name every secret the body contains.
     secrets: [input.clientSecret, input.code],
@@ -188,6 +244,62 @@ export function exchangeCode(input: {
       client_id: input.clientId,
       client_secret: input.clientSecret,
       grant_type: 'authorization_code',
+    },
+  })
+}
+
+/**
+ * Ask Linear for a token in Ogun's own name, with no browser and nobody's approval.
+ *
+ * This is the **default** way a project connects, and the reason is that everything the
+ * authorization-code flow needs in order to be safe is machinery this grant does not have
+ * to defend: no browser step, no redirect URI for Linear to match byte-for-byte, no
+ * `state` nonce, no authorization code sitting in a query string that `hono/logger` writes
+ * to the journal twice. Those were not incidental costs — they are three quarters of
+ * ADR-0014 — and a grant that needs none of them is not a shortcut, it is a smaller
+ * attack surface.
+ *
+ * What comes back, from Linear's own documentation: an `app` actor token — implicitly, so
+ * there is no `actor` parameter to send — which "has access to all public teams in the
+ * workspace", lasting `2591999` seconds (30 days), with **no refresh token**, because
+ * "your server is expected to fetch a new token if it receives a 401 error".
+ *
+ * ### The two costs, named rather than buried
+ *
+ *  - **Public teams only.** A workspace whose teams are private gets a token that
+ *    authenticates perfectly and reads nothing, which is the worst failure shape there is:
+ *    a poll that succeeds and returns zero tickets forever. `visibleTeams` exists to make
+ *    that visible at the moment of connecting, and `--consent` is the way out of it.
+ *  - **A workspace-wide token.** It reaches every public team, where an approver could
+ *    have granted less. Scope still bounds it — `read` and nothing else — but membership
+ *    does not.
+ *
+ * `scope` is required and **comma**-separated, the same delimiter `authorizationUrl` uses
+ * and the opposite of the space-separated `scope` that comes back. It is sent explicitly
+ * rather than relying on Linear's note that `read` "will always be present": a request
+ * that leans on a default is a request whose meaning changes when the default does.
+ *
+ * The client secret goes in the form body rather than in an HTTP basic header, which
+ * Linear also accepts, for the reason `refreshGrant` gives — a header is the part of a
+ * request people paste into bug reports.
+ */
+export function appTokenGrant(input: {
+  clientId: string
+  clientSecret: string
+  scopes?: readonly string[]
+  fetch?: Fetch
+  tokenUrl?: string
+}): Promise<LinearTokens> {
+  return tokenCall({
+    fetch: input.fetch,
+    tokenUrl: input.tokenUrl,
+    grantType: 'client_credentials',
+    secrets: [input.clientSecret],
+    body: {
+      client_id: input.clientId,
+      client_secret: input.clientSecret,
+      scope: (input.scopes ?? LINEAR_SCOPES).join(','),
+      grant_type: 'client_credentials',
     },
   })
 }
@@ -223,6 +335,7 @@ export function refreshGrant(input: {
   return tokenCall({
     fetch: input.fetch,
     tokenUrl: input.tokenUrl,
+    grantType: 'authorization_code',
     secrets: [input.clientSecret, input.refreshToken],
     body: {
       refresh_token: input.refreshToken,
@@ -330,11 +443,91 @@ export async function identify(input: {
   }
 }
 
-// ── the one call both grants make ──────────────────────────────────────────
+/**
+ * Which teams this token can actually see — asked once, at connect, and never stored.
+ *
+ * ### The failure this exists for
+ *
+ * A `client_credentials` token "has access to all public teams in the workspace", which is
+ * Linear's sentence and is also a trapdoor. A workspace whose teams are **private** hands
+ * back a token that authenticates perfectly, answers every query, and returns nothing — so
+ * the symptom is not an error anywhere. It is a source that polls every five minutes,
+ * records `ok`, sees zero tickets, and emits no jobs, forever, while `connections`,
+ * `doctor` and the Settings card all say the connection is healthy. Nothing in the
+ * credential is wrong. There is simply no overlap between what the operator wanted polled
+ * and what the token can reach.
+ *
+ * ADR-0014 named the adjacent gap honestly — *"whether a `read`-only `actor=app` install
+ * can read issues at all, which the documentation implies and nothing here has observed"*
+ * — and this is the cheapest possible observation of it: one query, at the one moment a
+ * person is watching, whose answer is printed beside the connection they just made. An
+ * operator who does not see their team in that list knows immediately, rather than in a
+ * fortnight.
+ *
+ * ### Why it is a second request rather than two fields on `identify`'s query
+ *
+ * Because GraphQL fails a whole document on a validation error. `teams` takes pagination
+ * arguments and its field set is one that could plausibly differ across API versions, so
+ * folding it into the identity query would mean a rename at Linear taking the workspace
+ * name and the actor check down with it — turning a cosmetic addition into a connect that
+ * cannot report who it connected as. Two calls cost one round trip on a command a human is
+ * waiting on, and each fails alone.
+ *
+ * ### Why nothing stores the answer
+ *
+ * A team list is a fact about a workspace at one instant, and workspaces gain teams. A
+ * stored copy would be consulted later by something that believed it, and would be wrong
+ * in the direction that matters: reporting a team as unreachable after somebody made it
+ * public. It is printed and dropped.
+ *
+ * Returns an empty list rather than throwing, for the reason `identify` does not throw:
+ * the tokens are valid and were just issued, and a connect that failed because a
+ * *reassurance* query failed would be a working credential thrown away over a display.
+ */
+export type LinearTeam = { id: string; key: string; name: string }
+
+const TEAMS_QUERY = `query OgunVisibleTeams {
+  teams(first: 50) { nodes { id key name } }
+}`
+
+export async function visibleTeams(input: {
+  accessToken: string
+  fetch?: Fetch
+  endpoint?: string
+}): Promise<LinearTeam[]> {
+  const doFetch = input.fetch ?? globalThis.fetch
+  try {
+    const response = await doFetch(input.endpoint ?? GRAPHQL_URL, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${input.accessToken}`,
+      },
+      body: JSON.stringify({ query: TEAMS_QUERY }),
+    })
+    const parsed: unknown = JSON.parse(await response.text())
+    const nodes = asRecord(asRecord(asRecord(parsed)?.data)?.teams)?.nodes
+    if (!Array.isArray(nodes)) return []
+    return nodes.flatMap((node): LinearTeam[] => {
+      const team = asRecord(node)
+      return team && typeof team.id === 'string' && typeof team.key === 'string' &&
+        typeof team.name === 'string'
+        ? [{ id: team.id, key: team.key, name: team.name }]
+        : []
+    })
+  } catch {
+    // Nothing from the failure is kept, and nothing is logged. The caller cannot act on it
+    // and the body would carry a live access token's worth of context for no gain.
+    return []
+  }
+}
+
+// ── the one call all three grants make ─────────────────────────────────────
 
 async function tokenCall(input: {
   body: Record<string, string>
   secrets: string[]
+  grantType: LinearGrantType
   fetch?: Fetch
   tokenUrl?: string
 }): Promise<LinearTokens> {
@@ -386,28 +579,40 @@ async function tokenCall(input: {
   }
 
   const refreshToken = record.refresh_token
-  if (typeof refreshToken !== 'string' || refreshToken === '') {
-    /**
-     * A token with no refresh token beside it. Linear's `client_credentials` grant returns
-     * exactly this — a 30-day token their docs say to replace by reacting to a 401 — and
-     * accepting one here would store a connection this build has no way to renew, which
-     * looks healthy for a month and then stops. Refused at the door instead, because the
-     * store refuses it too (`parseOAuthApp` requires the field) and a value rejected in two
-     * places with two different messages is worse than one rejected here with a reason.
-     */
+  const gotRefresh = typeof refreshToken === 'string' && refreshToken !== ''
+
+  /**
+   * A missing refresh token is a refusal for one grant and the documented answer for the
+   * other, and this used to be a flat refusal for both.
+   *
+   * **What the old rule said, and it is worth quoting because it was right at the time:**
+   * *"a token with no way to renew it is a connection that stops working in 30 days with
+   * no warning"*. That reasoning assumed the only renewal Ogun had was a refresh token. It
+   * is no longer true. A `client_credentials` token is renewed by *asking again* with the
+   * client id and secret already in the store — no person, no browser, nothing spent — so
+   * the absence of a refresh token there costs nothing at all.
+   *
+   * It still costs everything for `authorization_code`. That grant rotates: the pair that
+   * comes back replaces the pair that went out, and a response with no refresh token in it
+   * means the next renewal has nothing to spend. A build that shrugged at that would store
+   * a connection that dies in a day and reports as healthy until it does — so the refusal
+   * stays exactly where it was, narrowed to the grant it was ever about.
+   */
+  if (input.grantType === 'authorization_code' && !gotRefresh) {
     throw new LinearOAuthError(
       'config',
-      'linear returned an access token with no refresh token. That is what the ' +
-        'client-credentials grant does, and Ogun cannot use it: a token with no way to ' +
-        'renew it is a connection that stops working in 30 days with no warning',
+      "linear returned an access token with no refresh token beside it, and this is the " +
+        'authorization-code grant, which rotates — so there would be nothing to renew it ' +
+        'with. Nothing was stored',
     )
   }
 
   return {
     accessToken,
-    refreshToken,
-    expiresAt: expiresAtFrom(record.expires_in),
+    ...(gotRefresh ? { refreshToken } : {}),
+    expiresAt: expiresAtFrom(record.expires_in, input.grantType),
     scopes: scopesFrom(record.scope),
+    grantType: input.grantType,
   }
 }
 
@@ -474,15 +679,22 @@ function classifyTokenError(
  * after, so a config.json read back after a restart would report 24 hours remaining
  * forever — a token that is never refreshed because it never looks close to expiring.
  *
- * A missing or unusable `expires_in` falls back to Linear's documented 24 hours rather
- * than to "no expiry". Being wrong towards *sooner* costs one unnecessary refresh; being
- * wrong towards later is the 3am 401 this whole path exists to avoid.
+ * A missing or unusable `expires_in` falls back to the lifetime Linear documents for that
+ * grant — 24 hours for `authorization_code`, 30 days (`2591999` seconds) for
+ * `client_credentials` — rather than to "no expiry". The fallback is per grant rather than
+ * one number because being wrong in either direction has a cost and they are not
+ * symmetric: 24 hours applied to a 30-day token spends 29 unnecessary renewals, and 30
+ * days applied to a 24-hour token is the 3am 401 this whole path exists to avoid. Sooner
+ * is the safe direction, and the safe direction is only cheap when it is roughly right.
  */
-const FALLBACK_LIFETIME_MS = 24 * 60 * 60 * 1000
+const FALLBACK_LIFETIME_MS: Record<LinearGrantType, number> = {
+  authorization_code: 24 * 60 * 60 * 1000,
+  client_credentials: 2591999 * 1000,
+}
 
-function expiresAtFrom(raw: unknown, now = Date.now()): number {
+function expiresAtFrom(raw: unknown, grantType: LinearGrantType, now = Date.now()): number {
   const seconds = typeof raw === 'number' ? raw : Number(raw)
-  if (!Number.isFinite(seconds) || seconds <= 0) return now + FALLBACK_LIFETIME_MS
+  if (!Number.isFinite(seconds) || seconds <= 0) return now + FALLBACK_LIFETIME_MS[grantType]
   return now + seconds * 1000
 }
 

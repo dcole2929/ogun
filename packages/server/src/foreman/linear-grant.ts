@@ -1,28 +1,34 @@
 import {
+  appTokenGrant,
   credentialHealth,
   GRANT_REFRESH_HORIZON_MS,
+  LinearOAuthError,
   NoOAuthApp,
   readOAuthApp,
+  refreshGrant,
   sealSecret,
   storeOAuthGrant,
+  type Fetch,
   type OAuthGrant,
   type SecretName,
 } from '@ogun/core'
-import { LinearOAuthError, refreshGrant, type Fetch } from '../integrations/linear-oauth.ts'
 import type { LinearCredential } from '../integrations/linear.ts'
 
 /**
- * Keeping a 24-hour token alive for a poller that wakes at 3am (ADR-0014).
+ * Keeping a token alive for a poller that wakes at 3am (ADR-0014, amended).
  *
  * ### The problem, stated at the size it actually is
  *
- * A Linear access token lasts 24 hours. A source polls every five minutes when the control
- * plane is up, and the machine this runs on is a workstation that gets closed, a VPS that
- * gets restarted, or a laptop that sleeps. So the interesting case is not "the token
- * expires while we are watching" — it is "the process starts, or wakes, holding a token
- * that died some hours ago", and that is the *ordinary* case rather than the edge one.
+ * A Linear access token lasts 24 hours under the authorization-code grant and 30 days
+ * under the default one. A source polls every five minutes when the control plane is up,
+ * and the machine this runs on is a workstation that gets closed, a VPS that gets
+ * restarted, or a laptop that sleeps. So the interesting case is not "the token expires
+ * while we are watching" — it is "the process starts, or wakes, holding a token that died
+ * some hours ago", and that is the *ordinary* case rather than the edge one. Thirty days
+ * makes that worse rather than better: a fuse long enough that nobody has seen it burn is
+ * a fuse nobody recognises when it does.
  *
- * ### Refresh on demand, immediately before the poll that needs it
+ * ### Renew on demand, immediately before the poll that needs it
  *
  * Three designs were on the table.
  *
@@ -33,19 +39,31 @@ import type { LinearCredential } from '../integrations/linear.ts'
  * a token — spending a rotation, and therefore a chance to lose one, on a night when no
  * source was due.
  *
- * **React to a 401.** Rejected second, and it is the design that costs the most on the
- * night it matters. The poll has already spent a request; Linear answers an expired token
- * with `AUTHENTICATION_ERROR`, which is the same code it answers a *revoked* token with,
- * so the reactive path cannot tell "refresh this" from "this connection is over" without
- * trying — and `source_polls` records a failure for a poll that was always going to need
- * one round trip. It is also the shape ADR-0010 already declined for the model providers,
- * where the answer was "catch the lapse before it costs a night".
+ * **React to a 401.** Rejected second, and **the reason it was rejected has since
+ * dissolved for the default grant** — which is worth writing down rather than leaving as a
+ * decision that quietly outlived its argument. ADR-0014's objection was that Linear answers
+ * an expired token with `AUTHENTICATION_ERROR`, the same code it answers a *revoked* one
+ * with, so a reactive path could not tell "renew this" from "this connection is over"
+ * without spending a request to find out. Under `client_credentials` that ambiguity costs
+ * nothing: renewal is asking again with credentials already on disk, it is idempotent, and
+ * a connection that is genuinely over fails the renewal too and says so. Linear's own
+ * guidance for that grant is precisely this — "your server is expected to fetch a new token
+ * if it receives a 401 error".
  *
- * **Refresh on demand, here, before the request.** Chosen. The poll is the only thing that
+ * It is still not what happens here, and the remaining reason is narrower than the
+ * original: **a reactive renewal spends a poll.** The request has already gone out, the
+ * page it was fetching is lost, and `source_polls` records a failure for a poll that was
+ * always going to need one round trip — a row an operator reads at breakfast as a Linear
+ * outage. Proactive renewal costs the same request at a moment when nothing is riding on
+ * it. What has changed is that this is now a preference about legibility rather than a
+ * defence against an ambiguity, and a future finding that the 401 path should exist *as a
+ * safety net beneath* the proactive one would be a real finding.
+ *
+ * **Renew on demand, here, before the request.** Chosen. The poll is the only thing that
  * knows it is about to need a token, and it knows this at the one moment when doing
  * something about it is free. The check is `credentialHealth` — the same function the
  * credential preflight uses, against a horizon — so a token with four minutes left is
- * refreshed rather than used and lost halfway through a paged read.
+ * renewed rather than used and lost halfway through a paged read.
  *
  * ### How this relates to the credential preflight, which is a different thing
  *
@@ -59,6 +77,12 @@ import type { LinearCredential } from '../integrations/linear.ts'
  * poll; the preflight gates the job.
  *
  * ### The ADR-0010 trap that does not apply, and the one that does
+ *
+ * Everything in this section is about the **authorization-code** grant, which is the only
+ * one that has a refresh token to rotate. The default grant has none: renewal there is a
+ * second `client_credentials` request with the same client id and secret, which spends
+ * nothing, invalidates nothing, and can be repeated. None of the care below is needed for
+ * it, and that is most of why it is the default.
  *
  * ADR-0010 rejected refreshing an OAuth token because the provider **rotates the refresh
  * token on use** — and Linear does, explicitly: "a new valid access token and a new refresh
@@ -81,6 +105,8 @@ export type GrantDeps = {
   readApp?: typeof readOAuthApp
   store?: typeof storeOAuthGrant
   refresh?: typeof refreshGrant
+  /** The `client_credentials` renewal, which is the same request the connect made. */
+  reissue?: typeof appTokenGrant
   fetch?: Fetch
   now?: () => number
 }
@@ -181,14 +207,42 @@ async function refreshOnce(
     }
   }
 
+  /**
+   * Which renewal, decided by the grant that is stored rather than by what is beside it.
+   *
+   * `grantType` is on the grant precisely so this branch does not have to ask "is there a
+   * refresh token" and treat the answer as an instruction. A truncated write, an older
+   * build, a hand-edit — each can produce a grant missing a field, and inferring the
+   * renewal strategy from a missing field means the recovery for a damaged entry is to
+   * silently change how the connection is maintained. Reading the recorded intent means a
+   * damaged entry is `malformed` at the parser, where it says so.
+   *
+   * Both calls take the same client id and secret, and neither one is retried here: this
+   * function answers with `ready`, `refused` or `failed`, and *when* to try again is the
+   * poll's schedule.
+   */
   let tokens
   try {
-    tokens = await (deps.refresh ?? refreshGrant)({
-      refreshToken: grant.refresh.expose(),
-      clientId: app.app.clientId,
-      clientSecret: app.app.clientSecret.expose(),
-      ...(deps.fetch ? { fetch: deps.fetch } : {}),
-    })
+    tokens =
+      grant.grantType === 'client_credentials'
+        ? await (deps.reissue ?? appTokenGrant)({
+            clientId: app.app.clientId,
+            clientSecret: app.app.clientSecret.expose(),
+            scopes: grant.scopes.length > 0 ? grant.scopes : undefined,
+            ...(deps.fetch ? { fetch: deps.fetch } : {}),
+          })
+        : await (deps.refresh ?? refreshGrant)({
+            /**
+             * Non-null because `parseOAuthApp` refuses an authorization-code grant with no
+             * refresh token — the check that survived ADR-0014's blanket one, narrowed to
+             * the grant it was always about. A grant that reaches here without one is a
+             * `malformed` entry that never became an `OAuthGrant`.
+             */
+            refreshToken: grant.refresh?.expose() ?? '',
+            clientId: app.app.clientId,
+            clientSecret: app.app.clientSecret.expose(),
+            ...(deps.fetch ? { fetch: deps.fetch } : {}),
+          })
   } catch (err) {
     if (!(err instanceof LinearOAuthError)) throw err
     /**
@@ -209,16 +263,19 @@ async function refreshOnce(
       detail: permanent
         ? `the ${provider} connection for "${projectSlug}" could not be renewed: ` +
           `${err.message}. Nothing was deleted — reconnect from Settings, or ` +
-          `\`ogun linear connect --project ${projectSlug}\``
+          `\`ogun connect ${provider} --project ${projectSlug}\``
         : `could not renew the ${provider} access token for "${projectSlug}": ${err.message}. ` +
-          'The refresh token was kept; the next poll tries again',
+          (grant.grantType === 'client_credentials'
+            ? 'Nothing was spent; the next poll asks again'
+            : 'The refresh token was kept; the next poll tries again'),
     }
   }
 
   try {
     await (deps.store ?? storeOAuthGrant)(projectSlug, provider, {
       accessToken: tokens.accessToken,
-      refreshToken: tokens.refreshToken,
+      ...(tokens.refreshToken ? { refreshToken: tokens.refreshToken } : {}),
+      grantType: tokens.grantType,
       expiresAt: tokens.expiresAt,
       obtainedAt: now,
       // Carried forward rather than re-fetched. A refresh response reports the scopes it
@@ -233,14 +290,21 @@ async function refreshOnce(
     })
   } catch (err) {
     /**
-     * Written *before* used, and a write that failed stops the poll.
+     * Written *before* used, and a write that failed stops the poll — for both grants, for
+     * two different reasons that happen to want the same behaviour.
      *
-     * The tempting alternative is to poll with the new token anyway and hope the next
-     * write lands. It is wrong because the rotation already happened at Linear: the
-     * refresh token on disk is spent, so a poll that proceeds is a poll whose next renewal
-     * replays a consumed token. Stopping here keeps that inside Linear's 30-minute replay
-     * window, where the next attempt recovers the same pair — which is exactly what the
-     * window is documented to be for.
+     * Under `authorization_code` it is a correctness rule. The rotation already happened at
+     * Linear: the refresh token on disk is spent, so a poll that proceeds is a poll whose
+     * next renewal replays a consumed token. Stopping keeps the failure inside Linear's
+     * 30-minute replay window, where the next attempt recovers the same pair.
+     *
+     * Under `client_credentials` nothing has been spent and proceeding would be safe — so
+     * the reason to stop is a different one, and it is worth stating rather than inheriting.
+     * A poll that ran on a token the store never recorded would leave `connections`,
+     * `doctor` and the Settings card all reporting an expired grant while the polls quietly
+     * worked, which is a store that disagrees with reality: the class of bug where the
+     * evidence an operator debugs from is the thing that is wrong. One rule, and the
+     * failure it names is the one that applies.
      */
     const detail = err instanceof NoOAuthApp ? err.message : asMessage(err)
     return {
@@ -248,8 +312,11 @@ async function refreshOnce(
       detail:
         `renewed the ${provider} token for "${projectSlug}" and could not write it to this ` +
         `machine's config (${detail}). The poll was stopped rather than run on a token ` +
-        'nothing recorded; Linear allows the renewal to be replayed for 30 minutes, so ' +
-        'fixing the store and waiting for the next poll recovers it',
+        'nothing recorded' +
+        (grant.grantType === 'client_credentials'
+          ? '; nothing was spent, so fixing the store and waiting for the next poll recovers it'
+          : '; Linear allows the renewal to be replayed for 30 minutes, so fixing the store ' +
+            'and waiting for the next poll recovers it'),
     }
   }
 

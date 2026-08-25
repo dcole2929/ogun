@@ -1,8 +1,7 @@
 import { strict as assert } from 'node:assert'
 import { test } from 'node:test'
-import { sealSecret, type OAuthGrant, type ProjectOAuth } from '@ogun/core'
+import { LinearOAuthError, sealSecret, type OAuthGrant, type ProjectOAuth } from '@ogun/core'
 import { usableGrant } from '../src/foreman/linear-grant.ts'
-import { LinearOAuthError } from '../src/integrations/linear-oauth.ts'
 
 /**
  * When a 24-hour token gets renewed, for a poller that wakes at 3am (ADR-0014).
@@ -19,12 +18,19 @@ const grantExpiring = (inMs: number): OAuthGrant => ({
   clientId: 'client-1',
   access: sealSecret('access-old'),
   refresh: sealSecret('refresh-old'),
+  grantType: 'authorization_code',
   expiresAt: Date.now() + inMs,
   obtainedAt: Date.now() - 23 * HOUR,
   scopes: ['read'],
   actor: 'app',
   workspace: { id: 'org-1', name: 'Acme', urlKey: 'acme' },
 })
+
+/** The default grant: no refresh token, because renewal is asking again. */
+const appGrantExpiring = (inMs: number): OAuthGrant => {
+  const { refresh: _none, ...rest } = grantExpiring(inMs)
+  return { ...rest, grantType: 'client_credentials' }
+}
 
 const registered: ProjectOAuth = {
   state: 'present',
@@ -42,7 +48,14 @@ const deps = (over: Parameters<typeof usableGrant>[3] = {}) => ({
   refresh: async () => ({
     accessToken: 'access-new',
     refreshToken: 'refresh-new',
+    grantType: 'authorization_code' as const,
     expiresAt: Date.now() + 24 * HOUR,
+    scopes: ['read'],
+  }),
+  reissue: async () => ({
+    accessToken: 'access-reissued',
+    grantType: 'client_credentials' as const,
+    expiresAt: Date.now() + 30 * 24 * HOUR,
     scopes: ['read'],
   }),
   ...over,
@@ -177,7 +190,7 @@ test('a revoked grant refuses the poll, names the fix, and deletes nothing', asy
   if (result.state !== 'refused') return
   assert.equal(wrote, 0)
   assert.match(result.detail, /Nothing was deleted/)
-  assert.match(result.detail, /ogun linear connect --project ogun/)
+  assert.match(result.detail, /ogun connect linear --project ogun/)
 })
 
 /**
@@ -228,6 +241,7 @@ test('two polls arriving together produce one refresh, not two', async () => {
       return {
         accessToken: 'access-new',
         refreshToken: 'refresh-new',
+        grantType: 'authorization_code' as const,
         expiresAt: Date.now() + 24 * HOUR,
         scopes: ['read'],
       }
@@ -263,4 +277,118 @@ test('a grant whose application has been hand-removed names that, not the expiry
   assert.equal(result.state, 'refused')
   if (result.state !== 'refused') return
   assert.match(result.detail, /no application behind it/)
+})
+
+/**
+ * The property: **which renewal runs is decided by the recorded `grantType`, not by whether
+ * a refresh token happens to be sitting there.**
+ *
+ * Inference is the tempting implementation and it is wrong in the direction that costs a
+ * connection. A grant missing its refresh token through a truncated write, an older build
+ * or a hand-edit would be *silently* renewed a different way — so the recovery for a
+ * damaged entry becomes a change to how the credential is maintained, with nothing said.
+ * Reading the recorded intent means a damaged entry stops at the parser, as `malformed`,
+ * where it names itself.
+ *
+ * The two directions are asserted together because each one is a live failure. A
+ * client-credentials grant sent down the refresh path spends a `refresh_token` that does
+ * not exist and reports the refusal as a dead connection; an authorization-code grant sent
+ * down the reissue path asks Linear for a workspace token where a user-scoped one was
+ * approved, and quietly narrows what Ogun can see.
+ */
+test('the grant type decides the renewal, rather than the presence of a refresh token', async () => {
+  const called: string[] = []
+  const trace = {
+    refresh: async () => {
+      called.push('refresh')
+      return {
+        accessToken: 'access-new',
+        refreshToken: 'refresh-new',
+        grantType: 'authorization_code' as const,
+        expiresAt: Date.now() + 24 * HOUR,
+        scopes: ['read'],
+      }
+    },
+    reissue: async () => {
+      called.push('reissue')
+      return {
+        accessToken: 'access-reissued',
+        grantType: 'client_credentials' as const,
+        expiresAt: Date.now() + 30 * 24 * HOUR,
+        scopes: ['read'],
+      }
+    },
+  }
+
+  const app = await usableGrant('cc', 'linear', appGrantExpiring(-9 * HOUR), deps(trace))
+  assert.equal(app.state, 'ready')
+  if (app.state !== 'ready') return
+  assert.equal(app.refreshed, true)
+  assert.equal(app.credential.kind, 'oauth')
+
+  const code = await usableGrant('ac', 'linear', grantExpiring(-9 * HOUR), deps(trace))
+  assert.equal(code.state, 'ready')
+
+  assert.deepEqual(called, ['reissue', 'refresh'])
+})
+
+/**
+ * The property: what gets **written** after a client-credentials renewal has no refresh
+ * token in it, and still says which grant it came from.
+ *
+ * `storeOAuthGrant` is where a renewal turns into the thing the next process reads, and the
+ * shape it writes is the shape `parseOAuthApp` will judge. Writing a `grantType` of
+ * `authorization_code` here — by carrying the old value forward instead of taking the new
+ * one — would produce an entry that is `malformed` on the next read, because it would claim
+ * to be a rotating grant with nothing to rotate. A connection that works until the process
+ * restarts is the hardest kind of wrong to find.
+ */
+test('a renewed app token is written with no refresh token and its own grant type', async () => {
+  let written: Record<string, unknown> | undefined
+  const result = await usableGrant(
+    'ogun',
+    'linear',
+    appGrantExpiring(-9 * HOUR),
+    deps({
+      store: async (_slug, _provider, grant) => {
+        written = grant as unknown as Record<string, unknown>
+      },
+    }),
+  )
+
+  assert.equal(result.state, 'ready')
+  assert.equal(written?.grantType, 'client_credentials')
+  assert.equal(written?.refreshToken, undefined)
+  assert.equal(written?.accessToken, 'access-reissued')
+  // Carried forward rather than re-fetched: a renewal cannot change which workspace the
+  // grant is in, and re-running `identify` would be a GraphQL request a poll does not need.
+  assert.deepEqual(written?.workspace, { id: 'org-1', name: 'Acme', urlKey: 'acme' })
+})
+
+/**
+ * The property: a transport failure renewing an app token says **nothing was spent**.
+ *
+ * The same branch under the rotating grant says the refresh token was kept, and the
+ * difference is the whole point of the two sentences existing. There, a lost response is a
+ * consumed credential inside a 30-minute replay window, and an operator reading the line
+ * needs to know their connection is intact. Here nothing has been consumed at all, and
+ * telling somebody their refresh token survived — when there is no refresh token — is a
+ * sentence that sends them looking for a thing that does not exist.
+ */
+test('a failed app-token renewal reports that nothing was spent', async () => {
+  const result = await usableGrant(
+    'ogun',
+    'linear',
+    appGrantExpiring(-9 * HOUR),
+    deps({
+      reissue: async () => {
+        throw new LinearOAuthError('transport', 'could not reach linear')
+      },
+    }),
+  )
+
+  assert.equal(result.state, 'failed')
+  if (result.state !== 'failed') return
+  assert.match(result.detail, /nothing was spent/i)
+  assert.ok(!/refresh token was kept/.test(result.detail))
 })
