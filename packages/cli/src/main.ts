@@ -78,8 +78,10 @@ try {
     case 'project':
       if (sub === 'add') await projectAdd(rest, serverUrl)
       else if (sub === 'sync') await projectSync(rest, serverUrl)
-      // `secret` reaches no server: the store is this machine's config.json, and there is
-      // no route that takes a secret in a request body (ADR-0012).
+      // `secret` reaches no server: the store is this machine's config.json, written
+      // directly (ADR-0012). The Settings page can write it too, through the same
+      // function, but only from a transport that can carry a key — so this path is the one
+      // that works with the database down, before `ogun init`, and over SSH.
       else if (sub === 'secret' || sub === 'secrets') await projectSecret(rest)
       else if (sub === 'list' || sub === undefined) await projectList(serverUrl)
       else unknownSub('project', sub)

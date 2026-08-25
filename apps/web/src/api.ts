@@ -26,6 +26,23 @@ export type SystemInfo = {
    * screenshot, a devtools network panel, or a bug report to carry away.
    */
   projectSecrets: Array<{ project: string; name: string; state: 'present' | 'empty' }>
+  /**
+   * Whether this control plane will accept a key typed into this browser, and what to say
+   * instead when it will not.
+   *
+   * The condition is the transport — loopback, or an operator who declared a TLS
+   * terminator in front — and it is evaluated on the server. The page could work it out
+   * from `controlPlane.bind`, and then a security rule would have two implementations, one
+   * of them in a bundle anybody can edit. This field only decides whether a form is worth
+   * rendering; the server refuses regardless of what the page does.
+   */
+  projectSecretWrites: {
+    allowed: boolean
+    /** Null when allowed. Written for an operator, and names the CLI, which always works. */
+    reason: string | null
+    /** The closed set the server accepts, so the form cannot offer a name nothing reads. */
+    names: string[]
+  }
   checkouts: Array<{ slug: string; path: string; present: boolean }>
   counts: { projects: number; runs: number; openFindings: number; queuedJobs: number }
 }
@@ -323,6 +340,33 @@ export const api = {
     json<{ token: string; restartRequired: boolean }>('/api/system/token/rotate', {
       method: 'POST',
     }),
+  /**
+   * Store a project's API key. The only request in this client that carries a secret.
+   *
+   * The value is in the body and never in the path, because the path is what a server log
+   * and a proxy log record — `hono/logger` writes method, path and status, and nothing
+   * writes a body. The server refuses this outright unless the transport can carry it
+   * (`projectSecretWrites`), so a page that renders the form on a control plane that will
+   * not take one gets a 403 rather than a stored key.
+   *
+   * Nothing comes back but presence and a character count: there is no response field a
+   * value could arrive in, by the same rule that keeps one out of the listing (ADR-0012).
+   */
+  setProjectSecret: (project: string, name: string, value: string) =>
+    json<{ stored: { project: string; name: string }; characters: number }>(
+      `/api/system/secrets/${encodeURIComponent(project)}/${encodeURIComponent(name)}`,
+      {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ value }),
+      },
+    ),
+  /** `removed: false` means there was nothing there — a different answer, kept apart. */
+  removeProjectSecret: (project: string, name: string) =>
+    json<{ removed: boolean }>(
+      `/api/system/secrets/${encodeURIComponent(project)}/${encodeURIComponent(name)}`,
+      { method: 'DELETE' },
+    ),
   run: (id: string) => json<RunDetail>(`/api/runs/${id}`),
   findings: (params: { project?: string; status?: string }) => {
     const q = new URLSearchParams()

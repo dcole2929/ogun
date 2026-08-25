@@ -132,6 +132,7 @@ Unknown flags are refused rather than ignored. `ogun server --prot 8080` used to
 | `OGUN_PORT` | listen port (7777) — `--port` wins over it |
 | `OGUN_BIND` | interface (127.0.0.1) |
 | `OGUN_ADMIN_TOKEN` | use this instead of the stored one |
+| `OGUN_BEHIND_TLS_PROXY` | something in front of this process terminates TLS — see below |
 | `OGUN_STALE_CLAIM_MS` | how long a claim may go unreported before it is swept (45 minutes) |
 | `DATABASE_URL` | the database |
 
@@ -140,6 +141,15 @@ needed. Set `OGUN_BIND=0.0.0.0` and it generates an admin token on first start a
 it in `~/.ogun/config.json`. This API can define workers, so an open one on a shared
 network is remote code execution on this machine — it refuses to start wide and
 unauthenticated.
+
+`OGUN_BEHIND_TLS_PROXY=1` says that something in front of this process terminates TLS. It
+changes exactly one thing: whether the Settings page may accept a project's API key
+(ADR-0012). Ogun serves plain HTTP and cannot see past its own socket, so on a wider bind
+it assumes a key typed into a browser would cross the network in cleartext and refuses to
+store one, pointing at `ogun project secret set` instead. This variable is how an operator
+who has put nginx or Caddy in front says otherwise. It is not read as a header —
+`x-forwarded-proto` is written by whoever is talking to us, which on a plain-HTTP LAN is
+the client, and a guard a request can switch off is not a guard.
 
 ### `ogun runner init`
 
@@ -304,9 +314,14 @@ per workspace, so it has to be entered once and kept.
 
 Run it on the **control-plane machine** — that is what polls an integration, so that is
 where the key has to be. It stores into `~/.ogun/config.json` at mode 0600 and talks to no
-server: there is deliberately no route that accepts a secret, because a value in a request
-body is a value in a reverse proxy's access log. Never in the repository, never in the
-database, and never in a container (ADR-0012).
+server at all, which is why it works before `ogun init`, with the database down, and over
+SSH into a box with no browser on it. Never in the repository, never in the database, and
+never in a container (ADR-0012).
+
+The Settings page can also set one, and it writes through this same code and the same
+lockfile. It is allowed when the transport can carry a secret — a loopback bind, or a wider
+one where the operator has declared a TLS terminator in front with `OGUN_BEHIND_TLS_PROXY`
+— and refused otherwise, pointing back here. This command is the path that always works.
 
 ```
 ogun project secret set ogun linear < key.txt
@@ -332,7 +347,9 @@ the new value with no restart, and two live keys would mean nobody could say whi
   the UI, and no endpoint. It cannot say what is *missing*, either: which projects need a
   key is declared in each repository, and this command reads no repositories.
 - `ogun project secret rm <project> <name>` — forget one. Says whether there was anything
-  to forget, because "removed" and "there was nothing here" are different answers.
+  to forget, because "removed" and "there was nothing here" are different answers. Unlike
+  `set`, it takes any name rather than only a known one: `list` prints whatever the file
+  holds, that file gets hand-edited, and a row you can see has to be a row you can remove.
 
 Touches: `~/.ogun/config.json` (the secrets block, on this machine only).
 

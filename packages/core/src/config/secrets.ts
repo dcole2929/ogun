@@ -25,8 +25,9 @@ import {
  * already happened somewhere in this repo:
  *
  *  1. **Never in `.ogun/config.yaml`.** That file is committed. There is no code path
- *     from here to it — `projectConfigSchema` has no field a secret could land in, and
- *     the CLI command that writes one writes only to the machine file.
+ *     from here to it — `projectConfigSchema` has no field a secret could land in, and the
+ *     two things that write one, `ogun project secret set` and the Settings page's route,
+ *     both go through this module and therefore only into the machine file.
  *  2. **Never in a sandbox.** Nothing on the runner reads this module. The value is not on
  *     `claimedJobSchema`, so it cannot cross the wire to a runner; the runner is the only
  *     thing that builds `docker run`, so there is no route to a container's argv; and
@@ -250,10 +251,18 @@ export async function setProjectSecret(
  * An emptied project drops out entirely rather than being left as `{}`, so that a
  * subsequent read is `absent` — the state that means nobody set one — rather than a
  * project that exists in the store holding nothing.
+ *
+ * `name` is a plain string here where `setProjectSecret` takes a `SecretName`, and the
+ * asymmetry is deliberate. The closed set exists to stop a *write* creating a key nothing
+ * reads; removal creates nothing. What it has to cover is everything the store can
+ * actually hold, and that is wider than `SECRET_NAMES`: §4.5 says `~/.ogun/config.json`
+ * gets hand-edited, `listProjectSecrets` reports whatever it finds, and the Settings page
+ * renders that. A row a person can see and cannot remove is a live credential stranded in
+ * the file by a validator meant to protect it.
  */
 export async function clearProjectSecret(
   projectSlug: string,
-  name: SecretName,
+  name: string,
   path = localConfigPath(),
 ): Promise<boolean> {
   let existed = false
@@ -274,7 +283,8 @@ export async function clearProjectSecret(
 export class InvalidSecret extends Error {}
 
 /**
- * Clean up what arrived on stdin or out of a prompt, and refuse what cannot work.
+ * Clean up what arrived on stdin, out of a prompt, or in a request body, and refuse what
+ * cannot work.
  *
  * Whitespace goes first, and the trailing newline is why. `ogun project secret set ogun
  * linear < key.txt` and `pbpaste | ogun …` both deliver a value with `\n` on the end, and

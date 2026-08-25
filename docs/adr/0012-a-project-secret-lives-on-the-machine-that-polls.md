@@ -146,6 +146,56 @@ behaviour for a credential anyway: a secret that migrates itself is a secret in 
   TLS and a decision about request logging; a finding that the UI should be able to set one
   is a real finding.
 
+  [amended] It is now closed, on the condition this bullet named. The sentence above —
+  *"There is no route that accepts a secret, because a value in a request body is a value
+  in a reverse proxy's access log and in a browser's network panel"* — gave one reason and
+  two reasons that do not survive being checked against the code:
+
+  - **Ogun's own log is not the leak.** `hono/logger` writes method, path and status.
+    Nothing in the server logs a request body. That is also why the value goes in the body
+    and never in the path: the path is the one part of a request this process does write to
+    its journal, so `PUT /api/system/secrets/:project/:name` carries a slug and a name and
+    nothing else.
+  - **A proxy's access log is the operator's configuration, not Ogun's.** It is a real
+    hazard, and it is one they chose, can see, and can turn off. Declining to have the
+    feature does not remove their proxy; it sends them to a terminal and leaves the proxy
+    exactly as it was.
+  - **The browser's network panel shows the value to the person who just typed it.** That
+    is not a disclosure. It is the same screen the key was pasted into.
+
+  What is left is the one that was always load-bearing: **a secret crossing a network in
+  cleartext.** Ogun serves plain HTTP — there is no TLS listener anywhere in the process —
+  so the condition is the transport, not the existence of a route. `secretWriteTransport`
+  in `packages/server/src/auth.ts` allows a write on a loopback bind, where the request
+  never reaches an interface and the only attacker who could read it can already read
+  `~/.ogun/config.json` at 0600 as this user; and refuses it on a wider one unless the
+  operator has declared a TLS terminator in front with `OGUN_BEHIND_TLS_PROXY`. The refusal
+  names `ogun project secret set`, because a refusal on the only surface a remote operator
+  has must not be a dead end.
+
+  Deliberately **not** `x-forwarded-proto: https`. That header is written by whoever is
+  speaking to us, and on the exact deployment the guard exists for — plain HTTP straight
+  off a LAN — that is the client. A guard a request can switch off by asserting it is safe
+  is a comment, not a guard. The environment is the one input to the decision that nothing
+  on the wire can supply.
+
+  Considered and rejected: allowing it on any bind, on the grounds that a token-protected
+  control plane on plain HTTP already puts an admin token — which can define a worker,
+  which is to say execute code on the host — on the wire with every request, so an
+  eavesdropper who could take the Linear key already owns the machine. Nearly right, and it
+  loses on blast radius: the admin token's is this host, and a project's Linear key is a
+  credential in a third party's workspace that this operator may not even be able to
+  revoke. Adding a new class of victim to an already-compromised channel is a fresh loss
+  rather than a rounding error on an existing one, and the alternative costs one `ssh`.
+
+  What the route does *not* change is anything else in this record. It goes through
+  `setProjectSecret` and therefore through `updateLocalConfig`'s lock — one writer, not a
+  second one racing the first. It validates the name against `SECRET_NAMES` and, unlike the
+  CLI, the project against the database, because it has a handle and the CLI deliberately
+  does not. It returns presence and a character count and has no field a value fits in.
+  Removal has no transport condition at all: a delete carries nothing towards the wire, and
+  gating it would refuse a remote operator the one action that makes a leaked key harmless.
+
 - **The value cannot enter a sandbox, and it is a test rather than a promise.** The wire
   has no field for it (`claimedJobSchema` strips one), so it cannot reach a runner; the
   runner is the only thing that builds `docker run`; and nothing the runner mounts contains
