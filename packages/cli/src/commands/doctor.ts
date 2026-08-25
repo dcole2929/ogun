@@ -4,7 +4,14 @@ import { stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
-import { imageState, listProjectSecrets, loadLocalConfig, localConfigPath } from '@ogun/core'
+import {
+  describeGrant,
+  imageState,
+  listOAuthApps,
+  listProjectSecrets,
+  loadLocalConfig,
+  localConfigPath,
+} from '@ogun/core'
 import { caState, credentialStatuses, readCredentials } from '@ogun/gateway'
 import { bold, cyan, dim, green, red, yellow } from '../output.ts'
 import { authHeaders } from '../auth.ts'
@@ -94,6 +101,72 @@ export async function projectSecrets(path = localConfigPath()): Promise<Check> {
           'a poller reads that as a key that exists and does not work. Set it again',
     fatal: false,
   }
+}
+
+/**
+ * Which projects are connected to Linear as an application, and how long each grant lasts
+ * (ADR-0014).
+ *
+ * A separate check from `project secrets` above rather than a column on it, because the
+ * two answer different questions and one of them is not a yes/no. A personal key is
+ * present or it is not; a grant has an application, a workspace, a set of scopes and an
+ * expiry, and the whole point of connecting is to be able to see *which workspace Ogun is
+ * acting in* and *as whom*. Folding that into "linear: set" would give back exactly the
+ * information the flow exists to make visible.
+ *
+ * **It reports what is stored, never what is missing** — the same limit `projectSecrets`
+ * states, for the same reason. `doctor` reads no repositories, so it cannot know which
+ * projects have a `sources:` block that needs one.
+ *
+ * The line that earns this function is the shadowed key. A project with both a grant and a
+ * personal key authenticates with the grant (`readProjectSecret` decides, once), and an
+ * operator debugging a poll failure by rotating the key would be changing something
+ * nothing reads. Saying it here is the cheapest possible place to say it.
+ *
+ * Never fatal, and `warn` is reserved for the two states a person has to act on: an
+ * application registered but never connected, and an entry this build cannot read. An
+ * expired access token is *not* one of them — the next poll renews it, which is what
+ * `describeGrant` says out loud.
+ */
+export async function linearGrants(path = localConfigPath(), now = Date.now()): Promise<Check[]> {
+  const apps = await listOAuthApps(path).catch((err: Error) => err)
+  if (apps instanceof Error) {
+    return [{ name: 'linear oauth', ok: false, detail: apps.message, fatal: false }]
+  }
+  if (apps.length === 0) return []
+
+  const keyed = new Set(
+    (await listProjectSecrets(path).catch(() => [])).map((s) => `${s.project}/${s.name}`),
+  )
+
+  return apps.map((app) => {
+    if (app.malformed !== undefined) {
+      return {
+        name: `${app.provider} ${app.project}`,
+        ok: false,
+        // Named as an entry problem rather than a credential problem: the fix is to
+        // reconnect this one project, and nothing else on the machine is affected.
+        detail: `the stored entry is not a shape this build can read (${app.malformed}) — reconnect`,
+        fatal: false,
+      }
+    }
+    const health = describeGrant(app.expiresAt, now)
+    const where = app.workspace ? ` in ${app.workspace.name}` : ''
+    const asWhom = app.actor === 'app' ? 'as the app' : app.actor === 'user' ? 'as you' : ''
+    const shadowed = keyed.has(`${app.project}/${app.provider}`)
+      ? ' — an api key is also stored for this project and is NOT being used'
+      : ''
+    return {
+      name: `${app.provider} ${app.project}`,
+      ok: app.connected,
+      detail: app.connected
+        ? `${health.detail}${where}${asWhom ? `, ${asWhom}` : ''}` +
+          `${app.scopes.length > 0 ? `, scopes: ${app.scopes.join(' ')}` : ''}${shadowed}`
+        : `application ${app.clientId} registered, never connected — ` +
+          `\`ogun project linear connect ${app.project}\``,
+      fatal: false,
+    }
+  })
 }
 
 /**
@@ -270,6 +343,9 @@ export async function doctor(serverUrl: string): Promise<void> {
   // Same file, different question: the mode above is who can read it, this is what is in
   // it for a project rather than for this machine.
   checks.push(await projectSecrets())
+  // Same store, the other credential shape. Listed after the keys so the two read as one
+  // answer to "what can this machine authenticate to Linear with" (ADR-0014).
+  checks.push(...(await linearGrants()))
   checks.push(await sandboxImage())
 
   // The gateway is what a sandbox authenticates through, so "can this box run a job" now

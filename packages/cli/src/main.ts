@@ -4,6 +4,7 @@ import { helpFor, isHelpFlag, usage } from './help.ts'
 import { doctor } from './commands/doctor.ts'
 import { projectAdd, projectList, projectSync } from './commands/project.ts'
 import { projectSecret } from './commands/secrets.ts'
+import { projectLinear } from './commands/linear.ts'
 import { coverage, runsList, trigger } from './commands/runs.ts'
 import {
   checkCitations,
@@ -83,6 +84,10 @@ try {
       // function, but only from a transport that can carry a key — so this path is the one
       // that works with the database down, before `ogun init`, and over SSH.
       else if (sub === 'secret' || sub === 'secrets') await projectSecret(rest)
+      // `linear` does reach the server, unlike `secret` above, and the asymmetry is
+      // explained where the command lives: the CSRF nonce that protects an authorization
+      // and the callback that consumes it both live in the control-plane process.
+      else if (sub === 'linear') await projectLinear(rest, serverUrl)
       else if (sub === 'list' || sub === undefined) await projectList(serverUrl)
       else unknownSub('project', sub)
       break

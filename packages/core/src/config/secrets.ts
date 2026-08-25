@@ -8,7 +8,12 @@ import {
 } from './machine.ts'
 
 /**
- * A project's own API keys — the ones nobody's machine already has.
+ * A project's own credentials — the ones nobody's machine already has.
+ *
+ * Two shapes now, in two blocks of one file: a personal API key a person typed
+ * (`secrets`, ADR-0012), and an OAuth grant Ogun obtained for itself (`oauth`, ADR-0014).
+ * One module reads and writes both, and one function — `readProjectSecret` — decides which
+ * of them a poll authenticates with, so precedence exists in exactly one place.
  *
  * `gh` and `claude` are on the host because a human logged in with them, so ADR-0010 only
  * had to decide *who reads the file*. A Linear key is not like that: it is issued per
@@ -52,6 +57,24 @@ import {
  * with no evidence anywhere connecting the two.
  *
  * A name is added here when the code that reads it lands, not before.
+ *
+ * ### Why the OAuth client secret is *not* a name here
+ *
+ * It is the obvious candidate — a value a human types, stored on this machine, used to
+ * authenticate — and adding `linear-oauth-client-secret` was the first shape tried. It is
+ * wrong, and it fails through the exact door this closed set was built to close.
+ *
+ * These names are what the Settings page renders in a dropdown and what `list` reports as
+ * `set`. A client secret stored on its own is not a credential: it authenticates nothing
+ * without the client id beside it and a grant obtained with the pair. So an operator would
+ * paste one, see the row go green, see `ogun project secret list` agree, and have a
+ * project that authenticates to nothing — "a secret nothing reads looks exactly like one
+ * that works, right up until the night it mattered", arriving through the listing that
+ * sentence is written under.
+ *
+ * So the closed set stays closed and stays about *values used verbatim as credentials*.
+ * The application is written as a unit by the connect flow, which registers the id and the
+ * secret together and proves the pair by spending it — see `setOAuthApp` below.
  */
 export const SECRET_NAMES = ['linear'] as const
 export type SecretName = (typeof SECRET_NAMES)[number]
@@ -103,12 +126,23 @@ export function sealSecret(value: string): Secret {
 }
 
 /**
- * What reading a project's secret can tell you, kept as four separate facts.
+ * What reading a project's credential can tell you, kept as separate facts.
  *
  * Principle 6 in its narrowest form. A poller that cannot tell these apart has one
- * behaviour for all of them — stop, log "no Linear key" — and three of the four are then
+ * behaviour for all of them — stop, log "no Linear key" — and all but one are then
  * misreported:
  *
+ *  - `granted` — an OAuth grant (ADR-0014). Sent as `Bearer`, and it **wins over an API
+ *    key**; `apiKeyIgnored` says whether one is sitting behind it, because an operator
+ *    rotating a key that nothing reads is an hour gone.
+ *  - `unconnected` — an OAuth application is registered for this project, nobody finished
+ *    the authorization, and there is no key to fall back to. The fix is a browser rather
+ *    than a terminal, and reporting it as `absent` would send somebody who has already
+ *    done half the work off to paste a personal key instead.
+ *  - `malformed` — this project's OAuth entry is not a shape this build can read. Kept
+ *    apart from `unreadable` below because the fix is to reconnect one project, where
+ *    `unreadable` means a config.json that is currently failing to parse for everything
+ *    on the machine.
  *  - `absent` — nobody has set one. The fix is `ogun project secret set`.
  *  - `empty` — an entry exists and holds nothing. Only reachable by hand-editing the
  *    file, which §4.5 says people do, and the write path here refuses to create it. It is
@@ -122,9 +156,12 @@ export function sealSecret(value: string): Secret {
  *  - `present` — and even then the value only arrives sealed.
  */
 export type ProjectSecret =
+  | { state: 'granted'; grant: OAuthGrant; apiKeyIgnored: boolean }
   | { state: 'present'; secret: Secret }
+  | { state: 'unconnected'; clientId: string }
   | { state: 'absent' }
   | { state: 'empty' }
+  | { state: 'malformed'; reason: string }
   | { state: 'unreadable'; reason: string }
 
 /**
@@ -132,9 +169,33 @@ export type ProjectSecret =
  *
  * ```ts
  * const key = await readProjectSecret(project.slug, 'linear')
+ * if (key.state === 'granted') return bearer(key.grant)    // ADR-0014, and it wins
  * if (key.state !== 'present') return skipped(key.state)   // never a throw, never a retry
- * headers.set('authorization', key.secret.expose())
+ * headers.set('authorization', key.secret.expose())        // raw, with no prefix
  * ```
+ *
+ * ### Precedence lives here, in one function, so it cannot be decided twice
+ *
+ * **An OAuth grant wins over a personal API key.** The alternative was seriously
+ * considered — prefer whichever was set most recently, or prefer the key on the grounds
+ * that it is what the operator most recently touched — and both lose to the same argument.
+ * A grant exists only because somebody deliberately ran an authorization flow and a
+ * workspace admin approved an application; a personal key is very often a leftover from
+ * before that, still in the store because nothing asked for it to be removed. Preferring
+ * the leftover would mean a connection an operator just made silently does nothing, and
+ * — once write-back lands — that every comment Ogun posts appears under their own name
+ * after they connected an application precisely so that it would not.
+ *
+ * Falling *back* to a key when a grant has expired is the other tempting rule, and it is
+ * rejected outright. A grant whose refresh has stopped working is a fact the operator has
+ * to see; quietly authenticating as a person instead hides a broken connection behind a
+ * working poll, and changes who Linear attributes writes to without anyone asking. A dead
+ * grant refuses the poll and names the credential that died.
+ *
+ * A refresh is deliberately **not** here. It needs a network round trip and a write, and
+ * both belong to the caller: this function is called by a loop at 3am whose nearest
+ * `catch` would report a failed token exchange as "Linear is unreachable" — the exact
+ * misnaming the four states existed to prevent.
  *
  * Async and unmemoised on purpose. A rotation is a file write (`ogun project secret set`
  * again), and the whole point of rotating in place is that the next poll picks it up
@@ -156,9 +217,28 @@ export async function readProjectSecret(
   if (store.state === 'unreadable') return { state: 'unreadable', reason: store.reason }
 
   const stored = store.config.secrets[projectSlug]?.[name]
-  if (stored === undefined) return { state: 'absent' }
-  if (stored.trim() === '') return { state: 'empty' }
-  return { state: 'present', secret: sealSecret(stored) }
+  const apiKey: ProjectSecret =
+    stored === undefined
+      ? { state: 'absent' }
+      : stored.trim() === ''
+        ? { state: 'empty' }
+        : { state: 'present', secret: sealSecret(stored) }
+
+  const raw = store.config.oauth[projectSlug]?.[name]
+  if (raw === undefined) return apiKey
+
+  const app = parseOAuthApp(raw)
+  if (!app.ok) return { state: 'malformed', reason: app.reason }
+  if (app.app.grant) {
+    return { state: 'granted', grant: app.app.grant, apiKeyIgnored: apiKey.state === 'present' }
+  }
+  /**
+   * Registered but never authorized. A key beside it still works and is *not* shadowed by
+   * an application nobody has connected: this is the ordinary state of a project halfway
+   * through the migration, and refusing it would break a working poll to make a point.
+   */
+  if (apiKey.state === 'present') return apiKey
+  return { state: 'unconnected', clientId: app.app.clientId }
 }
 
 /**
@@ -358,3 +438,448 @@ async function readStore(path: string): Promise<Store> {
     return { state: 'unreadable', reason: (err as Error).message }
   }
 }
+
+// ── an OAuth grant, which is the other way a project authenticates ─────────
+
+/**
+ * The application a project's OAuth grant belongs to, as it sits in the store.
+ *
+ * `clientId` is deliberately a plain string and the two token fields are not. A client id
+ * is in every authorization URL the operator's browser visits and on Linear's own settings
+ * page; treating it as a secret would mean `doctor` and the Settings page could not say
+ * *which* application a project is connected as, which is the first question the moment
+ * two workspaces are involved. The client secret, the access token and the refresh token
+ * are sealed by the same `Secret` the API key uses, for the same reason.
+ *
+ * `redirectUri` is stored rather than derived. The token exchange has to send the *same*
+ * `redirect_uri` the authorization used and Linear enforces that, so the value that was
+ * actually used must survive the round trip. It is also the string the operator pasted
+ * into Linear's registration form, and showing it back is how a mismatch — the classic
+ * failure of this flow, and the one Linear's own error is least helpful about — becomes
+ * something you can see instead of something you guess at.
+ */
+export type OAuthApp = {
+  clientId: string
+  clientSecret: Secret
+  redirectUri: string
+  /** Absent until somebody completes the authorization. A registered application is not a
+   *  connection, and the two must never render as the same thing. */
+  grant: OAuthGrant | undefined
+}
+
+/**
+ * What Linear handed back, kept as the facts rather than as the response.
+ *
+ * The two tokens are sealed and everything beside them is not, and that split is the whole
+ * reason this is a record in its own block rather than a JSON blob in the `secrets` map.
+ * `doctor` prints `oauth, 7h left`, the Settings page shows the workspace and the scopes,
+ * and the poll decides whether to refresh — all from fields that are not credentials. If
+ * the expiry lived inside an opaque sealed string, every one of those callers would have
+ * to `expose()` a token to read the number next to it, and ADR-0012's "expose() appears
+ * once per consumer, at the wire" would be false by construction.
+ *
+ * `expiresAt` is absolute ms, not the `expires_in` seconds Linear sends. A duration is
+ * only true at the instant it was received: stored raw, a config.json read after a restart
+ * would say the token has 24 hours left forever. `CredentialExpiry`'s `{ kind: 'at' }`
+ * made the same choice for the same reason, and this converts into it.
+ *
+ * `scopes` is what Linear *granted*, taken from the token response, because there is no
+ * introspection endpoint anywhere in their API — the token response is the only place
+ * granted scopes are ever reported. A grant that does not record them can never answer
+ * "may this token comment?" except by trying it and reading the failure.
+ *
+ * `appUserId` is `viewer.id` under `actor=app`, which Linear's agent documentation asks
+ * integrations to store beside the token so an app can recognise its own writes in a
+ * workspace. Nothing reads it yet. It is recorded now because it is only obtainable while
+ * holding a live token, and the write path that could obtain it runs once.
+ */
+export type OAuthGrant = {
+  clientId: string
+  access: Secret
+  refresh: Secret
+  /** Absolute, ms since epoch. */
+  expiresAt: number
+  obtainedAt: number
+  /** As granted, not as requested. */
+  scopes: string[]
+  /** `app` or `user` — who Linear attributes a write to. Fixed at authorization time. */
+  actor: string
+  workspace?: { id: string; name: string; urlKey: string }
+  appUserId?: string
+}
+
+/**
+ * The application, including its client secret — for the two writers that need it.
+ *
+ * Separate from `readProjectSecret` because it answers a different question for a
+ * different audience. The poll asks "what do I authenticate with" and must never be handed
+ * a client secret it has no use for; the token exchange and the refresh ask "what
+ * application is this" and need the secret precisely because they are the wire. Keeping
+ * them apart means there is exactly one caller of `clientSecret.expose()`, in one file.
+ */
+export type ProjectOAuth =
+  | { state: 'present'; app: OAuthApp }
+  | { state: 'absent' }
+  | { state: 'malformed'; reason: string }
+  | { state: 'unreadable'; reason: string }
+
+export async function readOAuthApp(
+  projectSlug: string,
+  provider: SecretName,
+  path = localConfigPath(),
+): Promise<ProjectOAuth> {
+  const store = await readStore(path)
+  if (store.state === 'missing') return { state: 'absent' }
+  if (store.state === 'unreadable') return { state: 'unreadable', reason: store.reason }
+  const raw = store.config.oauth[projectSlug]?.[provider]
+  if (raw === undefined) return { state: 'absent' }
+  const parsed = parseOAuthApp(raw)
+  return parsed.ok
+    ? { state: 'present', app: parsed.app }
+    : { state: 'malformed', reason: parsed.reason }
+}
+
+/**
+ * Register (or replace) the application a project connects through.
+ *
+ * **An existing grant survives a change of client secret and does not survive a change of
+ * client id.** That asymmetry is the whole of this function. Rotating a secret in Linear's
+ * settings leaves every token that application already issued working, so dropping the
+ * grant would force an unnecessary reconnect — and a reconnect under `actor=app` needs a
+ * workspace admin, who may well not be the person doing the rotation. Pointing the project
+ * at a *different* application makes the stored tokens dead on arrival: they were minted by
+ * an application this project no longer uses, and keeping them would leave a connection
+ * that reports as healthy and 401s on the next poll. That is the state ADR-0012 keeps
+ * `empty` separate from `absent` to avoid, one field over.
+ */
+export async function setOAuthApp(
+  projectSlug: string,
+  provider: SecretName,
+  app: { clientId: string; clientSecret: string; redirectUri: string },
+  path = localConfigPath(),
+): Promise<{ grantKept: boolean }> {
+  let grantKept = false
+  await updateLocalConfig((config) => {
+    const existing = config.oauth[projectSlug]?.[provider]
+    const parsed = isRecord(existing) ? parseOAuthApp(existing) : undefined
+    const keep =
+      parsed?.ok === true && parsed.app.grant && parsed.app.clientId === app.clientId
+        ? (existing as Record<string, unknown>).grant
+        : undefined
+    grantKept = keep !== undefined
+    return {
+      ...config,
+      oauth: {
+        ...config.oauth,
+        [projectSlug]: {
+          ...config.oauth[projectSlug],
+          [provider]: {
+            clientId: app.clientId,
+            clientSecret: app.clientSecret,
+            redirectUri: app.redirectUri,
+            ...(keep === undefined ? {} : { grant: keep }),
+          },
+        },
+      },
+    }
+  }, path)
+  return { grantKept }
+}
+
+export class NoOAuthApp extends Error {}
+
+/**
+ * Write the tokens an authorization or a refresh produced.
+ *
+ * Merged into whatever the store holds *at the moment of the write*, inside
+ * `updateLocalConfig`'s lock, rather than written over a copy read earlier. That is not
+ * ceremony. A refresh reads the grant, spends a network round trip, and writes — and in
+ * that window `ogun project add`, a runner joining, or an admin-token rotation can each
+ * rewrite the same file. ADR-0010 rejected refreshing a *borrowed* credential partly
+ * because two writers race over a file neither of them locks; this credential is Ogun's
+ * own, this file has exactly one writer, and that is the difference which makes refreshing
+ * safe here and unsafe there.
+ *
+ * Refuses when no application is registered. A grant with no client id and secret beside
+ * it can never be refreshed, so storing one would create a connection with a 24-hour
+ * lifetime and no way to renew it — which looks identical to a healthy one until tomorrow.
+ */
+export async function storeOAuthGrant(
+  projectSlug: string,
+  provider: SecretName,
+  grant: {
+    accessToken: string
+    refreshToken: string
+    expiresAt: number
+    obtainedAt: number
+    scopes: string[]
+    actor: string
+    workspace?: { id: string; name: string; urlKey: string }
+    appUserId?: string
+  },
+  path = localConfigPath(),
+): Promise<void> {
+  await updateLocalConfig((config) => {
+    const existing = config.oauth[projectSlug]?.[provider]
+    const parsed = isRecord(existing) ? parseOAuthApp(existing) : undefined
+    if (parsed?.ok !== true) {
+      throw new NoOAuthApp(
+        `no ${provider} oauth application is registered for "${projectSlug}" on this ` +
+          'machine, so a grant stored now could never be refreshed. Register the ' +
+          'application first',
+      )
+    }
+    return {
+      ...config,
+      oauth: {
+        ...config.oauth,
+        [projectSlug]: {
+          ...config.oauth[projectSlug],
+          [provider]: { ...(existing as Record<string, unknown>), grant },
+        },
+      },
+    }
+  }, path)
+}
+
+/**
+ * Disconnect: forget the tokens, keep the application.
+ *
+ * Two functions rather than one flag, because they undo two different acts. Disconnecting
+ * is "stop acting in that workspace", and reconnecting afterwards is one click because the
+ * client id and secret are still here. Forgetting the application is "this project no
+ * longer has a Linear app", and it takes the grant with it — a grant outliving the
+ * credentials that could refresh it is exactly the unrefreshable connection
+ * `storeOAuthGrant` refuses to create.
+ *
+ * Neither revokes anything at Linear, because neither can: revocation is a network call
+ * with its own failure modes, and a local forget that depended on a remote call succeeding
+ * would leave an operator unable to remove a credential from their own machine while
+ * Linear was down. The route above this does attempt a revoke first, and forgets either
+ * way.
+ */
+export async function clearOAuthGrant(
+  projectSlug: string,
+  provider: string,
+  path = localConfigPath(),
+): Promise<boolean> {
+  let existed = false
+  await updateLocalConfig((config) => {
+    const entry = config.oauth[projectSlug]?.[provider]
+    if (!isRecord(entry) || entry.grant === undefined) return config
+    existed = true
+    const { grant: _dropped, ...rest } = entry
+    return {
+      ...config,
+      oauth: {
+        ...config.oauth,
+        [projectSlug]: { ...config.oauth[projectSlug], [provider]: rest },
+      },
+    }
+  }, path)
+  return existed
+}
+
+/**
+ * Forget the application entirely, grant included.
+ *
+ * `provider` is a plain string rather than a `SecretName`, for the reason
+ * `clearProjectSecret` gives: §4.5 says this file gets hand-edited, the listing reports
+ * whatever it finds, and a row a person can see has to be a row they can remove. A closed
+ * set guards writes, where an unknown name creates a credential nothing reads; there is
+ * nothing to guard on the way out.
+ */
+export async function clearOAuthApp(
+  projectSlug: string,
+  provider: string,
+  path = localConfigPath(),
+): Promise<boolean> {
+  let existed = false
+  await updateLocalConfig((config) => {
+    const entries = config.oauth[projectSlug]
+    if (!entries || !(provider in entries)) return config
+    existed = true
+    const { [provider]: _removed, ...rest } = entries
+    const { [projectSlug]: _project, ...others } = config.oauth
+    return {
+      ...config,
+      oauth: Object.keys(rest).length > 0 ? { ...others, [projectSlug]: rest } : others,
+    }
+  }, path)
+  return existed
+}
+
+/**
+ * Which projects have an application, and what state its connection is in — never a token.
+ *
+ * The same structural rule as `ProjectSecretPresence`, and it matters more here because
+ * there is more to say: this type has room for a workspace name, a scope list and an
+ * expiry, and no field that any of the three secrets would fit in. `clientSecretSet` is a
+ * boolean for exactly that reason — the honest thing to report is whether one is stored,
+ * and a future editor cannot widen a boolean into a disclosure.
+ *
+ * `expiresAt` is here and is not a secret. It is the number `doctor` and the Settings page
+ * print as "7h left", and withholding it would leave both of them able to say "connected"
+ * and unable to say whether the connection will survive tonight.
+ */
+export type ProjectGrantPresence = {
+  project: string
+  provider: string
+  clientId: string
+  clientSecretSet: boolean
+  redirectUri: string
+  connected: boolean
+  scopes: string[]
+  actor: string
+  expiresAt?: number
+  obtainedAt?: number
+  workspace?: { id: string; name: string; urlKey: string }
+  /** The entry is in the file and this build cannot read it. Not the same as absent. */
+  malformed?: string
+}
+
+export async function listOAuthApps(path = localConfigPath()): Promise<ProjectGrantPresence[]> {
+  const store = await readStore(path)
+  if (store.state === 'missing') return []
+  if (store.state === 'unreadable') throw new LocalConfigError(store.reason)
+
+  return Object.entries(store.config.oauth)
+    .flatMap(([project, providers]) =>
+      Object.entries(providers).map(([provider, raw]): ProjectGrantPresence => {
+        const parsed = parseOAuthApp(raw)
+        if (!parsed.ok) {
+          return {
+            project,
+            provider,
+            clientId: '',
+            clientSecretSet: false,
+            redirectUri: '',
+            connected: false,
+            scopes: [],
+            actor: '',
+            malformed: parsed.reason,
+          }
+        }
+        const { app } = parsed
+        return {
+          project,
+          provider,
+          clientId: app.clientId,
+          // The one `expose()` that is not at a wire, and it is here because the
+          // alternative is worse: carrying an "is it blank" boolean through the parser
+          // means a second field that can disagree with the value it describes.
+          clientSecretSet: app.clientSecret.expose().trim() !== '',
+          redirectUri: app.redirectUri,
+          connected: app.grant !== undefined,
+          scopes: app.grant?.scopes ?? [],
+          actor: app.grant?.actor ?? '',
+          ...(app.grant
+            ? { expiresAt: app.grant.expiresAt, obtainedAt: app.grant.obtainedAt }
+            : {}),
+          ...(app.grant?.workspace ? { workspace: app.grant.workspace } : {}),
+        }
+      }),
+    )
+    .sort((a, b) => a.project.localeCompare(b.project) || a.provider.localeCompare(b.provider))
+}
+
+/**
+ * The stored shape, parsed by hand and never by zod.
+ *
+ * The same rule as the secrets route's request body, for the same reason: a validator that
+ * echoes what it received is one dependency bump away from a leak, and every string in this
+ * object is either a credential or sits beside one. `zod@3` put the received value into an
+ * `invalid_enum_value` issue; `zod@4` does not, for the codes this shape would produce —
+ * and the distance between those two facts is a version range in a lockfile. Nothing below
+ * quotes a value: a failure names the field and what was expected there.
+ *
+ * Total, and permissive about fields it does not know. A grant written by a newer build
+ * must not make an older one report the project as disconnected, so unknown keys are
+ * ignored and only the fields this build actually uses are required.
+ */
+type ParsedApp = { ok: true; app: OAuthApp } | { ok: false; reason: string }
+
+function parseOAuthApp(raw: unknown): ParsedApp {
+  if (!isRecord(raw)) return { ok: false, reason: 'the entry is not an object' }
+  const { clientId, clientSecret, redirectUri } = raw
+  if (typeof clientId !== 'string' || clientId.trim() === '') {
+    return { ok: false, reason: 'clientId is missing or not a string' }
+  }
+  if (typeof clientSecret !== 'string') {
+    return { ok: false, reason: 'clientSecret is missing or not a string' }
+  }
+  if (typeof redirectUri !== 'string' || redirectUri.trim() === '') {
+    return { ok: false, reason: 'redirectUri is missing or not a string' }
+  }
+
+  const app: OAuthApp = {
+    clientId,
+    clientSecret: sealSecret(clientSecret),
+    redirectUri,
+    grant: undefined,
+  }
+  if (raw.grant === undefined) return { ok: true, app }
+
+  const g = raw.grant
+  if (!isRecord(g)) return { ok: false, reason: 'grant is not an object' }
+  const { accessToken, refreshToken, expiresAt } = g
+  if (typeof accessToken !== 'string' || accessToken.trim() === '') {
+    return { ok: false, reason: 'grant.accessToken is missing or not a string' }
+  }
+  /**
+   * A refresh token is required, not optional, even though the access token alone would
+   * authenticate a poll for the next few hours. A grant that cannot be refreshed is a
+   * connection with a 24-hour life and no symptom until it ends — and Linear's
+   * client-credentials flow does return a token with no refresh token beside it, so this
+   * is the shape a plausible future edit would write.
+   */
+  if (typeof refreshToken !== 'string' || refreshToken.trim() === '') {
+    return { ok: false, reason: 'grant.refreshToken is missing or not a string' }
+  }
+  /**
+   * Required, and required to be finite. A grant whose expiry cannot be read is a token
+   * this build would either refresh on every poll or never refresh at all, depending on
+   * which way a `NaN` falls through a comparison — and both are silent. Calling the entry
+   * malformed and asking for a reconnect costs thirty seconds and says what happened.
+   */
+  if (typeof expiresAt !== 'number' || !Number.isFinite(expiresAt)) {
+    return { ok: false, reason: 'grant.expiresAt is missing or not a number' }
+  }
+
+  return {
+    ok: true,
+    app: {
+      ...app,
+      grant: {
+        clientId,
+        access: sealSecret(accessToken),
+        refresh: sealSecret(refreshToken),
+        expiresAt,
+        obtainedAt: typeof g.obtainedAt === 'number' ? g.obtainedAt : 0,
+        // Tolerated rather than required: a grant with no recorded scopes came from a build
+        // that did not record them, and reporting "connected, scopes unknown" beats
+        // refusing to poll over a field nothing authenticates with.
+        scopes: Array.isArray(g.scopes)
+          ? g.scopes.filter((s): s is string => typeof s === 'string')
+          : [],
+        actor: typeof g.actor === 'string' ? g.actor : '',
+        ...(isRecord(g.workspace) &&
+        typeof g.workspace.id === 'string' &&
+        typeof g.workspace.name === 'string' &&
+        typeof g.workspace.urlKey === 'string'
+          ? {
+              workspace: {
+                id: g.workspace.id,
+                name: g.workspace.name,
+                urlKey: g.workspace.urlKey,
+              },
+            }
+          : {}),
+        ...(typeof g.appUserId === 'string' ? { appUserId: g.appUserId } : {}),
+      },
+    },
+  }
+}
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value)

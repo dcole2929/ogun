@@ -4,7 +4,11 @@ import { and, eq } from 'drizzle-orm'
 import { schema } from '@ogun/core/db'
 import { sealSecret, singleWorkerCycle, sourceSchema, type Ticket } from '@ogun/core'
 import { pollSource, pollSources, type SourceDeps } from '../src/foreman/sources.ts'
-import { LinearUnavailable, type LinearApi } from '../src/integrations/linear.ts'
+import {
+  LinearUnavailable,
+  type LinearApi,
+  type LinearCredential,
+} from '../src/integrations/linear.ts'
 import { reindexProject, ConfigInvalid } from '../src/reindex.ts'
 import { startHarness } from './harness.ts'
 import { fixtureApi } from './linear-fixtures.ts'
@@ -331,6 +335,116 @@ describe('a source', () => {
     assert.equal(result.outcome, 'refused')
     assert.match(result.detail ?? '', /secret store could not be read/)
     assert.match(result.detail ?? '', /probably still there/)
+  })
+
+  /**
+   * The property: a poll authenticating with an OAuth grant sends a `Bearer` token, and
+   * the refresh decision runs **before** the first request rather than after a 401
+   * (ADR-0014).
+   *
+   * Two mistakes are being fixed here and both are silent. Passing the grant's access
+   * token to the client as if it were a personal key produces a well-formed request and an
+   * `AUTHENTICATION_ERROR` — the same code Linear answers a revoked credential with — so
+   * the symptom is "your connection stopped working". And skipping the refresh means the
+   * poll spends a request to discover what the expiry field already said, on a poller whose
+   * ordinary state at 3am is a token that died some hours ago.
+   */
+  test('a granted project polls with a bearer token, renewed before the request', async () => {
+    const { row, config } = await source('granted')
+    let built: LinearCredential | undefined
+    const result = await pollSource(db, row, config, {
+      secrets: async () => ({
+        state: 'granted',
+        apiKeyIgnored: false,
+        grant: {
+          clientId: 'client-1',
+          access: sealSecret('access-stale'),
+          refresh: sealSecret('refresh-1'),
+          // Already dead, which is the normal state of a token when a nightly poller wakes.
+          expiresAt: Date.now() - 60 * 60 * 1000,
+          obtainedAt: Date.now() - 25 * 60 * 60 * 1000,
+          scopes: ['read'],
+          actor: 'app',
+          workspace: { id: 'org-1', name: 'Acme', urlKey: 'acme' },
+        },
+      }),
+      grant: async () => ({
+        state: 'ready',
+        credential: { kind: 'oauth', token: 'access-fresh', workspace: 'Acme' },
+        expiresAt: Date.now() + 86_400_000,
+        refreshed: true,
+      }),
+      linear: (credential) => {
+        built = credential
+        return fixtureApi([{ tickets: [], next: undefined }])
+      },
+    })
+
+    assert.equal(result.outcome, 'ok')
+    // The renewed token, not the stale one that came out of the store.
+    assert.deepEqual(built, { kind: 'oauth', token: 'access-fresh', workspace: 'Acme' })
+  })
+
+  /**
+   * The property: a connection that cannot be renewed **refuses** the poll rather than
+   * quietly falling back to a personal API key that is still in the store.
+   *
+   * The fallback is the tempting behaviour — the key is right there and the poll would
+   * succeed — and it is wrong twice. It hides a broken connection behind a working poll,
+   * so nothing ever tells the operator to reconnect; and it silently changes who Linear
+   * attributes activity to, which is the exact property the operator connected an
+   * application in order to control.
+   */
+  test('a dead grant refuses the poll instead of falling back to a stored api key', async () => {
+    const { row, config } = await source('dead-grant')
+    const result = await pollSource(db, row, config, {
+      secrets: async () => ({
+        state: 'granted',
+        apiKeyIgnored: true,
+        grant: {
+          clientId: 'client-1',
+          access: sealSecret('access-stale'),
+          refresh: sealSecret('refresh-revoked'),
+          expiresAt: Date.now() - 60 * 60 * 1000,
+          obtainedAt: 0,
+          scopes: ['read'],
+          actor: 'app',
+        },
+      }),
+      grant: async () => ({
+        state: 'refused',
+        detail: 'the linear connection for "sources" could not be renewed: linear refused the grant',
+      }),
+      linear: () => {
+        throw new Error('the poll must not authenticate with anything after a dead grant')
+      },
+    })
+
+    assert.equal(result.outcome, 'refused')
+    const [poll] = await pollsFor('dead-grant')
+    assert.match(poll?.detail ?? '', /could not be renewed/)
+  })
+
+  /**
+   * The property: an application registered but never connected gets its own refusal.
+   *
+   * Reported as `absent`, the message tells the operator to run `ogun project secret set` —
+   * sending somebody who has done most of the work of connecting an application back to
+   * the credential they were migrating off. Principle 6 again: this remedy is a browser,
+   * and no other state's sentence names one.
+   */
+  test('an application nobody finished connecting is refused with the connect command', async () => {
+    const { row, config } = await source('halfway')
+    const result = await pollSource(db, row, config, {
+      secrets: async () => ({ state: 'unconnected', clientId: 'client-1' }),
+      linear: () => {
+        throw new Error('the client must not be built without a credential')
+      },
+    })
+
+    assert.equal(result.outcome, 'refused')
+    assert.match(result.detail ?? '', /nobody has finished the authorization/)
+    assert.match(result.detail ?? '', /ogun project linear connect sources/)
   })
 
   test('records a linear failure as failed, distinct from a local refusal', async () => {

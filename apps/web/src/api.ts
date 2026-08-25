@@ -302,6 +302,42 @@ export type Drift = {
   what?: Array<'config' | 'skills'>
 }
 
+/**
+ * What a project's Linear connection looks like from outside (ADR-0014).
+ *
+ * There is no field a token would fit in, and that is the same structural rule as
+ * `projectSecrets` above rather than a habit: the server's `ProjectGrantPresence` carries a
+ * client id, a workspace, scopes and an expiry, and nothing else — so this page cannot
+ * render a credential by being handed one.
+ */
+export type LinearApp = {
+  project: string
+  provider: string
+  clientId: string
+  clientSecretSet: boolean
+  redirectUri: string
+  connected: boolean
+  scopes: string[]
+  actor: string
+  expiresAt?: number
+  obtainedAt?: number
+  workspace?: { id: string; name: string; urlKey: string }
+  /** The stored entry exists and this build cannot read it. Not the same as absent. */
+  malformed?: string
+}
+
+export type LinearOauth = {
+  apps: LinearApp[]
+  /** The exact callback URL to paste into Linear's registration form. */
+  redirectUri: string
+  registerUrl: string
+  scopes: string[]
+  actor: string
+  writesAllowed: boolean
+  /** Why the last connect attempt for a project failed, kept server-side, not in a URL. */
+  failures: Record<string, { reason: string; detail: string; at: number }>
+}
+
 /** The three things that stop work while every page still reports success. */
 export type Status = {
   runnersOnline: number
@@ -341,11 +377,11 @@ export const api = {
       method: 'POST',
     }),
   /**
-   * Store a project's API key. The only request in this client that carries a secret.
+   * Store a project's API key. One of two requests in this client that carry a secret.
    *
-   * The value is in the body and never in the path, because the path is what a server log
-   * and a proxy log record — `hono/logger` writes method, path and status, and nothing
-   * writes a body. The server refuses this outright unless the transport can carry it
+   * The value is in the body and never in the path, because the path — including its query
+   * string — is what a server log and a proxy log record, and nothing writes a body. The
+   * server refuses this outright unless the transport can carry it
    * (`projectSecretWrites`), so a page that renders the form on a control plane that will
    * not take one gets a 403 rather than a stored key.
    *
@@ -365,6 +401,53 @@ export const api = {
   removeProjectSecret: (project: string, name: string) =>
     json<{ removed: boolean }>(
       `/api/system/secrets/${encodeURIComponent(project)}/${encodeURIComponent(name)}`,
+      { method: 'DELETE' },
+    ),
+  /**
+   * Linear OAuth (ADR-0014): which projects have an application, and what state each
+   * connection is in.
+   *
+   * Separate from `system()` rather than folded into it, because they degrade differently.
+   * `GET /api/system` shells out to `git`, `docker`, `claude` and `codex` with ten-second
+   * timeouts; this reads one file. A Settings page that could not show the connection
+   * because a `docker --version` was hanging would be hiding the answer behind an
+   * unrelated question.
+   */
+  linearOauth: () => json<LinearOauth>('/api/oauth/linear'),
+  /**
+   * The client secret from Linear's registration form. The other request that carries one,
+   * and it goes through the same transport gate as `setProjectSecret` above and for the
+   * same reason: it is a credential in a third party's workspace, typed by a person.
+   *
+   * The response carries the redirect URI back deliberately. It is the string that has to
+   * be pasted into Linear's form, Linear matches it exactly, and a value retyped from
+   * memory differs by a trailing slash.
+   */
+  setLinearApp: (project: string, clientId: string, clientSecret: string) =>
+    json<{ project: string; clientId: string; redirectUri: string; grantKept: boolean }>(
+      `/api/oauth/linear/app/${encodeURIComponent(project)}`,
+      {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ clientId, clientSecret }),
+      },
+    ),
+  /**
+   * Mint a `state` and get the URL to send the browser to.
+   *
+   * The state is created by the server and never by this page: it is a CSRF nonce, and one
+   * generated in a bundle anybody can edit protects nothing. The page's whole part in it is
+   * to navigate to the URL it is handed.
+   */
+  startLinearConnect: (project: string) =>
+    json<{ authorizeUrl: string; redirectUri: string; scopes: string[]; actor: string }>(
+      `/api/oauth/linear/start/${encodeURIComponent(project)}`,
+      { method: 'POST' },
+    ),
+  /** `removed: false` means there was nothing there. `revoked` is a separate fact. */
+  disconnectLinear: (project: string, forgetApp: boolean) =>
+    json<{ removed: boolean; revoked: boolean; appForgotten: boolean }>(
+      `/api/oauth/linear/${encodeURIComponent(project)}${forgetApp ? '?app=true' : ''}`,
       { method: 'DELETE' },
     ),
   run: (id: string) => json<RunDetail>(`/api/runs/${id}`),

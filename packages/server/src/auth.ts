@@ -94,10 +94,17 @@ export const TLS_PROXY_ENV = 'OGUN_BEHIND_TLS_PROXY'
  * network panel. Both halves were re-checked against what this process actually does, and
  * only one thing survives:
  *
- *  - **Ogun's own log is not the leak.** `hono/logger` writes method, path and status.
- *    Nothing here logs a request body — which is also why the value goes in the body and
- *    never in the path: the path is the one part of a request this server does write to
- *    its journal.
+ *  - **Ogun's own log is not the leak.** Nothing here logs a request body — which is also
+ *    why the value goes in the body and never in the path: the request line is the part of
+ *    a request this server does write to its journal.
+ *
+ *    [corrected] That line used to say `hono/logger` "writes method, path and status". It
+ *    writes `url.slice(url.indexOf('/', 8))`, which is the path **and the query string**.
+ *    Nothing about this route changes — its value is in the body either way — but the
+ *    imprecision mattered the moment a route arrived whose *query* carries a credential,
+ *    and ADR-0014's callback is exempted from the logger because of it. Recorded rather
+ *    than quietly fixed: a paraphrase that was load-bearing somewhere else is worth
+ *    marking where it was first written down.
  *  - **A proxy's access log is the operator's configuration, not ours.** A real hazard,
  *    and one they chose and can see. Not having the feature does not remove their proxy;
  *    it only sends them to a terminal.
@@ -219,11 +226,26 @@ const RUNNER_ROUTES = [
 ]
 
 /**
- * Reachable while holding only an invite. `/join` is how a machine turns an invite into
- * a runner credential, so requiring a runner credential to reach it would be circular.
- * It validates the invite itself, and refuses a used or revoked one.
+ * Routes that carry their own credential, so requiring one of ours would be circular.
+ *
+ * `/runners/join` is how a machine turns an invite into a runner credential; it validates
+ * the invite itself and refuses a used or revoked one.
+ *
+ * `/oauth/linear/callback` is the same shape for a different reason, and it is worth
+ * spelling out because it looks like a hole. The session cookie is `SameSite=Strict`, and
+ * a redirect from `linear.app` back to this origin is a cross-site navigation — so the
+ * browser does not send it. Requiring the admin token here would make the OAuth flow
+ * impossible on every control plane that has one, which is every control plane bound
+ * beyond localhost, which is the deployment the feature exists for. What authenticates the
+ * request instead is the `state` nonce: 256 bits from `randomBytes`, minted by this
+ * process, bound to one project, single-use, and expiring in ten minutes. A callback that
+ * does not present a matching one is refused before the authorization code is spent.
  */
-const ENROLLMENT_ROUTES = [/^\/api\/runners\/join$/, /^\/api\/session$/]
+const ENROLLMENT_ROUTES = [
+  /^\/api\/runners\/join$/,
+  /^\/api\/session$/,
+  /^\/api\/oauth\/linear\/callback$/,
+]
 
 export const scopeForPath = (path: string): Scope | 'enrollment' =>
   ENROLLMENT_ROUTES.some((r) => r.test(path))

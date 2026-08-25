@@ -335,8 +335,64 @@ const topics: Record<string, Topic> = {
       ['add [dir]', 'tell this machine where a repo is checked out'],
       ['sync [dir]', "read the repo's .ogun/config.yaml and register it"],
       ['list', 'every project the control plane knows about (the default)'],
+      ['linear …', 'connect this project to Linear as an application (preferred)'],
       ['secret …', "an API key for this project, kept out of the repo"],
     ],
+  },
+
+  'project linear': {
+    summary: 'connect a project to Linear as an application, rather than as you',
+    usage: [
+      'ogun project linear app <project>',
+      'ogun project linear connect <project>',
+      'ogun project linear status [project]',
+      'ogun project linear disconnect <project> [--forget-app]',
+    ],
+    where:
+      'On the control-plane machine, because the control plane is what polls and what ' +
+      "receives Linear's callback. `status` reads this machine's config.json directly, so " +
+      'it answers even when the server is down; the other three need it running.',
+    notes: [
+      'This is the preferred way to authenticate. A personal API key makes every request ' +
+        'Ogun sends — and, once write-back lands, every comment it posts — appear as you, ' +
+        'on a board other people read, with no way to tell the machine apart. An ' +
+        'application acts as itself.',
+      'Ogun ships no client id: it is self-hosted, so each workspace registers its own ' +
+        'application at https://linear.app/settings/api/applications/new. `app` prints the ' +
+        'exact redirect callback URL to paste into that form — a mismatch there is the ' +
+        'classic failure of this flow, and the error Linear gives for it says nothing.',
+      'It asks for `read` and nothing else. Write scopes are added when the code that ' +
+        'needs them lands, not before, because a scope is approved by somebody reading a ' +
+        'consent screen.',
+      'It installs with `actor=app`, which is a workspace-level install Linear requires a ' +
+        'workspace admin to approve. If you are not an admin there, `ogun project secret ' +
+        'set <project> linear` still works and is still supported.',
+      'A connected project ignores any personal key it also has, and both `status` and ' +
+        '`runner doctor` say so — a key nothing reads is an evening spent rotating it.',
+      'Access tokens last 24 hours and are renewed by the poll that needs one, from a ' +
+        'refresh token that never leaves this machine. Nothing has to be running at any ' +
+        'particular time for that to work.',
+      'Neither the client secret nor a URL containing an authorization code goes on the ' +
+        'command line. argv is readable by `ps` and lands in your shell history; both are ' +
+        'read from prompts with the echo off.',
+    ],
+    flags: [
+      [
+        '--forget-app',
+        'on `disconnect`, also remove the client id and secret. Without it the ' +
+          'application stays registered and reconnecting is one command',
+      ],
+    ],
+    env: [
+      [
+        'OGUN_PUBLIC_URL',
+        'the address a browser reaches this control plane at, when it is not the one this ' +
+          'process sees — a reverse proxy terminating TLS. The redirect URI is built from ' +
+          'it, and Linear matches that string exactly',
+      ],
+    ],
+    touches: [[LOCAL_CONFIG, 'the oauth block, mode 0600, on this machine only']],
+    see: ['ogun project secret', 'ogun runner doctor'],
   },
 
   'project add': {
@@ -791,6 +847,7 @@ ${bold('projects')}
   ogun project add [dir] [--name]  tell this machine where a repo is checked out
   ogun project sync [dir]          read .ogun/config.yaml and register it
   ogun project list
+  ogun project linear <project>    connect a project to Linear as an application
   ogun project secret set <p> <n>  an API key for a project, read from stdin
   ogun project secret list         which projects have one — never the value
 
