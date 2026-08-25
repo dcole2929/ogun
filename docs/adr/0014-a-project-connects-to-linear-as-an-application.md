@@ -381,7 +381,7 @@ use is how someone spends an hour debugging the wrong one:
   becomes visibly unnecessary rather than invisibly load-bearing.
 
 - **The personal API key path is untouched and stays supported.** Every rule in ADR-0012
-  still holds for it, `ogun project secret set` still writes the file with no server running,
+  still holds for it, `ogun secret set linear` still writes the file with no server running,
   and the transport gate is unchanged. Removing it would strand any operator who is not an
   admin of their workspace, which is not a rare configuration.
 

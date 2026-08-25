@@ -437,8 +437,13 @@ function ProjectSecrets({
                 key anyway, which is the one thing this refusal is preventing. */}
             {writes.reason}
           </p>
+          {/* The whole command, redirection included. `ogun secret set linear` on its own
+              reads as complete and is not — the key arrives on stdin, and an operator who
+              copies a line that does not say so gets a hung terminal at a machine they had
+              to SSH into. --project rather than the directory default, because the control
+              plane that refused this write is the one least likely to have the repo on it. */}
           <pre className="md-code" style={{ fontSize: 11, marginBottom: 0 }}>
-            ogun project secret set &lt;project&gt; {writes.names[0] ?? 'linear'}
+            ogun secret set {writes.names[0] ?? 'linear'} --project &lt;slug&gt; &lt; key.txt
           </pre>
         </>
       )}

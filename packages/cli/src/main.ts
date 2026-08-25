@@ -3,7 +3,7 @@ import { cyan, fail, red } from './output.ts'
 import { helpFor, isHelpFlag, usage } from './help.ts'
 import { doctor } from './commands/doctor.ts'
 import { projectAdd, projectList, projectSync } from './commands/project.ts'
-import { projectSecret } from './commands/secrets.ts'
+import { secret } from './commands/secrets.ts'
 import { projectLinear } from './commands/linear.ts'
 import { coverage, runsList, trigger } from './commands/runs.ts'
 import {
@@ -79,17 +79,46 @@ try {
     case 'project':
       if (sub === 'add') await projectAdd(rest, serverUrl)
       else if (sub === 'sync') await projectSync(rest, serverUrl)
-      // `secret` reaches no server: the store is this machine's config.json, written
-      // directly (ADR-0012). The Settings page can write it too, through the same
-      // function, but only from a transport that can carry a key — so this path is the one
-      // that works with the database down, before `ogun init`, and over SSH.
-      else if (sub === 'secret' || sub === 'secrets') await projectSecret(rest)
-      // `linear` does reach the server, unlike `secret` above, and the asymmetry is
+      /**
+       * `ogun project secret` moved out to `ogun secret`, and this is a signpost rather
+       * than an alias.
+       *
+       * The namespace only ever existed to hold the `<project>` positional, and that
+       * positional is now inferred from the directory you are standing in. Nothing outside
+       * this repository calls the old spelling — it is two days old — so there is no
+       * compatibility to keep, and an alias would be a second shape to keep working
+       * forever. What there is instead is muscle memory, which outlives a release, and for
+       * that a bare "unknown subcommand" is a dead end.
+       */
+      else if (sub === 'secret' || sub === 'secrets') {
+        fail(
+          '`ogun project secret` is now `ogun secret`.\n' +
+            '  The project comes from the directory you are in, or from --project <slug>:\n' +
+            '    ogun secret set linear < key.txt\n' +
+            '    ogun secret set linear --project other-repo < key.txt',
+        )
+      }
+      // `linear` does reach the server, unlike `secret` did, and the asymmetry is
       // explained where the command lives: the CSRF nonce that protects an authorization
       // and the callback that consumes it both live in the control-plane process.
       else if (sub === 'linear') await projectLinear(rest, serverUrl)
       else if (sub === 'list' || sub === undefined) await projectList(serverUrl)
       else unknownSub('project', sub)
+      break
+
+    /**
+     * `secret` reaches no server: the store is this machine's config.json, written
+     * directly (ADR-0012). The Settings page can write one too, through the same function,
+     * but only from a transport that can carry a key — so this path is the one that works
+     * with the database down, before `ogun init`, and over SSH.
+     *
+     * Top-level rather than under `project`, and unambiguous there because the machine's
+     * own credentials are `ogun token`. `secrets` is accepted as the plural people reach
+     * for; `help.ts` aliases the topic so `ogun secrets --help` is not a dead end.
+     */
+    case 'secret':
+    case 'secrets':
+      await secret([sub, ...rest].filter(Boolean) as string[])
       break
 
     case 'init':

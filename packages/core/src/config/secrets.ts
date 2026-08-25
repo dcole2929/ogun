@@ -31,8 +31,8 @@ import {
  *
  *  1. **Never in `.ogun/config.yaml`.** That file is committed. There is no code path
  *     from here to it — `projectConfigSchema` has no field a secret could land in, and the
- *     two things that write one, `ogun project secret set` and the Settings page's route,
- *     both go through this module and therefore only into the machine file.
+ *     two things that write one, `ogun secret set` and the Settings page's route, both
+ *     go through this module and therefore only into the machine file.
  *  2. **Never in a sandbox.** Nothing on the runner reads this module. The value is not on
  *     `claimedJobSchema`, so it cannot cross the wire to a runner; the runner is the only
  *     thing that builds `docker run`, so there is no route to a container's argv; and
@@ -52,9 +52,9 @@ import {
  *
  * Closed rather than free-form because of the failure `inertPolicies` exists for
  * elsewhere: a key that nothing reads is indistinguishable from a key that works, right
- * up until the night it mattered. `ogun project secret set ogun linaer` typed at 1am
- * would otherwise store a secret, print success, and leave the poller unauthenticated
- * with no evidence anywhere connecting the two.
+ * up until the night it mattered. `ogun secret set linaer` typed at 1am would otherwise
+ * store a secret, print success, and leave the poller unauthenticated with no evidence
+ * anywhere connecting the two.
  *
  * A name is added here when the code that reads it lands, not before.
  *
@@ -67,8 +67,8 @@ import {
  * These names are what the Settings page renders in a dropdown and what `list` reports as
  * `set`. A client secret stored on its own is not a credential: it authenticates nothing
  * without the client id beside it and a grant obtained with the pair. So an operator would
- * paste one, see the row go green, see `ogun project secret list` agree, and have a
- * project that authenticates to nothing — "a secret nothing reads looks exactly like one
+ * paste one, see the row go green, see `ogun secret list` agree, and have a project
+ * that authenticates to nothing — "a secret nothing reads looks exactly like one
  * that works, right up until the night it mattered", arriving through the listing that
  * sentence is written under.
  *
@@ -143,7 +143,7 @@ export function sealSecret(value: string): Secret {
  *    apart from `unreadable` below because the fix is to reconnect one project, where
  *    `unreadable` means a config.json that is currently failing to parse for everything
  *    on the machine.
- *  - `absent` — nobody has set one. The fix is `ogun project secret set`.
+ *  - `absent` — nobody has set one. The fix is `ogun secret set`.
  *  - `empty` — an entry exists and holds nothing. Only reachable by hand-editing the
  *    file, which §4.5 says people do, and the write path here refuses to create it. It is
  *    kept apart from `absent` because the fixes differ: one is "set it", the other is
@@ -197,8 +197,8 @@ export type ProjectSecret =
  * `catch` would report a failed token exchange as "Linear is unreachable" — the exact
  * misnaming the four states existed to prevent.
  *
- * Async and unmemoised on purpose. A rotation is a file write (`ogun project secret set`
- * again), and the whole point of rotating in place is that the next poll picks it up
+ * Async and unmemoised on purpose. A rotation is a file write (`ogun secret set` again),
+ * and the whole point of rotating in place is that the next poll picks it up
  * without restarting the control plane. Against a poll interval of minutes, re-reading a
  * small file costs nothing; the gateway's five-second credential memo exists because it
  * is on a per-request path, and this is not.
@@ -299,26 +299,54 @@ export async function listProjectSecrets(
  * already serialises writers under a lock, because concurrent read-modify-write silently
  * dropped whichever edit lost. A second secret file would be a second chance to get both
  * of those wrong, and they were not cheap to get right the first time.
+ *
+ * ### It reports what it displaced
+ *
+ * The overwrite is the right behaviour and it was also, for two days, an invisible one:
+ * `ogun project secret set` printed the same four lines whether it had stored the first
+ * key for a project or destroyed a working one, with only a character count differing. The
+ * only mention of replacement was boilerplate that printed either way, which is to say it
+ * carried no information about what had happened. So the caller is told.
+ *
+ * The previous state is read *inside* the updater, under `updateLocalConfig`'s lock and in
+ * the same read-modify-write that performs the change. A caller that checked first and
+ * wrote second would be reporting a fact from before the lock — usually right, wrong
+ * exactly when two writers race, which is the case the lock exists for.
+ *
+ * It is `ProjectSecretPresence['state'] | 'absent'` and not the old value, and not the
+ * updated config either. `updateLocalConfig` hands back the whole `LocalConfig`, which now
+ * has live secrets in it, and a caller who logged the result of "set" would be logging the
+ * thing it just set. A three-state enum has no field a value fits in — the same property
+ * `ProjectSecretPresence` is built on, for the same reason.
  */
+export type DisplacedSecret = 'absent' | 'present' | 'empty'
+
 export async function setProjectSecret(
   projectSlug: string,
   name: SecretName,
   value: string,
   path = localConfigPath(),
-): Promise<void> {
-  // Returns void rather than the updated config. `updateLocalConfig` hands back the whole
-  // `LocalConfig`, which now has live secrets in it, and a caller who logged the result of
-  // "set" would be logging the thing it just set.
+): Promise<DisplacedSecret> {
+  let displaced: DisplacedSecret = 'absent'
   await updateLocalConfig(
-    (config) => ({
-      ...config,
-      secrets: {
-        ...config.secrets,
-        [projectSlug]: { ...config.secrets[projectSlug], [name]: value },
-      },
-    }),
+    (config) => {
+      const previous = config.secrets[projectSlug]?.[name]
+      // `empty` is worth keeping apart from `absent`: a blank entry is only reachable by
+      // hand-editing the file, and a poller reads it as a key that exists and does not
+      // work. "replaced" is a misleading word for it and "stored" is a wrong one.
+      displaced =
+        previous === undefined ? 'absent' : previous.trim() === '' ? 'empty' : 'present'
+      return {
+        ...config,
+        secrets: {
+          ...config.secrets,
+          [projectSlug]: { ...config.secrets[projectSlug], [name]: value },
+        },
+      }
+    },
     path,
   )
+  return displaced
 }
 
 /**
@@ -366,9 +394,9 @@ export class InvalidSecret extends Error {}
  * Clean up what arrived on stdin, out of a prompt, or in a request body, and refuse what
  * cannot work.
  *
- * Whitespace goes first, and the trailing newline is why. `ogun project secret set ogun
- * linear < key.txt` and `pbpaste | ogun …` both deliver a value with `\n` on the end, and
- * an API key is not a whitespace-delimited token — so the naive implementation stores the
+ * Whitespace goes first, and the trailing newline is why. `ogun secret set linear <
+ * key.txt` and `pbpaste | ogun …` both deliver a value with `\n` on the end, and an API
+ * key is not a whitespace-delimited token — so the naive implementation stores the
  * newline. What happens then is genuinely hard to diagnose: the value becomes an
  * `authorization` header, undici rejects a header containing a control character with
  * `ERR_INVALID_CHAR`, and the poll fails with an error naming neither Linear nor the key.

@@ -20,9 +20,9 @@ import { promptHidden } from './secrets.ts'
  * exact URL to open, and — when the browser could not reach the control plane at all —
  * accept the URL it landed on so the exchange happens from here.
  *
- * ### Why it talks to the server, where `project secret` does not
+ * ### Why it talks to the server, where `ogun secret` does not
  *
- * `ogun project secret set` deliberately reaches no server: it writes config.json directly,
+ * `ogun secret set` deliberately reaches no server: it writes config.json directly,
  * so it works before `ogun init`, with the database down, and over SSH. This one cannot
  * make that promise and does not pretend to. The `state` nonce that protects the flow lives
  * in the control-plane process, and the callback is delivered to the control-plane process
@@ -55,7 +55,7 @@ const REGISTER_URL = 'https://linear.app/settings/api/applications/new'
  * The client id is prompted for visibly and the secret is not, which is the honest split:
  * the id is in every authorization URL a browser visits and on Linear's own settings page,
  * and hiding it would mean an operator cannot check they pasted the right one. The secret
- * goes through the same hidden prompt `ogun project secret set` uses, and for the same
+ * goes through the same hidden prompt `ogun secret set` uses, and for the same
  * reason — this command gets run over SSH into a terminal that scrolls back.
  *
  * Neither is accepted as a positional argument. `/proc/<pid>/cmdline` is world-readable
@@ -151,7 +151,7 @@ async function linearConnect(args: string[], serverUrl: string): Promise<void> {
         '     `actor=app` makes Ogun act as the application rather than as you, which is\n' +
         '     the whole point — but it installs at the workspace level, so Linear needs a\n' +
         '     workspace admin to approve it. If you are not one, the personal API key\n' +
-        '     (`ogun project secret set`) is still supported.\n',
+        '     (`ogun secret set linear`) is still supported.\n',
     ),
   )
   console.log('  2. Linear sends your browser back to:\n')

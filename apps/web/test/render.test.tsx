@@ -123,7 +123,7 @@ test('a control plane that cannot carry a secret offers the CLI, not a form', ()
   )
 
   assert.ok(!html.includes('type="password"'), 'a key field was rendered on a refusing bind')
-  assert.match(html, /ogun project secret set/, 'the refusal has to name the path that works')
+  assert.match(html, /ogun secret set/, 'the refusal has to name the path that works')
   assert.match(html, /plain HTTP/, "the server's reason should be shown, not paraphrased")
 })
 

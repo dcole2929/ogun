@@ -430,8 +430,8 @@ oauthRoutes.get('/linear/callback', async (c) => {
  * a machine behind a bastion — the browser fails on the redirect and the code is sitting in
  * the address bar. This takes the whole URL they landed on and finishes the job.
  *
- * The URL goes in a **body**, never in argv. That is the same rule `ogun project secret
- * set` refuses a positional value for: `/proc/<pid>/cmdline` is world-readable while the
+ * The URL goes in a **body**, never in argv. That is the same rule `ogun secret set`
+ * refuses a positional value for: `/proc/<pid>/cmdline` is world-readable while the
  * command runs, and a shell writes its history to a file nobody audits. The code is
  * single-use and worthless without the client secret, so this is belt rather than braces —
  * but the belt costs nothing and the CLI already has the hidden-prompt machinery.

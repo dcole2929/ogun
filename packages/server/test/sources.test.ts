@@ -313,7 +313,7 @@ describe('a source', () => {
     const [poll] = await pollsFor('nokey')
     assert.equal(poll?.outcome, 'refused')
     assert.match(poll?.detail ?? '', /no linear api key for "sources"/)
-    assert.match(poll?.detail ?? '', /ogun project secret set sources linear/)
+    assert.match(poll?.detail ?? '', /ogun secret set linear --project sources/)
   })
 
   test('a store it could not read is not reported as a key nobody set', async () => {
@@ -428,7 +428,7 @@ describe('a source', () => {
   /**
    * The property: an application registered but never connected gets its own refusal.
    *
-   * Reported as `absent`, the message tells the operator to run `ogun project secret set` —
+   * Reported as `absent`, the message tells the operator to run `ogun secret set` —
    * sending somebody who has done most of the work of connecting an application back to
    * the credential they were migrating off. Principle 6 again: this remedy is a browser,
    * and no other state's sentence names one.

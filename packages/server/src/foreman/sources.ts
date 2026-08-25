@@ -508,7 +508,7 @@ function missingKey(
   slug: string,
   key: Exclude<ProjectSecret, { state: 'present' } | { state: 'granted' }>,
 ): string {
-  const set = `\`ogun project secret set ${slug} linear\``
+  const set = `\`ogun secret set linear --project ${slug}\``
   switch (key.state) {
     case 'unconnected':
       return (

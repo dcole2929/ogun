@@ -145,7 +145,7 @@ behaviour for a credential anyway: a secret that migrates itself is a secret in 
   doing; it is not possible now, and guessing would be the absence-of-evidence mistake the
   credential preflight was built to avoid.
 
-- **Setting is CLI-only, on the control-plane machine.** There is no route that accepts a
+- **Setting is `ogun secret set <name>`, on the control-plane machine.** There is no route that accepts a
   secret, because a value in a request body is a value in a reverse proxy's access log and
   in a browser's network panel. The UI shows presence and points at the command. **This is
   a real gap for a remote control plane** — the operator has to reach a shell on that
@@ -177,8 +177,8 @@ behaviour for a credential anyway: a secret that migrates itself is a secret in 
   never reaches an interface and the only attacker who could read it can already read
   `~/.ogun/config.json` at 0600 as this user; and refuses it on a wider one unless the
   operator has declared a TLS terminator in front with `OGUN_BEHIND_TLS_PROXY`. The refusal
-  names `ogun project secret set`, because a refusal on the only surface a remote operator
-  has must not be a dead end.
+  names `ogun secret set`, because a refusal on the only surface a remote operator has
+  must not be a dead end.
 
   Deliberately **not** `x-forwarded-proto: https`. That header is written by whoever is
   speaking to us, and on the exact deployment the guard exists for — plain HTTP straight
@@ -197,11 +197,100 @@ behaviour for a credential anyway: a secret that migrates itself is a secret in 
 
   What the route does *not* change is anything else in this record. It goes through
   `setProjectSecret` and therefore through `updateLocalConfig`'s lock — one writer, not a
-  second one racing the first. It validates the name against `SECRET_NAMES` and, unlike the
-  CLI, the project against the database, because it has a handle and the CLI deliberately
-  does not. It returns presence and a character count and has no field a value fits in.
+  second one racing the first. It validates the name against `SECRET_NAMES` and the project
+  against the database, because it has a handle — the CLI checks the same fact against the
+  local evidence it has instead, which is the amendment below. It returns presence and a
+  character count and has no field a value fits in.
   Removal has no transport condition at all: a delete carries nothing towards the wire, and
   gating it would refuse a remote operator the one action that makes a leaked key harmless.
+
+  [amended] The command spelling in this bullet is now `ogun secret set <name>`, and the
+  project it writes under is checked. Three things about `ogun project secret set <project>
+  <name>` were wrong and one of them was a hole:
+
+  - **An unknown slug was stored in silence.** `ogun project secret set heirchive-api
+    linear` on a machine whose only project was `ogun` printed `linear set for
+    heirchive-api (23 characters)` and left a live key in `~/.ogun/config.json` where
+    nothing would ever read it. That is the failure `SECRET_NAMES` is a closed set to
+    prevent — "a secret nothing reads looks exactly like one that works, right up until the
+    night it mattered" — reasoned about the secret's *name* and never about its *project*.
+
+    The stated reason for not checking was that the CLI runs with no database. True, and it
+    does not follow: `~/.ogun/config.json` carries the projects map that `ogun project add`
+    and `ogun project sync` write and `resolveProjectPath` reads, so the slug is checkable
+    on that machine with nothing running. The database is the better oracle and it is the
+    one the route uses; its absence is an argument for the weaker local evidence, not for
+    none. A `.ogun/config.yaml` in the directory the command was run from counts as
+    evidence too, and is stronger: a repository declaring its own name beats this machine's
+    cache of that declaration, and requiring `project add` first would make "set the key,
+    then sync" impossible for no gain.
+
+    There *is* a legitimate case for a slug this machine has no record of, and it is why
+    the refusal has a door rather than being absolute: a hosted control plane polls
+    projects whose repositories are checked out somewhere else entirely, so its projects
+    map is legitimately empty. The key still works there — `readProjectSecret` looks a
+    secret up by slug and never consults that map — so a hard refusal would lock the
+    *correct* operator out of the only path that works with the database down. The escape
+    is `--allow-unregistered`, named for what it permits rather than `--force`, and it
+    warns. What was wrong was the silence, not the storing.
+
+  - **The usage line hid the input the command exists for.** `ogun project secret set
+    <project> <name>` reads as complete and says nothing about a key arriving at all, let
+    alone on stdin. The reasoning for keeping the value out of argv was already written
+    down in the source and was invisible to anyone reading `--help`, which is the one
+    audience it was for. Every usage line the command prints now carries the redirection,
+    and `--help` carries `/proc/<pid>/cmdline` and the shell history file by name.
+
+  - **It was the only command in its namespace that demanded a slug.** `project add` and
+    `project sync` take the current directory and read the name out of its
+    `.ogun/config.yaml`; this took an explicit positional, and the `project` namespace
+    existed to hold it. Inferring the project the same way empties the namespace out, so
+    the command moved to the top level, where `ogun token` already establishes that a
+    bare `secret` means the per-project one. The old path is dropped rather than aliased —
+    it was two days old with no caller outside this repository — and answers with a line
+    naming the new spelling, because muscle memory outlives a release.
+
+  - **It never said that it had destroyed a key.** The output was byte-identical whether a
+    set stored a project's first key or overwrote a working one — only the character count
+    differed — and the single sentence mentioning replacement was boilerplate printed
+    either way. Overwriting is still the behaviour this record settled on and it is not
+    revisited here: a rotation window is the provider's to offer, and two live values means
+    a 401 cannot be attributed. What was wrong was that the surface with a confirmation
+    step warned and the surface where a piped one-liner destroys a credential did not. The
+    Settings page has said *"already has a `<name>` key. Storing replaces it — there is no
+    history"* since it was built.
+
+    So the confirmation now reports the event — `stored for` or `replaced for` — and a
+    replace adds that the previous value cannot be recovered from this machine. The fact
+    comes back from `setProjectSecret`, decided inside `updateLocalConfig`'s lock in the
+    same read-modify-write that performs the change, rather than from a read taken before
+    it: a caller that checks and then writes reports something that was true a moment ago,
+    and is wrong in exactly the case the lock exists for. A blank entry being filled in is
+    its own third answer, because `empty` is what a poller reads as a key that exists and
+    does not work, and calling that repair a "replace" would send somebody looking for a
+    value that never worked.
+
+    Considered and rejected: a `[y/N]` gate on a replace. It needs a `--yes` for the
+    non-interactive path; every script would set that flag once and never remove it; the
+    gate would then guard nobody while costing everybody a keystroke — on the operation
+    this record settled as the *intended* one. A prompt on the happy path is a prompt people
+    learn to answer without reading. What survives from the idea is its useful half: at a
+    terminal, the warning is printed *before* the value is asked for, where an operator can
+    still stop without having pasted anything, and a pipe is never blocked.
+
+    `ogun secret rm` finding nothing to remove is the same question with a different wrong
+    answer, and got the same treatment. It always distinguished the two outcomes; what
+    changed is that the project is now inferred from the directory, so a `rm` run one level
+    too high is a plausible way to reach that branch — it is no longer whispered in grey, it
+    names the project it searched and where that name came from, and it still exits 0,
+    because a removal that finds nothing has reached the state it was asked for.
+
+  One thing got *narrower* on the way through. The CLI used to quote a rejected secret name
+  back at the operator, where the route deliberately does not. With two positionals that
+  said which word was wrong; with one it says nothing, and the plausible mistake becomes
+  `ogun secret set lin_api_…` — someone who remembered that the key does not go in argv and
+  forgot that the name does. So the CLI now withholds it too, and says instead that if that
+  is what happened, the key should be treated as compromised.
 
 - **The value cannot enter a sandbox, and it is a test rather than a promise.** The wire
   has no field for it (`claimedJobSchema` strips one), so it cannot reach a runner; the

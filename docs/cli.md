@@ -21,7 +21,7 @@ reach it. Four groups cannot:
 
 | | run it on |
 |---|---|
-| `server`, `db *`, `token *`, `runner invite`, `project secret *` | the control-plane machine |
+| `server`, `db *`, `token *`, `runner invite`, `secret *` | the control-plane machine |
 | `runner init`, `runner join`, `runner start`, `runner doctor`, `image build` | the runner machine |
 | `project add`, `project sync`, `skill new`, `skill link` | a machine with the repo checked out |
 | `findings write`, `validate-findings`, `check-citations` | inside the sandbox, by a skill |
@@ -146,7 +146,7 @@ unauthenticated.
 changes exactly one thing: whether the Settings page may accept a project's API key
 (ADR-0012). Ogun serves plain HTTP and cannot see past its own socket, so on a wider bind
 it assumes a key typed into a browser would cross the network in cleartext and refuses to
-store one, pointing at `ogun project secret set` instead. This variable is how an operator
+store one, pointing at `ogun secret set` instead. This variable is how an operator
 who has put nginx or Caddy in front says otherwise. It is not read as a header —
 `x-forwarded-proto` is written by whoever is talking to us, which on a plain-HTTP LAN is
 the client, and a guard a request can switch off is not a guard.
@@ -291,7 +291,7 @@ A `sources:` block is where a ticket becomes a job (§4.13, ADR-0013), and sync 
 source that could never fire is refused rather than left to poll quietly forever: a
 `cycle:` naming nothing, or naming a cycle with more than one entry node. Each source that
 does register prints the cycle it feeds. It does **not** print whether this machine holds
-the API key it will need — `ogun project secret list` answers that, and a source with no
+the API key it will need — `ogun secret list` answers that, and a source with no
 key polls, refuses, and records the command that fixes it.
 
 A skill or worker only reaches an automated run once it is **on the default branch** — the
@@ -306,11 +306,24 @@ skills).
 Every project the control plane knows about, with its default branch and remote. The
 default when `ogun project` is given no subcommand.
 
-### `ogun project secret set | list | rm`
+### `ogun secret set | list | rm`
+
+```
+ogun secret set <name> [--project <slug>] [--allow-unregistered] < key.txt
+ogun secret list [--project <slug>]
+ogun secret rm <name> [--project <slug>]
+```
 
 An API key a project needs that this machine did not already have. Everything else Ogun
 authenticates with is on the host because a human logged in with it; a Linear key is issued
 per workspace, so it has to be entered once and kept.
+
+It was `ogun project secret …` for two days. The slug was a positional, the `project`
+namespace existed to hold it, and now that the project comes from the directory you are
+standing in — the way `project add` and `project sync` have always resolved one — there is
+nothing left for the namespace to carry. Machine-wide credentials are `ogun token`, so
+`ogun secret` is unambiguous. The old spelling is gone rather than aliased, and answers
+with a line naming the new one.
 
 Run it on the **control-plane machine** — that is what polls an integration, so that is
 where the key has to be. It stores into `~/.ogun/config.json` at mode 0600 and talks to no
@@ -324,32 +337,71 @@ one where the operator has declared a TLS terminator in front with `OGUN_BEHIND_
 — and refused otherwise, pointing back here. This command is the path that always works.
 
 ```
-ogun project secret set ogun linear < key.txt
-op read op://vault/linear/key | ogun project secret set ogun linear
-ogun project secret set ogun linear        # prompts, with the echo off
+ogun secret set linear < key.txt
+op read op://vault/linear/key | ogun secret set linear
+ogun secret set linear                     # no pipe: prompts, with the echo off
+ogun secret set linear --project heirchive-api < key.txt
 ```
 
 **The value is never a command-line argument**, and passing one is refused rather than
 accepted. Anything in argv is readable by every account on the box through `ps` while the
 command runs, and your shell writes the whole line into its history file. So it comes from
 stdin when stdin is a pipe and from a hidden prompt when it is a terminal; nothing chooses
-between them, because the shape of stdin already has.
+between them, because the shape of stdin already has. The redirection is part of every
+usage line this command prints, because `ogun secret set <name>` reads as complete and is
+not — the value is the whole point of the command, and a script that runs it with no stdin
+blocks with nothing on screen saying why.
+
+**The project defaults to the one you are in.** In order: `--project`, then the `name:` in
+this directory's `.ogun/config.yaml`, then the registered project whose root contains this
+directory, then the directory's own name. `--project` is for a repo that is not checked out
+on this machine at all.
+
+**A slug this machine has never heard of is refused, and nothing is stored.** This is the
+rule the closed set of secret names exists for, applied to the other half of a key's
+address: a key filed under a project nothing polls reports as set and is read by nothing.
+The evidence is local, so no server is needed — the projects map in `~/.ogun/config.json`
+that `project add` and `project sync` write, or a `.ogun/config.yaml` in the current
+directory naming itself. `--allow-unregistered` is the way through, for a control plane
+that polls repositories it has no copy of; it warns, because the slug then has to match
+what the control plane polls under and nothing local can check that.
 
 Known names: `linear`. A name Ogun does not read is refused — a secret nothing reads looks
-exactly like one that works, until the night it mattered.
+exactly like one that works, until the night it mattered. The rejected name is **not**
+quoted back: with the value on stdin, the single positional this command takes is exactly
+where a mistyped invocation puts the key.
 
 Rotation is setting it again. There is no history and no second slot: the next poll reads
 the new value with no restart, and two live keys would mean nobody could say which one a
 401 came from.
 
-- `ogun project secret list [project]` — which projects have one, by name. Presence only.
+**The confirmation says which of the two just happened.** `linear stored for ogun` and
+`linear replaced for ogun` are different events, and for two days the line was identical
+for both — the only mention of replacement was boilerplate that printed either way, so it
+described what the command generally does rather than what it had just done. A replace also
+says that the previous value is unrecoverable from this machine, because the recovery for a
+key you have overwritten is Linear's, not ours. At a terminal it says a key is already there
+*before* asking for the new one, where an operator can still stop; a pipe is never blocked,
+because a piped key is usually a rotation somebody wrote down deliberately, and a `[y/N]`
+gate would need a `--yes` that every script would set once and forever.
+
+- `ogun secret list [--project <slug>]` — which projects have one, by name. Presence only.
   Nothing anywhere prints a stored value back — not this command, not `runner doctor`, not
-  the UI, and no endpoint. It cannot say what is *missing*, either: which projects need a
-  key is declared in each repository, and this command reads no repositories.
-- `ogun project secret rm <project> <name>` — forget one. Says whether there was anything
-  to forget, because "removed" and "there was nothing here" are different answers. Unlike
-  `set`, it takes any name rather than only a known one: `list` prints whatever the file
-  holds, that file gets hand-edited, and a row you can see has to be a row you can remove.
+  the UI, and no endpoint. It does **not** narrow to the current directory the way `set`
+  does: this is the machine's inventory, asked from a home directory over SSH, and a
+  listing that answered for wherever the shell happened to be would say "none" on a machine
+  holding four. It cannot say what is *missing*, either: which projects need a key is
+  declared in each repository, and this command reads no repositories.
+- `ogun secret rm <name> [--project <slug>]` — forget one. Says whether there was anything
+  to forget, because "removed" and "there was nothing here" are different answers — and the
+  second is now the interesting one, since the project is inferred from the directory and a
+  `rm` run one level too high finds nothing. It names the project it looked in and where
+  that name came from, and still exits 0, because a removal that finds nothing has reached
+  the state it was asked for. It
+  checks neither the name nor the project, where `set` checks both: `list` prints whatever
+  the file holds, that file gets hand-edited, and a row you can see has to be a row you can
+  remove. Validation guards writes, where an unknown name or slug creates a key nothing
+  reads.
 
 Touches: `~/.ogun/config.json` (the secrets block, on this machine only).
 

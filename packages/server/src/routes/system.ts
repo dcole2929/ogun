@@ -248,10 +248,15 @@ systemRoutes.post('/token/rotate', async (c) => {
  *  3. **The name**, against `SECRET_NAMES`. A name Ogun does not read stores a key that
  *     reports as set and authenticates nothing, which is the failure that closed set
  *     exists for — the symptom arrives hours later as an unauthenticated poller.
- *  4. **The project**, against the database. The CLI cannot do this and does not try: it
- *     writes the file with no control plane running and no database up. This route has a
- *     handle, and the same argument as the name applies — a secret under a slug nothing
- *     polls is a secret nothing reads.
+ *  4. **The project**, against the database — the same argument as the name: a secret
+ *     under a slug nothing polls is a secret nothing reads. This route has a handle. The
+ *     CLI, which has neither a control plane nor a database up, checks the same fact
+ *     against the weaker local evidence it does have (`~/.ogun/config.json`'s projects
+ *     map, plus the `.ogun/config.yaml` in the directory it was run from) and has an
+ *     `--allow-unregistered` escape for the hosted case this route does not need. This
+ *     comment used to say the CLI "cannot do this and does not try", and the second half
+ *     was doing the work: it stored a key under `heirchive-api` on a machine that had
+ *     never heard of it and reported success.
  *  5. **The value**, through `normalizeSecretInput`, which is the CLI's validator and not
  *     a second one. One writer, one set of rules: a trailing newline from a paste becomes
  *     `ERR_INVALID_CHAR` inside undici at poll time, hours away from anything that names
@@ -351,6 +356,13 @@ systemRoutes.put('/secrets/:project/:name', async (c) => {
   // Through the same function the CLI calls, which writes through `updateLocalConfig`'s
   // lock. A second writer here would re-open the lost-update this repo already paid for:
   // read-modify-write races between `ogun project add`, a runner joining, and this.
+  //
+  // It now answers with what it displaced, and that answer is deliberately dropped here.
+  // The CLI needs it because a piped invocation has no before-state on screen; this page
+  // already renders "already has a <name> key — storing replaces it" *beside the field*,
+  // which is the same warning arriving at the better moment. Putting the fact in the
+  // response too would be a field the UI does not read, and an unread field is one
+  // somebody later fills with something else.
   await setProjectSecret(project, name, secret.expose())
 
   /**

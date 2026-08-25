@@ -83,7 +83,7 @@ export async function projectSecrets(path = localConfigPath()): Promise<Check> {
     return {
       name: 'project secrets',
       ok: true,
-      detail: 'none stored here — `ogun project secret set <project> <name>`',
+      detail: 'none stored here — `ogun secret set <name>` in the project directory',
       fatal: false,
     }
   }
