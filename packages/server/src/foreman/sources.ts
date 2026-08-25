@@ -16,7 +16,13 @@ import {
   type SourceConfig,
   type Ticket,
 } from '@ogun/core'
-import { linearHttp, LinearUnavailable, type LinearApi } from '../integrations/linear.ts'
+import {
+  linearHttp,
+  LinearUnavailable,
+  type LinearApi,
+  type LinearCredential,
+} from '../integrations/linear.ts'
+import { usableGrant } from './linear-grant.ts'
 import { fleetCredentials } from './admission.ts'
 import { startCycleRun } from './cycles.ts'
 
@@ -61,26 +67,42 @@ const { cycles, projects, sourceEmissions, sourcePolls, sources } = schema
 
 export type SourceDeps = {
   /**
-   * Where a project's Linear key comes from — `readProjectSecret` (ADR-0012), taken as a
-   * parameter so a test can answer it without a `~/.ogun/config.json`.
+   * Where a project's Linear credential comes from — `readProjectSecret` (ADR-0012,
+   * ADR-0014), taken as a parameter so a test can answer it without a
+   * `~/.ogun/config.json`.
    *
-   * Consumed rather than reimplemented, and consumed *whole*: the four states it returns
-   * are carried through to four different refusal sentences rather than collapsed into
-   * "no key". Collapsing them is the failure principle 6 names — `absent` tells an
-   * operator to set a key, `empty` tells them something wrote a blank over the one they
-   * set, and `unreadable` says the store itself is broken and their key is probably fine.
-   * A poller that reports all three as the first sends somebody to create a second key
-   * for a project that already has one.
+   * Consumed rather than reimplemented, and consumed *whole*: every state it returns is
+   * carried through to its own refusal sentence rather than collapsed into "no key".
+   * Collapsing them is the failure principle 6 names — `absent` tells an operator to set a
+   * key, `empty` tells them something wrote a blank over the one they set, `unreadable`
+   * says the store itself is broken and their key is probably fine, and `unconnected` says
+   * an OAuth application is registered and the authorization was never finished. A poller
+   * that reports all of them as the first sends somebody to create a second key for a
+   * project that already has one.
+   *
+   * **Which credential wins is decided there, not here.** That is the point of it being
+   * one function: this file cannot hold a second opinion about precedence, and neither can
+   * `doctor`, and neither can the Settings page.
    */
   secrets?: (projectSlug: string, name: SecretName) => Promise<ProjectSecret>
   /**
-   * How a client is built from a key.
+   * How a client is built from a credential.
    *
    * The seam `publish.ts` puts around `gh`, for the same reason: every rule this file
    * enforces has to be testable on a machine with no Linear credential and no network,
    * and there is no machine in this project that has one.
+   *
+   * It takes a `LinearCredential` rather than a string because the two shapes disagree
+   * about the `Authorization` header — raw for a personal key, `Bearer` for an OAuth
+   * access token — and a `string` parameter is a parameter that cannot say which.
    */
-  linear?: (apiKey: string) => LinearApi
+  linear?: (credential: LinearCredential) => LinearApi
+  /**
+   * How an OAuth grant becomes a usable token, refreshing it first if the poll would
+   * outlive it (ADR-0014). Injected so that the *precedence* rules in this file can be
+   * tested without a token endpoint, which is the half that has no fixture.
+   */
+  grant?: typeof usableGrant
   now?: () => Date
 }
 
@@ -279,15 +301,49 @@ export async function pollSource(
   const project = await db.query.projects.findFirst({ where: eq(projects.id, row.projectId) })
   if (!project) return refuse('this source belongs to no project')
 
-  const key = await (deps.secrets ?? readProjectSecret)(project.slug, 'linear')
-  if (key.state !== 'present') return refuse(missingKey(project.slug, key))
-
   /**
-   * `expose()` at the wire and nowhere else — the one place per consumer ADR-0012 asks
-   * for. The value goes straight into the client that puts it in a header; it is never
-   * held in a variable this function logs, records, or puts in a `source_polls` row.
+   * Which credential, decided in `readProjectSecret` and nowhere else (ADR-0014).
+   *
+   * An OAuth grant wins over a personal API key, and the reasoning for that lives with the
+   * function that applies it rather than being restated — the point of putting precedence
+   * in one place is that this file cannot hold a second opinion about it.
    */
-  const api = (deps.linear ?? ((apiKey: string) => linearHttp({ apiKey })))(key.secret.expose())
+  const key = await (deps.secrets ?? readProjectSecret)(project.slug, 'linear')
+
+  let credential: LinearCredential
+  if (key.state === 'granted') {
+    /**
+     * The refresh, immediately before the request that needs the token, because a token
+     * that lasts 24 hours and a poller that wakes at 3am never coincide by accident. See
+     * `linear-grant.ts` for why this is not a timer and not a reaction to a 401.
+     */
+    const usable = await (deps.grant ?? usableGrant)(project.slug, 'linear', key.grant)
+    if (usable.state === 'refused') return refuse(usable.detail)
+    if (usable.state === 'failed') {
+      return record({
+        source: row.name,
+        outcome: 'failed',
+        seen: 0,
+        admitted: 0,
+        emitted: [],
+        trimmed: 0,
+        truncated: false,
+        detail: usable.detail,
+      })
+    }
+    credential = usable.credential
+  } else if (key.state === 'present') {
+    /**
+     * `expose()` at the wire and nowhere else — the one place per consumer ADR-0012 asks
+     * for. The value goes straight into the client that puts it in a header; it is never
+     * held in a variable this function logs, records, or puts in a `source_polls` row.
+     */
+    credential = { kind: 'api-key', token: key.secret.expose() }
+  } else {
+    return refuse(missingKey(project.slug, key))
+  }
+
+  const api = (deps.linear ?? ((c: LinearCredential) => linearHttp({ credential: c })))(credential)
 
   /**
    * The read. Paged, bounded, and ordered by `updatedAt` so that the tickets a cap cuts
@@ -434,18 +490,37 @@ export async function pollSource(
 }
 
 /**
- * The three ways a key can be missing, each with the sentence that fixes it.
+ * The ways a credential can be missing, each with the sentence that fixes it.
  *
  * Written out per state rather than templated, because the whole value of
- * `readProjectSecret` returning four states is lost the moment they share a message. The
- * `unreadable` case is the one that matters most and reads least like a credential
- * problem: the store is broken — a config.json mangled by an unrelated edit — and the key
- * is very likely still in it, so telling somebody to go and set one would send them to
- * overwrite a file that is already failing to parse.
+ * `readProjectSecret` returning a state per remedy is lost the moment they share a
+ * message. The `unreadable` case is the one that matters most and reads least like a
+ * credential problem: the store is broken — a config.json mangled by an unrelated edit —
+ * and the key is very likely still in it, so telling somebody to go and set one would send
+ * them to overwrite a file that is already failing to parse.
+ *
+ * `unconnected` is the one ADR-0014 added, and it is the same mistake one step further
+ * along: an operator who has registered an OAuth application and not finished the
+ * authorization has done most of the work, and telling them to paste a personal API key
+ * sends them backwards to the credential they were migrating off.
  */
-function missingKey(slug: string, key: Exclude<ProjectSecret, { state: 'present' }>): string {
+function missingKey(
+  slug: string,
+  key: Exclude<ProjectSecret, { state: 'present' } | { state: 'granted' }>,
+): string {
   const set = `\`ogun project secret set ${slug} linear\``
   switch (key.state) {
+    case 'unconnected':
+      return (
+        `"${slug}" has a linear oauth application registered (client ${key.clientId}) and ` +
+        'nobody has finished the authorization, so there is nothing to poll with. Connect ' +
+        `it from Settings, or run \`ogun project linear connect ${slug}\``
+      )
+    case 'malformed':
+      return (
+        `the linear oauth entry for "${slug}" is not a shape this build can read ` +
+        `(${key.reason}). The store itself is fine — this one project needs reconnecting`
+      )
     case 'absent':
       return `no linear api key for "${slug}" on this machine — run ${set}`
     case 'empty':

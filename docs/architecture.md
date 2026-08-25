@@ -369,6 +369,25 @@ nothing for a file no one opens.
   // logged in with them. Present once one has been set on this box.
   "secrets": { "ogun": { "linear": "lin_api_…" } },
 
+  // A project's OAuth grants (ADR-0014). The preferred way to reach Linear:
+  // the application is registered in the operator's own workspace, and Ogun
+  // refreshes the 24-hour access token itself, before the poll that needs one.
+  "oauth": {
+    "ogun": {
+      "linear": {
+        "clientId": "…",                // not a secret — it is in every authorize URL
+        "clientSecret": "…",
+        "redirectUri": "http://…/api/oauth/linear/callback",
+        "grant": {                      // absent until somebody completes the flow
+          "accessToken": "…", "refreshToken": "…",
+          "expiresAt": 1787000000000,   // absolute, not Linear's expires_in seconds
+          "scopes": ["read"], "actor": "app",
+          "workspace": { "id": "…", "name": "Acme", "urlKey": "acme" }
+        }
+      }
+    }
+  },
+
   // Present once this machine is a runner.
   "runner": {
     "id": "wsl-desktop",
@@ -1284,11 +1303,27 @@ picture, and "three of four reviewers ran" is not derivable from findings alone.
   one implementation; the PR cap is a live `gh pr list` and is written down nowhere.
 - **Linear** — poll every N minutes with a *deterministic* filter (status, label,
   not-blocked) before any AI sees a ticket. Sources emit jobs; they are not workers.
-  **Built** (ADR-0013), read-only, and unwired until a project has a key.
-  The API key is per workspace, so it is the first credential Ogun stores rather than
-  borrows: `~/.ogun/config.json` on the control-plane machine, host-side only, and
-  structurally unable to reach a container (§4.5, ADR-0012). An agent never sees one —
-  the filter runs before the prompt is built, which is what makes that possible.
+  **Built** (ADR-0013), read-only, and unwired until a project has a credential.
+  The credential is per workspace, so it is the first Ogun stores rather than borrows:
+  `~/.ogun/config.json` on the control-plane machine, host-side only, and structurally
+  unable to reach a container (§4.5, ADR-0012). An agent never sees one — the filter runs
+  before the prompt is built, which is what makes that possible.
+
+  **A project connects as an *application*, and the personal API key is the fallback.**
+  [settled — ADR-0014] The reason is attribution rather than tidiness: with a personal key,
+  every comment Ogun will post appears as the person whose key it is, on a shared board,
+  indistinguishable from theirs. Linear's `actor=app` fixes that and a personal key cannot.
+  Scope is the second reason — `read` today, `comments:create` when the code that posts a
+  comment lands, rather than everything one person can do forever.
+
+  Ogun ships no client id: it is self-hosted, so each workspace registers its own
+  application and pastes back the callback URL the Settings page prints. Access tokens last
+  24 hours and are renewed **on demand, immediately before the poll that needs one** — not
+  on a timer, which does not fire in a process that is asleep, and not in reaction to a 401,
+  which Linear answers identically for an expired token and a revoked one. Which credential
+  a poll uses is decided in `readProjectSecret` and nowhere else: a grant wins over a key,
+  a dead grant refuses rather than falling back, and every surface says when a stored key is
+  being ignored.
 
 #### What a source is
 
@@ -2044,8 +2079,21 @@ recorded from Linear's published GraphQL schema and its developer documentation,
 **pipeline is not built**: no scope-evaluation skill, and no ticket → plan → implement →
 review → draft PR graph. A source today emits into whatever cycle a project names it.
 
-Remaining: that pipeline, and the per-project secret store the source reads its key from —
-consumed here behind a one-function seam whose default holds nothing and says so.
+Also done: **OAuth** (ADR-0014). A project connects to Linear as an application rather than
+as a person, because writing back is next and a personal key puts somebody's name on the
+machine's comments. `read` only, `actor=app`, a `state` nonce that is single-use and
+project-bound, an authorization code that reaches neither the journal nor a redirect URL,
+and a 24-hour token renewed before the poll that needs it — from a refresh token Ogun owns
+outright, which is what makes the rotation ADR-0010 rejected safe here. The personal API key
+stays supported and documented, because installing an application needs a workspace admin.
+
+The same honest gap applies one layer up: **no Linear application is registered to this
+project either**, so the flow has never run end to end. `test/linear-oauth-fixtures.ts`
+records what the fixtures prove — request shapes, units, delimiters, failure classification,
+redaction — and what they cannot.
+
+Remaining: that pipeline, and write-back itself, which is what `comments:create` and the
+scope decision in ADR-0014 are waiting for.
 
 **Explicit non-goals:** Kubernetes, multi-tenancy, RBAC, billing, graphical workflow
 canvas, auto-merge, agent memory, model auto-selection, remote runner mesh.

@@ -101,7 +101,14 @@ behaviour for a credential anyway: a secret that migrates itself is a secret in 
 ## Consequences
 
 - **Reading is one function, and it is total.** `readProjectSecret(projectSlug, name)`
-  returns `present | absent | empty | unreadable` and never throws. Four states because
+  returns `present | absent | empty | unreadable` and never throws.
+
+  [amended — ADR-0014] It now also returns `granted`, `unconnected` and `malformed`, for
+  the OAuth grant that became the preferred way to reach Linear. The shape of this record
+  is unchanged: still one function, still total, still the seam a keyring implementation
+  would slot into. What ADR-0014 adds is that the same function decides *which* credential
+  a poll uses — a grant wins over a key — so precedence cannot be answered differently by
+  the poll, `doctor` and the UI. Four states because
   they have four fixes, and because a poller is a loop at 2am whose nearest `catch` would
   otherwise report a missing key as "Linear is unreachable". `empty` is only reachable by
   hand-editing the file, which §4.5 says people do, and it is kept separate from `absent`
@@ -216,6 +223,7 @@ behaviour for a credential anyway: a secret that migrates itself is a secret in 
   credential.
 
 - **`secrets` has to stay declared in `localConfigSchema`, and deleting it is silent.**
+  [ADR-0014 added an `oauth` block beside it, under the same rule and for the same reason.]
   `updateLocalConfig` is a read-modify-write through that schema and zod strips what it does
   not name, so an undeclared block would be dropped by the next `ogun project add` or
   `ogun runner join`. The symptom would be a Linear key that stopped working on the day

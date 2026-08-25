@@ -13,6 +13,7 @@ import { projectsRoutes } from './routes/projects.ts'
 import { findingsRoutes } from './routes/findings.ts'
 import { skillsRoutes } from './routes/skills.ts'
 import { runnersRoutes } from './routes/runners.ts'
+import { LINEAR_CALLBACK_PATH, oauthRoutes } from './routes/oauth.ts'
 import { systemRoutes } from './routes/system.ts'
 import { workersRoutes } from './routes/workers.ts'
 import { triggerRoutes } from './routes/trigger.ts'
@@ -20,7 +21,34 @@ import { triggerRoutes } from './routes/trigger.ts'
 export function createApp(ctx: AppContext, token?: string) {
   const app = new Hono<Env>()
 
-  app.use('*', logger())
+  /**
+   * The request log, with one path exempted.
+   *
+   * `hono/logger` does **not** log "method, path and status" — it logs
+   * `url.slice(url.indexOf('/', 8))`, which is the path *and the query string*, twice per
+   * request. That is fine for every other route in this process and wrong for exactly one:
+   * `GET /api/oauth/linear/callback?code=…&state=…`, where the query is an authorization
+   * code and a CSRF nonce, and this journal is the one log Ogun definitely writes.
+   *
+   * Exempted rather than silenced. A callback that arrived and failed has to leave
+   * evidence — a missing line is indistinguishable from a callback Linear never sent — so
+   * the substitute below records the method, the path, the status and the fact that the
+   * query was elided. `ogun` at the start of the line matches nothing else here on
+   * purpose: it is a line a person grepping for the code will find, and it says why the
+   * code is not in it.
+   *
+   * The route also redirects immediately to a clean URL, so this is one of three defences
+   * rather than the only one (`routes/oauth.ts` has the argument).
+   */
+  const requestLog = logger()
+  app.use('*', async (c, next) => {
+    if (c.req.path !== LINEAR_CALLBACK_PATH) return requestLog(c, next)
+    await next()
+    console.log(
+      `ogun: ${c.req.method} ${LINEAR_CALLBACK_PATH} ${c.res.status} ` +
+        '(query withheld — it carries an authorization code)',
+    )
+  })
   // Before auth, not after: scope checking has to look up an enrolled runner, which
   // needs the database handle.
   app.use('*', async (c, next) => {
@@ -68,6 +96,7 @@ export function createApp(ctx: AppContext, token?: string) {
   app.route('/api/findings', findingsRoutes)
   app.route('/api/skills', skillsRoutes)
   app.route('/api/runners', runnersRoutes)
+  app.route('/api/oauth', oauthRoutes)
   app.route('/api/system', systemRoutes)
   app.route('/api/workers', workersRoutes)
   app.route('/api/trigger', triggerRoutes)

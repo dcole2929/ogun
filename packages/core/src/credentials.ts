@@ -119,6 +119,68 @@ export const wouldFailAuth = (health: CredentialHealth): boolean =>
   health.state === 'absent' || health.state === 'expired' || health.state === 'expiring'
 
 /**
+ * How much life a Linear OAuth access token needs before a poll will use it as it stands
+ * (ADR-0014).
+ *
+ * Here rather than beside the poll for the reason at the top of this file: three things
+ * have to agree about it and they live in three packages. The **server** refreshes a grant
+ * that falls inside this window, the **CLI** prints what `doctor` thinks of the same
+ * grant, and the **web UI** colours a pill for it. The moment two of them keep their own
+ * number, `doctor` says "expiring, act now" about a token the next poll renews by itself —
+ * which teaches an operator to act on something that needs no action, and then to ignore
+ * the line on the night it means something.
+ *
+ * Not zero, for the reason the preflight above exists: a poll reads up to `maxPages`
+ * pages, and a token that passes "is it alive right now" can die between the second page
+ * and the third. Ten minutes is far longer than any poll and short enough that a healthy
+ * connection renews about once a day rather than continuously.
+ */
+export const GRANT_REFRESH_HORIZON_MS = 10 * 60 * 1000
+
+/**
+ * What every surface says about an OAuth grant's remaining life.
+ *
+ * Deliberately reassuring where the gateway's equivalent is alarming, and the difference is
+ * a fact about the system rather than a matter of tone. `describeAnthropic` warns about an
+ * expiring token because **nothing renews it** — the gateway re-reads a file the host's own
+ * CLI refreshes, so an expired one needs a person at a terminal (ADR-0010). A Linear grant
+ * is renewed by the next poll, from a refresh token Ogun owns outright, so the same warning
+ * here would be telling somebody to fix what fixes itself.
+ *
+ * `ok` therefore stays true through `expired`, and the sentence names who does the renewing
+ * rather than implying nobody will. What is *not* claimed is that the renewal will succeed:
+ * a refresh token can be revoked at the other end, and the thing that finds out is the
+ * poll, which records a refusal naming the connection. A status line cannot know that, and
+ * says only what it knows.
+ */
+export function describeGrant(
+  expiresAt: number | undefined,
+  now = Date.now(),
+): { ok: boolean; detail: string } {
+  if (expiresAt === undefined) return { ok: false, detail: 'registered, not connected' }
+  const health = credentialHealth(
+    { kind: 'at', expiresAt },
+    { now, horizonMs: GRANT_REFRESH_HORIZON_MS },
+  )
+  switch (health.state) {
+    case 'valid':
+      return { ok: true, detail: `oauth, ${humanDuration(health.msRemaining)} left` }
+    case 'expiring':
+      return {
+        ok: true,
+        detail: `oauth, ${humanDuration(health.msRemaining)} left — the next poll renews it`,
+      }
+    default:
+      return {
+        ok: true,
+        detail:
+          `oauth, expired ${humanDuration(health.state === 'expired' ? health.msElapsed : 0)} ` +
+          'ago — the next poll renews it from the refresh token',
+      }
+  }
+}
+
+/**
  * How long, in the terse form `doctor`'s one-line details and admission's refusals use.
  *
  * Minutes below ninety, and that is the point of the function rather than a nicety.

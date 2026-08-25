@@ -49,6 +49,36 @@ export const localConfigSchema = z.object({
    */
   secrets: z.record(z.string(), z.record(z.string(), z.string())).default({}),
 
+  /**
+   * A project's OAuth grants, keyed by project slug and then by provider (ADR-0014).
+   *
+   * The sibling of `secrets` above, in the same file, written through the same lock, read
+   * by the same module — and a separate block because the two hold different *kinds* of
+   * thing rather than because they are different stores. `secrets` is "a value a person
+   * typed, used verbatim as a credential". A grant is a record with four fields nothing
+   * types: an access token and a refresh token Linear issued, an absolute expiry, and the
+   * scopes it was actually granted. Folding a grant into `secrets` as a JSON string would
+   * mean `listProjectSecrets` reporting it as a key, the Settings form offering to
+   * overwrite it with a paste, and `doctor` unable to say "7h left" without exposing the
+   * token to read the expiry beside it.
+   *
+   * The same zod warning as `secrets` applies with the same force: **this has to stay
+   * declared here.** `updateLocalConfig` is a read-modify-write through this schema and
+   * zod strips what it does not name, so an undeclared block would be silently deleted by
+   * the next `ogun project add`. The symptom would be a Linear connection that dropped on
+   * the day somebody registered an unrelated repository.
+   *
+   * Deliberately loose here — `z.record(z.string(), z.unknown())` — and parsed properly in
+   * `secrets.ts`, which is the only module that reads or writes it. Two reasons. A strict
+   * schema in this file would make a grant written by a newer build unparseable by an
+   * older one, and `parseLocalConfig` throws on a schema failure, so one unknown field
+   * would take the admin token and the runner credential down with it. And a zod issue
+   * from a strict shape names a path like `oauth.ogun.linear.accessToken` and states
+   * types; keeping the value-bearing fields out of this parser keeps them out of the one
+   * error message in this file that is printed by every CLI command.
+   */
+  oauth: z.record(z.string(), z.record(z.string(), z.unknown())).default({}),
+
   /** Present once this machine has joined a control plane as a runner. */
   runner: z
     .object({

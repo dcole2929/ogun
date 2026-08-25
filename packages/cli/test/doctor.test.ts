@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import { credentialStatuses } from '@ogun/gateway'
 import type { CredentialSet } from '@ogun/gateway'
-import { configPermissions, gatewayCredentials } from '../src/commands/doctor.ts'
+import { configPermissions, gatewayCredentials, linearGrants } from '../src/commands/doctor.ts'
 
 const configAt = async (mode: number): Promise<string> => {
   const path = join(await mkdtemp(join(tmpdir(), 'ogun-doctor-')), 'config.json')
@@ -111,4 +111,121 @@ test('an absent github token stays the intended default rather than a credential
   const github = gatewayCredentials(credentialStatuses({}, now))[2]!
   assert.equal(github.fatal, false)
   assert.match(github.detail, /intended default/)
+})
+
+// ── the linear connection ──────────────────────────────────────────────────
+
+const storeWith = async (config: unknown): Promise<string> => {
+  const path = join(await mkdtemp(join(tmpdir(), 'ogun-doctor-oauth-')), 'config.json')
+  await writeFile(path, JSON.stringify(config))
+  return path
+}
+
+const anApp = (grant?: unknown) => ({
+  clientId: 'client-1',
+  clientSecret: 'lin_secret_abcdefghij',
+  redirectUri: 'http://localhost:7777/api/oauth/linear/callback',
+  ...(grant === undefined ? {} : { grant }),
+})
+
+const aGrant = (expiresAt: number) => ({
+  accessToken: 'access-abcdefghij',
+  refreshToken: 'refresh-abcdefghij',
+  expiresAt,
+  obtainedAt: expiresAt - 24 * 36e5,
+  scopes: ['read'],
+  actor: 'app',
+  workspace: { id: 'org-1', name: 'Acme', urlKey: 'acme' },
+})
+
+/**
+ * The property: `doctor` says which workspace Ogun is acting in and as whom, not merely
+ * that something is connected.
+ *
+ * A green "linear: connected" answers the wrong question. The entire reason for an OAuth
+ * application rather than a personal key is *who Linear attributes activity to*, so a
+ * status line that omits the workspace and the actor has removed the evidence the feature
+ * exists to produce — and the case it hides is the expensive one: an operator who
+ * authorized the wrong workspace, whose tickets simply never arrive.
+ */
+test('a connected project reports its workspace, actor, scopes and remaining life', async () => {
+  const store = await storeWith({ oauth: { ogun: { linear: anApp(aGrant(now + 7 * 36e5)) } } })
+  const [check] = await linearGrants(store, now)
+
+  assert.equal(check?.ok, true)
+  assert.match(check!.detail, /7h left/)
+  assert.match(check!.detail, /in Acme/)
+  assert.match(check!.detail, /as the app/)
+  assert.match(check!.detail, /scopes: read/)
+  // Never a token. There is no branch of that function that could print one: the listing
+  // type it reads has no field a credential fits in.
+  assert.ok(!check!.detail.includes('access-'))
+  assert.ok(!check!.detail.includes('refresh-'))
+})
+
+/**
+ * The property: **an expired access token is not a warning.**
+ *
+ * This is the one place `doctor`'s Linear line deliberately disagrees with its Anthropic
+ * line, and the difference is a fact about the system rather than a matter of tone.
+ * Nothing renews the Anthropic token — the gateway re-reads a file a human's own CLI
+ * refreshes — so an expired one needs a person, and the line is red. A Linear grant is
+ * renewed by the next poll from a refresh token Ogun owns. Warning about it would train an
+ * operator to act on the one state that needs no action, and then to ignore the line on
+ * the night it means something.
+ */
+test('an expired access token is reported as renewable, not as a problem', async () => {
+  const store = await storeWith({ oauth: { ogun: { linear: anApp(aGrant(now - 9 * 36e5)) } } })
+  const [check] = await linearGrants(store, now)
+
+  assert.equal(check?.ok, true)
+  assert.match(check!.detail, /the next poll renews it/)
+})
+
+/**
+ * The property: **a personal key that a grant is shadowing is called out.**
+ *
+ * The line that earns this check. A project with both authenticates with the grant —
+ * `readProjectSecret` decides, once — so an operator debugging a poll failure by rotating
+ * the key is changing something nothing reads, and every observation afterwards confirms
+ * the wrong theory. Nothing else in the system is in a position to say it: the poll's
+ * error names a credential, and `project secret list` only knows about keys.
+ */
+test('an api key behind a live grant is reported as not being used', async () => {
+  const store = await storeWith({
+    secrets: { ogun: { linear: 'lin_api_the_old_way' } },
+    oauth: { ogun: { linear: anApp(aGrant(now + 7 * 36e5)) } },
+  })
+  const [check] = await linearGrants(store, now)
+  assert.match(check!.detail, /api key is also stored/)
+  assert.match(check!.detail, /NOT being used/)
+})
+
+/**
+ * The property: an application registered and never connected is a warning with the
+ * command that finishes it.
+ *
+ * It is the one genuinely actionable state here, and it is invisible from every other
+ * surface — the poll refuses, quietly, into a `source_polls` row. `doctor` is where a
+ * person looks when nothing is happening.
+ */
+test('an application nobody connected warns, and names the command that finishes it', async () => {
+  const store = await storeWith({ oauth: { ogun: { linear: anApp() } } })
+  const [check] = await linearGrants(store, now)
+  assert.equal(check?.ok, false)
+  assert.match(check!.detail, /never connected/)
+  assert.match(check!.detail, /ogun project linear connect ogun/)
+})
+
+/**
+ * The property: a machine with no applications produces **no line at all**, rather than a
+ * green one.
+ *
+ * A check that said "linear: none" would read as coverage it does not have. `doctor` reads
+ * no repositories, so it cannot know which projects declare a `sources:` block and need a
+ * connection — and the absence-of-evidence mistake is the one the credential preflight was
+ * built to avoid.
+ */
+test('a machine with no linear applications adds no line', async () => {
+  assert.deepEqual(await linearGrants(await storeWith({ projects: {} }), now), [])
 })

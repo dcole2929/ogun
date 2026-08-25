@@ -50,7 +50,12 @@ const serving = (status: number, body: string, headers: Record<string, string> =
   }
 }
 
-const client = (apiKey = 'lin_api_test') => linearHttp({ apiKey, endpoint })
+const client = (token = 'lin_api_test') =>
+  linearHttp({ credential: { kind: 'api-key', token }, endpoint })
+
+/** The same client authenticating with an OAuth grant instead (ADR-0014). */
+const oauthClient = (token = 'lin_oauth_test', workspace?: string) =>
+  linearHttp({ credential: { kind: 'oauth', token, workspace }, endpoint })
 
 describe('the linear client', () => {
   it('sends the key raw, with no Bearer prefix', async () => {
@@ -176,6 +181,68 @@ describe('the linear client', () => {
 
     assert.ok(err instanceof LinearUnavailable)
     assert.equal(err.kind, 'auth')
+  })
+
+  it('sends an oauth access token with a Bearer prefix, and a personal key without one', async () => {
+    /**
+     * The property: one client, two credential shapes, and the shape is decided by the
+     * credential rather than by the caller remembering (ADR-0014).
+     *
+     * What a naive implementation gets wrong is not the code — it is that both mistakes
+     * are *silent*. A personal key sent as `Bearer lin_api_…` and an OAuth token sent raw
+     * are both well-formed requests, and Linear answers both with the same
+     * `AUTHENTICATION_ERROR` it answers a revoked credential with. So the symptom of
+     * getting this backwards is indistinguishable from "your key stopped working", which
+     * is the failure an operator will spend an afternoon on. Asserting the bytes here is
+     * the only place this can be caught, because there is no Linear credential on any
+     * machine in this project to find it live.
+     */
+    sent = []
+    serving(200, await fixtureText('issues-page-2'))
+    await oauthClient('lin_oauth_zzz').issues({ filter: {}, first: 50 })
+    assert.equal(sent[0]?.headers.authorization, 'Bearer lin_oauth_zzz')
+
+    sent = []
+    serving(200, await fixtureText('issues-page-2'))
+    await client('lin_api_zzz').issues({ filter: {}, first: 50 })
+    assert.equal(sent[0]?.headers.authorization, 'lin_api_zzz')
+  })
+
+  it('names which credential linear rejected, and never quotes it', async () => {
+    /**
+     * The property: an auth failure says *which* credential failed, because a project can
+     * hold both a personal API key and an OAuth grant at once — the key is the documented
+     * fallback and connecting does not remove it (ADR-0014).
+     *
+     * The naive message is "linear rejected the api key", hard-coded, which is what this
+     * client said before there were two shapes. On a project authenticating with a grant
+     * that sentence sends an operator to rotate a key nothing reads, and every observation
+     * they make afterwards confirms the wrong theory: the poll still fails, the key still
+     * looks fine, and nothing anywhere connects the two.
+     *
+     * The second half is that naming the credential must not become quoting it. A message
+     * that helpfully included the last four characters would put part of a live token into
+     * `source_polls.detail`, which is a database column the run page renders.
+     */
+    serving(400, await fixtureText('error-authentication'))
+
+    const err = await oauthClient('lin_oauth_secret_value', 'Acme')
+      .issues({ filter: {}, first: 50 })
+      .then(() => null, (e: unknown) => e)
+
+    assert.ok(err instanceof LinearUnavailable)
+    assert.equal(err.kind, 'auth')
+    assert.match(err.message, /oauth access token for Acme/)
+    assert.doesNotMatch(err.message, /lin_oauth_secret_value/)
+
+    serving(400, await fixtureText('error-authentication'))
+    const keyErr = await client('lin_api_secret_value')
+      .issues({ filter: {}, first: 50 })
+      .then(() => null, (e: unknown) => e)
+
+    assert.ok(keyErr instanceof LinearUnavailable)
+    assert.match(keyErr.message, /personal api key/)
+    assert.doesNotMatch(keyErr.message, /lin_api_secret_value/)
   })
 
   it('does not mistake an html error page for an empty result', async () => {

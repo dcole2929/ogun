@@ -22,11 +22,17 @@ import type { Ticket } from '@ogun/core'
  * plan, and a client that takes a document string is one refactor away from a slice that
  * does. A human moves the ticket.
  *
- * **The key never leaves the host.** It is read from the per-project secret store by the
+ * **The credential never leaves the host.** It is read from the per-project store by the
  * poll, handed to this function, and used in one header. Nothing about Linear is ever
  * mounted into, injected into, or reachable from a sandbox: the ticket reaches an agent as
  * prompt text and nothing else (ADR-0010, principle 3). If a worker in this pipeline ever
  * appears to need `api.linear.app` on its egress allowlist, the allowlist is not the fix.
+ *
+ * That holds for the OAuth grant added by ADR-0014 with no change and one extra reason.
+ * The grant is refreshed on the host, by the control plane, out of the same config.json —
+ * so the *only* process that has ever held a Linear token is this one, and the gateway
+ * (which splices credentials for three model providers into sandbox traffic) knows nothing
+ * about Linear and must not learn.
  */
 
 export const LINEAR_ENDPOINT = 'https://api.linear.app/graphql'
@@ -206,8 +212,26 @@ export function toTicket(node: z.infer<typeof issueSchema>): Ticket {
   }
 }
 
+/**
+ * The two ways a project authenticates, as a value rather than as a boolean.
+ *
+ * One client, two credential shapes, and they disagree about the *format of one header*.
+ * A boolean `bearer: true` beside a `token: string` would compile and would be exactly the
+ * kind of flag that gets defaulted wrong by a caller added later; a discriminated union
+ * cannot be constructed without saying which one it is.
+ *
+ * `describe` is not decoration. When a poll 401s, the only useful first question is which
+ * credential Linear rejected — a project can have both a personal key and an OAuth grant
+ * in the store, and an operator who rotates the wrong one loses an evening. So the kind
+ * travels with the token and is the first thing in the auth failure below. It never
+ * contains the token; see `LinearUnavailable`'s message construction.
+ */
+export type LinearCredential =
+  | { kind: 'api-key'; token: string }
+  | { kind: 'oauth'; token: string; workspace?: string | undefined }
+
 export type LinearHttpOptions = {
-  apiKey: string
+  credential: LinearCredential
   /** Overridden only by tests, which point it at a local server. */
   endpoint?: string
   /** The `fetch` to use. Injected so a test can assert what was sent without a socket. */
@@ -215,13 +239,29 @@ export type LinearHttpOptions = {
 }
 
 /**
- * The only implementation that touches the network.
+ * How the credential goes on the wire, which is the one thing the two modes disagree on.
  *
- * The `Authorization` header carries the personal API key **raw**, with no `Bearer`
- * prefix. That is not a stylistic choice and it is the single most common way to get a
- * `401` out of this API: Linear's own documentation shows `Authorization: <API_KEY>` for a
- * personal key and reserves `Authorization: Bearer <token>` for OAuth access tokens. The
- * two authentication modes share one header and disagree about its shape.
+ * The personal API key is sent **raw**, with no `Bearer` prefix; an OAuth access token is
+ * sent **with** one. That is not a stylistic choice and it is the single most common way
+ * to get a `401` out of this API: Linear's documentation shows `Authorization: <API_KEY>`
+ * for a personal key and `Authorization: Bearer <token>` for OAuth. The two share one
+ * header and neither error says which shape it expected.
+ *
+ * A function rather than an inline ternary at the call site because getting it backwards
+ * is invisible — both produce a well-formed request and a 401 that reads like a revoked
+ * credential — so it is worth a name and a test of its own.
+ */
+export const authorizationHeader = (credential: LinearCredential): string =>
+  credential.kind === 'oauth' ? `Bearer ${credential.token}` : credential.token
+
+/** What to call the credential in a failure, without any part of the credential in it. */
+export const describeCredential = (credential: LinearCredential): string =>
+  credential.kind === 'oauth'
+    ? `the oauth access token${credential.workspace ? ` for ${credential.workspace}` : ''}`
+    : 'the personal api key'
+
+/**
+ * The only implementation that touches the network.
  */
 export function linearHttp(options: LinearHttpOptions): LinearApi {
   const endpoint = options.endpoint ?? LINEAR_ENDPOINT
@@ -235,8 +275,9 @@ export function linearHttp(options: LinearHttpOptions): LinearApi {
           method: 'POST',
           headers: {
             'content-type': 'application/json',
-            // Raw. See the note above; a `Bearer ` here is a silent 401.
-            authorization: options.apiKey,
+            // Raw for a personal key, `Bearer` for an OAuth token. See
+            // `authorizationHeader`; getting it backwards is a silent 401.
+            authorization: authorizationHeader(options.credential),
           },
           body: JSON.stringify({
             query: ISSUES_QUERY,
@@ -284,7 +325,18 @@ export function linearHttp(options: LinearHttpOptions): LinearApi {
           )
         }
         if (codes.includes('AUTHENTICATION_ERROR') || response.status === 401) {
-          throw new LinearUnavailable('auth', `linear rejected the api key: ${message}`)
+          /**
+           * Which credential, by name. A project can hold a personal key and an OAuth
+           * grant at the same time — the key is the documented fallback, and connecting
+           * does not remove it — so "linear rejected the api key" on a project that is
+           * actually authenticating with a grant sends an operator to rotate something
+           * nothing reads. The name comes from the credential this client was built with,
+           * which is the only thing that knows.
+           */
+          throw new LinearUnavailable(
+            'auth',
+            `linear rejected ${describeCredential(options.credential)}: ${message}`,
+          )
         }
         throw new LinearUnavailable('transport', `linear returned an error: ${message}`)
       }

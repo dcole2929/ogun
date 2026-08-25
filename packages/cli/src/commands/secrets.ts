@@ -241,7 +241,7 @@ const CTRL_D = '\u0004'
 const DELETE = '\u007f'
 const BACKSPACE = '\u0008'
 
-function promptHidden(label: string): Promise<string> {
+export function promptHidden(label: string): Promise<string> {
   const input = process.stdin
   return new Promise<string>((resolve, reject) => {
     process.stderr.write(label)
