@@ -395,6 +395,14 @@ paths a container is mounted. Set with `ogun project secret set <project> <name>
 reads the value from stdin or a hidden prompt and refuses one passed as an argument,
 because argv is readable by `ps` and lands in shell history.
 
+The Settings page can set one too, through the same function and the same lockfile — and
+only when the transport can carry it. Ogun serves plain HTTP, so a loopback bind is allowed
+(the request never reaches an interface, and whoever could read it can already read the
+0600 file), a wider bind is refused with the CLI named, and `OGUN_BEHIND_TLS_PROXY` is how
+an operator with a TLS terminator in front says the wire is safe. The condition is the
+transport, not the existence of a route: `hono/logger` records method, path and status and
+never a body, which is also why the value goes in the body and never in the path.
+
 Reading it is `readProjectSecret(slug, name)`, which answers `present | absent | empty |
 unreadable` — four states because they have four fixes (principle 6) — and hands back a
 sealed value that prints as `[redacted]` through `console.log`, `JSON.stringify` and string

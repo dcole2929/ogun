@@ -17,9 +17,17 @@ import { bold, cyan, dim, fail, green, table, yellow } from '../output.ts'
  * has, and that must never reach the repository (ADR-0012).
  *
  * Runs on the machine with the control plane on it, because the control plane is what
- * polls. It writes `~/.ogun/config.json` and talks to no server: there is deliberately no
- * HTTP route that accepts a secret, so there is no request body for a proxy, an access
- * log, or a browser's network panel to keep a copy of.
+ * polls. It writes `~/.ogun/config.json` and talks to no server at all, which is what
+ * makes it the path that always works: before `ogun init`, with the database down, and
+ * over SSH into a box with no browser.
+ *
+ * There is now also `PUT /api/system/secrets/:project/:name`, which the Settings page
+ * uses. It calls the same functions this file calls — one writer, one lockfile, one set of
+ * validation rules — and refuses outright unless the transport can carry a key, which is a
+ * loopback bind or an operator who has declared a TLS terminator in front. The comment
+ * here used to say no such route existed, on the grounds that a request body is a value in
+ * an access log and a browser's network panel; `secretWriteTransport` in the server has
+ * why only the cleartext-on-the-wire half of that survived being checked.
  */
 export async function projectSecret(args: string[]): Promise<void> {
   const [sub, ...rest] = args
@@ -154,12 +162,21 @@ async function secretList(args: string[]): Promise<void> {
   console.log(dim(`\nvalues are never printed. ${localConfigPath()}`))
 }
 
+/**
+ * Any name, not only a known one — unlike `set`, which refuses what Ogun does not read.
+ *
+ * `list` prints whatever the store holds, and §4.5 says that file gets hand-edited, so a
+ * `linaer` somebody typed into config.json by hand shows up in the table. Refusing to
+ * remove it would leave a live credential in the file that the listing keeps advertising,
+ * which is the closed set protecting the value from its owner. The set guards writes,
+ * where an unknown name creates a key nothing reads; there is nothing to guard here.
+ */
 async function secretRemove(args: string[]): Promise<void> {
   const { positionals } = parse(args, {}, 'ogun project secret rm <project> <name>')
   const [project, name] = positionals
   if (!project || !name) fail('usage: ogun project secret rm <project> <name>')
 
-  const removed = await clearProjectSecret(project, requireSecretName(name))
+  const removed = await clearProjectSecret(project, name)
   // "removed" and "there was nothing here" are different answers. Printing the first for
   // both is how you learn it worked after removing it from the wrong project.
   if (removed) console.log(green(`${name} removed for ${project}`))

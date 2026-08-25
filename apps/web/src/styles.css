@@ -222,6 +222,10 @@ button.primary { background: var(--accent); color: #16110a; border-color: var(--
 .form small { color: var(--muted); font-size: 11px; line-height: 1.45; }
 .form small.error { color: var(--red); }
 input[type='text'],
+/* Password fields are the token gate and the project-secret field. They were unstyled
+   because this list named only `text` and untyped inputs, so both rendered as the
+   browser's default control in the middle of a styled form. */
+input[type='password'],
 input:not([type]),
 select,
 textarea {

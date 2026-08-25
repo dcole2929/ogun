@@ -1,7 +1,7 @@
 import { useState } from 'react'
-import { useMutation, useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link } from 'react-router'
-import { api } from '../api.ts'
+import { api, type SystemInfo } from '../api.ts'
 import { Empty, Page } from '../ui.tsx'
 
 /**
@@ -173,39 +173,127 @@ export function SettingsPage() {
       </div>
 
       <h2>Project secrets</h2>
+      <ProjectSecrets secrets={projectSecrets} writes={data.projectSecretWrites} />
+
+      <h2>Adding a machine</h2>
       <div className="card">
-        <p className="muted" style={{ marginTop: 0, fontSize: 12 }}>
-          API keys a project needs that this machine did not already have. A Linear key is
-          issued per workspace, so — unlike the credentials above — nobody&rsquo;s home
-          directory has one. Stored in <span className="mono">~/.ogun/config.json</span> on
-          the control-plane machine, never in the repository and never in the database.
+        <p style={{ marginTop: 0, fontSize: 13 }}>
+          Runners connect outward, so adding one means minting a token here and running one
+          command there. <Link to="/runners">Runners</Link> does it.
         </p>
-        {/*
-          Presence, by name. The value is not in this response and there is no field for
-          one, which is the point: a page that renders a secret is a secret in a
-          screenshot. Setting one is `ogun project secret set` on that machine — there is
-          deliberately no form here, because a value typed into a browser is a value in a
-          request body and in an access log.
-        */}
-        {projectSecrets.length === 0 ? (
-          <p className="muted" style={{ fontSize: 13, marginBottom: 0 }}>
-            None stored. Run{' '}
-            <span className="mono">ogun project secret set &lt;project&gt; linear</span> on
-            this machine. Which projects need one is declared in each repository, so this
-            list cannot say what is missing — only what is here.
-          </p>
-        ) : (
-          <table>
-            <thead>
-              <tr>
-                <th>Project</th>
-                <th>Secret</th>
-                <th />
-              </tr>
-            </thead>
-            <tbody>
-              {projectSecrets.map((s) => (
-                <tr key={`${s.project}/${s.name}`}>
+      </div>
+    </Page>
+  )
+}
+
+/**
+ * Which projects have an API key on the control-plane machine, and — when the transport
+ * can carry one — a field to set or replace it.
+ *
+ * ### The field is write-only, and that is the whole design
+ *
+ * A stored value is never fetched, so there is nothing to populate an input with: the
+ * server's listing type has no field a value fits in (ADR-0012), and this page could not
+ * render one if it wanted to. That rule predates the form and the form does not weaken it,
+ * because the argument behind it is untouched — *a page that renders a secret is a secret
+ * in a screenshot*, and a screenshot of this card shows a project, a name, and a row of
+ * dots that were never anybody's key.
+ *
+ * So "already set" is shown as a state and a warning, never as a masked value. An input
+ * pre-filled with eight bullets to represent an existing key would be the ordinary way to
+ * build this and it is exactly wrong: it puts the value in the DOM, in the page's memory,
+ * and in whatever a browser extension or a session recorder can read, in exchange for a
+ * reassurance the pill already gives.
+ *
+ * ### What is deliberately not here
+ *
+ * No reveal, on the row or anywhere else — unlike the admin token above, which has one.
+ * The difference is who the credential belongs to: the admin token is this machine's, it
+ * is generated rather than typed, and an operator locked out of the UI on another device
+ * has no other way to see it. A Linear key belongs to a workspace, its owner has it
+ * already, and Linear's own settings page is where you look at it.
+ *
+ * The value is not passed as a mutation variable either. `useMutation` keeps `variables`
+ * on the observer after the call settles, so a key sent as one would sit in React state
+ * and in any devtools inspecting it long after the field was cleared — the containment
+ * loss that `Secret` exists to stop on the server side, wearing a browser's clothes. The
+ * mutation closes over the field instead, and the field is cleared on success.
+ */
+function ProjectSecrets({
+  secrets,
+  writes,
+}: {
+  secrets: SystemInfo['projectSecrets']
+  writes: SystemInfo['projectSecretWrites']
+}) {
+  const qc = useQueryClient()
+  // Only for the form: the table renders slugs the store already holds, which needs no
+  // lookup and must keep working for a project that has since been removed.
+  const projects = useQuery({
+    queryKey: ['projects'],
+    queryFn: api.projects,
+    enabled: writes.allowed,
+  })
+  const [project, setProject] = useState('')
+  const [name, setName] = useState(writes.names[0] ?? 'linear')
+  const [value, setValue] = useState('')
+  const [stored, setStored] = useState<{ project: string; name: string; characters: number } | null>(
+    null,
+  )
+  const [confirming, setConfirming] = useState<string | null>(null)
+
+  const store = useMutation({
+    mutationFn: () => api.setProjectSecret(project, name, value),
+    onSuccess: (result) => {
+      // Cleared first. Everything after this line is presentation, and the field should
+      // not still hold the key while any of it runs.
+      setValue('')
+      setStored({ project, name, characters: result.characters })
+      void qc.invalidateQueries({ queryKey: ['system'] })
+    },
+  })
+
+  const remove = useMutation({
+    mutationFn: (row: { project: string; name: string }) =>
+      api.removeProjectSecret(row.project, row.name),
+    onSuccess: () => {
+      setConfirming(null)
+      void qc.invalidateQueries({ queryKey: ['system'] })
+    },
+  })
+
+  const existing = secrets.find((s) => s.project === project && s.name === name)
+  const ready = project !== '' && value.trim() !== ''
+
+  return (
+    <div className="card">
+      <p className="muted" style={{ marginTop: 0, fontSize: 12 }}>
+        API keys a project needs that this machine did not already have. A Linear key is
+        issued per workspace, so — unlike the credentials above — nobody&rsquo;s home
+        directory has one. Stored in <span className="mono">~/.ogun/config.json</span> on
+        the control-plane machine, never in the repository and never in the database.
+      </p>
+
+      {secrets.length === 0 ? (
+        <p className="muted" style={{ fontSize: 13 }}>
+          None stored. Which projects need one is declared in each repository, so this list
+          cannot say what is missing — only what is here.
+        </p>
+      ) : (
+        <table>
+          <thead>
+            <tr>
+              <th>Project</th>
+              <th>Secret</th>
+              <th />
+              <th />
+            </tr>
+          </thead>
+          <tbody>
+            {secrets.map((s) => {
+              const key = `${s.project}/${s.name}`
+              return (
+                <tr key={key}>
                   <td>{s.project}</td>
                   <td className="mono">{s.name}</td>
                   <td>
@@ -220,21 +308,132 @@ export function SettingsPage() {
                       </span>
                     )}
                   </td>
+                  <td>
+                    {/* Removal carries no value, so it is offered whatever the transport
+                        is — and for any name, including one a hand-edit of config.json
+                        put there. A row you can see has to be a row you can remove. */}
+                    {confirming === key ? (
+                      <span className="row">
+                        <span className="muted" style={{ fontSize: 12 }}>
+                          the next poll authenticates with nothing — sure?
+                        </span>
+                        <button
+                          className="danger"
+                          disabled={remove.isPending}
+                          onClick={() => remove.mutate({ project: s.project, name: s.name })}
+                        >
+                          Remove
+                        </button>
+                        <button onClick={() => setConfirming(null)}>Cancel</button>
+                      </span>
+                    ) : (
+                      <button className="danger" onClick={() => setConfirming(key)}>
+                        Remove
+                      </button>
+                    )}
+                  </td>
                 </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-      </div>
+              )
+            })}
+          </tbody>
+        </table>
+      )}
+      {remove.error && <p className="error">{String(remove.error)}</p>}
 
-      <h2>Adding a machine</h2>
-      <div className="card">
-        <p style={{ marginTop: 0, fontSize: 13 }}>
-          Runners connect outward, so adding one means minting a token here and running one
-          command there. <Link to="/runners">Runners</Link> does it.
-        </p>
-      </div>
-    </Page>
+      {writes.allowed ? (
+        <>
+          <div className="form" style={{ marginTop: 14 }}>
+            <label>
+              <span>Project</span>
+              <select value={project} onChange={(e) => setProject(e.target.value)}>
+                <option value="">choose…</option>
+                {(projects.data?.projects ?? []).map((p) => (
+                  <option key={p.slug} value={p.slug}>
+                    {p.slug}
+                  </option>
+                ))}
+              </select>
+              <small className="muted">
+                A key filed under a slug nothing polls is read by nothing, so the server
+                refuses a project it does not know.
+              </small>
+            </label>
+
+            <label>
+              <span>Secret</span>
+              <select value={name} onChange={(e) => setName(e.target.value)}>
+                {writes.names.map((n) => (
+                  <option key={n} value={n}>
+                    {n}
+                  </option>
+                ))}
+              </select>
+              <small className="muted">
+                The names Ogun reads. One is added when the code that reads it lands.
+              </small>
+            </label>
+
+            <label className="wide">
+              <span>Key</span>
+              {/*
+                Never populated, and there is nothing to populate it with. type=password so
+                a shared screen and a screenshot show dots; autoComplete off so a browser
+                does not offer to keep it; spellCheck off so it is not sent anywhere to be
+                checked.
+              */}
+              <input
+                type="password"
+                value={value}
+                autoComplete="off"
+                spellCheck={false}
+                placeholder="paste the key"
+                onChange={(e) => setValue(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && ready && !store.isPending && store.mutate()}
+              />
+              <small className={existing ? 'error' : 'muted'}>
+                {existing
+                  ? `${project} already has a ${name} key. Storing replaces it — there is no ` +
+                    'history, and the next poll uses the new one with no restart.'
+                  : 'Sent once, in the request body, and never returned. Setting it again is ' +
+                    'how a key is rotated.'}
+              </small>
+            </label>
+          </div>
+
+          <div className="row" style={{ marginTop: 10 }}>
+            <button
+              className="primary"
+              disabled={!ready || store.isPending}
+              onClick={() => store.mutate()}
+            >
+              {store.isPending ? 'storing…' : existing ? 'Replace' : 'Store'}
+            </button>
+            {/* Only while the form still points at what was stored. A confirmation that
+                outlives the selection it describes is one an operator reads as applying to
+                the project now in the dropdown. */}
+            {stored && stored.project === project && stored.name === name && (
+              <span className="muted" style={{ fontSize: 12 }}>
+                {/* The length and nothing else — the same answer the CLI gives. It catches
+                    a truncated paste and narrows a random key by nothing. */}
+                {stored.name} set for {stored.project} ({stored.characters} characters)
+              </span>
+            )}
+          </div>
+          {store.error && <p className="error">{String(store.error)}</p>}
+        </>
+      ) : (
+        <>
+          <p className="muted" style={{ fontSize: 12, marginTop: 14, marginBottom: 4 }}>
+            {/* Not a disabled field: an input you can type into and not submit collects the
+                key anyway, which is the one thing this refusal is preventing. */}
+            {writes.reason}
+          </p>
+          <pre className="md-code" style={{ fontSize: 11, marginBottom: 0 }}>
+            ogun project secret set &lt;project&gt; {writes.names[0] ?? 'linear'}
+          </pre>
+        </>
+      )}
+    </div>
   )
 }
 

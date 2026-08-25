@@ -75,6 +75,98 @@ export function assertBindIsSafe(config: AuthConfig): void {
   )
 }
 
+/**
+ * The one environment variable that says "something in front of me terminates TLS".
+ *
+ * An *assertion by the operator*, not a fact Ogun can check — and a variable rather than a
+ * header for that reason. `secretWriteTransport` has the argument.
+ */
+export const TLS_PROXY_ENV = 'OGUN_BEHIND_TLS_PROXY'
+
+/**
+ * Whether this control plane may accept a project's API key in a request body (ADR-0012),
+ * and when it may not, what to tell the person who tried.
+ *
+ * ### The condition is the transport, not the existence of a route
+ *
+ * The rule this replaces was "no route accepts a secret, ever", on the grounds that a
+ * value in a request body is a value in a reverse proxy's access log and in a browser's
+ * network panel. Both halves were re-checked against what this process actually does, and
+ * only one thing survives:
+ *
+ *  - **Ogun's own log is not the leak.** `hono/logger` writes method, path and status.
+ *    Nothing here logs a request body — which is also why the value goes in the body and
+ *    never in the path: the path is the one part of a request this server does write to
+ *    its journal.
+ *  - **A proxy's access log is the operator's configuration, not ours.** A real hazard,
+ *    and one they chose and can see. Not having the feature does not remove their proxy;
+ *    it only sends them to a terminal.
+ *  - **The browser's network panel shows the value to the person who just typed it.** That
+ *    is not a disclosure. It is the same screen the key was pasted into.
+ *
+ * What is left is the irreducible one: **a secret crossing a network in cleartext**. Ogun
+ * serves plain HTTP — there is no TLS listener anywhere in this process — so on a wider
+ * bind the key is readable by anything on the path.
+ *
+ * ### So the rule is about what the transport can carry
+ *
+ *  - **Loopback.** Allowed. The request never reaches a network interface, and the only
+ *    attacker who can see it is one already running as this user on this machine — who can
+ *    read `~/.ogun/config.json` at 0600 directly. ADR-0012 draws its boundary in exactly
+ *    that place, for exactly that reason.
+ *  - **A wider bind.** Refused, unless the operator has declared a TLS terminator in front
+ *    by setting `OGUN_BEHIND_TLS_PROXY`. Ogun cannot see past its own socket, so that is
+ *    the operator asserting something only they know.
+ *
+ * ### Why an environment variable and not `x-forwarded-proto: https`
+ *
+ * Because that header is written by whoever is speaking to us, and on the exact bind this
+ * guard exists for — plain HTTP straight off a LAN — that is the client. A guard a request
+ * can switch off by asserting it is safe is not a guard, it is a comment. The environment
+ * is the one input to this decision that something on the wire cannot supply, and it is
+ * set once, by the person who built the deployment.
+ *
+ * ### Considered and rejected: allow it on any bind, since the token is already there
+ *
+ * The strongest objection, and it is nearly right. A token-protected control plane on
+ * plain HTTP already puts an admin token — which can define a worker, which is to say
+ * execute code on this host — on the wire with every request. An eavesdropper who could
+ * take the Linear key already owns the machine. So what does refusing protect?
+ *
+ * *Somebody else's* system. The admin token's blast radius is this host and the work it
+ * runs; a project's Linear key is a credential in a third party's workspace, and revoking
+ * it is not this operator's call. Adding a new class of victim to a channel that is
+ * already compromised is a fresh loss rather than a rounding error on an existing one —
+ * and the alternative costs one `ssh` and a command that already exists.
+ *
+ * Note what this is *not*: authentication. A wider bind already requires the admin token
+ * for every `/api/system` route (`scopeForPath`), and this runs after that check. The
+ * question here is not who is asking; it is what the wire does with the answer.
+ */
+export type SecretWriteTransport =
+  | { allowed: true; because: 'loopback' | 'declared-tls' }
+  | { allowed: false; reason: string }
+
+export function secretWriteTransport(
+  env: NodeJS.ProcessEnv = process.env,
+): SecretWriteTransport {
+  const bind = env.OGUN_BIND ?? '127.0.0.1'
+  if (LOCAL_BINDS.has(bind)) return { allowed: true, because: 'loopback' }
+  // Any non-blank value. A variable whose meaning turned on `1` versus `true` is one
+  // somebody sets to `yes` and then believes they have set.
+  if ((env[TLS_PROXY_ENV] ?? '').trim() !== '') return { allowed: true, because: 'declared-tls' }
+  return {
+    allowed: false,
+    reason:
+      `this control plane is bound to ${bind} and serves plain HTTP, so a key typed into ` +
+      'a browser would cross the network in cleartext — and Ogun cannot tell from inside ' +
+      'whether anything in front of it terminates TLS. Set it with `ogun project secret ' +
+      'set <project> <name>` on the control-plane machine, which writes the file directly ' +
+      'and sends nothing anywhere. If TLS is terminated in front of this process, say so ' +
+      `by starting the server with ${TLS_PROXY_ENV}=1.`,
+  }
+}
+
 /** Prefixed so one is recognisable in a shell history or a config file. */
 export const mintToken = (prefix: 'ogun' | 'ogr' = 'ogun'): string =>
   `${prefix}_${randomBytes(32).toString('hex')}`
