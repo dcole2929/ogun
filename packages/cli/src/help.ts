@@ -919,18 +919,46 @@ function definitions(rows: Array<[string, string]>): string {
 
 const WIDTH = 88
 
+/**
+ * Wrap prose to `WIDTH`, and leave anything the author laid out by hand alone.
+ *
+ * The previous implementation was `text.split(/\s+/)`, which treats a newline as one more
+ * space — so every `\n` an author wrote was destroyed and the whole entry re-flowed into a
+ * single paragraph. The visible cost was in `ogun connect`, whose two worked examples ran
+ * together into the sentence above them:
+ *
+ *     pipe it and it is read from stdin: ogun connect linear prompts for both op read
+ *     op://vault/linear/secret | ogun connect linear <client-id> Passing it inline works
+ *
+ * A help topic is the one place a person reads before they know what they are doing, and
+ * an example is the part they copy. Newlines are now paragraph breaks, and a line the
+ * author indented is emitted verbatim — an example is already the width its author chose,
+ * and re-flowing a command line makes it wrong rather than merely ugly.
+ */
 function wrap(text: string, indent: string): string {
-  const lines: string[] = []
-  let line = indent
-  for (const word of text.split(/\s+/)) {
-    if (line.trim() !== '' && line.length + 1 + word.length > WIDTH) {
-      lines.push(line)
-      line = indent
+  const out: string[] = []
+  for (const paragraph of text.split('\n')) {
+    /**
+     * Four spaces or more is a worked example, by the same convention Markdown uses for a
+     * code block. Not merely "indented": a continuation line the author indented by two to
+     * keep the source readable is still prose and still wants wrapping, and treating it as
+     * verbatim pushes it past the width instead.
+     */
+    if (/^ {4,}/.test(paragraph)) {
+      out.push(paragraph.trim() === '' ? '' : indent + paragraph.replace(/\s+$/, ''))
+      continue
     }
-    line += line === indent ? word : ` ${word}`
+    let line = indent
+    for (const word of paragraph.split(/\s+/).filter(Boolean)) {
+      if (line.trim() !== '' && line.length + 1 + word.length > WIDTH) {
+        out.push(line)
+        line = indent
+      }
+      line += line === indent ? word : ` ${word}`
+    }
+    out.push(line)
   }
-  lines.push(line)
-  return lines.join('\n')
+  return out.join('\n')
 }
 
 export const isHelpFlag = (arg: string): boolean =>
