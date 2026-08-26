@@ -773,6 +773,48 @@ export async function executeJob(
         ...(testCommand ? { testCommand } : {}),
         ...(change?.facts ? { patch: change.facts } : {}),
         deadline,
+        round,
+        /**
+         * What an agent lens needs to be an agent (§4.10). Handed in rather than
+         * resolved inside the gate, because the runtime and the sandbox are the two
+         * things `runVerifyGate` is deliberately given rather than allowed to build —
+         * and a test that drives the gate without them gets a lens that *refuses* rather
+         * than one that quietly passes. See `reviewCheck`.
+         *
+         * The `reviewer` role, not `job.model`. A patch graded by the model that wrote
+         * it is the cheap half of a second opinion and the wrong half: §4.7 puts the
+         * strong model on judgment for exactly this reason, and the whole reason a
+         * modifier can afford it is that this runs once at the end rather than for the
+         * length of the round.
+         */
+        agentLens: {
+          spec,
+          ...(resolveModel(job.runtime, 'reviewer')
+            ? { model: resolveModel(job.runtime, 'reviewer') as string }
+            : {}),
+          guestRoot,
+          baseSha: workspace.sha,
+        },
+        /**
+         * An agent lens's own turns, on the run's timeline, tagged with the lens that
+         * produced them.
+         *
+         * Sequenced from *this* run's parser rather than the lens's own, so the review
+         * interleaves with the round it judged in the order it happened; the lens keeps a
+         * separate parser state internally so that its `sessionId` never overwrites the
+         * one a retry resumes into (see `runReviewLens`). Without the tag, a reader of
+         * the timeline would find a second agent talking about the diff in the first
+         * person and no way to tell it from the one that wrote it.
+         */
+        onLensEvent: (events) => {
+          flusher.push(
+            events.map((e) => ({
+              ...e,
+              seq: nextSeq(parser),
+              payload: { ...e.payload, lens: 'review' },
+            })),
+          )
+        },
       })
       if (verdict.tests) {
         note(describeTests(verdict), {
@@ -804,6 +846,7 @@ export async function executeJob(
         permissions: 'modifier',
         gates: verdict.gates,
         tests: verdict.tests,
+        ...(verdict.review ? { review: verdict.review } : {}),
         remainingMs: deadline - Date.now(),
       })
       // Said whichever way it went. "This patch was refused and nobody tried again" is

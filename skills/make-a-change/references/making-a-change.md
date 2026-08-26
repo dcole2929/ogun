@@ -1,10 +1,14 @@
 # Making a change
 
-The shared procedure for any modifier skill. A modifier carries its own mission — what to
-change, and how to choose it — and delegates everything below, because none of it depends
-on the mission. One procedure, not one per modifier: the extractor, the test gate and the
-publisher are the same machinery behind every worker that writes, and most of the ways to
-lose a run to them are invisible from inside the sandbox.
+The procedure for every run that writes code. The mission — what to change, and how the
+work reached you — is in `SKILL.md`; none of what follows depends on it, because the
+extractor, the test gate, the patch lenses and the publisher are the same machinery behind
+every worker that writes, and most of the ways to lose a run to them are invisible from
+inside the sandbox.
+
+**One copy of this file, on purpose.** A second modifier skill would mean a second copy,
+and the half of a duplicated procedure that drifts is never the mission — it is this one,
+the safety half, where every rule was written down because a run was already lost to it.
 
 ## 1. Know how your work leaves this sandbox
 
@@ -64,15 +68,16 @@ The full message body is reproduced verbatim in the pull request. It is the revi
 so write it as one:
 
 - **Subject**: imperative, specific, under about 70 characters. `Reject a port of 0 in
-  parseAuthority`, not `Fix bug` and not `Fix the issue described in the finding`.
+  parseAuthority`, not `Fix bug` and not `Do what the plan said`.
 - **Body**: what was actually wrong and how you know; what you changed, and why this
   repair rather than the other one you considered; what you checked, including the suite;
-  and the fingerprint of the finding, so a reader can find the write-up you worked from.
+  and an identifier for what you worked from — the finding's fingerprint, or the
+  ticket the plan came from — so a reader can find the argument behind the change.
 - **What you did not do** belongs here too. The first question anyone asks of an agent's
   patch is what else it touched, and "I saw X nearby and deliberately left it" answers it.
 
-Write it in your own words. A message that restates the finding's title and nothing else
-tells the reviewer only that you can read an inbox.
+Write it in your own words. A message that restates the finding's title, or the plan's,
+and nothing else tells the reviewer only that you can read your input.
 
 ## 4. Never write a closing keyword
 
@@ -114,9 +119,9 @@ The runner runs the same command again after you exit, against the tree you left
 patch whose suite is red is never published. What happens then is that you may be handed
 the suite's output and asked again — **there is a retry, and it is short**. The runner
 resumes this same session, your commits are still in the workspace, and you get what is
-left of the job's timeout minus what the gate needs to run the suite one more time. If
-there is not enough left for that, there is no second attempt at all and the run ends
-refused.
+left of the job's timeout minus what the gate needs to run the suite one more time — and,
+where your worker asks for one, minus what the review of your diff costs as well. If there
+is not enough left for that, there is no second attempt at all and the run ends refused.
 
 So the only thing running the suite yourself changes is whether you are still here, with
 budget, to fix what it says. Skipping it does not save the time; it spends most of it and
@@ -125,7 +130,7 @@ leaves the repair to a round that has almost none.
 - **Run it once before you change anything.** A suite that was already red is not your
   patch's fault, and that is a fact you can only establish before you touch the tree. If
   it was already red, say so in your notes — it is worth more than a guess about why.
-- **Add a test that fails before your change and passes after**, wherever the finding is
+- **Add a test that fails before your change and passes after**, wherever the change is
   the kind of thing a test can see. Write it first and watch it fail. Without that, "the
   suite passed" only means you broke nothing, which is not the claim you are making.
 - **Leave room in the budget.** The gate's clock is what remains of the job's timeout, not
@@ -158,14 +163,14 @@ commit, never from your workspace. Editing it here changes nothing about how you
 judged. What it does do is put "the agent tried to set its own exam" into a diff a person
 is about to read, and it is not left to them to notice: the `self-gating` lens says so on
 the run's timeline whether or not anybody opens the diff. That lens does not refuse — this
-file is a file like any other and a finding about it deserves a fix. If the one you are
-fixing genuinely requires a change there, make it and say so plainly in the message, and
+file is a file like any other and a finding about it deserves a fix. If the work you were
+given genuinely requires a change there, make it and say so plainly in the message, and
 expect the old command to be what you are held to.
 
 If your change turns a test red, there are exactly two honest cases:
 
 - the test encodes something your change got wrong — fix the change; or
-- the test asserts the behaviour the finding says is broken — change the test, say so in
+- the test asserts the behaviour your work says is wrong — change the test, say so in
   the commit message, and make the new assertion at least as strong as the old one.
 
 Deleting the test, loosening the assertion, or marking it skipped is neither, and it
@@ -173,8 +178,8 @@ produces the one artefact this whole path exists to prevent: a green suite over 
 
 **Do not add or upgrade a dependency.** Adding one is a supply-chain decision a person
 makes, this sandbox reaches only the package registry and the model API, and a lockfile
-change buried inside a bug fix is the least reviewable diff there is. If the finding
-cannot be fixed without one, decline and say which package and why.
+change buried inside a bug fix is the least reviewable diff there is. If the work
+cannot be done without one, decline and say which package and why.
 
 ## 8. Say what happened, including when the answer is "nothing"
 
@@ -189,13 +194,13 @@ JSON
 
 A modifier that changed nothing is recorded as `approved` — it ran, it read, and it
 decided nothing needed doing. That is an ordinary outcome and not a failure. The note is
-what turns it from silence into a result: say which finding you looked at, what the code
-actually said, and what stopped you.
+what turns it from silence into a result: say what you were given or what you chose, what
+the code actually said, and what stopped you.
 
 - **Something you noticed but did not fix is a finding, not an edit.** Write it up with a
   fingerprint and citations exactly as a reviewer would; a modifier's findings reach the
   inbox the same way. That is the alternative to fixing it now, and it is what keeps "one
-  finding, one change" from meaning "the second bug is lost".
+  item, one change" from meaning "the second bug is lost".
 - **Do not adjudicate.** `adjudications` change what the inbox says about findings that
   already exist, and yours would be wrong: your patch is a draft nobody has merged, so
   `fixed` is false until a person merges it — and an inbox claiming `fixed` while the bug

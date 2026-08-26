@@ -1,7 +1,9 @@
 import { existsSync } from 'node:fs'
-import type { GateResult, Lens, VerifyConfig } from '@ogun/core'
+import type { GateResult, Lens, RunEvent, VerifyConfig } from '@ogun/core'
 import { findingsDocumentSchema, parseFingerprint } from '@ogun/core'
 import { SWEEP_UP_SUBJECT, type PatchFacts } from './patch.ts'
+import { REVIEW_LENS, runReviewLens } from './review.ts'
+import type { RuntimeSpec } from './runtimes/index.ts'
 import type { Sandbox } from './sandbox/index.ts'
 
 /**
@@ -47,6 +49,31 @@ export type VerifyInput = {
    * a second budget of the gate's own. See `testsCheck` for why there is only one number.
    */
   deadline: number
+  /**
+   * What an agent lens needs to actually be an agent: the runtime to invoke, the model
+   * role it should run as, and where the workspace and its base commit are.
+   *
+   * Optional, and its absence is not neutral. A caller that drives `runVerifyGate`
+   * without it — the tests, and anything exercising the tool lenses on their own — cannot
+   * run an agent lens, and a declared agent lens that cannot run **fails** rather than
+   * being recorded as skipped. See `runVerifyGate`.
+   */
+  agentLens?: {
+    spec: RuntimeSpec
+    /** Concrete model for the reviewer role, or none to let the runtime choose (§4.7). */
+    model?: string
+    /** Workspace root as the agent sees it, which is not the host path (§5.1). */
+    guestRoot: string
+    baseSha: string
+  }
+  /**
+   * Which round is being graded, 1-based. Only an agent lens needs it, and only so its
+   * output file cannot be mistaken for the previous round's — the workspace is never
+   * reset between rounds (§5.2), so a fixed path is a stale path waiting to happen.
+   */
+  round?: number
+  /** Timeline events an agent lens produced, handed to the caller that owns the sequence. */
+  onLensEvent?: (events: RunEvent[]) => void
 }
 
 export type VerifyOutcome = {
@@ -71,44 +98,143 @@ export type VerifyOutcome = {
      */
     durationMs?: number
   }
+  /**
+   * What became of the review of the diff, when a worker asked for one.
+   *
+   * The same two-field split as `tests` above, for the same reason and with the same
+   * consumer: `retryDecision` has to tell "the reviewer read the patch and refused it",
+   * which another round can act on, from "no verdict exists", which no round can repair.
+   * `durationMs` is what the retry holds back so the *next* round's gate can afford to
+   * review again — a reserve covering only the suite would send a round out with no
+   * budget for the second half of its own gate.
+   */
+  review?: { ran: boolean; durationMs?: number }
 }
 
 export async function runVerifyGate(input: VerifyInput): Promise<VerifyOutcome> {
   const results: GateResult[] = []
   const lenses = resolveLenses(input)
   let tests: VerifyOutcome['tests']
+  let review: VerifyOutcome['review']
+  const outcome = (): VerifyOutcome => ({
+    gates: results,
+    ...(tests ? { tests } : {}),
+    ...(review ? { review } : {}),
+  })
 
   for (const lens of lenses.filter((l) => l.method === 'tool')) {
     if (lens.name === TESTS_LENS && !lens.command) {
-      const outcome = await testsCheck(input)
-      tests = outcome.tests
-      results.push(outcome.gate)
-      if (!outcome.gate.passed) return { gates: results, tests }
+      const checked = await testsCheck(input)
+      tests = checked.tests
+      results.push(checked.gate)
+      if (!checked.gate.passed) return outcome()
       continue
     }
     if (PATCH_LENSES.has(lens.name) && !lens.command) {
       const result = patchLens(lens.name, input)
       results.push(result)
-      if (!result.passed) return { gates: results, ...(tests ? { tests } : {}) }
+      if (!result.passed) return outcome()
       continue
     }
     const result = await runToolLens(lens, input)
     results.push(result)
     // Short-circuit: once a deterministic check has failed, an agent lens grading the
     // same output is spending a call to reach a conclusion we already have.
-    if (!result.passed) return { gates: results, ...(tests ? { tests } : {}) }
+    if (!result.passed) return outcome()
   }
 
+  /**
+   * Agent lenses, and the one of them that is wired.
+   *
+   * §4.10 records that these are "resolved and recorded as skipped, rather than silently
+   * reported as passed", and the reason is a calibration argument about *default* rubrics:
+   * a standing set of grading prompts written before there is a week of real output to
+   * check them against would bake in the wrong rubric permanently. That argument still
+   * holds and nothing here weakens it — no lens is added to any profile's defaults.
+   *
+   * What changes is that a worker may now *ask* for one by name. `review` is the first,
+   * and the only one, because it is the one whose rubric is not a guess: it is §4.10's
+   * own list of what a modifier's patch needs graded, and `review.ts` owns the prompt so
+   * that a worker cannot write its own exam. A lens a worker names and this build does
+   * not recognise is still recorded as skipped, with its name in the reason — silently
+   * passing an expectation somebody wrote down is the failure this whole column is
+   * shaped around.
+   */
   for (const lens of lenses.filter((l) => l.method === 'agent')) {
-    results.push({
-      name: lens.name,
-      method: 'agent',
-      passed: true,
-      detail: 'agent lenses are not wired in phase 1 — recorded as skipped, not as passed silently',
-    })
+    if (lens.name !== REVIEW_LENS) {
+      results.push({
+        name: lens.name,
+        method: 'agent',
+        passed: true,
+        detail:
+          `no agent lens named "${lens.name}" is wired in this build — recorded as skipped, ` +
+          'not as passed silently',
+      })
+      continue
+    }
+    const checked = await reviewCheck(input)
+    review = checked.review
+    results.push(checked.gate)
+    if (!checked.gate.passed) return outcome()
   }
 
-  return { gates: results, ...(tests ? { tests } : {}) }
+  return outcome()
+}
+
+/**
+ * The review lens, and the three things that have to be true before a model is worth
+ * paying for.
+ *
+ * **A run that changed nothing passes.** There is no diff to read, so there is no review
+ * to be had — and it passes *with a detail saying which* it was, on the same principle-6
+ * grounds `patchLens` states: "reviewed and cleared" and "there was nothing to review"
+ * must not wear the same value.
+ *
+ * **A lens that cannot run fails.** This is the case worth stating out loud. The caller
+ * hands in `agentLens` only when it can actually invoke a runtime; without it the honest
+ * options are to skip — which publishes an unreviewed patch produced by a worker that
+ * asked to be reviewed — or to refuse. §5.1's rule that a failed dependency must not
+ * silently produce an unreviewed result is the same rule one level down, so it refuses,
+ * and the reason names the seam rather than the patch.
+ */
+async function reviewCheck(
+  input: VerifyInput,
+): Promise<{ gate: GateResult; review: VerifyOutcome['review'] }> {
+  if (!input.patch) {
+    return {
+      gate: {
+        name: REVIEW_LENS,
+        method: 'agent',
+        passed: true,
+        detail: 'this run produced no patch, so there was no diff to review',
+      },
+      review: { ran: false },
+    }
+  }
+  if (!input.agentLens) {
+    return {
+      gate: {
+        name: REVIEW_LENS,
+        method: 'agent',
+        passed: false,
+        detail:
+          'this worker asked for its diff to be reviewed and this runner cannot run an ' +
+          'agent lens, so the patch is unreviewed. It is refused rather than skipped: a ' +
+          'review nobody could run must not read as a review that passed',
+      },
+      review: { ran: false },
+    }
+  }
+  return runReviewLens({
+    sandbox: input.sandbox,
+    spec: input.agentLens.spec,
+    ...(input.agentLens.model ? { model: input.agentLens.model } : {}),
+    guestRoot: input.agentLens.guestRoot,
+    baseSha: input.agentLens.baseSha,
+    round: input.round ?? 1,
+    deadline: input.deadline,
+    ...(input.onLensEvent ? { onEvent: input.onLensEvent } : {}),
+  })
 }
 
 /** The one lens whose command comes from the project rather than from the worker. */
@@ -122,7 +248,7 @@ export const TESTS_LENS = 'tests'
  * rewriting the artefact a person is reviewing — so a warning would record the harm
  * without preventing it, and the harm lands weeks later on somebody who never saw this
  * run: an issue nobody connected to the work closes itself, citing an agent's commit as
- * the reason. `skills/fix-a-finding` has said "never write a closing keyword" since it
+ * the reason. `skills/make-a-change` has said "never write a closing keyword" since it
  * was written, and §4.10 is where an instruction becomes a gate.
  *
  * It is also almost always *wrong on its own terms*: a modifier takes work out of the
@@ -351,7 +477,7 @@ function patchLens(name: string, input: VerifyInput): GateResult {
  * `close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved`, any case, optionally
  * followed by a colon, then whitespace, then an issue reference — and the reference has
  * to come *immediately* after. That last part is the whole difference between this lens
- * and a broken one: `skills/fix-a-finding` tells a modifier to write "the bug reported in
+ * and a broken one: `skills/make-a-change` tells a modifier to write "the bug reported in
  * #14", which is a sentence GitHub does not act on, and a check that flagged every `#14`
  * near the word "fixes" would refuse the exact phrasing the skill recommends.
  *

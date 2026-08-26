@@ -1,4 +1,5 @@
 import type { GateResult } from '@ogun/core'
+import { REVIEW_LENS } from './review.ts'
 import { TESTS_LENS, type VerifyOutcome } from './verify.ts'
 
 /**
@@ -54,11 +55,24 @@ export const MAX_MODIFIER_ROUNDS = 2
  * Lenses whose failure another round could plausibly repair.
  *
  * An allowlist, not a denylist, and it fails closed: a lens added later — a worker's own
- * `expectations` entry, an agent lens when those are wired — gets no retry until somebody
- * decides it deserves one. The alternative is that a new check quietly starts costing a
- * second model round for a verdict it will reach again.
+ * `expectations` entry, an agent lens nobody has argued about yet — gets no retry until
+ * somebody decides it deserves one. The alternative is that a new check quietly starts
+ * costing a second model round for a verdict it will reach again.
+ *
+ * `review` was argued about, and it earns its place on exactly the test lens's argument
+ * even though the two failures look nothing alike. A red suite is retryable because the
+ * gate produced something the agent can act on: the name of the test that broke. A
+ * refused review is retryable for the same reason and with more of it — the rejection is
+ * prose written *for* the agent, naming what is wrong and frequently what would fix it,
+ * and `retryPrompt` hands it back verbatim. That is the most actionable rejection this
+ * gate can produce.
+ *
+ * What is not retryable is a review that never *happened*, and `permanence` keeps those
+ * apart on `review.ran` exactly as it does on `tests.ran`. A run that could not review
+ * its diff — no runtime seam, no budget left, no verdict written — is a fact about the
+ * run: another round produces another patch that also cannot be reviewed.
  */
-const RETRYABLE_LENSES = new Set<string>([TESTS_LENS])
+const RETRYABLE_LENSES = new Set<string>([TESTS_LENS, REVIEW_LENS])
 
 export type RetryDecision =
   | { retry: false; reason: string }
@@ -82,6 +96,8 @@ export function retryDecision(input: {
   permissions: 'observer' | 'reviewer' | 'modifier'
   gates: GateResult[]
   tests: VerifyOutcome['tests']
+  /** Absent when this worker asked for no review of its diff, which is most of them. */
+  review?: VerifyOutcome['review']
   /** `deadline - Date.now()`, taken by the caller so this function is pure. */
   remainingMs: number
 }): RetryDecision {
@@ -103,7 +119,7 @@ export function retryDecision(input: {
    * tells them the cap was never the problem.
    */
   const permanent = failed
-    .map((g) => permanence(g, input.tests))
+    .map((g) => permanence(g, input.tests, input.review))
     .filter((r): r is string => r !== undefined)
   if (permanent.length > 0) {
     return {
@@ -147,24 +163,37 @@ export function retryDecision(input: {
   }
 
   /**
-   * Twice the suite, and both halves are the same measurement.
+   * What the gate will cost again, plus one suite run for the agent itself.
    *
-   * One for the gate to run it after the agent exits. One for the *agent* to run it
-   * itself — `references/making-a-change.md` §5 tells a modifier to prove its change
-   * before it finishes, and a round that cannot afford a single suite run is a round
-   * that must guess. A retry that guesses is a retry that produces a second red patch
-   * and spends the rest of the budget doing it.
+   * The reserve is everything the *next* gate has to do over: the suite, and — for a
+   * worker that asked for one — the review of the diff, which is a model round and is not
+   * free. A reserve covering only the suite was right while the suite was the whole gate;
+   * with a review lens it sends a round out with enough budget to write a patch and not
+   * enough for the gate to finish judging it, which produces "the review never happened"
+   * and refuses to publish for a reason that reads like a broken harness rather than a
+   * bad patch. Both halves are measurements of what each step just cost, for the reason
+   * given above: a constant here would be a second number able to disagree with
+   * `timeoutMs`.
+   *
+   * The extra suite run on top is for the *agent* — `references/making-a-change.md` §5
+   * tells a modifier to prove its change before it finishes, and a round that cannot
+   * afford a single suite run is a round that must guess. A retry that guesses is a retry
+   * that produces a second red patch and spends the rest of the budget doing it.
    */
-  const reserveMs = suiteMs
-  if (input.remainingMs < 2 * suiteMs) {
+  const reviewMs = input.review?.durationMs ?? 0
+  const reserveMs = suiteMs + reviewMs
+  if (input.remainingMs < suiteMs + reserveMs) {
     return {
       retry: false,
       reason:
         `no second attempt: ${Math.round(input.remainingMs / 1000)}s of the job's timeout ` +
-        `remain and the suite alone takes ${Math.round(suiteMs / 1000)}s. A round that ` +
-        'cannot run the suite once and still leave the gate time to run it again produces ' +
-        '"the suite never ran", which refuses to publish for a reason that looks like a ' +
-        'broken harness',
+        `remain and the gate needs ${Math.round(reserveMs / 1000)}s to judge a patch again ` +
+        `(the suite takes ${Math.round(suiteMs / 1000)}s` +
+        (reviewMs > 0 ? `, the review of the diff ${Math.round(reviewMs / 1000)}s` : '') +
+        '), on top of one suite run for the agent itself. A round the gate cannot finish ' +
+        'judging produces "the suite never ran", or a diff nothing reviewed, which ' +
+        'refuses to publish for a reason that looks like a broken harness rather than a ' +
+        'bad patch',
     }
   }
 
@@ -194,7 +223,11 @@ export function retryDecision(input: {
  * and neither is repaired by writing more code. That is the distinction
  * `VerifyOutcome.tests` was split in two to keep, used here for the first time.
  */
-const permanence = (gate: GateResult, tests: VerifyOutcome['tests']): string | undefined => {
+const permanence = (
+  gate: GateResult,
+  tests: VerifyOutcome['tests'],
+  review: VerifyOutcome['review'],
+): string | undefined => {
   if (!RETRYABLE_LENSES.has(gate.name)) {
     return `${gate.name} failed, and it is not a lens another round can repair`
   }
@@ -205,6 +238,12 @@ const permanence = (gate: GateResult, tests: VerifyOutcome['tests']): string | u
     if (tests.durationMs === undefined) {
       return "the project's suite never finished, so nothing measured what the gate would need again"
     }
+  }
+  if (gate.name === REVIEW_LENS && review?.ran !== true) {
+    return (
+      'the diff was never reviewed, so no round produced a complaint to act on — another ' +
+      'attempt would produce another patch nothing could review either'
+    )
   }
   return undefined
 }

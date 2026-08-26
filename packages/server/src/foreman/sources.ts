@@ -544,7 +544,7 @@ export async function pollSource(
     const outcome = await emit(db, {
       row,
       cycleId: cycle.id,
-      entryNodeKey: entry,
+      nodeKeys: definition.nodes.map((n) => n.key),
       ticket,
       credentials: await fleetCredentials(db),
     })
@@ -690,7 +690,31 @@ async function emit(
   input: {
     row: typeof sources.$inferSelect
     cycleId: string
-    entryNodeKey: string
+    /**
+     * Every node of the cycle this ticket starts, not only the one it starts *at*.
+     *
+     * `entryNode` is still checked and still refuses a cycle with more than one entry:
+     * that rule is about there being exactly one place a ticket *arrives*, which is a
+     * question about the graph's shape. Which nodes may *read* the ticket is a different
+     * question, and answering it with the entry node was the wrong answer for anything
+     * longer than one node.
+     *
+     * A cycle a ticket started is about that ticket end to end. A planning node that
+     * cannot read the ticket is planning from an upstream node's paraphrase of it, and a
+     * ticket retyped by a model is not the ticket — the words somebody actually filed are
+     * the whole of what §4.13's filter admitted, and losing them at the first hop makes
+     * every node after it work from a summary nobody can check. The node that builds the
+     * change needs them for the same reason from the other end: it is the one that can
+     * tell that the plan it was handed would not give the person who filed the ticket
+     * what they asked for.
+     *
+     * Nothing about the layering changes (§5.1): the brief is *appended* to each node's
+     * own resolved prompt, so every node still knows what it was asked to do and now also
+     * knows what about. A node in this cycle with no interest in the ticket — a reviewer
+     * reused from another graph — gets a paragraph it can ignore, which is the cheap side
+     * of being wrong.
+     */
+    nodeKeys: string[]
     ticket: AdmittedTicket
     credentials: Awaited<ReturnType<typeof fleetCredentials>>
   },
@@ -732,7 +756,9 @@ async function emit(
        * came from Linear" a `like` query.
        */
       trigger: `source:${input.row.name}`,
-      promptContext: { [input.entryNodeKey]: ticketBrief(input.ticket) },
+      promptContext: Object.fromEntries(
+        input.nodeKeys.map((key) => [key, ticketBrief(input.ticket)]),
+      ),
       credentials: input.credentials,
     })
     await db

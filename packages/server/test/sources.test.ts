@@ -163,6 +163,63 @@ describe('a source', () => {
     assert.match(job!.prompt, /Rate limiter drops the first request/)
   })
 
+  /**
+   * Every node of the cycle gets the ticket, not only the node the ticket arrives at.
+   *
+   * The two rules look like one and are not. A source's cycle must have exactly *one
+   * entry node*, which is about there being a single place work starts — and that check is
+   * unchanged and still refuses a graph with two. Which nodes may *read* the ticket is a
+   * different question, and answering it with the entry node is only right while the cycle
+   * is one node long.
+   *
+   * The failure it caused is silent and it is the expensive kind. A planning node two hops
+   * in has no ticket in its prompt, so it plans from whatever the node before it wrote
+   * down — and a ticket retyped by a model is not the ticket. The words somebody filed are
+   * the whole of what the deterministic filter admitted (ADR-0013); losing them at the
+   * first hop makes every node after it work from a summary nobody can check against
+   * Linear, because nothing downstream can reach Linear at all.
+   */
+  test('the ticket reaches every node of the cycle it started, not only the first', async () => {
+    await db.insert(schema.workers).values({
+      projectId,
+      name: 'planner',
+      skillRef: 'plan-a-ticket',
+      runtime: 'claude',
+      versionHash: 'v',
+      config: {},
+    })
+    await db.insert(schema.cycles).values({
+      projectId,
+      name: 'chain',
+      definition: {
+        nodes: [
+          { key: 'scope', worker: 'scope-evaluator' },
+          { key: 'plan', worker: 'planner' },
+        ],
+        edges: [{ from: 'scope', to: 'plan', onDepFailure: 'block' }],
+        onMissed: 'skip',
+        enabled: true,
+      },
+    })
+
+    const { row, config } = await source('chained', { cycle: 'chain' })
+    await pollSource(db, row, config, deps([ticket()]))
+
+    const emission = (await emissions()).find((e) => e.sourceName === 'chained')
+    const jobs = await db
+      .select()
+      .from(schema.jobs)
+      .where(eq(schema.jobs.cycleRunId, emission!.cycleRunId!))
+
+    assert.equal(jobs.length, 2)
+    for (const job of jobs) {
+      assert.match(job.prompt, /-----BEGIN TICKET-----/, `${job.nodeKey} was not given the ticket`)
+      // And still appended rather than substituted, on every node: the layers decide what
+      // to do and the source decides what to do it to (§5.1).
+      assert.match(job.prompt, /Use the .+ skill\./)
+    }
+  })
+
   test('polling the same ticket ten times emits once', async () => {
     /**
      * The property the whole design turns on. Nothing moves the card, so every poll admits

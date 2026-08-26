@@ -1116,14 +1116,26 @@ as a *published artefact*:
 Both are deterministic, which is not an economy: neither needs judgment. What genuinely
 does is in the agent-lens column above, and none of it is built.
 
-**Only the tool checks are wired.** [open] `schema`, `grounded`, `commit-message`,
-`self-gating` and the test gate run and can fail a run; agent lenses are resolved and
-recorded as skipped with that stated as the reason, rather than silently reported as
-passed. Grading findings quality with a model is a prompt-calibration problem, not a
-plumbing one, and guessing at the rubric before there is a week of real reviewer output
-to calibrate against would bake in the wrong one. The modifier column is the same
-argument with less evidence behind it — there is one merged modifier patch in
-existence.
+**Only the tool checks are wired *by default*.** [amended] `schema`, `grounded`,
+`commit-message`, `self-gating` and the test gate run and can fail a run; an agent lens
+that no default set contains is resolved and recorded as skipped with that stated as the
+reason, rather than silently reported as passed. Grading findings quality with a model is
+a prompt-calibration problem, not a plumbing one, and guessing at the rubric before there
+is a week of real reviewer output to calibrate against would bake in the wrong one. That
+argument is about *defaults* and it still holds: nothing has been added to any profile's
+default set.
+
+What is new is that a worker may **ask** for one by name, and exactly one is wired —
+`review`, which reads the diff (ADR-0015). It is the modifier column's own list of what a
+suite structurally cannot answer, so its rubric is not a guess; it lives in
+`runner/src/review.ts` rather than in `verify.expectations[].prompt`, because a rubric a
+worker can rewrite in its own stanza is a worker grading its own exam. A `critical` or
+`high` finding against the patch refuses it, which withholds the pull request and buys the
+agent one more round with the reviewer's words verbatim (§5.2). A review that produced no
+readable verdict fails rather than skipping — skipping publishes an unreviewed patch from
+a worker that asked to be reviewed — and it fails as a review that never *ran*, so no round
+is spent asking a modifier to repair somebody else's silence. An agent lens this build does
+not recognise is still recorded as skipped, with its own name in the reason.
 
 **Cheap and fatal runs first.** [settled] `commit-message` costs microseconds and the
 suite costs minutes, so a patch that is unpublishable whatever the suite says never
@@ -2121,7 +2133,7 @@ with the PR cap as `policies.maxOpenPullRequests` (ADR-0009). Modifiers can also
 what they noticed, as ordinary findings.
 
 Also done, and it is what all of the above had been missing: **something to drive it.**
-`skills/fix-a-finding` is the first modifier skill — take one finding out of the inbox the
+`skills/fix-a-finding` was the first modifier skill — take one finding out of the inbox the
 reviewers and triage fill, fix it, prove it against `tests.command`, commit it with a
 message written for the person who will read the pull request. It closes the loop the
 system is built around: reviewer finds → triage publishes → modifier fixes → draft PR.
@@ -2135,8 +2147,10 @@ on merge and nothing can strip one without destroying the artefact (ADR-0009). T
 is no longer only an instruction: the `commit-message` lens below refuses the patch, which
 is what §4.10 is for. And **declining is a result**: a modifier that changed nothing is
 `approved`, an ordinary outcome, so the skill is written to make "I could not find a safe
-fix" cheaper to say than to guess. Ogun's own `fix-a-finding` worker carries **no
-schedule**, and will not until a
+fix" cheaper to say than to guess. (Phase 4 generalised that skill into
+`skills/make-a-change`, which is the same procedure taking its work from either the inbox
+or a plan — ADR-0015. The worker keeps its name.) Ogun's own `fix-a-finding` worker carries
+**no schedule**, and will not until a
 person has watched one of these runs end to end — `maxOpenPullRequests` bounds the damage
 of an unattended modifier; it is not a substitute for having seen one work.
 
@@ -2229,11 +2243,40 @@ on. What is in the file instead is the worker, which a person can hand a ticket 
 `ogun trigger`, and a worked example of what a real operator writes in the repository the
 tickets are actually about.
 
-One honest gap remains where there were two. The **pipeline is not built**: no
-scope-evaluation skill, and no ticket → plan → implement → review → draft PR graph. A
-source today emits into whatever cycle a project names it.
+Also done, and it is the other half of that gap: **the pipeline** (§9, ADR-0015) —
+*ticket → plan → implement → draft PR*, as three nodes and a lens rather than the four
+nodes this section named, and the reason is where publication happens. `publishIfReady`
+runs inside the modifier's own job, before the foreman has released anything downstream, so
+a review *node* after it can only annotate a pull request that is already open. The verify
+gate is the only place a patch is stopped, so the review of the diff is a lens there: it
+withholds the pull request, and `retryDecision` hands its refusal back to the agent verbatim
+exactly as it hands back a red suite.
 
-The other — *"nothing has run against a live Linear workspace"* — **is closed**, and the
+Three other things were settled by machinery that already existed rather than by taste. A
+**plan is a staged finding**, because `/inputs` is the one channel between the nodes of a
+cycle — which also means a plan's citations are checked by the `grounded` lens, so a plan
+invented from the ticket text is deterministically unpublishable, and a plan that finds
+nothing to build declines with the same `verdict` the evaluator uses. **`implement` is not
+a new skill**: `fix-a-finding` is generalised into `make-a-change`, because a skill travels
+as one directory and a second one sharing `references/making-a-change.md` by relative path
+would dangle silently in every project that is not this one. And every edge in the chain is
+`block` rather than `degrade` — degrade is right for a fan-in reporting on a batch and
+wrong for a chain, where each node is the sole input to the next and there is nothing to
+degrade to.
+
+The ticket now reaches **every node of the cycle it started**, not only the entry node. A
+planning node two hops in would otherwise plan from whatever the node before it wrote down,
+and a ticket retyped by a model is not the ticket. ADR-0013's "exactly one entry node" rule
+is untouched: that is about where work starts, not about who may read the ticket.
+
+No node declares `connections: [linear]`. The door ADR-0013's amendment opened stays shut,
+because the grant cannot be narrower than the whole workspace and the plan node's output is
+piped into the instructions of the node that writes code. If it is ever opened it goes on
+the plan node and only there, which is one of the reasons plan and implement are separate
+workers.
+
+The other gap this phase carried — *"nothing has run against a live Linear workspace"* —
+**is closed**, and the
 fixtures' caveat in `test/linear-fixtures.ts` is now a statement about what the *tests*
 prove rather than about the client. A `client_credentials` grant against a real workspace
 polled a real team: 132 issues read, 18 admitted, 3 emitted and 15 held behind
@@ -2270,11 +2313,15 @@ project either**, so the flow has never run end to end. `test/linear-oauth-fixtu
 records what the fixtures prove — request shapes, units, delimiters, failure classification,
 redaction — and what they cannot.
 
-Remaining: the rest of the pipeline — *plan → implement → review → draft PR* behind the
-evaluator — and write-back itself, which is what `comments:create` and the scope decision in
-ADR-0014 are waiting for. Write-back is the one that would change what a decline is worth:
-today the reason lands in Ogun's own ledger and the card sits untouched in `Todo`, so the
-person who filed it learns nothing unless somebody goes and looks.
+Remaining: write-back itself, which is what `comments:create` and the scope decision in
+ADR-0014 are waiting for. It is the one that would change what a decline is worth: today the
+reason lands in Ogun's own ledger and the card sits untouched in `Todo`, so the person who
+filed it learns nothing unless somebody goes and looks — and that is now true of a plan node
+declining as well as an evaluator.
+
+And a run. The pipeline behind the evaluator has been exercised against scripted runtimes
+and real git, and not once against a real ticket end to end. The first one should be
+watched, for the same reason `fix-a-finding` still has no schedule.
 
 **Explicit non-goals:** Kubernetes, multi-tenancy, RBAC, billing, graphical workflow
 canvas, auto-merge, agent memory, model auto-selection, remote runner mesh.

@@ -1,0 +1,10 @@
+interface:
+  display_name: "Plan a Ticket"
+  short_description: "Turn one admitted ticket into a plan a modifier can build"
+  default_prompt: "Use the plan-a-ticket skill."
+policy:
+  # Never auto-triggered. This skill is meaningless outside a ticket cycle: its subject is
+  # the brief a source appends to the job's prompt, and its output is staged for one
+  # specific node downstream. An agent reaching for it mid-task would be writing a plan
+  # nobody asked for into a document nothing reads.
+  allow_implicit_invocation: false

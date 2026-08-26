@@ -77,7 +77,19 @@ const job = (over: Partial<ClaimedJob> = {}): ClaimedJob =>
  * is exactly what the agent does inside the container — the workspace is a bind mount,
  * and extraction reads whatever is there when the process exits.
  */
-type Turn = { write?: (workspace: string) => Promise<void>; suiteExit: number }
+type Turn = {
+  write?: (workspace: string) => Promise<void>
+  suiteExit: number
+  /**
+   * What the review of this round's diff writes as its verdict, for a job that asked for
+   * one. `null` scripts a reviewer that produced nothing, which is the fail-closed case;
+   * absent means this job declared no review lens and none should be invoked.
+   */
+  review?: string | null
+}
+
+/** The one string that tells the review lens's invocation from the modifier's. */
+const REVIEW_MARKER = 'You are reviewing one change'
 
 type Recorded = { argv: string[]; opts?: ExecOptions }
 
@@ -102,6 +114,26 @@ const scriptedSandbox = (turns: Turn[], workspace: string) => {
           done: Promise.resolve({ code: current.suiteExit, stderr: '', timedOut: false }),
         }
       }
+      /**
+       * The review lens, invoked in the same container as the agent it is judging but as
+       * its own session (`review.ts`). It runs after the suite, so `turn` has already
+       * advanced past the round being graded — which is also the round number its verdict
+       * file is named for.
+       */
+      if (argv.some((a) => a.includes(REVIEW_MARKER))) {
+        const graded = turns[Math.min(turn - 1, turns.length - 1)]!
+        return {
+          lines: (async function* () {
+            if (graded.review != null) {
+              await mkdir(join(workspace, '.ogun-out'), { recursive: true })
+              await writeFile(join(workspace, '.ogun-out', `review-${turn}.json`), graded.review)
+            }
+            yield JSON.stringify({ type: 'result', subtype: 'success', result: 'reviewed' })
+          })(),
+          done: Promise.resolve({ code: 0, stderr: '', timedOut: false }),
+        }
+      }
+
       const write = current.write
       return {
         lines: (async function* () {
@@ -386,4 +418,117 @@ test('findings written in the first round survive into the second', async () => 
   // And nothing the runner swept between rounds reached the patch, which is the other
   // half of the same mechanism.
   assert.equal(report.change?.filesChanged, 1)
+})
+
+/**
+ * The review lens inside the loop it feeds (§4.10, §9's phase 4).
+ *
+ * `review-lens.test.ts` covers the verdict and the decision in isolation. What can only
+ * be seen from here is that the two meet: a review that refuses a patch which the suite
+ * was perfectly happy with still ends the round, still costs the run its pull request,
+ * and still buys the agent a second attempt with the reviewer's words in its prompt.
+ */
+const REVIEWED = {
+  verify: { expectations: [{ name: 'review', method: 'agent' }] },
+} satisfies Partial<ClaimedJob>
+
+const rejection = (title: string) =>
+  JSON.stringify({
+    findings: [
+      {
+        fingerprint: 'review/app/one-change/scope-creep',
+        title,
+        body: 'Two unrelated things in one diff; a person cannot merge half of it.',
+        severity: 'high',
+        citations: [{ path: 'app.ts', line: 1 }],
+      },
+    ],
+  })
+
+/**
+ * A green suite is not a publishable patch.
+ *
+ * This is the whole reason the review is a lens rather than a fourth node: the refusal has
+ * to arrive before `publishIfReady`, and it has to arrive somewhere `retryDecision` can
+ * read it. Round one's suite passes and the review refuses; round two is delivered the
+ * refusal and the review clears it; the run ends `dispatched` carrying only the final
+ * verdict, exactly as a recovered test failure does.
+ */
+test('a review that refuses a green patch costs the round and buys another', async () => {
+  const { report, calls } = await drive(
+    [
+      {
+        write: commitInWorkspace(
+          'app.ts',
+          'export const answer = 42\nexport const tidied = true\n',
+          'Fix it and tidy up',
+        ),
+        suiteExit: 0,
+        review: rejection('This patch does two things'),
+      },
+      {
+        // A second commit rather than an amended first one, which is what the retry
+        // prompt tells a modifier to do and what keeps the patch extractable.
+        write: commitInWorkspace(
+          'app.ts',
+          'export const answer = 42\n',
+          'Undo the tidying and keep the fix',
+        ),
+        suiteExit: 0,
+        review: JSON.stringify({ findings: [], notes: 'one change, proved by a test' }),
+      },
+    ],
+    REVIEWED,
+  )
+
+  assert.equal(report.rounds, 2)
+  assert.equal(report.outcome, 'dispatched')
+  assert.deepEqual(
+    report.gates.filter((g) => !g.passed),
+    [],
+  )
+
+  /**
+   * And the second round was told what the reviewer said, verbatim. A retry handed
+   * "your patch was refused" and nothing else spends its budget guessing at which of the
+   * things it did was the problem.
+   */
+  const rounds = calls().filter(
+    (c) => c.opts?.raw !== true && !c.argv.some((a) => a.includes(REVIEW_MARKER)),
+  )
+  assert.equal(rounds.length, 2)
+  assert.ok(rounds[1]!.argv.some((a) => a.includes('This patch does two things')))
+})
+
+/**
+ * A patch nobody could review is refused, and it is refused *once*.
+ *
+ * The reviewer here writes no verdict at all — a crash, a runtime that exited early, a
+ * model that answered in prose. Passing would publish an unreviewed patch from a worker
+ * that asked to be reviewed. Retrying would spend a round asking a modifier to repair
+ * somebody else's silence, so `permanence` ends the run instead, and the report carries a
+ * failed gate that keeps `finalizeRun` from deriving anything publishable.
+ */
+test('a patch nothing could review is refused, with no second attempt', async () => {
+  const { report, calls } = await drive(
+    [
+      {
+        write: commitInWorkspace('app.ts', 'export const answer = 42\n', 'Fix it'),
+        suiteExit: 0,
+        review: null,
+      },
+    ],
+    REVIEWED,
+  )
+
+  assert.equal(report.rounds, 1)
+  assert.equal(report.gates.find((g) => g.name === 'review')?.passed, false)
+  // The suite passed, so the only thing standing between this patch and a pull request is
+  // the review — which is the arrangement, stated as an assertion.
+  assert.equal(report.change?.testsPassed, true)
+  assert.equal(
+    calls().filter((c) => c.opts?.raw !== true && !c.argv.some((a) => a.includes(REVIEW_MARKER)))
+      .length,
+    1,
+  )
 })

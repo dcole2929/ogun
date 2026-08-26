@@ -106,3 +106,4 @@ wrong is a proposed ADR that supersedes it, not a finding.
 - [ADR-0012 — A project secret lives on the machine that polls, not in the database](0012-a-project-secret-lives-on-the-machine-that-polls.md)
 - [ADR-0013 — A source emits jobs and is not a worker](0013-a-source-emits-jobs-and-is-not-a-worker.md)
 - [ADR-0014 — A project connects to Linear as an application](0014-a-project-connects-to-linear-as-an-application.md)
+- [ADR-0015 — A ticket becomes a plan, then a patch, and the review of it is a lens](0015-a-ticket-becomes-a-plan-then-a-patch.md)

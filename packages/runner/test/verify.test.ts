@@ -104,7 +104,18 @@ test('zero findings is a valid document — clean is a real result', async () =>
   assert.ok(gates.every((g) => g.passed))
 })
 
-test('agent lenses are recorded as skipped, never as silently passed', async () => {
+/**
+ * An expectation somebody wrote down must never be reported as met by a build that did
+ * not check it.
+ *
+ * This used to be the whole story for agent lenses, and for a lens this build does not
+ * recognise it still is: §4.10's calibration argument means no agent rubric is in any
+ * profile's *defaults*, so a worker naming one that is not wired gets a gate recorded as
+ * skipped, with its own name in the reason. The one wired lens — `review` — is covered
+ * in `review-lens.test.ts`, where the interesting property is the opposite one: a review
+ * that could not run fails rather than being skipped.
+ */
+test('an agent lens this build does not know is recorded as skipped, never as silently passed', async () => {
   const { gates } = await runVerifyGate({
     config: {
       expectations: [
@@ -122,5 +133,5 @@ test('agent lenses are recorded as skipped, never as silently passed', async () 
   })
   const lens = named(gates, 'actionable')
   assert.equal(lens?.method, 'agent')
-  assert.match(lens?.detail ?? '', /not wired in phase 1/)
+  assert.match(lens?.detail ?? '', /no agent lens named "actionable" is wired/)
 })
