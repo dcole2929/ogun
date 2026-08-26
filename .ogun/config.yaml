@@ -32,7 +32,7 @@ workers:
   # for a person having watched one of these runs end to end. A schedule is the last thing
   # to add, after that has happened, and adding it is one line.
   fix-a-finding:
-    skill: fix-a-finding
+    skill: make-a-change
     # `claude`, and the difference that decides it is what happens inside the container.
     # Codex's own sandbox cannot run in ours (§10.2), so a codex job runs with
     # `--dangerously-bypass-approvals-and-sandbox` and the container is the only thing
@@ -141,6 +141,60 @@ workers:
         - name: verdict
           method: tool
 
+  # The planning half of phase 4's pipeline (§9, ADR-0015). A reviewer, not a modifier: it
+  # produces no patch, so the edit tools are withheld and the workspace is mounted
+  # read-only — and the plan it writes is staged for the node after it rather than
+  # published to the inbox, because it has a dependent (§4.12).
+  #
+  # `model: reviewer` for the same reason `fix-a-finding` uses it: the expensive mistake
+  # here is not a slow round, it is a plan that looks right. A wrong plan costs the whole
+  # of the next node's container as well as this one's.
+  #
+  # **No `connections: [linear]`.** The door ADR-0013's amendment opened stays shut: the
+  # grant cannot be narrower than the whole workspace, and this node's output is piped
+  # into the instructions of the node that writes code. If it is ever opened it goes here
+  # and only here, which is one reason this is a separate worker from `implement`.
+  plan-a-ticket:
+    skill: plan-a-ticket
+    runtime: claude
+    model: reviewer
+    permissions: reviewer
+    sandbox: container
+    # The same lens `scope-a-ticket` declares, for the same reason one stage later
+    # (§4.10, ADR-0015). A planner that finds nothing to build answers `verdict:
+    # decline` and stops the cycle there; one that hits its timeout mid-thought would
+    # otherwise report `approved` with no plan and release a modifier at nothing. A
+    # missing answer is a failed gate, not a quiet yes.
+    verify:
+      expectations:
+        - name: verdict
+          method: tool
+
+  # The building half. The same skill as `fix-a-finding` above, bound differently — §4.8's
+  # skill-vs-worker distinction doing actual work: one procedure, two sources of work.
+  implement:
+    skill: make-a-change
+    runtime: claude
+    model: reviewer
+    permissions: modifier
+    sandbox: container
+    # `review`, and it is the only agent lens this build wires (ADR-0015). It reads the
+    # diff — one change or four, a test weakened to make the suite green, a message that
+    # explains the repair — refuses the patch on a `critical` or `high`, and the refusal
+    # buys the agent one more round with the reviewer's words verbatim. Asked for here
+    # rather than defaulted, because a rubric with nothing to calibrate against should
+    # cost one worker rather than every modifier (§4.10).
+    verify:
+      expectations:
+        - name: review
+          method: agent
+    # 60 minutes rather than `fix-a-finding`'s 45, and the extra quarter of an hour is the
+    # review. The gate's clock is what remains of this number when the agent exits
+    # (verify.ts), and the gate now runs the suite *and* a model round. A retry holds back
+    # both measurements, so a timeout that cannot cover them refuses with the numbers in
+    # the sentence — legible, and still a run that produced no pull request.
+    timeoutMs: 3600000
+
 cycles:
   # The reviewers run in parallel and stage what they find; triage is the only thing
   # that writes to the inbox. Listing a worker under `then:` is what makes its inputs
@@ -228,6 +282,42 @@ cycles:
 #
 # `install` first because the workspace is a clone with no node_modules; the pnpm store
 # lives in the cache volume the runner mounts, so only the first run pays for it.
+  # Phase 4's pipeline: ticket → plan → implement → draft PR (§9, ADR-0015). A source names
+  # this cycle; there is deliberately no `schedule:`, because what starts it is a ticket.
+  #
+  # Written as `nodes`/`edges` rather than with `workers:`/`then:` sugar, because the sugar
+  # expresses a fan-in — several workers into one — and this is a chain. Three nodes, two
+  # edges, and `scope` is the single entry node a source requires (ADR-0013).
+  #
+  # **`block` on both edges, where `nightly` uses `degrade`.** The rule that separates them
+  # is what the dependent's job *is*. Triage reports on a batch, so a partial batch is a
+  # partial report and running it is better than losing the night. A planner acts on a
+  # verdict and a modifier acts on a plan: each node here is the sole input to the next, so
+  # there is nothing to degrade to. `degrade` on the first edge plans a ticket nobody
+  # admitted; on the second it writes code with no confirmed plan.
+  #
+  # `block` is therefore about a node that *crashed*, and only that. A node that **declined**
+  # — the evaluator refusing a ticket, or the planner finding nothing to build — is blocked
+  # on whatever the edge says, because `releaseDependents` reads the verdict rather than the
+  # edge: a decline is not a break, and "carry on without them" and "carry on against them"
+  # are different permissions. Both nodes declare the `verdict` lens, so a node that answers
+  # nothing fails its gate rather than releasing the rest of the chain.
+  ticket:
+    nodes:
+      - key: scope
+        worker: scope-a-ticket
+      - key: plan
+        worker: plan-a-ticket
+      - key: implement
+        worker: implement
+    edges:
+      - from: scope
+        to: plan
+        onDepFailure: block
+      - from: plan
+        to: implement
+        onDepFailure: block
+
 tests:
   command: pnpm install --frozen-lockfile && pnpm -s test
 

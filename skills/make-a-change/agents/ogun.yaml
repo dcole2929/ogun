@@ -1,7 +1,7 @@
 interface:
-  display_name: "Fix a Finding"
-  short_description: "Fix one finding from the inbox and leave a draft pull request"
-  default_prompt: "Use the fix-a-finding skill."
+  display_name: "Make a Change"
+  short_description: "Build one item of work and leave a draft pull request"
+  default_prompt: "Use the make-a-change skill."
 policy:
   # Never auto-triggered, and here that is more than the standing rule for a factory skill
   # (§4.8). This one writes code. An agent that reached for it mid-task would be editing a

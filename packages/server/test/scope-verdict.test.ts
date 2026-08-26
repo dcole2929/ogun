@@ -32,6 +32,7 @@ describe('a scope verdict decides what the rest of the cycle does', () => {
   let projectId = ''
   let cycleId = ''
   let strictCycleId = ''
+  let chainCycleId = ''
   const workerIds = new Map<string, string>()
 
   before(async () => {
@@ -40,13 +41,13 @@ describe('a scope verdict decides what the rest of the cycle does', () => {
     const [p] = await db.insert(schema.projects).values({ slug }).returning()
     projectId = p!.id
 
-    for (const name of ['scope', 'plan']) {
+    for (const name of ['scope', 'plan', 'implement']) {
       const [w] = await db
         .insert(schema.workers)
         .values({
           projectId,
           name,
-          skillRef: name === 'scope' ? 'scope-a-ticket' : 'plan',
+          skillRef: name === 'scope' ? 'scope-a-ticket' : name,
           runtime: 'claude',
           // `plan` is a reviewer here rather than the modifier it will really be. A
           // modifier is refused at admission on a project with no checkout and no test
@@ -76,6 +77,30 @@ describe('a scope verdict decides what the rest of the cycle does', () => {
       .values({ projectId, name: 'ticket-pipeline-strict', definition: strict })
       .returning()
     strictCycleId = s!.id
+
+    /**
+     * The full ticket pipeline (ADR-0015), so that a decline can be asserted from a node
+     * that is neither the entry nor the last. Written as nodes and edges because that is
+     * what a chain needs — the sugar expresses a fan-in.
+     */
+    const chain = expandCycle(
+      cycleConfigSchema.parse({
+        nodes: [
+          { key: 'scope', worker: 'scope' },
+          { key: 'plan', worker: 'plan' },
+          { key: 'implement', worker: 'implement' },
+        ],
+        edges: [
+          { from: 'scope', to: 'plan', onDepFailure: 'block' },
+          { from: 'plan', to: 'implement', onDepFailure: 'block' },
+        ],
+      }),
+    )
+    const [ch] = await db
+      .insert(schema.cycles)
+      .values({ projectId, name: 'ticket-pipeline-chain', definition: chain })
+      .returning()
+    chainCycleId = ch!.id
   })
 
   after(async () => {
@@ -162,6 +187,42 @@ describe('a scope verdict decides what the rest of the cycle does', () => {
     assert.match(planCoverage.reason ?? '', /declined the work/)
   })
 
+
+  /**
+   * The verdict is not the entry node's alone.
+   *
+   * `findings.ts` says so — *"a planner that cannot find a plan is answering the same
+   * question one stage later"* — and the ticket pipeline (ADR-0015) is built on it: a plan
+   * node that reads the code and concludes there is nothing one reviewable change could do
+   * declines, and the modifier behind it never starts. Without this, the alternatives are
+   * a modifier spending a container to read an empty plan and decline in turn, or a lens
+   * that files "I decided not to" as "the gate refused me".
+   *
+   * Asserted mid-chain rather than trusted from the two-node case, because the thing that
+   * could break it is exactly a positional assumption — `declinedNodes` keying on the entry
+   * node, or a release that only consults the verdict for a job with no dependencies of its
+   * own. Both would pass every test above.
+   */
+  test('a planner declining stops the modifier behind it, one hop further in', async () => {
+    const { cycleRunId } = await startCycleRun(db, { cycleId: chainCycleId, trigger: 'test' })
+
+    const admitted = await report(cycleRunId, 'scope', 'admit')
+    assert.equal(admitted.result.outcome, 'approved')
+    assert.equal(
+      (await jobFor(cycleRunId, 'plan')).state,
+      'queued',
+      'an admitted ticket has to reach the planner, or this proves nothing',
+    )
+
+    const declined = await report(cycleRunId, 'plan', 'decline')
+    assert.equal(declined.result.outcome, 'declined')
+
+    const implement = await jobFor(cycleRunId, 'implement')
+    assert.equal(implement.state, 'skipped')
+    const coverage = await coverageFor(cycleRunId, 'implement')
+    assert.equal(coverage.outcome, 'blocked')
+    assert.match(coverage.reason ?? '', /declined the work/)
+  })
   /**
    * The half that records it. A decline that stopped the pipeline and left nothing saying
    * why is the silence principle 6 exists to prevent — and it is worse here than anywhere
