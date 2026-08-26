@@ -3,9 +3,12 @@ import { mkdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import {
   baseImage,
+  candidateImage,
   findingsDocumentSchema,
   parseFingerprint,
   projectImage,
+  PROJECT_CONFIG_PATH,
+  PROJECT_DOCKERFILE_PATH,
   readPolicies,
   readTestCommand,
   verifySchema,
@@ -28,6 +31,7 @@ import {
   type Sandbox,
 } from './sandbox/index.ts'
 import { nextSeq, newParserState, resolveModel, resolveRuntime } from './runtimes/index.ts'
+import { dockerBuilder, type ImageBuilder } from './bootstrap.ts'
 import { checkDismissals, gatherEvidence } from './evidence.ts'
 import { extractPatch, type PatchExtraction } from './patch.ts'
 import { githubCli, publishPatch } from './publish.ts'
@@ -114,6 +118,16 @@ export type RunnerContext = {
    * Absent means `createSandbox`, which is what every real caller uses.
    */
   sandboxes?: (input: CreateSandboxInput) => Sandbox
+  /**
+   * How an image is built, for the one gate that builds one (ADR-0016). A seam on exactly
+   * the terms `sandboxes` above is a seam: the decisions worth protecting — which patches
+   * a containerisation may contain, what a failed build buys the agent, whether the
+   * candidate tag is ever the real one — sit above `docker build`, and a decision that can
+   * only be exercised by starting a daemon is a decision nothing exercises.
+   *
+   * Absent means `dockerBuilder`, which is what every real caller uses.
+   */
+  imageBuilder?: () => ImageBuilder
 }
 
 /**
@@ -351,7 +365,18 @@ export async function executeJob(
      * modifier's whole round spent producing a patch nothing can check.
      */
     const testCommand = pinned === undefined ? undefined : readTestCommand(pinned)
-    if (job.permissions === 'modifier' && !testCommand) {
+    /**
+     * …except for the worker whose patch is what writes that line.
+     *
+     * This is the runner's half of the exemption admission already granted (§4.3,
+     * ADR-0016): a `bootstrap: project-image` job is expected to arrive at a commit that
+     * declares no test command, because declaring one is the work. It is not ungated —
+     * `resolveLenses` swaps the tests lens for `project-image`, which builds the proposed
+     * Dockerfile and runs the *proposed* command inside it. Reading `job.bootstrap` rather
+     * than re-deriving anything: the control plane decided this at admission, and a runner
+     * that reached its own conclusion would be a second answer to a settled question.
+     */
+    if (job.permissions === 'modifier' && !testCommand && !job.bootstrap) {
       return await refuse(
         `${PROJECT_CONFIG_PATH} at ${workspace.sha.slice(0, 12)} declares no tests.command, ` +
           'so nothing could show this modifier\'s patch works. A modifier that cannot be ' +
@@ -359,6 +384,40 @@ export async function executeJob(
           `${PROJECT_CONFIG_PATH} and commit it to ${job.projectDefaultBranch}.`,
       )
     }
+
+    /**
+     * Whether the project already had an image at the commit this workspace was pinned to.
+     *
+     * Only a bootstrap run asks, and only so the gate can say which of two runs this was:
+     * a project's *first* image, or a replacement for one that already existed. The second
+     * is a legitimate thing to want — a toolchain moves — and it is the case where a person
+     * reading the pull request most needs to be told, because the diff shows a Dockerfile
+     * being rewritten and says nothing about what depended on the old one.
+     *
+     * Read from git at the pinned base rather than from disk, like every other fact about
+     * what this project said before the agent touched it. The workspace copy is one the
+     * agent has just written.
+     */
+    const hadImage =
+      job.bootstrap === undefined
+        ? false
+        : await gitIn(workspace.path, [
+            'cat-file',
+            '-e',
+            `${workspace.sha}:${PROJECT_DOCKERFILE_PATH}`,
+          ])
+            .then(() => true)
+            .catch(() => false)
+
+    /**
+     * What the gate will actually run, for the sentences that name it.
+     *
+     * A bootstrap run has no pinned command — writing one is the work — so the gate reads
+     * the proposal out of the workspace instead and this side has no way to know it until
+     * afterwards. Named rather than interpolated as `undefined`, which is what the sweep
+     * note said before there was a second kind of gate.
+     */
+    const gateCommand = testCommand ?? 'the test command this patch proposes'
 
     // Deliberately not caught: a node that cannot read its input must fail loudly
     // rather than run against an empty one. The outer catch turns it into a failed run.
@@ -775,6 +834,29 @@ export async function executeJob(
         deadline,
         round,
         /**
+         * The alternate gate, present only for the worker admitted without an image
+         * (ADR-0016). Its presence is what swaps `project-image` in for `tests`, so this
+         * spread is load-bearing rather than decorative: drop it and a bootstrap job is
+         * held to a tests lens with no command, which refuses.
+         *
+         * The candidate tag is keyed on the run, never on the project alone — see
+         * `candidateImage` for why an image built out of an unmerged patch must not become
+         * the one the next modifier is verified in.
+         */
+        ...(job.bootstrap
+          ? {
+              bootstrap: {
+                workspace: workspace.path,
+                tag: candidateImage(job.projectSlug, job.runId),
+                builder: (config.imageBuilder ?? dockerBuilder)(),
+                previous: {
+                  image: hadImage,
+                  ...(testCommand ? { testCommand } : {}),
+                },
+              },
+            }
+          : {}),
+        /**
          * What an agent lens needs to be an agent (§4.10). Handed in rather than
          * resolved inside the gate, because the runtime and the sandbox are the two
          * things `runVerifyGate` is deliberately given rather than allowed to build —
@@ -816,7 +898,14 @@ export async function executeJob(
           )
         },
       })
-      if (verdict.tests) {
+      /**
+       * Only when the *tests* lens produced it. A bootstrap run also fills `verdict.tests`
+       * — its suite really did run, inside the image the patch proposes — but the sentence
+       * describing it belongs to the `project-image` lens, which says what was built as
+       * well as what was run, and the loop below already puts that on the timeline. Two
+       * notes about one suite would read as two suite runs.
+       */
+      if (verdict.tests && verdict.gates.some((g) => g.name === TESTS_LENS)) {
         note(describeTests(verdict), {
           round,
           testsRun: verdict.tests.ran,
@@ -847,6 +936,7 @@ export async function executeJob(
         gates: verdict.gates,
         tests: verdict.tests,
         ...(verdict.review ? { review: verdict.review } : {}),
+        ...(verdict.image ? { image: verdict.image } : {}),
         remainingMs: deadline - Date.now(),
       })
       // Said whichever way it went. "This patch was refused and nobody tried again" is
@@ -865,7 +955,7 @@ export async function executeJob(
       const swept = await sweepGateArtifacts(workspace.path)
       if (swept.dirty.length > 0) {
         note(
-          `no second attempt after all: running \`${testCommand}\` modified tracked files ` +
+          `no second attempt after all: running \`${gateCommand}\` modified tracked files ` +
             `(${swept.dirty.slice(0, 5).join(', ')}), so a retry could not tell this ` +
             "project's suite output from the agent's work",
           { round, dirty: swept.dirty.length },
@@ -888,6 +978,9 @@ export async function executeJob(
           reserveMs: decision.reserveMs,
           guestRoot,
           outputPath: OUTPUT_PATH,
+          // A bootstrap round is told something different about what it can check for
+          // itself, which is nothing — see `retryPrompt`.
+          ...(job.bootstrap ? { bootstrap: true } : {}),
         }),
         budgetMs: decision.agentBudgetMs,
       }
@@ -1048,6 +1141,23 @@ export async function executeJob(
         baseSha: change.baseSha,
         ...(policies ? { policies } : {}),
         tests: { run: verdict.tests?.ran, passed: verdict.tests?.passed },
+        /**
+         * What the pull request has to say instead of "the project's suite passed on this
+         * tree", and the step nothing else would ever tell whoever merges it: build the
+         * image (§4.6, ADR-0016). Built from the gate's own measurements rather than from
+         * anything read again — the workspace is about to be deleted, and this is the last
+         * moment either number exists.
+         */
+        ...(verdict.image?.built && verdict.image.command && verdict.tests?.passed
+          ? {
+              bootstrap: {
+                image: candidateImage(job.projectSlug, job.runId),
+                command: verdict.image.command,
+                buildSeconds: Math.round((verdict.image.durationMs ?? 0) / 1000),
+                suiteSeconds: Math.round((verdict.tests.durationMs ?? 0) / 1000),
+              },
+            }
+          : {}),
       })
     }
 
@@ -1185,6 +1295,8 @@ async function publishIfReady(input: {
   baseSha: string
   policies?: PinnedPolicies
   tests: { run?: boolean; passed?: boolean }
+  /** What a containerisation run proved, for the pull request body. See `bodyFor`. */
+  bootstrap?: { image: string; command: string; buildSeconds: number; suiteSeconds: number }
 }): Promise<void> {
   const note = (text: string, fields: Record<string, unknown> = {}): void => {
     input.flusher.push([
@@ -1227,6 +1339,7 @@ async function publishIfReady(input: {
       outcome: input.outcome,
       tests: input.tests,
       ...(input.policies ? { policies: input.policies } : {}),
+      ...(input.bootstrap ? { bootstrap: input.bootstrap } : {}),
       // The only place a credential enters this pipeline. `publishPatch` takes it as a
       // parameter so every gate above it can be tested without one (ADR-0009).
       remote: githubCli(),
@@ -1255,9 +1368,6 @@ async function publishIfReady(input: {
     console.error(`[runner] run=${input.job.runId} publish failed`, err)
   }
 }
-
-/** Where a project says how it is built and how it is tested (§4.6, §9). */
-const PROJECT_CONFIG_PATH = '.ogun/config.yaml'
 
 /**
  * The project's test command as of the commit the workspace was pinned to, read out of
@@ -1441,8 +1551,22 @@ function describeExtraction(change: PatchExtraction): string {
  * another. `projectImage` is now the only place the format string exists; exported so a
  * test can hold the builder and the runner to the same answer.
  */
-export const imageFor = (job: Pick<ClaimedJob, 'permissions' | 'projectSlug'>): string =>
-  job.permissions === 'modifier' ? projectImage(job.projectSlug) : baseImage()
+/**
+ * A `bootstrap: project-image` worker is the one modifier that gets the base image, and
+ * that is not a special case bolted on — it is the same rule read forwards.
+ *
+ * The project image exists so that a patch can be proved against the project's real
+ * toolchain. This worker's patch *is* the toolchain: there is no project image to run it
+ * in, which is exactly the condition it was dispatched to fix. So it gets what every
+ * non-modifier gets, and its patch is proved by the `project-image` lens instead —
+ * host-side, in an image built out of the patch itself (ADR-0016).
+ */
+export const imageFor = (
+  job: Pick<ClaimedJob, 'permissions' | 'projectSlug'> & { bootstrap?: string },
+): string =>
+  job.permissions === 'modifier' && !job.bootstrap
+    ? projectImage(job.projectSlug)
+    : baseImage()
 
 async function trackedPaths(workspace: string): Promise<Set<string>> {
   // Through `gitIn`, like every git call made after the container has exited: `ls-files`

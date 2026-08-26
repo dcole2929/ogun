@@ -201,10 +201,33 @@ Guards, each at the scope where its scarce resource actually lives:
 | Concurrent modifiers | project | **yes** — `policies.maxConcurrentModifiers`, default 1 |
 | Consecutive-failure breaker | worker × project | **yes** — ~30 lines, prevents the real disaster |
 | Modifier verifiability | project | **yes** — no image or no test command, no modifier |
+| Bootstrap exemption | worker | **built** — one named worker, and only while the files are missing (ADR-0016) |
 | Credential preflight | runtime × host | **yes** — a job that cannot log in is refused, not dispatched |
 | Runs per day | worker × project | defer |
 | Token budget per day | global, per runtime | defer |
 | Open agent PRs | project | **built** — `policies.maxOpenPullRequests`, at publish (ADR-0009) |
+
+**Modifier verifiability has exactly one exemption, and it is named.** [built —
+ADR-0016] Both requirements are files in the repository, which makes the refusal circular
+for the repository that has neither: the thing that would fix it is a patch, a patch needs
+a modifier, and a modifier needs the thing that would fix it. A worker declaring
+`bootstrap: project-image` is admitted without them — it runs in `ogun/base`, which is
+what a non-modifier already gets, and is graded by the `project-image` lens instead of the
+tests lens (§4.10).
+
+The exemption is narrow at both ends. `workerSchema` refuses `bootstrap:` on anything that
+is not a `modifier`, in a `container`, bound to `containerise-a-project` — so spelling it
+on a worker that fixes findings means pointing that worker at the skill whose whole text is
+"write this repository's Dockerfile", at which point it is not that worker any more. And
+the swapped-in gate refuses any patch that is not a containerisation, so even a config that
+somehow carried the field would buy nothing: the exemption is from *which* gate applies,
+never from being gated.
+
+It also expires by construction rather than by rule. `modifierReadiness` reports
+`bootstrappable` only when everything missing is something that worker writes, so a project
+that already has both files passes ordinary readiness and spends no exemption, and a project
+this control plane cannot find on disk is refused exactly as any other modifier is. A second
+run against a ready project is an *upgrade*, held to the same gate.
 
 **The two project-scoped numbers come from `projects.policies`, not from a constant.**
 [settled] They were in `.ogun/config.yaml`, parsed, posted by sync — and dropped on
@@ -481,7 +504,10 @@ Base carries `claude`, `codex`, `git`, node. The project layer adds its toolchai
 
 - Tag by content hash of Dockerfile + lockfile.
 - Rebuild when either changes, or the image ages past N days.
-- Build at `ogun project add`, **not** at 2am.
+- Build at `ogun project add`, **not** at 2am. Which means a merged `.ogun/Dockerfile`
+  is not an installed image: somebody still runs `ogun image build <dir>`, and until they
+  do, the next modifier fails on an image docker cannot find. A containerisation pull
+  request says so in its body, in front of whoever presses merge (ADR-0016).
 - Mount a persistent package-manager cache volume, or every nightly run re-downloads
   the world. One volume per runtime, read-write in every concurrent sandbox — which is
   the one shared mutable thing here that is safe, and only for a specific reason. pnpm's
@@ -490,6 +516,50 @@ Base carries `claude`, `codex`, `git`, node. The project layer adds its toolchai
   `verify-store-integrity` is the backstop. `container.ts` records the caveats, the
   chief one being that this rests on a maintainer's statement rather than on pnpm's
   documentation.
+- **And mounting it is not the same as using it.** See the paragraph below: a cache
+  volume the tool does not choose, or an image-baked store hidden under it, is a
+  download every night that nobody sees.
+
+**A container is three filesystems, and nothing announces which one you are on.**
+[corrected — ADR-0016] `/` is the image's overlay, `/workspace` is a bind mount of a host
+directory, `/home/dev/.cache` is a named volume. This constrains **every** project image,
+which is why it is here rather than only in the skill that writes them:
+
+- **A named volume hides what the image baked under it.** Docker seeds a volume from the
+  image only when the volume is *empty*, so a store baked at `/home/dev/.cache/…` is
+  present on a clean machine and invisible on every runner that has run a job before.
+  Bake caches under `/opt`, which nothing mounts over.
+- **A tool that hardlinks its cache into its output will silently relocate the cache**
+  rather than fail, because the workspace and the image are different devices. pnpm writes
+  a temp file in the project directory, tries to hardlink it beside its preferred store,
+  and on `EXDEV` falls back to `<mountpoint>/.pnpm-store`. Measured in `ogun/project-ogun`,
+  which sets `PNPM_HOME=/home/dev/.cache/pnpm`: `pnpm store path` in `/workspace` answered
+  `/workspace/.pnpm-store/v10`, so the volume held a metadata cache and no store at all and
+  every run re-downloaded what the bullet above says it should not. The same image with a
+  working directory that is not a bind mount resolves to `PNPM_HOME`. The fix is to name
+  the store on the command line in `tests.command`, where no filesystem probe can overrule
+  it — this repository's own now does, and the same install went from `reused 0,
+  downloaded 97` to `reused 97, downloaded 0`.
+- **The failure mode is silence in both cases.** A cache that is ignored looks exactly like
+  a cache that works, only slower, and "slower" is invisible at 3am. The only proof is an
+  install run with the package manager's offline flag, reading its "downloaded 0" line.
+
+**The one file nobody wants to write can now be written by a worker.** [built —
+ADR-0016] A `.ogun/Dockerfile` demands knowing that this image is `FROM ogun/base` and
+why, that a suite needing a service gets it *inside* the image because the docker socket
+is never mounted, that the container runs `--network none`, and that the last `USER` has
+to be `dev` or patch extraction later trips over root-owned files in the workspace. None
+of that is knowledge a project's owner has any reason to have. `skills/containerise-a-project`
+carries it, and the `project-image` lens (§4.10) proves the result rather than trusting
+it — the only place in Ogun that ever checks that a project image works.
+
+Its reference now carries a real multi-service worked example rather than a reasoned-about
+one — thirteen compose services reduced to four and a router, 58 suites and 500 tests
+passing inside one `--network none` container — and the two bugs that stood between "the
+stack comes up" and "the suite passes". Both were properties of this sandbox rather than of
+that project: the filesystem split above, and a database schema that is baked in two phases
+and therefore created by two roles, so anything role-scoped has to name both. ADR-0016
+records what each cost.
 
 **The tag is keyed on the project slug**, `ogun/project-<slug>`, and on nothing about
 where the repo sits on a disk. `ogun image build <dir>` used to derive it from the
@@ -994,6 +1064,20 @@ workers:
     # grants read access to the whole workspace the project's grant covers; see §4.13.
     connections: [linear]
 
+  containerise:
+    # The one worker that may run before a project has an image, because writing one is
+    # what it does (§4.3, ADR-0016). The field is refused on anything that is not a
+    # modifier, in a container, bound to this skill — and the gate it swaps in refuses any
+    # patch that is not a containerisation, so it cannot become a way around the tests
+    # gate. No `schedule:`; it runs once, when somebody adds a project.
+    skill: containerise-a-project
+    permissions: modifier
+    sandbox: container
+    bootstrap: project-image
+    # Longer than any other worker's. One budget covers the agent's round, a `docker
+    # build`, and the proposed suite run inside the result.
+    timeoutMs: 5400000
+
 policies:
   # Read by the runner from the git blob at the pinned base — never from the workspace
   # and never from the database. See "Where each policy is read from" below.
@@ -1081,6 +1165,7 @@ no diff. The reviewer analog grades *findings quality*:
 |---|---|---|
 | `reviewer` | output matches schema; every cited `file:line` exists in the diff | actionable? grounded in cited evidence? not N restatements of one issue? |
 | `modifier` | `commit-message`, `self-gating`, then the project's own suite | one change or four? was a test weakened to pass? does the message explain the repair? |
+| `modifier`, `bootstrap: project-image` | `commit-message`, `self-gating`, then `project-image` — build the proposed Dockerfile, run the proposed command inside it | — |
 
 Per-worker overrides: `skipDefaultLenses: [...]`, or `lensProfile: none` for
 non-code work. Neither reaches a modifier's three, which belong to the project rather
@@ -1136,6 +1221,38 @@ readable verdict fails rather than skipping — skipping publishes an unreviewed
 a worker that asked to be reviewed — and it fails as a review that never *ran*, so no round
 is spent asking a modifier to repair somebody else's silence. An agent lens this build does
 not recognise is still recorded as skipped, with its own name in the reason.
+
+**One modifier is graded by a different third lens, and it is a stronger one.** [built —
+ADR-0016] A worker declaring `bootstrap: project-image` (§4.3) has no project image to run
+a suite in, because writing one is its job. `project-image` replaces the tests lens for it:
+the host builds the `.ogun/Dockerfile` the patch proposes and runs the `tests.command` the
+patch proposes **inside the image it just built**, on `--network none`, through the same
+sandbox flags every job gets. That proves the image and the suite together, where the
+ordinary gate assumes the image and proves only the suite.
+
+Three properties are worth stating because each is load-bearing:
+
+- **It refuses any patch that is not a containerisation.** Nothing outside `.ogun/` (plus a
+  root `.dockerignore`) may be in the diff, and `.ogun/Dockerfile` must be. A suite this
+  patch wrote, in an image this patch built, proves nothing about a change to `src/` — so
+  the exemption cannot become a way to publish unverified code.
+- **It reads `tests.command` from the workspace**, which is the exact reverse of every
+  other gate here, because there is no command at the pinned base to read. What makes that
+  safe is that the proposal is *executed* rather than trusted: the agent is not marking its
+  own work, it is being made to demonstrate. A command that cannot fail (`true`, `:`,
+  `exit 0`, a bare `echo`) is refused by name, and the measured duration goes on the
+  timeline and into the pull request, which is how a person notices a suite that "passed in
+  0s".
+- **`self-gating` fires on every one of these runs**, because writing the `tests:` block
+  means editing `.ogun/config.yaml`. It stays, loudly. This is the case it was built for —
+  the one legitimate patch that changes its own gates — and an announcement that fired only
+  on the suspicious cases would be one nobody had calibrated.
+
+It is host-side, like publication and for the same reason: `docker build` needs a socket a
+sandbox never gets. The build shares the job's one clock, and its cost is measured and held
+back by the retry reserve alongside the suite's and the review's — a round given budget for
+a Dockerfile and not for building it produces the same "the gate never ran" that the reserve
+exists to prevent.
 
 **Cheap and fatal runs first.** [settled] `commit-message` costs microseconds and the
 suite costs minutes, so a patch that is unpublishable whatever the suite says never
@@ -2322,6 +2439,24 @@ declining as well as an evaluator.
 And a run. The pipeline behind the evaluator has been exercised against scripted runtimes
 and real git, and not once against a real ticket end to end. The first one should be
 watched, for the same reason `fix-a-finding` still has no schedule.
+
+Also done, and it is the barrier in front of *every* one of the above for a repository that
+is not this one: **a project can be containerised by a worker** (ADR-0016). Adding a project
+to Ogun cost one hand-written `.ogun/Dockerfile`, and it was the one file Ogun could not be
+asked to write — a modifier needs the project image, and the project image comes from a file
+only a modifier could produce. The circle is broken by a named worker
+(`bootstrap: project-image`) whose patch is graded by a *different and stronger* gate: the
+host builds the Dockerfile the patch proposes and runs the `tests.command` the patch
+proposes inside the image it just built, on `--network none`. The exemption is from which
+gate applies rather than from being gated — the swapped-in lens refuses any patch touching
+anything outside `.ogun/` — and it expires by itself, because a project that already has
+both files passes ordinary readiness and spends no exemption.
+
+Nothing here has run against a real repository either. The gate was exercised against a
+faked `ImageBuilder`, a scripted sandbox and real git; no image has been built by it. There
+is deliberately **no `containerise` worker in Ogun's own config**: this repository already
+has an image, so a worker here could only exercise the upgrade path, which is the rarer half
+and the less interesting one to watch first.
 
 **Explicit non-goals:** Kubernetes, multi-tenancy, RBAC, billing, graphical workflow
 canvas, auto-merge, agent memory, model auto-selection, remote runner mesh.

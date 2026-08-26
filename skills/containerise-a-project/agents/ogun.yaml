@@ -1,0 +1,13 @@
+interface:
+  display_name: "Containerise a Project"
+  short_description: "Write the image and the test command that make a repository workable by Ogun"
+  default_prompt: "Use the containerise-a-project skill."
+policy:
+  # Never auto-triggered, and for a sharper reason than the standing rule for a factory
+  # skill (§4.8). This skill's product is what decides how every future patch in a
+  # repository is verified: the image a modifier runs in, and the command that says whether
+  # its work passed. An agent that reached for it mid-task would be writing that file for
+  # reasons nobody asked about, in a session with no patch extraction, no image build and
+  # no draft pull request behind it — so the one artefact that most needs reviewing would
+  # be the one nobody ever saw.
+  allow_implicit_invocation: false

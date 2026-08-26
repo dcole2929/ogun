@@ -522,3 +522,54 @@ test('a base sha that is not a sha is refused before git sees it', async () => {
     assert.match(result.refused!, /not an object name/)
   }
 })
+
+/**
+ * The step nothing else in the system would ever tell the operator (§4.6, ADR-0016).
+ *
+ * Images are built at `ogun project add` and never during a run, so that a night does not
+ * fail on a bad network — which means a merged `.ogun/Dockerfile` is not an installed
+ * image. Without this, the next modifier for that project fails on docker's "Unable to
+ * find image": an error about a thing nobody built, arriving days later on somebody who
+ * never saw the run that wrote the file. The pull request is where whoever merges it is
+ * standing, so the instruction goes in the body.
+ *
+ * The second half is about not lying. "The project's suite passed on this tree" is what an
+ * ordinary body says and is the more misleading of the two available sentences here: the
+ * suite passed *inside an image this patch also proposes*, which is a stronger claim about
+ * the patch and a weaker one about the repository, and a reviewer has to be told which.
+ */
+test('a containerisation pull request says the image still has to be built', async () => {
+  const { calls, go } = await publishing()
+  const published = await go({
+    bootstrap: {
+      image: 'ogun/project-thing:candidate-9f3c2a104b5e',
+      command: 'pnpm install --frozen-lockfile && pnpm -s test',
+      buildSeconds: 214,
+      suiteSeconds: 61,
+    },
+  })
+  assert.ok(published.pr, published.refused)
+
+  const body = calls.published[0]!.body
+  assert.match(body, /ogun image build/)
+  assert.match(body, /pnpm install --frozen-lockfile && pnpm -s test/)
+  assert.match(body, /inside the image this patch builds/)
+  assert.match(body, /--network none/)
+  assert.doesNotMatch(
+    body,
+    /suite passed on this tree/,
+    'the ordinary sentence claims something this run did not check',
+  )
+  // The candidate is gone, and saying so is what stops somebody assuming the machine is
+  // already set up because a gate built an image once.
+  assert.match(body, /deleted with the run/)
+})
+
+/** And an ordinary publication is untouched by any of that. */
+test('an ordinary pull request says nothing about building an image', async () => {
+  const { calls, go } = await publishing()
+  await go()
+  const body = calls.published[0]!.body
+  assert.match(body, /suite passed on this tree/)
+  assert.doesNotMatch(body, /ogun image build/)
+})

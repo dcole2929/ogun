@@ -214,3 +214,124 @@ test('the retry prompt carries the rejection verbatim and the rules that lose ro
   // way, which is why it is said out loud.
   assert.match(prompt, /git revert/)
 })
+
+/**
+ * The bootstrap gate's cost is the build *and* the suite, so the reserve has to be both.
+ *
+ * This is ADR-0015's argument arriving through a second door. The reserve was "what the
+ * suite just cost"; the review lens made it "the suite plus the review", because a round
+ * sent out with budget for a patch and not for the gate that judges it produces a refusal
+ * reading like a broken harness. A build is the same door again, and the larger half: a
+ * project image that installs a database from packages is minutes before the first test
+ * runs.
+ */
+test('a bootstrap gate holds back the build as well as the suite', async () => {
+  const decision = decide({
+    gates: [{ name: 'project-image', method: 'tool', passed: false, detail: 'suite failed' }],
+    tests: { ran: true, passed: false, durationMs: SUITE_MS },
+    image: { ran: true, built: true, durationMs: 5 * 60_000 },
+    remainingMs: 40 * 60_000,
+  })
+  assert.equal(decision.retry, true)
+  if (!decision.retry) return
+  assert.equal(decision.reserveMs, SUITE_MS + 5 * 60_000)
+  assert.equal(decision.agentBudgetMs, 40 * 60_000 - decision.reserveMs)
+})
+
+/**
+ * The most valuable retry in the system, and the one that would be silently lost by a
+ * reserve that only knew about suites.
+ *
+ * A containerise agent cannot build its own image or run its own suite — there is no
+ * docker socket in a sandbox and it is sitting in `ogun/base` rather than in the image it
+ * is describing. The gate is the only thing that ever tells it whether any of this works,
+ * so a failed build is its first and only sight of a build log. Nothing measured the suite,
+ * because the suite never ran; the build was measured, and that is enough to work out what
+ * to hold back.
+ */
+test('a build that failed is retried on its own measurement, with no suite to go on', async () => {
+  const decision = decide({
+    gates: [{ name: 'project-image', method: 'tool', passed: false, detail: 'docker build failed' }],
+    tests: undefined,
+    image: { ran: true, built: false, durationMs: 3 * 60_000 },
+    remainingMs: 30 * 60_000,
+  })
+  assert.equal(decision.retry, true)
+  if (!decision.retry) return
+  assert.equal(decision.reserveMs, 3 * 60_000)
+})
+
+/**
+ * Everything before the build is a fact about what this run produced rather than a question
+ * another round could answer, and — decisively — nothing measured it, so there is no
+ * reserve to work out. Each case gets its own sentence because the repairs are unrelated: a
+ * patch that did not contain a Dockerfile, a job that needs longer, and a suite that hangs
+ * send three different people to three different places.
+ */
+test('a bootstrap gate that built nothing is not retried', async () => {
+  const gates: GateResult[] = [
+    { name: 'project-image', method: 'tool', passed: false, detail: 'no Dockerfile in this patch' },
+  ]
+  const nothingBuilt = decide({ gates, tests: undefined, image: { ran: false, built: false } })
+  assert.equal(nothingBuilt.retry, false)
+  assert.match(nothingBuilt.reason, /no image was built/)
+
+  // A build killed at the deadline measured how much time was *left*, not how long a build
+  // takes. Granting a round out of that number would be quoting the budget back at itself.
+  const timedOut = decide({ gates, tests: undefined, image: { ran: true, built: false } })
+  assert.equal(timedOut.retry, false)
+  assert.match(timedOut.reason, /never finished/)
+
+  // Built, and the suite inside it hung. The build is measured and the suite is not, so the
+  // next gate's cost is unknown in exactly the half that just proved it can run long.
+  const suiteHung = decide({
+    gates,
+    tests: { ran: true, passed: false },
+    image: { ran: true, built: true, durationMs: 1000 },
+  })
+  assert.equal(suiteHung.retry, false)
+  assert.match(suiteHung.reason, /never finished inside the image/)
+})
+
+/**
+ * The ordinary path must be untouched by any of the above. `image` is absent for every
+ * worker that is not bootstrapping one, and absent has to mean "adds nothing to the
+ * reserve" rather than "nothing was measured" — a suite that finished in under a
+ * millisecond measures `0`, which is a measurement, and folding the two together would
+ * refuse a second round to exactly the projects whose gate is cheapest to run again.
+ */
+test('a suite that measured zero is still a measurement', async () => {
+  const decision = decide({ tests: { ran: true, passed: false, durationMs: 0 } })
+  assert.equal(decision.retry, true)
+  if (!decision.retry) return
+  assert.equal(decision.reserveMs, 0)
+})
+
+/**
+ * A bootstrap round is told something different at the end, because the ordinary advice —
+ * "run the suite yourself while you still have time to act on what it says" — is not merely
+ * unhelpful here but impossible, and an instruction an agent cannot follow is how a round
+ * gets spent looking for a docker socket that is not there.
+ */
+test('the bootstrap retry prompt does not tell the agent to run what it cannot run', async () => {
+  const gates: GateResult[] = [
+    { name: 'project-image', method: 'tool', passed: false, detail: 'E: Unable to locate package' },
+  ]
+  const common = {
+    round: 2,
+    maxRounds: 2,
+    gates,
+    agentBudgetMs: 12 * 60_000,
+    reserveMs: SUITE_MS,
+    guestRoot: '/workspace',
+    outputPath: '.ogun-out/findings.json',
+  }
+  const bootstrap = retryPrompt({ ...common, bootstrap: true })
+  assert.match(bootstrap, /Unable to locate package/, 'the build log is the whole point')
+  assert.match(bootstrap, /no docker socket/)
+  assert.doesNotMatch(bootstrap, /Run the suite yourself/)
+  // Declining is still a result, and here it is a common one.
+  assert.match(bootstrap, /git revert/)
+
+  assert.match(retryPrompt(common), /Run the suite yourself/, 'the ordinary round is unchanged')
+})

@@ -153,6 +153,11 @@ export async function startCycleRun(
               // of a token left than one capped at ten minutes.
               runtime: worker.runtime,
               ...timeoutOf(worker.config),
+              // The exemption from `modifierReadiness`, out of the stored config for the
+              // same reason `timeoutMs` is: `workers.config` is the whole parsed worker,
+              // so a worker indexed before this field existed simply has none — which is
+              // also what every ordinary worker has, and is the direction that refuses.
+              ...bootstrapOf(worker.config),
             },
             policies,
             readiness,
@@ -458,3 +463,23 @@ function timeoutOf(config: Record<string, unknown>): { timeoutMs?: number } {
   return typeof timeoutMs === 'number' && Number.isFinite(timeoutMs) ? { timeoutMs } : {}
 }
 
+
+/**
+ * The worker's `bootstrap:` declaration, if its stored config carries a usable one.
+ *
+ * Guarded and spread on the same terms as `timeoutOf` above, and the guard matters more
+ * here than it does there: this is the field that exempts a modifier from the image and
+ * test-command requirements, and `workers.config` is a jsonb column that `workerSchema`
+ * writes but does not own. A non-string value written into the database by hand must
+ * arrive at admission as *nothing said* — which is the direction that refuses — rather
+ * than as a truthy object nobody compared against a name.
+ *
+ * The value is passed through as a string rather than narrowed to `BootstrapKind` here.
+ * `admit` compares it against the one name it honours, so an unrecognised one is refused
+ * by not matching; narrowing here would move that decision into a parser and leave the
+ * comparison looking like it could be skipped.
+ */
+function bootstrapOf(config: Record<string, unknown>): { bootstrap?: string } {
+  const bootstrap = config.bootstrap
+  return typeof bootstrap === 'string' && bootstrap.length > 0 ? { bootstrap } : {}
+}

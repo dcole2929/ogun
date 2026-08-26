@@ -1,6 +1,12 @@
 import { existsSync } from 'node:fs'
 import type { GateResult, Lens, RunEvent, VerifyConfig } from '@ogun/core'
-import { findingsDocumentSchema, parseFingerprint } from '@ogun/core'
+import { findingsDocumentSchema, parseFingerprint, PROJECT_CONFIG_PATH } from '@ogun/core'
+import {
+  PROJECT_IMAGE_LENS,
+  runProjectImageLens,
+  type ProjectImageInput,
+} from './bootstrap.ts'
+import { outputOf, pushTail } from './gate-detail.ts'
 import { SWEEP_UP_SUBJECT, type PatchFacts } from './patch.ts'
 import { REVIEW_LENS, runReviewLens } from './review.ts'
 import type { RuntimeSpec } from './runtimes/index.ts'
@@ -72,6 +78,21 @@ export type VerifyInput = {
    * reset between rounds (§5.2), so a fixed path is a stale path waiting to happen.
    */
   round?: number
+  /**
+   * What the `project-image` lens needs, present only for a `bootstrap: project-image`
+   * worker (§4.3, ADR-0016) — and its presence is what swaps that lens in for the tests
+   * lens. See `resolveLenses`.
+   *
+   * Handed in rather than derived here, on `agentLens`'s rule: the docker daemon and the
+   * host workspace path are things this function is deliberately given rather than allowed
+   * to reach for, so that every decision about what a containerisation patch may be can be
+   * exercised without one.
+   *
+   * A caller that forgets it gives a bootstrap job the *ordinary* tests gate, which will
+   * refuse it for having no pinned `tests.command` — wrong in the direction that refuses,
+   * which is the direction an omission has to be wrong in.
+   */
+  bootstrap?: Omit<ProjectImageInput, 'sandbox' | 'patch' | 'deadline'>
   /** Timeline events an agent lens produced, handed to the caller that owns the sequence. */
   onLensEvent?: (events: RunEvent[]) => void
 }
@@ -109,6 +130,30 @@ export type VerifyOutcome = {
    * budget for the second half of its own gate.
    */
   review?: { ran: boolean; durationMs?: number }
+  /**
+   * What became of the image a containerisation patch proposed, when one was graded.
+   *
+   * The same three-field split `tests` and `review` use, for the same consumer:
+   * `retryDecision` has to tell "the build ran and the Dockerfile is wrong", which another
+   * round can act on, from "no build happened", which no round can repair — and it has to
+   * know what the build *cost*, because for a bootstrap run the reserve held back for the
+   * next gate is mostly the rebuild. A reserve covering only the suite would send a round
+   * out with no budget for the half of its own gate that takes the longest.
+   */
+  image?: {
+    ran: boolean
+    built: boolean
+    durationMs?: number
+    /**
+     * The `tests.command` the patch proposes, once the gate has read it out of the tree.
+     *
+     * Carried out of the gate rather than re-read downstream, and that is the point: the
+     * publisher puts it in the pull request body, and a second read of the same file would
+     * be a second answer to "what command was actually run" — from a workspace that no
+     * longer exists by then.
+     */
+    command?: string
+  }
 }
 
 export async function runVerifyGate(input: VerifyInput): Promise<VerifyOutcome> {
@@ -116,15 +161,36 @@ export async function runVerifyGate(input: VerifyInput): Promise<VerifyOutcome> 
   const lenses = resolveLenses(input)
   let tests: VerifyOutcome['tests']
   let review: VerifyOutcome['review']
+  let image: VerifyOutcome['image']
   const outcome = (): VerifyOutcome => ({
     gates: results,
     ...(tests ? { tests } : {}),
     ...(review ? { review } : {}),
+    ...(image ? { image } : {}),
   })
 
   for (const lens of lenses.filter((l) => l.method === 'tool')) {
     if (lens.name === TESTS_LENS && !lens.command) {
       const checked = await testsCheck(input)
+      tests = checked.tests
+      results.push(checked.gate)
+      if (!checked.gate.passed) return outcome()
+      continue
+    }
+    /**
+     * The tests lens's replacement, for the one worker that has no image to run a suite in
+     * because writing one is its job (ADR-0016). It reports `tests` as well as `image`:
+     * the suite really did run, in the image this patch proposes, and the publisher's gate
+     * and the `changes` row read that field and should not have to learn a second one.
+     */
+    if (lens.name === PROJECT_IMAGE_LENS && !lens.command && input.bootstrap) {
+      const checked = await runProjectImageLens({
+        ...input.bootstrap,
+        sandbox: input.sandbox,
+        ...(input.patch ? { patch: input.patch } : {}),
+        deadline: input.deadline,
+      })
+      image = checked.image
       tests = checked.tests
       results.push(checked.gate)
       if (!checked.gate.passed) return outcome()
@@ -292,7 +358,27 @@ function resolveLenses(input: VerifyInput): Lens[] {
       ? [
           { name: COMMIT_MESSAGE_LENS, method: 'tool' },
           { name: SELF_GATING_LENS, method: 'tool' },
-          { name: TESTS_LENS, method: 'tool' },
+          /**
+           * One of the two, never both and never neither.
+           *
+           * A `bootstrap: project-image` worker is graded by the gate that builds its
+           * proposed image and runs its proposed suite inside it, and the tests lens has
+           * nothing to run: the project has no image yet, which is why this worker exists.
+           * Swapped rather than added, because both would mean running the suite twice —
+           * once in `ogun/base`, where it cannot work — and a mandatory lens that always
+           * fails is a gate nobody can pass.
+           *
+           * `self-gating` stays above it, and stays mandatory, and this is the run it was
+           * built for: a containerisation patch edits `.ogun/config.yaml` every single
+           * time, because writing the `tests:` block is half of what it is for. The lens
+           * passes and says so, on the timeline, on every one of these runs — the one
+           * legitimate patch that changes its own gates, announcing itself. Suppressing it
+           * here was never considered seriously: an announcement that fires only on the
+           * suspicious cases is one nobody has calibrated.
+           */
+          input.bootstrap
+            ? { name: PROJECT_IMAGE_LENS, method: 'tool' }
+            : { name: TESTS_LENS, method: 'tool' },
         ]
       : []
   if (config?.lensProfile === 'none') return [...mandatory, ...config.expectations]
@@ -392,10 +478,7 @@ async function testsCheck(
    * from blocking on a full pipe.
    */
   const tail: string[] = []
-  for await (const line of handle.lines) {
-    tail.push(line)
-    if (tail.length > TAIL_LINES) tail.shift()
-  }
+  for await (const line of handle.lines) pushTail(tail, line)
   const { code, stderr, timedOut } = await handle.done.catch((err: Error) => ({
     code: 1,
     stderr: err.message,
@@ -407,14 +490,14 @@ async function testsCheck(
     return fail(
       `\`${input.testCommand}\` was still running after ${elapsed}s, which is all that ` +
         "remained of the job's timeout, and was killed. A suite that does not finish has " +
-        'not passed' + output(tail, stderr),
+        'not passed' + outputOf(tail, stderr),
       true,
     )
   }
   if (code !== 0) {
     return fail(
       `\`${input.testCommand}\` exited ${code ?? 'on a signal'} after ${elapsed}s` +
-        output(tail, stderr),
+        outputOf(tail, stderr),
       true,
       Date.now() - startedAt,
     )
@@ -546,7 +629,7 @@ function commitMessageCheck(patch: PatchFacts): GateResult {
  * the single most important sentence a person can be handed before they read the diff,
  * and it must not depend on them noticing one path in a file list.
  */
-const GATE_PATHS = ['.ogun/config.yaml']
+const GATE_PATHS = [PROJECT_CONFIG_PATH]
 
 function selfGatingCheck(patch: PatchFacts): GateResult {
   const touched = patch.paths.filter((p) => GATE_PATHS.includes(p))
@@ -561,15 +644,6 @@ function selfGatingCheck(patch: PatchFacts): GateResult {
       'pinned base, so the edit changed nothing about how this run was judged — but a ' +
       'person reviewing the pull request should know it is in there.',
   }
-}
-
-/** Enough to name the failing test, not enough to put a build log in postgres. */
-const TAIL_LINES = 40
-const MAX_DETAIL_BYTES = 4000
-
-const output = (tail: string[], stderr: string): string => {
-  const text = [tail.join('\n'), stderr.trim()].filter(Boolean).join('\n')
-  return text ? `:\n${text}`.slice(-MAX_DETAIL_BYTES) : ' — and printed nothing'
 }
 
 async function runToolLens(lens: Lens, input: VerifyInput): Promise<GateResult> {
@@ -590,16 +664,13 @@ async function runToolLens(lens: Lens, input: VerifyInput): Promise<GateResult> 
    */
   const { lines, done } = input.sandbox.exec(['sh', '-c', lens.command], { raw: true })
   const tail: string[] = []
-  for await (const line of lines) {
-    tail.push(line)
-    if (tail.length > TAIL_LINES) tail.shift()
-  }
+  for await (const line of lines) pushTail(tail, line)
   const { code, stderr } = await done.catch((err: Error) => ({ code: 1, stderr: err.message }))
   return {
     name: lens.name,
     method: 'tool',
     passed: code === 0,
-    ...(code === 0 ? {} : { detail: `exited ${code}${output(tail, stderr)}` }),
+    ...(code === 0 ? {} : { detail: `exited ${code}${outputOf(tail, stderr)}` }),
   }
 }
 

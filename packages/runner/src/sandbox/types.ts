@@ -43,6 +43,23 @@ export type ExecOptions = {
    * an error anyone would recognise from the output.
    */
   raw?: boolean
+  /**
+   * Run this command in a different image than the sandbox's own, keeping everything else
+   * about the sandbox — the mounts, the gateway session, the memory caps, `--network
+   * none`.
+   *
+   * Exists for exactly one caller: the `project-image` lens, which has just built an image
+   * out of the patch it is grading and has to run the patch's own test command *inside
+   * it* (ADR-0016). Nothing else should reach for this. The sandbox's image is chosen by
+   * `imageFor` from the job, and a second way to choose one is a second answer to "what
+   * did this run actually execute in".
+   *
+   * Only meaningful with `raw`, and only on a container sandbox: a worktree sandbox has no
+   * image to override and refuses rather than silently running the command on the host.
+   * That refusal is the point — a gate that ran the project's proposed suite outside the
+   * proposed image would report a pass that proves nothing about the image.
+   */
+  image?: string
 }
 
 export type Sandbox = {

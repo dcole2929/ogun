@@ -88,3 +88,26 @@ test('a reviewer runs in the base image, not a project one', () => {
   assert.equal(imageFor({ permissions: 'reviewer', projectSlug: 'ogun' }), baseImage())
   assert.equal(imageFor({ permissions: 'observer', projectSlug: 'ogun' }), baseImage())
 })
+
+/**
+ * And neither does the one modifier whose patch is what creates the project image
+ * (ADR-0016).
+ *
+ * Not a special case bolted on: it is the same rule read forwards. The project image
+ * exists so a patch can be proved against the project's real toolchain, and this worker's
+ * patch *is* the toolchain — there is no image to run it in, which is exactly the condition
+ * it was dispatched to fix. Asking for one would fail on docker's "Unable to find image",
+ * which is the same misleading error this whole file exists about, arriving for a project
+ * where nobody could have built it.
+ */
+test('a bootstrap modifier runs in the base image, because the image is what it is writing', () => {
+  assert.equal(
+    imageFor({ permissions: 'modifier', projectSlug: 'ogun', bootstrap: 'project-image' }),
+    baseImage(),
+  )
+  // And an ordinary modifier is unaffected, which is the half that must not regress.
+  assert.equal(
+    imageFor({ permissions: 'modifier', projectSlug: 'ogun' }),
+    projectImage('ogun'),
+  )
+})

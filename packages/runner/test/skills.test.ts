@@ -1,8 +1,10 @@
 import { strict as assert } from 'node:assert'
 import { execFile } from 'node:child_process'
-import { mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import { mkdtemp, mkdir, readdir, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { test } from 'node:test'
 import { ensureSkillAvailable, listAvailableSkills, nativeSkillDir } from '../src/skills.ts'
@@ -145,4 +147,67 @@ test('the error names skills from every source, not just the repo', async () => 
     'local-only',
     'universal',
   ])
+})
+
+/**
+ * Every skill Ogun ships to other repositories has to be **self-contained**, and this is
+ * the one place that is checkable.
+ *
+ * `ensureSkillAvailable` copies a skill's own directory into the workspace and nothing
+ * else. So a `SKILL.md` that says "follow the procedure at `../make-a-change/references/`"
+ * resolves here — where the workspace is this whole repository — and dangles in every
+ * project that names the built-in, which is the one case `skills/` exists for. The failure
+ * is silent in the worst way: the agent reads "follow the procedure at …", finds nothing,
+ * and proceeds without the half of the instructions that keeps a run from being lost.
+ *
+ * That is ADR-0015's recorded lesson, and until now it was a lesson rather than a check —
+ * which lasted exactly as long as there was one modifier skill. Every reference a shipped
+ * skill points at is opened here, from the directory that would actually travel.
+ */
+const BUILTIN_SKILLS = join(dirname(fileURLToPath(import.meta.url)), '../../../skills')
+
+test('every built-in skill can be read from its own directory alone', async () => {
+  const entries = await readdir(BUILTIN_SKILLS, { withFileTypes: true })
+  const skills = entries.filter((e) => e.isDirectory()).map((e) => e.name)
+  assert.ok(skills.length > 0, 'skills/ must contain the skills this build ships')
+
+  for (const name of skills) {
+    const dir = join(BUILTIN_SKILLS, name)
+    assert.ok(existsSync(join(dir, 'SKILL.md')), `${name} has no SKILL.md`)
+    /**
+     * `agents/ogun.yaml` is what makes a skill schedulable at all (§4.8) — and
+     * `allow_implicit_invocation: false` is the line that matters: a factory skill an
+     * agent could reach for mid-task would run with no patch extraction, no gate and no
+     * draft pull request behind it.
+     */
+    const agents = join(dir, 'agents', 'ogun.yaml')
+    assert.ok(existsSync(agents), `${name} has no agents/ogun.yaml`)
+    assert.match(
+      await readFile(agents, 'utf8'),
+      /allow_implicit_invocation:\s*false/,
+      `${name} must not be auto-triggerable`,
+    )
+
+    const skillText = await readFile(join(dir, 'SKILL.md'), 'utf8')
+    assert.doesNotMatch(
+      skillText,
+      /\.\.\//,
+      `${name}'s SKILL.md points outside its own directory, which dangles in every ` +
+        'project that names it (ADR-0015)',
+    )
+
+    // Every `references/<file>` any of this skill's own files names must be in this
+    // skill's own directory, since that directory is the whole of what travels.
+    const files = [skillText]
+    const refDir = join(dir, 'references')
+    if (existsSync(refDir)) {
+      for (const ref of await readdir(refDir)) files.push(await readFile(join(refDir, ref), 'utf8'))
+    }
+    for (const body of files) {
+      for (const match of body.matchAll(/`(references\/[\w./-]+)`/g)) {
+        const ref = match[1]!
+        assert.ok(existsSync(join(dir, ref)), `${name} names ${ref}, which it does not carry`)
+      }
+    }
+  }
 })

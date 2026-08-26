@@ -41,8 +41,14 @@ RUN chmod +x /usr/local/bin/ogun-project-entrypoint \
 USER dev
 ENV DATABASE_URL=postgres://ogun:ogun@localhost:5433/ogun \
     PGDATA=/var/lib/postgresql/data \
-    # pnpm's store in the cache volume the runner already mounts, so a nightly does not
-    # re-download the world (§4.6).
+    # Points pnpm's *bin* directory at the cache volume the runner already mounts. It does
+    # NOT decide where the store goes, which is what this line used to claim (§4.6,
+    # ADR-0016). pnpm chooses its store by writing a temp file in the project directory and
+    # trying to hardlink it beside `$PNPM_HOME/store`; `/workspace` is a bind mount and the
+    # volume is a third device, so the link fails with EXDEV and pnpm silently falls back
+    # to `/workspace/.pnpm-store` — a fresh clone every run, and a full download every
+    # night, reported as nothing at all. The store is named on the command line in
+    # `.ogun/config.yaml` instead, where no filesystem probe can overrule it.
     PNPM_HOME=/home/dev/.cache/pnpm
 
 ENTRYPOINT ["/usr/local/bin/ogun-project-entrypoint"]

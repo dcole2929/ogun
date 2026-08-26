@@ -3,6 +3,7 @@ import { and, eq } from 'drizzle-orm'
 import { z } from 'zod'
 import { schema } from '@ogun/core/db'
 import {
+  CONTAINERISE_SKILL,
   PERMISSION_PROFILES,
   RUNTIMES,
   cycleDefinitionSchema,
@@ -477,7 +478,7 @@ const toWorkerConfig = (input: z.infer<typeof workerFields> & Record<string, unk
 async function validate(
   db: Env['Variables']['ctx']['db'],
   projectId: string,
-  input: { skill?: string; permissions?: string; sandbox?: string },
+  input: { skill?: string; permissions?: string; sandbox?: string; bootstrap?: string },
   policies: Policies | undefined,
 ): Promise<string | null> {
   if (input.skill) {
@@ -507,8 +508,40 @@ async function validate(
       'you mean to allow that.'
     )
   }
+  /**
+   * `bootstrap:` is not a field this UI edits, and it is one an edit can *invalidate*.
+   *
+   * `workerSchema` refuses the exemption on any worker that is not a modifier, in a
+   * container, bound to `containerise-a-project` (ADR-0016) — so toggling a containerise
+   * worker's permissions in the form builds a config that will not parse. Everything the
+   * UI does not manage is carried through untouched by `toWorkerConfig`, which is what
+   * keeps `verify:` and `egress:` from being silently dropped, and which here means the
+   * stale `bootstrap:` comes along and the parse throws where nothing catches it: a 500
+   * on a form submission, with the real reason two packages away.
+   *
+   * So it is refused here, with the sentence, on the same terms as the sandbox downgrade
+   * above. The schema is still what enforces it — nothing is trusted to this check that
+   * `workerSchema` does not check again — and this is what makes the refusal readable.
+   */
+  if (input.bootstrap && !bootstrapWorkerIsCoherent(input)) {
+    return (
+      `this worker declares \`bootstrap: ${input.bootstrap}\`, which exempts it from the ` +
+      'image and test-command requirements every other modifier is held to, and is only ' +
+      `accepted on a \`modifier\` in a \`container\` bound to \`${CONTAINERISE_SKILL}\`. ` +
+      'Remove that line from .ogun/config.yaml first if this is no longer that worker.'
+    )
+  }
   return null
 }
+
+const bootstrapWorkerIsCoherent = (input: {
+  skill?: string
+  permissions?: string
+  sandbox?: string
+}): boolean =>
+  input.permissions === 'modifier' &&
+  input.sandbox === 'container' &&
+  input.skill === CONTAINERISE_SKILL
 
 /**
  * The project's `policies:` as its config.yaml currently says, or `undefined` when this

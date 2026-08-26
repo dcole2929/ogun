@@ -1,6 +1,7 @@
 import { z } from 'zod'
 import { CONNECTED_APPS } from './connections.ts'
 import type { CredentialOutlook } from './credentials.ts'
+import { BOOTSTRAP_KINDS } from './config/project.ts'
 import { egressSchema } from './config/egress.ts'
 import { runEventSchema } from './events.ts'
 import { dismissalCheckSchema, findingEvidenceSchema } from './evidence.ts'
@@ -116,6 +117,17 @@ export const claimedJobSchema = z.object({
    * and says which names exist.
    */
   connections: z.array(z.enum(CONNECTED_APPS)).min(1).optional(),
+  /**
+   * That this worker exists to make the project runnable rather than to change it
+   * (§4.3, ADR-0016). Absent on every ordinary worker, and on every job claimed by a
+   * runner older than this field — which is the same value and the safe direction, since
+   * absent means "hold this to the ordinary modifier gate".
+   *
+   * A closed set rather than `z.string()`, for the reason `connections` gives two fields
+   * up: this one decides which gate a patch is judged by, so a name this build does not
+   * recognise has no safe interpretation. Refusing the claim is the only honest answer.
+   */
+  bootstrap: z.enum(BOOTSTRAP_KINDS).optional(),
   timeoutMs: z.number().int().positive(),
   skillRef: z.string(),
   verify: z.unknown().optional(),

@@ -2,6 +2,7 @@ import { strict as assert } from 'node:assert'
 import { test } from 'node:test'
 import { parse as parseYaml } from 'yaml'
 import {
+  CONTAINERISE_SKILL,
   controlPlanePoliciesSchema,
   defaultControlPlanePolicies,
   inertPolicies,
@@ -10,6 +11,7 @@ import {
   readPolicies,
   readTestCommand,
   workerRequirements,
+  workerSchema,
 } from '../src/config/project.ts'
 
 /**
@@ -261,4 +263,73 @@ test('directPush: true is reported as inert, and the default configuration says 
     [],
     'settings that are honoured must not be reported, however unusual their value',
   )
+})
+
+/**
+ * `bootstrap: project-image` is the only exemption from the image and test-command
+ * requirements every other modifier is held to (§4.3, ADR-0016), and the property that
+ * has to hold is that it **cannot be spelled on an ordinary worker**. The moment it can,
+ * it is the way somebody publishes unverified code by copying a stanza that worked.
+ *
+ * The schema is one of the two answers — the other is the `project-image` lens, which
+ * refuses any patch that is not a containerisation, and which no config can reach. This
+ * asserts the first: the field drags three other fields with it, and the one that makes it
+ * narrow is `skill:`. To write the exemption you must also point the worker at the skill
+ * whose whole text is "write this repository's Dockerfile", at which point it has stopped
+ * being the worker you were trying to exempt.
+ */
+test('bootstrap: project-image is refused on a worker that is not the one it was written for', () => {
+  const worker = (over: Record<string, unknown>) =>
+    workerSchema.safeParse({
+      skill: CONTAINERISE_SKILL,
+      permissions: 'modifier',
+      sandbox: 'container',
+      bootstrap: 'project-image',
+      ...over,
+    })
+
+  assert.equal(worker({}).success, true, 'the worker it was written for must parse')
+
+  for (const [field, over] of [
+    ['permissions', { permissions: 'reviewer' }],
+    ['sandbox', { sandbox: 'worktree' }],
+    ['skill', { skill: 'make-a-change' }],
+  ] as const) {
+    const parsed = worker(over)
+    assert.equal(parsed.success, false, `${field} must be constrained by bootstrap:`)
+    const message = parsed.error!.issues.map((i) => i.message).join(' ')
+    assert.match(
+      message,
+      /bootstrap: project-image/,
+      'the refusal must name the field that caused it, not only the field it constrained',
+    )
+  }
+})
+
+/**
+ * A closed set, so that a second bootstrap kind is a value somebody adds rather than a
+ * meaning somebody reinterprets. `bootstrap: true` was the obvious spelling and loses on
+ * the same argument `connections:` makes: a name this build does not recognise has no safe
+ * interpretation, and the safe direction is to refuse the config rather than to ignore a
+ * line whose author believed it did something.
+ */
+test('an unrecognised bootstrap kind fails to parse rather than being ignored', () => {
+  const parsed = workerSchema.safeParse({
+    skill: CONTAINERISE_SKILL,
+    permissions: 'modifier',
+    sandbox: 'container',
+    bootstrap: 'everything',
+  })
+  assert.equal(parsed.success, false)
+})
+
+/**
+ * Absent on every ordinary worker, and absent has to stay the value that means "held to
+ * the ordinary modifier gate" — not a key that arrives as `undefined` and reads truthy
+ * somewhere downstream, which is how `requires:` came to be parsed and never read.
+ */
+test('a worker that says nothing about bootstrapping carries no such field', () => {
+  const parsed = workerSchema.parse({ skill: 'make-a-change', permissions: 'modifier' })
+  assert.equal(parsed.bootstrap, undefined)
+  assert.equal('bootstrap' in parsed, false)
 })

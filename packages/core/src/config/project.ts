@@ -17,6 +17,79 @@ export const SANDBOX_KINDS = ['container', 'worktree'] as const
 export type SandboxKind = (typeof SANDBOX_KINDS)[number]
 
 /**
+ * The skill a bootstrap worker is required to bind, by name.
+ *
+ * Named here rather than only in `skills/` because `workerSchema` refuses a
+ * `bootstrap:` worker that binds anything else, and a string a schema enforces belongs
+ * next to the schema that enforces it.
+ */
+export const CONTAINERISE_SKILL = 'containerise-a-project'
+
+/**
+ * The two files that decide whether a project can be worked on at all, written down once.
+ *
+ * There were three copies of the second string before this: the runner's refusal messages,
+ * the `self-gating` lens's list of paths that must be announced, and the gate that reads a
+ * containerisation patch's proposed test command. Three copies of a path is three chances
+ * for one of them to keep pointing at the old name — and the failure is silent in the
+ * direction that matters, because a `self-gating` lens looking for a path nothing writes
+ * any more simply never fires.
+ *
+ * Workspace-relative and posix-separated, because that is how they are compared: against
+ * `git diff --name-only` output and against `git show <sha>:<path>`, neither of which
+ * knows what a backslash is.
+ */
+export const PROJECT_CONFIG_PATH = '.ogun/config.yaml'
+export const PROJECT_DOCKERFILE_PATH = '.ogun/Dockerfile'
+
+/**
+ * The one exemption from `modifierReadiness`, spelled as a closed set so that it can only
+ * ever be the exemptions somebody argued about (§4.3).
+ *
+ * ### The paradox this exists to break
+ *
+ * A modifier is refused unless its project has a `.ogun/Dockerfile` and a
+ * `tests.command`, because its patch is only publishable once the project's own suite has
+ * been run against it — and a suite cannot run in `ogun/base`, which carries the agent
+ * CLIs and none of the project's toolchain. So the file that makes a repository workable
+ * by Ogun is the one file Ogun cannot be asked to write. Somebody writes it by hand, for
+ * every repository, and it demands knowing what the base image does, that the docker
+ * socket is never mounted, and that the container runs `--network none` — none of which a
+ * project's owner has any reason to know.
+ *
+ * `bootstrap: project-image` names the way out. Such a worker runs in `ogun/base` — which
+ * is what `imageFor` already gives anything that is not a modifier — and is graded by the
+ * `project-image` lens instead of the tests lens: the host builds the `.ogun/Dockerfile`
+ * the patch proposes and runs the patch's own `tests.command` **inside the image it just
+ * built**. That gate is strictly stronger than the ordinary one, because it proves the
+ * image and the suite together rather than assuming the image.
+ *
+ * ### Why this cannot be spelled on an ordinary worker
+ *
+ * Two independent reasons, and the second is the one that matters.
+ *
+ * The `.check()` below refuses the field on anything that is not a `modifier`, in a
+ * `container`, bound to `containerise-a-project`. So writing it on a worker that fixes
+ * findings does not produce a worker that skips its test gate; it produces a config that
+ * does not parse, naming the three fields.
+ *
+ * And even if it parsed, it would buy nothing. The `project-image` lens **refuses any
+ * patch that is not a containerisation**: no `.ogun/Dockerfile` in the diff, or one line
+ * changed outside `.ogun/`, and the gate fails. There is no path through here that
+ * publishes application code without a suite having passed over it. The exemption is from
+ * *which* gate applies, never from being gated — which is why it can be narrow rather
+ * than merely discouraged.
+ *
+ * A closed set rather than a boolean because a second bootstrap kind is a thing somebody
+ * will want (a `.ogun/config.yaml` for a project that has none, say), and `bootstrap:
+ * true` would have to be reinterpreted the day it arrives. An unknown value fails to
+ * parse rather than being ignored, on the same grounds `connections:` gives: a name this
+ * build does not recognise has no safe interpretation.
+ */
+export const BOOTSTRAP_KINDS = ['project-image'] as const
+export type BootstrapKind = (typeof BOOTSTRAP_KINDS)[number]
+
+/**
  * How long a worker may run before it is given up on, when it does not say.
  *
  * Named rather than inlined because admission reads it too: a credential preflight has to
@@ -109,6 +182,15 @@ export const workerSchema = z.object({
    * `src/connections.ts`.
    */
   connections: z.array(z.enum(CONNECTED_APPS)).min(1).optional(),
+  /**
+   * That this worker exists to make the project runnable, rather than to change it
+   * (§4.3, ADR-0016). Absent on every ordinary worker, which is nearly all of them.
+   *
+   * See `BOOTSTRAP_KINDS` for what it grants and why an ordinary worker cannot wear it.
+   * The `.check()` below is half of that answer; the `project-image` lens is the other
+   * half and is the one that would still hold if this schema were bypassed entirely.
+   */
+  bootstrap: z.enum(BOOTSTRAP_KINDS).optional(),
   verify: verifySchema.optional(),
 })
   /**
@@ -160,6 +242,59 @@ export const workerSchema = z.object({
           'would be read from — so there is nothing for the gateway to keep out of it',
       })
     }
+  })
+  /**
+   * The narrow half of the exemption: `bootstrap:` is refused on any worker that is not
+   * the one it was written for (§4.3, ADR-0016).
+   *
+   * Refused where it is written, and refused rather than ignored, because of what the
+   * field *does*. It is the one key in this schema that changes which gate a patch is held
+   * to, and a key like that on an ordinary worker is the way somebody eventually publishes
+   * unverified code — not maliciously, but by copying a stanza that worked. A warning
+   * would record that; a refusal stops the config from parsing, with the offending fields
+   * named, thirty seconds before anybody is confused.
+   *
+   * Three constraints, and each is a property the `project-image` lens or the runner
+   * depends on rather than a matter of taste:
+   *
+   *  - `permissions: modifier`, because the worker writes files. An `observer` or
+   *    `reviewer` gets a read-only mount and could not write a Dockerfile at all, so the
+   *    field on one of those is a config that cannot do what it says.
+   *  - `sandbox: container`, because the gate runs the proposed suite in a *second*
+   *    container built from the patch's own Dockerfile, and only the container sandbox has
+   *    an image to override. A worktree bootstrap worker would also be a modifier editing
+   *    files directly on the host, which `allowSandboxDowngrade` exists to refuse.
+   *  - `skill: containerise-a-project`, which is what makes this narrow rather than merely
+   *    discouraged. Spelling `bootstrap:` on a worker that fixes findings now also means
+   *    pointing it at the skill whose entire text is "read this repository and write its
+   *    Dockerfile" — at which point it is no longer that worker. A repository may still
+   *    ship its own `containerise-a-project` under `.agents/skills/`, which overrides the
+   *    built-in (see `skills/README.md`); that is the documented specialisation path and
+   *    it stays open, since the gate does not care who wrote the skill.
+   */
+  .check((ctx) => {
+    const worker = ctx.value
+    if (!worker.bootstrap) return
+    const wrong: string[] = [
+      ...(worker.permissions === 'modifier' ? [] : ['`permissions: modifier` (it writes files)']),
+      ...(worker.sandbox === 'container'
+        ? []
+        : ['`sandbox: container` (the gate builds and runs an image)']),
+      ...(worker.skill === CONTAINERISE_SKILL
+        ? []
+        : [`\`skill: ${CONTAINERISE_SKILL}\` (this field exists for that skill alone)`]),
+    ]
+    if (wrong.length === 0) return
+    ctx.issues.push({
+      code: 'custom',
+      input: worker,
+      path: ['bootstrap'],
+      message:
+        `\`bootstrap: ${worker.bootstrap}\` exempts a worker from the image and ` +
+        'test-command requirements every other modifier is held to, so it is only ' +
+        `accepted on the worker it was written for. This one is missing ${wrong.join(', ')}. ` +
+        'Remove the line, or make the worker the one it describes',
+    })
   })
 export type WorkerConfig = z.infer<typeof workerSchema>
 

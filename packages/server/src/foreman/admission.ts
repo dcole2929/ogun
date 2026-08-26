@@ -6,6 +6,8 @@ import {
   credentialHealth,
   DEFAULT_WORKER_TIMEOUT_MS,
   humanDuration,
+  PROJECT_CONFIG_PATH,
+  PROJECT_DOCKERFILE_PATH,
   readTestCommand,
   wouldFailAuth,
   type ControlPlanePolicies,
@@ -55,7 +57,19 @@ export async function admit(
   db: Db,
   // Carries `runtime` and `timeoutMs` because the credential gate needs to know which
   // provider this job will authenticate against and for how long it must stay valid.
-  worker: { id: string; permissions?: string; runtime?: string; timeoutMs?: number },
+  worker: {
+    id: string
+    permissions?: string
+    runtime?: string
+    timeoutMs?: number
+    /**
+     * `bootstrap: project-image`, when this worker declared it. The one exemption from
+     * readiness, and see `modifierReadiness` for why it is asked here rather than folded
+     * into the readiness probe: readiness is a fact about the *project* and cannot depend
+     * on which worker is asking.
+     */
+    bootstrap?: string
+  },
   /**
    * The project's control-plane policies. Required rather than defaulted: every caller
    * already holds a project, and a default here would be the same silent fallback that
@@ -120,7 +134,32 @@ export async function admit(
           'confirmed its patches could be verified',
       }
     }
-    if (!modifier.ready) return { allowed: false, reason: modifier.reason }
+    /**
+     * The exemption, and it is narrower than "a bootstrap worker skips readiness".
+     *
+     * `bootstrappable` is set only when every missing requirement is one this worker
+     * exists to write — the Dockerfile, the test command, or both — which means the
+     * exemption **cannot be used once it is not needed**. A project whose readiness fails
+     * because the control plane has no local checkout is refused here exactly as any
+     * other modifier is: nothing has confirmed the repository can be reached, so nothing
+     * could confirm what the patch is missing either, and the fix is `ogun project sync`
+     * rather than a worker.
+     *
+     * A project that is *already* ready never reaches this branch at all, which is the
+     * answer to "should the exemption expire". It expires by construction: once the image
+     * and the command exist, a containerise worker passes ordinary readiness on its own
+     * terms and is admitted without any exemption being spent. Running it again is then an
+     * upgrade — a legitimate thing to want, since a project's toolchain moves — and it is
+     * still held to the `project-image` gate, which builds the *new* Dockerfile and runs
+     * the *new* command inside it. Refusing the second run was considered and rejected: it
+     * would make the only way to change a project image the same by-hand edit this whole
+     * mechanism exists to remove, and the run says on its own timeline which of the two
+     * it was.
+     */
+    if (!modifier.ready) {
+      const exempt = worker.bootstrap === 'project-image' && modifier.bootstrappable === true
+      if (!exempt) return { allowed: false, reason: modifier.reason }
+    }
   }
 
   /**
@@ -168,8 +207,42 @@ export async function admit(
  * also not the same fact as a failed test gate, and must never wear that name: nothing
  * about the agent's work failed here, because there was never anything to judge
  * (principle 6).
+ *
+ * ### The one worker this does not refuse
+ *
+ * Both requirements are *files in the repository*, which makes the refusal circular for
+ * the repository that has neither: the thing that would fix it is a patch, and a patch
+ * needs a modifier, and a modifier needs the thing that would fix it. `bootstrap:
+ * project-image` breaks the circle (§4.3, ADR-0016) and this function is where the break
+ * is described rather than taken — it reports `bootstrappable` alongside the refusal, and
+ * `admit` decides. Kept apart on purpose: readiness is a fact about a project and must
+ * not vary with who is asking, or the answer stops being cacheable per cycle run and
+ * starts being an argument.
  */
-export type ModifierReadiness = { ready: true } | { ready: false; reason: string }
+export type ModifierReadiness =
+  | { ready: true }
+  | {
+      ready: false
+      reason: string
+      /**
+       * True when *everything* missing is something a `bootstrap: project-image` worker
+       * exists to write, so such a worker may run against this project anyway (§4.3,
+       * ADR-0016).
+       *
+       * A property of the refusal rather than a second function, because the two answers
+       * have to be derived from one probe of one disk: a `bootstrapReadiness(slug, found)`
+       * beside `modifierReadiness(slug, found)` is two readings of the same tree that can
+       * disagree, and the day they do, the one that disagrees in the admitting direction
+       * is the one nobody notices.
+       *
+       * Absent — not `false` — on a refusal no worker can exempt itself from, which today
+       * is the one where the control plane has no local path at all. The distinction is
+       * the same one the reason string makes: "the two files are missing" points at work
+       * somebody (or something) can do, "this project is unreachable from here" points at
+       * a machine.
+       */
+      bootstrappable?: boolean
+    }
 
 /** What a probe found in a project's `.ogun/` directory. */
 export type ModifierRequirements = {
@@ -210,7 +283,17 @@ export function modifierReadiness(slug: string, found: ModifierRequirements): Mo
         ]),
   ]
 
-  return missing.length === 0 ? { ready: true } : { ready: false, reason: missing.join('; ') }
+  /**
+   * `bootstrappable` on every refusal reached from here, and that is safe *because* of
+   * where the early return above sits: by this line the repository has been found and
+   * read, so the only two things that can be missing are the two files below — which are
+   * exactly the two a containerise worker writes. A future third requirement added to
+   * `missing` would silently join that set, so it goes in the list only alongside a
+   * decision about whether a bootstrap worker can produce it.
+   */
+  return missing.length === 0
+    ? { ready: true }
+    : { ready: false, reason: missing.join('; '), bootstrappable: true }
 }
 
 /**
@@ -225,10 +308,10 @@ export function modifierReadiness(slug: string, found: ModifierRequirements): Mo
 export async function probeProject(slug: string): Promise<ModifierRequirements> {
   const root = (await readProjectMap())[slug]
   if (!root) return { hasImage: false }
-  const config = await readFile(join(root, '.ogun', 'config.yaml'), 'utf8').catch(() => null)
+  const config = await readFile(join(root, PROJECT_CONFIG_PATH), 'utf8').catch(() => null)
   return {
     root,
-    hasImage: existsSync(join(root, '.ogun', 'Dockerfile')),
+    hasImage: existsSync(join(root, PROJECT_DOCKERFILE_PATH)),
     ...(config === null ? {} : { testCommand: readTestCommand(config) }),
   }
 }
