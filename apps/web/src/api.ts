@@ -349,6 +349,107 @@ export type Status = {
   runnersOnline: number
   drifted: string[]
   breakers: Array<{ worker: string; project: string; failures: number }>
+  /**
+   * Sources in a state somebody has to act on — the fourth thing that stops work while
+   * every page still reports success.
+   *
+   * **Which sources those are is decided on the server** (`troubledSources`), not here.
+   * The rule is not obvious — a rate-limited poll is not worth interrupting anybody about
+   * until it has persisted through several cadences, while a dead credential is worth it
+   * on the first failure — and a browser bundle holding its own copy of it is a second
+   * implementation of a judgement, in the half anybody can edit.
+   */
+  sources: Array<{
+    project: string
+    source: string
+    state: SourceState
+    /** Only ever set on `failing`, and the reason the rail can say what to do. */
+    kind: SourceFailureKind | null
+    detail: string | null
+  }>
+}
+
+/** Mirrors `SourceFailureKind` on the server; four remedies, deliberately not merged. */
+export type SourceFailureKind = 'auth' | 'ratelimited' | 'transport' | 'local'
+
+export type SourceState =
+  | 'disabled'
+  | 'overdue'
+  | 'never-polled'
+  | 'refused'
+  | 'failing'
+  | 'silent'
+  | 'healthy'
+
+/**
+ * One source, and the state its poll ledger puts it in (§4.13).
+ *
+ * The trigger's answer to the question the coverage ledger asks about workers: a run that
+ * never happened and a run that happened and found nothing are different facts, and so are
+ * a poll that could not look, a poll that looked and matched nothing, and a poll loop that
+ * was never started.
+ */
+export type SourceReport = {
+  id: string
+  project: string
+  name: string
+  kind: string
+  cycle: string
+  enabled: boolean
+  pollMinutes: number
+  team: string
+  /** Null when the stored config is not a shape this build can parse — itself a fault. */
+  filter: {
+    status: string[]
+    labels: string[]
+    excludeLabels: string[]
+    notBlocked: boolean
+  } | null
+  health: {
+    state: SourceState
+    kind: SourceFailureKind | null
+    detail: string | null
+    /** What to do. Null where `detail` already carries it — a refusal names its own fix. */
+    remedy: string | null
+    lastPolledAt: string | null
+    lastOkAt: string | null
+    lastAdmittedAt: string | null
+    lastEmittedAt: string | null
+    firstPollAt: string | null
+    /** Rows in the ledger. Not `polls` below, which is the history the route hangs on. */
+    pollsRecorded: number
+  }
+  /** The last 20, for the follow-up question: not "is it broken" but "since when". */
+  polls: Array<{
+    startedAt: string
+    endedAt: string | null
+    outcome: string
+    kind: SourceFailureKind | null
+    seen: number
+    admitted: number
+    emitted: number
+    trimmed: number
+    truncated: boolean
+    detail: string | null
+  }>
+}
+
+/**
+ * A ticket that has already produced work.
+ *
+ * Ogun writes nothing back to Linear (ADR-0004), so the card stays in `Todo` with its
+ * label on however thoroughly it has been dealt with — this row is the only record that
+ * anything happened, and "it was emitted on Tuesday" is the answer to most of the
+ * questions a live source generates.
+ */
+export type SourceEmission = {
+  externalKey: string
+  externalId: string
+  sourceName: string
+  outcome: string
+  detail: string | null
+  cycleRunId: string | null
+  createdAt: string
 }
 
 export const api = {
@@ -366,6 +467,11 @@ export const api = {
       `/api/projects/${slug}/workers`,
     ),
   coverage: (slug: string) => json<{ coverage: CoverageRow[] }>(`/api/projects/${slug}/coverage`),
+  /** The coverage ledger for a trigger: did anything look, and what came of it (§4.13). */
+  sources: (slug: string) =>
+    json<{ sources: SourceReport[]; emissions: SourceEmission[]; ticket: string | null }>(
+      `/api/projects/${slug}/sources`,
+    ),
   runNotes: (slug: string) => json<{ notes: RunNote[] }>(`/api/runs/notes?project=${slug}`),
   runs: () =>
     json<{

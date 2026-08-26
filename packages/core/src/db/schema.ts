@@ -786,6 +786,32 @@ export const sourcePolls = pgTable(
      * else, including finding nothing.
      */
     outcome: text('outcome').notNull(),
+    /**
+     * Which kind of "did not get an answer" — `auth` | `ratelimited` | `transport` |
+     * `local` — and null for anything that is not a `failed` poll.
+     *
+     * `LinearUnavailable` has kept three kinds apart since it was written, for the reason
+     * principle 6 keeps every trio apart: **the remedies differ**. `auth` is somebody's
+     * credential and only a person can fix it. `ratelimited` fixes itself in one cadence.
+     * `transport` is the network, or a Linear change worth knowing about. `local` is the
+     * fourth that only shows up here — a renewal that succeeded at Linear and could not be
+     * written to this machine's config — and it is a `failed` rather than a `refused`
+     * because the poll did reach the network.
+     *
+     * Recorded rather than derived, and that is the whole reason for the column. The
+     * classification exists for one statement inside `pollSource` and was then flattened
+     * into a prose `detail`; every reader downstream — a route, a table, a status rail —
+     * had to recover it by matching a prefix on that sentence, which is a second
+     * implementation of a rule living in a string somebody will one day reword. The
+     * failure mode is silent and exactly the one this table exists to prevent: three
+     * different remedies collapsing back into "poll failed".
+     *
+     * Nullable rather than defaulted, because `ok` and `refused` genuinely have no kind
+     * and a `failed` row written by a build that could not classify what it caught (the
+     * unforeseen-error catch in `pollSources`) is honestly "failed, kind unknown". A
+     * default would make that indistinguishable from a real classification.
+     */
+    kind: text('kind'),
     /** Tickets the poll read. */
     seen: integer('seen').notNull().default(0),
     /** Tickets the deterministic filter admitted. */

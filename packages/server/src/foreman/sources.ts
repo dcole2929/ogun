@@ -110,6 +110,27 @@ export type SourceDeps = {
 export type PollResult = {
   source: string
   outcome: 'ok' | 'refused' | 'failed'
+  /**
+   * Which kind of failure, for a `failed` poll only, and it is carried rather than
+   * recovered downstream.
+   *
+   * `LinearUnavailable` has drawn this distinction since it was written because the
+   * remedies differ, and until now the distinction died here: it went into `detail` as a
+   * `"auth: …"` prefix and every reader had to match that prefix back out of a sentence
+   * written for a human. That is a rule with two implementations, one of them a regular
+   * expression over prose, and when the prose is reworded the three remedies silently
+   * become one "poll failed" — the collapse `source_polls` exists to prevent.
+   *
+   * `local` is the fourth and belongs to `failed` rather than `refused`: a renewal that
+   * Linear granted and this machine could not store did reach the network, so it is not a
+   * refusal, and it is not fixed by waiting, so it is not `transport`.
+   *
+   * Absent on `ok` and `refused` — a refusal never reached Linear, so it has no kind of
+   * unavailability — and absent on the one `failed` that cannot be classified, the
+   * unforeseen-error catch in `pollSources`. "Failed, and we do not know which" is an
+   * honest answer; a default would forge one.
+   */
+  kind?: 'auth' | 'ratelimited' | 'transport' | 'local'
   seen: number
   admitted: number
   emitted: string[]
@@ -195,7 +216,7 @@ export async function pollSources(db: Db, deps: SourceDeps = {}): Promise<PollRe
     try {
       results.push(await pollSource(db, row, config, deps))
     } catch (err) {
-      results.push({
+      const failure: PollResult = {
         source: row.name,
         outcome: 'failed',
         seen: 0,
@@ -204,7 +225,40 @@ export async function pollSources(db: Db, deps: SourceDeps = {}): Promise<PollRe
         trimmed: 0,
         truncated: false,
         detail: err instanceof Error ? err.message : String(err),
-      })
+      }
+      /**
+       * Recorded here as well as returned, and it was not before.
+       *
+       * The claim above has already advanced `lastPolledAt`, so a poll that died in this
+       * catch consumed its turn and left **no row at all** — the one shape the ledger
+       * cannot represent, and the one it was built to prevent. A source throwing on every
+       * poll looked, from every surface, exactly like a source nobody had ever configured:
+       * a `last_polled_at` ticking forward beside an empty history. The result was returned
+       * to `main.ts`, which printed it to a terminal nobody is watching at 3am.
+       *
+       * Best-effort, and a failure to write it is swallowed: reaching here already means
+       * something unforeseen, and an insert that throws inside the handler for an
+       * unforeseen error would escape the loop and stop every *later* source in this tick
+       * — trading one broken source for a machine that has quietly stopped hearing about
+       * tickets, which is the trade this catch exists to refuse.
+       *
+       * No `kind`. Everything `pollSource` can classify it classifies itself; an
+       * unforeseen throw is by definition unclassified, and guessing `transport` for it
+       * would put a fabricated remedy in front of an operator.
+       */
+      await db
+        .insert(sourcePolls)
+        .values({
+          projectId: row.projectId,
+          sourceId: row.id,
+          sourceName: row.name,
+          startedAt: now,
+          endedAt: deps.now?.() ?? new Date(),
+          outcome: 'failed',
+          detail: failure.detail ?? null,
+        })
+        .catch(() => {})
+      results.push(failure)
     }
   }
 
@@ -230,6 +284,7 @@ export async function pollSource(
       startedAt,
       endedAt: deps.now?.() ?? new Date(),
       outcome: result.outcome,
+      ...(result.kind !== undefined ? { kind: result.kind } : {}),
       seen: result.seen,
       admitted: result.admitted,
       emitted: result.emitted.length,
@@ -323,6 +378,10 @@ export async function pollSource(
       return record({
         source: row.name,
         outcome: 'failed',
+        // Taken from the grant rather than guessed at here. `usableGrant` is the only
+        // thing that knows whether the token endpoint was unreachable or the write to this
+        // machine's store failed, and those two want opposite advice.
+        kind: usable.kind,
         seen: 0,
         admitted: 0,
         emitted: [],
@@ -372,6 +431,22 @@ export async function pollSource(
       return record({
         source: row.name,
         outcome: 'failed',
+        /**
+         * The kind, stored as a fact and not only as a prefix on the sentence above.
+         *
+         * The prefix stays because it is what a person reads, but it is no longer what a
+         * *machine* reads: `auth` sends somebody to `ogun connect`, `ratelimited` sends
+         * them nowhere because the next poll fixes it, and `transport` is worth watching
+         * for a pattern. A surface recovering that by matching `/^(auth|…):/` on a string
+         * a future edit may reword is one prose change away from telling every operator
+         * the same useless thing.
+         *
+         * Not anything at all when this was not a `LinearUnavailable`: the client throws
+         * that for everything it can classify, so reaching the `String(err)` branch means
+         * something nobody foresaw, and inventing `transport` for it would be a guess
+         * recorded as evidence.
+         */
+        ...(err instanceof LinearUnavailable ? { kind: err.kind } : {}),
         seen: seen.length,
         admitted: 0,
         emitted: [],
@@ -485,7 +560,13 @@ export async function pollSource(
     emitted,
     trimmed,
     truncated,
-    ...detailFor({ seen, admitted: admitted.length, notes: [...edited, ...failures], truncated }),
+    ...detailFor({
+      seen,
+      admitted: admitted.length,
+      team: config.team,
+      notes: [...edited, ...failures],
+      truncated,
+    }),
   })
 }
 
@@ -549,6 +630,7 @@ function missingKey(
 function detailFor(input: {
   seen: Ticket[]
   admitted: number
+  team: string
   notes: string[]
   truncated: boolean
 }): { detail?: string } {
@@ -556,6 +638,30 @@ function detailFor(input: {
   if (input.admitted === 0 && input.seen.length > 0) {
     const statuses = [...new Set(input.seen.map((t) => t.status))].sort()
     parts.push(`nothing matched; the statuses on those tickets were: ${statuses.join(', ')}`)
+  }
+  /**
+   * A poll that read **nothing at all**, which is a different fault from a poll that read
+   * a hundred tickets and admitted none — and it used to say nothing, because the branch
+   * above needs at least one ticket to describe.
+   *
+   * Found by pointing a real source at a team key the workspace does not have: the poll
+   * reported `ok`, `seen: 0`, no detail, and looked exactly like a well-configured source
+   * on a quiet afternoon. Forever, since a team key does not fix itself.
+   *
+   * Two causes and both are named, because they are indistinguishable from here and have
+   * different fixes. Linear answers a filter on an unknown team key with an empty list
+   * rather than an error, so a typo reads as emptiness; and a `client_credentials` grant
+   * reaches only the workspace's *public* teams, so a correct key for a private team reads
+   * as emptiness too. `ogun connect list` prints which grant is in use, which is the half
+   * this sentence cannot know.
+   */
+  if (input.seen.length === 0) {
+    parts.push(
+      `read no tickets at all for team "${input.team}" — either no issue in that team ` +
+        'matched the remote query, or the team key is not one this workspace has, or the ' +
+        'grant cannot see it (an app-token grant reaches only public teams; `ogun connect ' +
+        'list` says which grant this project uses)',
+    )
   }
   if (input.truncated) {
     parts.push('stopped at maxPages, so the least recently updated tickets were not read')

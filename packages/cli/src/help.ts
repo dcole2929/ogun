@@ -942,6 +942,79 @@ const topics: Record<string, Topic> = {
     ],
   },
 
+  sources: {
+    summary: 'whether the outside world is still reaching this project, and what came of it',
+    usage: ['ogun sources [--project <slug>] [--source <name>] [--ticket <key>]'],
+    where:
+      'Anywhere, but it reaches the control plane — the poll ledger is in postgres, not ' +
+      "in this machine's config.json, which is what `ogun connect list` reads. That is " +
+      'itself part of the answer when it cannot connect: the poll loop runs inside the ' +
+      'control-plane process, so a server that is down is also a server that is not ' +
+      'polling.',
+    notes: [
+      'A source polls Linear on a cadence and turns admitted tickets into cycle runs ' +
+        '(§4.13). Every look is recorded, including the ones that found nothing and the ' +
+        'ones that failed, because a dead key, a renamed team, a typo in `status:` and a ' +
+        'genuinely quiet week are otherwise the same observation.',
+      'It prints a STATE per source, not a log. There are ~288 polls a day per source and ' +
+        'listing them answers "what happened at 03:12" instead of "is this working".',
+      'The states are: healthy · silent · failing · refused · overdue · never-polled · ' +
+        'disabled. Two of them are worth reading twice.\n' +
+        '`refused` never reached Linear — no credential for this project, a `cycle:` ' +
+        'naming a cycle that does not exist — and its detail names the command that fixes ' +
+        'it.\n' +
+        '`overdue` means NOTHING LOOKED. It is the one state with no ledger row behind ' +
+        'it, and the only evidence of two failures that are otherwise invisible: a ' +
+        'control plane that is not running its poll loop, and a source whose stored ' +
+        'config this build cannot parse — which the poller skips deliberately, silently, ' +
+        'and forever.',
+      'A `failing` source always says WHICH KIND, and the four are not degrees of one ' +
+        'thing:\n' +
+        '    auth         the credential. Nothing retries this into working — `ogun connect`\n' +
+        '    ratelimited  Linear is throttling. It clears itself; raise pollMinutes if not\n' +
+        '    transport    the network, or Linear. The next poll asks again\n' +
+        '    local        Linear answered and this machine could not store the token\n' +
+        'Collapsing them into "failed" throws away the only part that says what to do.',
+      '`silent` is NOT a failure. A source that matches nothing is working; a source that ' +
+        'has matched nothing for a week probably has a filter that does not match what the ' +
+        'team actually calls its columns. A poll that admits nothing records the statuses ' +
+        'it really saw, and --source prints those next to the ones the filter asks for.',
+      'Worked examples:\n' +
+        '    ogun sources                       every source here, and its state\n' +
+        '    ogun sources --source tickets      one, with its filter and recent polls\n' +
+        '    ogun sources --ticket ENG-123      has this ticket already produced work?\n' +
+        '    ogun sources --project heirchive   a repo not checked out on this machine',
+      '--ticket is the one to know. Ogun writes nothing back to Linear (ADR-0004), so a ' +
+        'ticket that has been completely dealt with still sits in Todo with its label on, ' +
+        'looking exactly like one nothing ever saw. "It was emitted on Tuesday, into this ' +
+        'cycle run" is the answer to most of the questions a source produces.',
+      'It takes no positional arguments, on purpose. `ogun coverage <project>` next door ' +
+        'takes a bare word as the project, so `ogun sources tickets` is a plausible thing ' +
+        'to type and could mean either a project or a source — it is refused rather than ' +
+        'guessed at.',
+    ],
+    flags: [
+      [
+        '--project <slug>',
+        'which project, when the current directory is not inside it. Otherwise the slug ' +
+          'comes from .ogun/config.yaml here, or the registered checkout containing this ' +
+          'directory',
+      ],
+      [
+        '--source <name>',
+        'one source in full: its filter, the statuses its polls actually saw, and the last ' +
+          '20 polls with when each state began',
+      ],
+      [
+        '--ticket <key>',
+        'has this ticket already produced work? Takes the human key (ENG-123), matched ' +
+          "case-insensitively. \"No row\" is not \"rejected\" — a ticket the filter refuses is " +
+          'deliberately not recorded, since it may be admitted next week',
+      ],
+    ],
+    see: ['ogun coverage', 'ogun connect list', 'ogun project sync'],
+  },
+
   findings: {
     summary: 'the finding inbox, and the format agents write',
     usage: ['ogun findings list [--project <slug>] [--status <a,b>]', 'ogun findings write | schema'],
@@ -1217,6 +1290,7 @@ ${bold('running')}
   ogun trigger <project> <worker>  queue a run now
   ogun runs                        recent runs
   ogun coverage <project>          what ran, what didn't, and why
+  ogun sources [--ticket ENG-1]    is Linear still reaching us, and what came of it
 
 ${bold('findings')}
   ogun findings list [--project x] [--status open]

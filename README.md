@@ -146,6 +146,7 @@ ogun workers                every worker, and when it next runs
 ogun runs                   recent runs
 ogun findings list          the inbox
 ogun coverage <project>     what ran, what didn't, and why
+ogun sources                is Linear still reaching us, and what came of it
 ```
 
 Every command, its flags, which machine it runs on, and what it writes:

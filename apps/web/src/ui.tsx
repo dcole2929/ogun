@@ -55,6 +55,23 @@ const OUTCOME_TONE: Record<string, string> = {
   'not-selected': '',
   pending: 'blue',
   errored: 'red',
+  /**
+   * A source's states (§4.13). `healthy` and `silent` are the pair worth being careful
+   * about: a source that matches nothing is *working*, so `silent` is a remark in yellow
+   * and never a failure in red — colouring it red would teach people that red on this page
+   * means "probably fine", which costs the reds that are not.
+   *
+   * `overdue` is red because nothing looked at all, which is strictly worse than a poll
+   * that looked and failed: there is no row and therefore no explanation anywhere else.
+   */
+  healthy: 'green',
+  silent: 'yellow',
+  failing: 'red',
+  overdue: 'red',
+  'never-polled': '',
+  disabled: '',
+  /** Poll outcomes, as recorded on the row. `refused` above already carries yellow. */
+  ok: 'green',
 }
 
 export const Pill = ({ value }: { value: string }) => (

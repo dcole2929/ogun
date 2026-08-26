@@ -23,6 +23,7 @@ import { mintToken, secretWriteTransport } from '../auth.ts'
 import { updateLocalConfig } from '@ogun/core'
 import { reachableAddresses, reachabilityWarning } from './runners.ts'
 import { driftAcross } from '../drift.ts'
+import { troubledSources } from '../source-health.ts'
 
 const run = promisify(execFile)
 const { breakers, findings, jobs, projects, runners, runs, workers } = schema
@@ -50,10 +51,16 @@ const version = async (bin: string, args: string[]): Promise<string | null> =>
  * `claude` and `codex` with ten-second timeouts — fine for a page you open, ruinous for
  * something the chrome polls every few seconds. This is four queries and one file hash.
  *
- * All three fail the same way: everything reports success and nothing runs. No runner
+ * All of them fail the same way: everything reports success and nothing runs. No runner
  * online and jobs queue forever; a drifted config runs last week's definition; an open
- * breaker refuses a worker at admission. Each is visible today only on the page that owns
- * it, which is no use when you are looking at something else.
+ * breaker refuses a worker at admission; a source whose credential died stops turning
+ * tickets into work while every page about work stays truthful and empty. Each is visible
+ * today only on the page that owns it, which is no use when you are looking at something
+ * else.
+ *
+ * The sources are the fourth and were the one with no page of its own at all — the poll
+ * ledger had no reader anywhere, so a dead key at 3am produced a row nobody could see and
+ * a line in a terminal nobody was watching.
  */
 systemRoutes.get('/status', async (c) => {
   const { db, config } = c.var.ctx
@@ -75,6 +82,13 @@ systemRoutes.get('/status', async (c) => {
 
   const drift = await driftAcross(db, config)
 
+  /**
+   * Which sources are in a state somebody has to act on. The rule — and in particular why
+   * a rate-limited poll is not one of them until it has persisted — is in
+   * `troubledSources`, so the browser cannot hold a second opinion about it.
+   */
+  const troubled = await troubledSources(db)
+
   return c.json({
     runnersOnline: online?.n ?? 0,
     // Only `drifted` is actionable. `unreachable` is a hosted control plane working as
@@ -83,6 +97,7 @@ systemRoutes.get('/status', async (c) => {
       .filter(([, d]) => d.state === 'drifted')
       .map(([slug]) => slug),
     breakers: tripped,
+    sources: troubled,
   })
 })
 

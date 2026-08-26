@@ -28,7 +28,13 @@ test('a line break an author wrote survives to the reader', () => {
  * example, by the convention Markdown already uses for a code block.
  */
 test('prose is still wrapped, however its source happened to be indented', () => {
-  for (const page of [['connect'], ['connect', 'list'], ['secret'], ['secret', 'set']]) {
+  for (const page of [
+    ['connect'],
+    ['connect', 'list'],
+    ['secret'],
+    ['secret', 'set'],
+    ['sources'],
+  ]) {
     const rendered = helpFor(page)
     assert.ok(rendered, page.join(' '))
 
@@ -66,6 +72,17 @@ test('every credential a command collects is named in one of its usage lines', (
     [['secret', 'set'], [/ogun secret set <name> <key>/]],
     [['secret', 'rm'], [/ogun secret rm <name>/]],
     [['connect', 'list'], [/ogun connect list \[--project <slug>\]/]],
+    /**
+     * `ogun sources` collects no credential, and the bar is not about credentials — it is
+     * that a reader can see every input from the usage line alone. Two of these are the
+     * whole command: `--source` is how you name one, `--ticket` is how you ask about one
+     * ticket, and neither is a positional, so neither appears anywhere a reader would
+     * infer it from. The prose below the line explains them; the line has to *have* them.
+     */
+    [
+      ['sources'],
+      [/ogun sources \[--project <slug>\] \[--source <name>\] \[--ticket <key>\]/],
+    ],
   ]
   for (const [page, expected] of cases) {
     const rendered = helpFor(page)

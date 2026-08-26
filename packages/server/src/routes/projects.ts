@@ -12,6 +12,7 @@ import {
 import { discoverSkills, expandCycle, hashSkillSet, loadProjectConfig } from '@ogun/core'
 import { builtinSkillsRoot, driftAcross } from '../drift.ts'
 import { reindexProject } from '../reindex.ts'
+import { recentEmissions, recentPolls, sourceHealth } from '../source-health.ts'
 import { parseSchedule } from '../foreman/scheduler.ts'
 import type { Env } from '../context.ts'
 
@@ -452,4 +453,63 @@ projectsRoutes.get('/:slug/coverage', async (c) => {
     .orderBy(desc(cycleRuns.startedAt))
     .limit(200)
   return c.json({ coverage: rows })
+})
+
+/**
+ * The coverage ledger for a *trigger* — whether the factory was ever asked (§4.13).
+ *
+ * The sibling of `/coverage` above and deliberately shaped like it. That one answers "did
+ * the workers selected for last night's batch actually run"; this one answers the question
+ * one step upstream, which for a ticket-driven project is the one that goes wrong first:
+ * **did anything look at Linear, and what came of it.** A dead credential produces no batch
+ * at all, so the coverage ledger has nothing to report and reports nothing — an empty page
+ * that reads exactly like a quiet week.
+ *
+ * Two things come back, because a source generates two different questions:
+ *
+ *  - `sources` is a *state* per source, not a log. `source_polls` gets ~288 rows a day and
+ *    a page of them is a log; what an operator needs is "this one is failing, and here is
+ *    which kind of failing and what to do". The recent history rides along underneath,
+ *    bounded, for the follow-up question of when it started.
+ *  - `emissions` is which tickets have already produced work. Ogun writes nothing back to
+ *    Linear (ADR-0004), so a ticket that has been fully dealt with still sits in `Todo`
+ *    looking untouched, and *"why did nothing happen for ENG-123"* has "it did, on Tuesday"
+ *    as its most common answer. `?ticket=ENG-123` asks that directly.
+ *
+ * A project with no sources gets an empty list rather than a 404 — every project is
+ * legitimately in that state, and it is the answer the UI needs in order to render nothing
+ * rather than an error.
+ */
+projectsRoutes.get('/:slug/sources', async (c) => {
+  const { db } = c.var.ctx
+  const project = await db.query.projects.findFirst({
+    where: eq(projects.slug, c.req.param('slug')),
+  })
+  if (!project) return c.json({ error: 'no such project' }, 404)
+
+  const reports = await sourceHealth(db, { projectId: project.id })
+
+  /**
+   * The history rides under the state rather than being a second request, because the
+   * follow-up question — *when did it start failing* — is asked within a second of the
+   * first one and never on its own.
+   *
+   * Serial rather than a `Promise.all` fan-out: a project has a handful of sources, not
+   * hundreds, and a bounded serial loop is a bounded amount of database at a time.
+   */
+  const withHistory = []
+  for (const report of reports) {
+    withHistory.push({ ...report, polls: await recentPolls(db, report.id) })
+  }
+
+  const ticket = c.req.query('ticket')
+  return c.json({
+    sources: withHistory,
+    emissions: await recentEmissions(db, project.id, ticket ? { ticket } : {}),
+    /**
+     * Echoed back so a surface can say "nothing has been emitted for ENG-9999" rather than
+     * "no emissions" — different sentences, and only one of them answers what was asked.
+     */
+    ticket: ticket ?? null,
+  })
 })

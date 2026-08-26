@@ -1403,10 +1403,30 @@ Five things about it are decisions rather than details:
   `source_emissions` is unique on `(project, external id)`, the row is inserted *before* the
   run is created, and the insert is the claim. A ticket edited afterwards is reported and
   **not** re-emitted.
-- **A source that stops working leaves evidence.** `source_polls` records every look. An
-  expired key, a team key that was renamed, a `status:` with a typo and a genuinely quiet
-  week are otherwise the same observation — and identical to a poll loop that was never
-  started (principle 6).
+- **A source that stops working leaves evidence, and the evidence has readers.**
+  `source_polls` records every look. An expired key, a team key that was renamed, a
+  `status:` with a typo and a genuinely quiet week are otherwise the same observation — and
+  identical to a poll loop that was never started (principle 6).
+
+  What is *read off* it is a **state per source**, not the log: ~288 rows a day answers
+  "what happened at 03:12" and cannot answer "is this working". `GET
+  /api/projects/:slug/sources`, `ogun sources`, a section of the Coverage page and the
+  status rail all derive from one function, and all four keep the failure kinds apart —
+  `auth` needs a person, `ratelimited` needs nobody, `transport` needs watching, `local`
+  needs this machine's store fixed. That distinction is why `source_polls.kind` is a
+  column: it existed for one statement inside the poll and was flattened into prose, and
+  every reader recovering it by matching a prefix would be one rewording from collapsing
+  four remedies into "poll failed".
+
+  Two of the states have no row behind them and are the reason a state is derived at all
+  rather than read off the latest poll. **`overdue`** — nothing has looked for far longer
+  than the source's own cadence — is the only evidence of a control plane that has stopped
+  polling, and of a source whose stored config the poller *skips* because it cannot parse
+  it (deliberately, so one bad source cannot stop the others; silently, and forever).
+  **`silent`** — polling fine and admitting nothing for over a week — is not a failure and
+  is never rendered as one; a source that matches nothing is working, and one that has
+  matched nothing for a week is more likely to be `status: [To Do]` against a column the
+  team calls `Todo`.
 - **Ticket *selection* never reaches a sandbox, and a skill working on a ticket may still
   call Linear.** These are two statements about two different things and both are true.
 
@@ -1924,9 +1944,14 @@ source_emissions    id, project_id, source_id?, source_name, external_id, extern
                     -- digest is a *hash* of title+status+description, never the text —
                     -- a record of what Ogun did, not a copy of what Linear says (ADR-0004)
 source_polls        id, project_id, source_id?, source_name, started_at, ended_at,
-                    outcome, seen, admitted, emitted, trimmed, truncated, detail
+                    outcome, kind?, seen, admitted, emitted, trimmed, truncated, detail
                     -- the coverage ledger for a trigger. "looked and nothing matched",
                     -- "could not look" and "was never started" are three different facts
+                    -- kind is auth|ratelimited|transport|local, on a `failed` row only.
+                    -- recorded rather than derived: the classification exists for one
+                    -- statement inside the poll and used to die there, leaving every
+                    -- reader to recover it by matching a prefix on a human sentence —
+                    -- four remedies one rewording away from becoming "poll failed"
 ```
 
 `worker_version` and `skill_version` on every run answer the question that otherwise
@@ -2204,12 +2229,33 @@ on. What is in the file instead is the worker, which a person can hand a ticket 
 `ogun trigger`, and a worked example of what a real operator writes in the repository the
 tickets are actually about.
 
-Two things are honest gaps rather than oversights. **Nothing has run against a live Linear
-workspace** — there is no key on any machine here, so the client was built against responses
-recorded from Linear's published GraphQL schema and its developer documentation, and
-`test/linear-fixtures.ts` says exactly what that proves and what it does not. And the
-**pipeline is not built**: no scope-evaluation skill, and no ticket → plan → implement →
-review → draft PR graph. A source today emits into whatever cycle a project names it.
+One honest gap remains where there were two. The **pipeline is not built**: no
+scope-evaluation skill, and no ticket → plan → implement → review → draft PR graph. A
+source today emits into whatever cycle a project names it.
+
+The other — *"nothing has run against a live Linear workspace"* — **is closed**, and the
+fixtures' caveat in `test/linear-fixtures.ts` is now a statement about what the *tests*
+prove rather than about the client. A `client_credentials` grant against a real workspace
+polled a real team: 132 issues read, 18 admitted, 3 emitted and 15 held behind
+`maxPerPoll`; the same client with a bad key raised and recorded a real `auth` failure. Two
+silent-success bugs came out of that hour and neither was reachable from a fixture. A
+source pointed at a **team key the workspace does not have** read zero tickets and reported
+`ok` with no detail at all — Linear answers an unknown team key with an empty list rather
+than an error, so it was indistinguishable from a well-configured source on a quiet
+afternoon, permanently. And a source whose `status:` said `To Do` where the column is
+called `Todo` recorded the statuses it actually saw, which turned out to be the whole
+diagnosis and was sitting in a table nothing read.
+
+Also done, and it is what made those two visible: **the poll ledger has readers** (§4.13).
+`source_polls` shipped with nothing querying it, correctly — there was no route with a
+caller — and that stopped being correct the moment a project connected. What is read off it
+is a state per source rather than a log, on four surfaces from one derivation: an API
+route, `ogun sources`, a section of the Coverage page, and the status rail. The failure
+kinds stay four all the way to the surface, which is why `kind` became a column rather than
+a prefix recovered from prose. And the catch of last resort in `pollSources` now writes a
+row: it had already advanced the cursor, so a source throwing on every tick left a moving
+`last_polled_at` beside an empty history — the one shape the ledger could not represent,
+and the one it exists to prevent.
 
 Also done: **OAuth** (ADR-0014). A project connects to Linear as an application rather than
 as a person, because writing back is next and a personal key puts somebody's name on the

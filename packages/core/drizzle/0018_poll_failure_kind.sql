@@ -1,0 +1,1 @@
+ALTER TABLE "source_polls" ADD COLUMN "kind" text;

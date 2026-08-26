@@ -253,6 +253,144 @@ test('SKILL.md renders every block type it uses', () => {
   assert.match(html, /<strong>/)
 })
 
+/**
+ * A project whose source is failing, and one whose filter has matched nothing for a week.
+ *
+ * Both come off the same route and both are abnormal; only one of them is a fault, and the
+ * page has to keep them apart in the two ways a reader actually perceives — the word and
+ * the colour.
+ */
+const sourcesPayload = () => ({
+  sources: [
+    {
+      id: 'a1',
+      project: 'ogun',
+      name: 'tickets',
+      kind: 'linear',
+      cycle: 'ticket-pipeline',
+      enabled: true,
+      pollMinutes: 5,
+      team: 'HEI',
+      filter: { status: ['Todo'], labels: ['ogun'], excludeLabels: [], notBlocked: true },
+      health: {
+        state: 'failing' as const,
+        kind: 'auth' as const,
+        detail: 'auth: linear rejected the credential',
+        remedy: 'The credential, not the network. `ogun connect linear --project ogun`',
+        lastPolledAt: new Date().toISOString(),
+        lastOkAt: new Date(Date.now() - 3_600_000).toISOString(),
+        lastAdmittedAt: null,
+        lastEmittedAt: null,
+        firstPollAt: new Date(Date.now() - 86_400_000).toISOString(),
+        pollsRecorded: 40,
+      },
+      polls: [],
+    },
+    {
+      id: 'b2',
+      project: 'ogun',
+      name: 'quiet',
+      kind: 'linear',
+      cycle: 'ticket-pipeline',
+      enabled: true,
+      pollMinutes: 5,
+      team: 'HEI',
+      filter: { status: ['To Do'], labels: [], excludeLabels: [], notBlocked: true },
+      health: {
+        state: 'silent' as const,
+        kind: null,
+        detail: 'nothing matched; the statuses on those tickets were: Todo, In Progress',
+        remedy: 'Polling normally — this is not a failure.',
+        lastPolledAt: new Date().toISOString(),
+        lastOkAt: new Date().toISOString(),
+        lastAdmittedAt: null,
+        lastEmittedAt: null,
+        firstPollAt: new Date(Date.now() - 20 * 86_400_000).toISOString(),
+        pollsRecorded: 5000,
+      },
+      polls: [],
+    },
+  ],
+  emissions: [
+    {
+      externalKey: 'HEI-42',
+      externalId: 'uuid-42',
+      sourceName: 'tickets',
+      outcome: 'emitted',
+      detail: null,
+      cycleRunId: 'run-1',
+      createdAt: new Date(Date.now() - 7_200_000).toISOString(),
+    },
+  ],
+  ticket: null,
+})
+
+/**
+ * **The property: a failing source names which kind of failing, on the page.**
+ *
+ * `auth`, `ratelimited`, `transport` and `local` are kept apart all the way from
+ * `LinearUnavailable` to the ledger column because the remedies differ — a rejected
+ * credential needs a person and a throttled poll needs nobody. The last step is where that
+ * is cheapest to lose: one red "failing" pill renders all four identically and is the
+ * obvious way to build this. If the kind stops reaching the DOM, four remedies have
+ * collapsed into one and nothing else would notice.
+ */
+test('a failing source shows which kind of failure it is, not just that it failed', () => {
+  const html = render(<CoveragePage />, (qc) => {
+    qc.setQueryData(['projects'], { projects: [{ slug: 'ogun' }] })
+    qc.setQueryData(['sources', 'ogun'], sourcesPayload())
+  })
+
+  assert.match(html, /pill red">failing/, 'a failing source is red')
+  assert.match(html, />auth</, 'the kind reaches the page, beside the state')
+  assert.match(html, /tickets/)
+})
+
+/**
+ * The other half, and the one it is easier to get wrong in the expensive direction.
+ *
+ * A source that matches nothing is *working* — `ok` covers "looked and found nothing" on
+ * purpose. Rendering `silent` in red would teach a reader that red on this page means
+ * "probably fine", which costs the reds that are not fine: the dead credential three rows
+ * up. So it is yellow, and it is said, because a filter matching nothing for a week is far
+ * more likely to be `status: [To Do]` against a column called `Todo`.
+ */
+test('a source that has matched nothing is a remark, not a failure', () => {
+  const html = render(<CoveragePage />, (qc) => {
+    qc.setQueryData(['projects'], { projects: [{ slug: 'ogun' }] })
+    qc.setQueryData(['sources', 'ogun'], sourcesPayload())
+  })
+
+  assert.match(html, /pill yellow">silent/, 'silence is a remark and must not be red')
+  assert.ok(!/pill red">silent/.test(html))
+  // The statuses the poll actually saw are the diagnosis, and they have to be readable
+  // without opening anything: `To Do` in the filter against `Todo` on the tickets.
+  assert.match(html, /statuses on those tickets/)
+})
+
+/**
+ * Ogun writes nothing back to Linear (ADR-0004), so a ticket that has been completely dealt
+ * with sits in `Todo` with its label on, looking exactly like one nothing ever saw. The
+ * emission row is the only record anywhere that anything happened, and it had no reader.
+ */
+test('tickets that already produced work are named on the page', () => {
+  const html = render(<CoveragePage />, (qc) => {
+    qc.setQueryData(['projects'], { projects: [{ slug: 'ogun' }] })
+    qc.setQueryData(['sources', 'ogun'], sourcesPayload())
+  })
+  assert.match(html, /HEI-42/)
+  assert.match(html, /looks untouched/)
+})
+
+/** A project with no sources renders no panel at all — most projects have none. */
+test('a project with no sources gets no source panel', () => {
+  const html = render(<CoveragePage />, (qc) => {
+    qc.setQueryData(['projects'], { projects: [{ slug: 'ogun' }] })
+    qc.setQueryData(['sources', 'ogun'], { sources: [], emissions: [], ticket: null })
+  })
+  assert.ok(!html.includes('Whether anything is'), 'an empty panel is chrome nobody reads')
+})
+
 test('markdown never emits markup from its source', () => {
   const hostile = [
     '# Title',
