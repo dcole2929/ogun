@@ -18,6 +18,12 @@ export const cyan = (s: string) => paint('36', s)
 export const severityColor = (s: string): string =>
   s === 'critical' || s === 'high' ? red(s) : s === 'medium' ? yellow(s) : dim(s)
 
+/**
+ * `declined` deliberately falls through to yellow rather than getting an arm of its own.
+ * Green would say the work went ahead and red would say something broke; a ticket Ogun
+ * looked at and refused is neither, it is a thing for a person to read (§4.13). Yellow is
+ * already what this function means by that.
+ */
 export const outcomeColor = (s: string): string =>
   s === 'approved' || s === 'dispatched'
     ? green(s)

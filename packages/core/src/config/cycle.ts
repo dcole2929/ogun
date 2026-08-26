@@ -20,6 +20,11 @@ export const cycleEdgeSchema = z.object({
    * `degrade` lets triage run with three of four reviewers and mark the batch
    * incomplete in the coverage ledger. Silent coverage loss is worse than a partial
    * result, so a failed dependency does not have to block a dependent (§5.1).
+   *
+   * **It answers "what if this node broke", and a decline is not a break.** A dependency
+   * whose run ended `declined` blocks its dependents whatever this says — see
+   * `releaseDependents`. The name is the honest one: this is `onDep*Failure*`, and a scope
+   * evaluator refusing a ticket produced the result it exists to produce.
    */
   onDepFailure: z.enum(['block', 'degrade']).default('block'),
 })

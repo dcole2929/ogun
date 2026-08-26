@@ -145,6 +145,19 @@ function Produced({ detail }: { detail: RunDetail }) {
           </p>
         )}
 
+        {/* A decline is a result, so it is not styled as an error — but it is the whole
+            output of the run and it must not be something a reader has to go and find.
+            Ogun writes nothing back to the ticket and never emits it twice, so this
+            sentence is all the person who filed it will ever get (§4.13). */}
+        {outcome === 'declined' && (
+          <p className="note" style={{ marginTop: 0, fontSize: 13 }}>
+            <strong>Declined.</strong> This worker judged the work it was handed and
+            refused it, so everything downstream of it in this cycle was skipped. Nothing
+            failed.
+            {detail.run.detail && <> {detail.run.detail}</>}
+          </p>
+        )}
+
         {/* What the node wanted said, before the list of what it filed. A triage run
             that names the reviewer which crashed is telling you the inbox below is
             short by one surface, and that is not derivable from the findings. */}

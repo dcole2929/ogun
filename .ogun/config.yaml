@@ -75,6 +75,72 @@ workers:
     # a bad patch.
     timeoutMs: 2700000
 
+  # The entry node of a ticket pipeline: the one worker that decides whether a ticket is
+  # work Ogun should attempt at all (§4.13, ADR-0013). It is the first worker here whose
+  # product is a *decision* rather than a description, and everything below follows from
+  # that.
+  #
+  # **No `schedule:`, and no source pointing at it in this repository** — see the
+  # `sources:` note below for why this config has no such block. Here it runs by hand, and
+  # the way to watch one of these read before wiring a real board to it is a manual trigger
+  # carrying a pasted ticket as the prompt override:
+  #
+  #     curl -X POST $OGUN/api/trigger -H 'content-type: application/json' \
+  #       -d '{"project":"ogun","worker":"scope-a-ticket","prompt":"Use the scope-a-ticket
+  #            skill.\n\n<the ticket text>"}'
+  #
+  # A manual override *replaces* the prompt rather than appending to it (§5.1), which is why
+  # the skill sentence has to be in there too — a source appends, a person does not.
+  scope-a-ticket:
+    skill: scope-a-ticket
+    runtime: claude
+    # Not the default `worker`. That default is an argument about a nightly fleet — the
+    # worker burns the tokens and the clock, so point it at the cheaper model (§4.7) — and
+    # it does not survive contact with this one. This worker spends almost nothing: a
+    # search, three files, one paragraph. What it decides is whether a whole pipeline runs,
+    # and a wrong decline is *permanent*, because Ogun writes nothing back to the tracker
+    # and the emission ledger never re-emits a ticket. The cheap mistake here costs a
+    # ticket that nobody ever notices was dropped.
+    model: reviewer
+    # `observer` — reads the code and nothing else — and this is the first worker in the
+    # fleet that is honestly one. `reviewer` is the label that says "emits findings", and
+    # the whole discipline of this skill is that it emits none: it is judging a ticket, not
+    # the code, and it has none of a reviewer's evidence behind it. `modifier` is out for
+    # the reason that matters most: an evaluator that can write is one that can start doing
+    # the work it was asked to judge, and the temptation to do exactly that is strongest at
+    # the moment it decides the work is doable. The read-only mount is what makes "do not
+    # do the work" a fact rather than an instruction.
+    permissions: observer
+    sandbox: container
+    # **No `connections: [linear]`, deliberately**, and this is the decision in here most
+    # likely to be revisited. The tempting argument is that a thin ticket often has its
+    # real content in the comments, so let the evaluator go and read them. That inverts the
+    # skill: "this ticket is underspecified" is the most useful thing it can ever say, and
+    # an evaluator that goes looking for the missing half turns it into "this ticket plus
+    # forty comments might be specified" — after which the pipeline downstream is handed a
+    # brief that does not contain what the decision was based on. It is also the wrong
+    # worker to hand a credential to. `connections:` grants arbitrary reads across the
+    # whole workspace the project's grant covers (§4.13), and this worker's prompt contains
+    # untrusted text written by whoever filed the ticket.
+    #
+    # 10 minutes rather than the default 30, and the cap is a *bound on a failure mode*
+    # rather than a performance target. The way this skill goes wrong is enthusiasm — the
+    # agent is already in the repository, works out the fix because that is more satisfying
+    # than deciding whether anybody should, and then admits whatever it managed to design.
+    # Reading three files and writing a paragraph does not need half an hour; designing a
+    # change does.
+    timeoutMs: 600000
+    # What turns a missing verdict into a failed gate instead of a silent `approved`
+    # (§4.10). Declared here rather than defaulted anywhere, because only this stanza knows
+    # that this worker's whole product is an answer: a reviewer that carries no verdict is
+    # an ordinary reviewer, and this one is broken. Without it, an evaluator that hits its
+    # timeout mid-thought releases its dependents, and the plan and implement stages run on
+    # a ticket nobody judged — fail-open at exactly the gate whose job is to be closed.
+    verify:
+      expectations:
+        - name: verdict
+          method: tool
+
 cycles:
   # The reviewers run in parallel and stage what they find; triage is the only thing
   # that writes to the inbox. Listing a worker under `then:` is what makes its inputs
@@ -90,6 +156,71 @@ cycles:
     # `degrade` — if a reviewer errors, triage still runs and reports the night as
     # incomplete. `block` would mean one crashed reviewer buries the other's findings.
     onDepFailure: degrade
+
+# ---------------------------------------------------------------------------------------
+# `sources:` — deliberately absent, and the absence is the honest answer rather than a gap.
+#
+# A source is per project: it names a team on a board and a cycle in *this* config, and
+# every ticket it admits becomes a job against *this* repository (§4.13, ADR-0013). The one
+# workspace this machine can currently reach belongs to a different codebase, so a source
+# here would poll another project's tickets and open pull requests against Ogun about work
+# that has nothing to do with it. `enabled: false` would be no better: it is the same
+# incoherent statement, switched off, waiting for somebody to switch it on because it looks
+# like it was meant to be running.
+#
+# What a real operator writes, in the repository the tickets are actually about:
+#
+#     sources:
+#       tickets:
+#         kind: linear
+#         cycle: scope-a-ticket   # or a named cycle — see below
+#         team: ENG
+#         pollMinutes: 5
+#         maxPerPoll: 3
+#         filter:
+#           status: [Todo]
+#           labels: [ogun]        # all of them, not any
+#           excludeLabels: [needs-design]
+#           notBlocked: true
+#
+# plus `ogun secret set <project> linear` or `ogun connect linear <project>` for the
+# credential, which lives on the host and never reaches a container.
+#
+# **`cycle:` may name a worker.** Every worker is a one-node cycle (§5.1, ADR-0007), so
+# pointing a source straight at `scope-a-ticket` is the smallest thing that works and needs
+# no `cycles:` block at all: the ticket is judged, and admitted tickets go no further
+# because there is nowhere further to go. That is a real configuration and not a
+# placeholder — a board where a person wants Ogun's opinion on what is worth attempting,
+# and nothing else.
+#
+# **The pipeline attaches without redesign.** `ogun project sync` refuses a source whose
+# cycle does not have exactly one entry node, because a ticket has to arrive somewhere and
+# picking the first node in array order would be right most nights and wrong invisibly. The
+# sugar form already produces exactly one:
+#
+#     cycles:
+#       ticket-pipeline:
+#         workers: [scope-a-ticket]
+#         then: plan
+#         onDepFailure: block      # not optional here — see below
+#
+# and the general nodes/edges form takes it further along a chain. Either way the entry node
+# stays this one, which is the property everything downstream depends on: the ticket is
+# judged before anything is attempted.
+#
+# **Write `onDepFailure: block`, and know why.** The sugar defaults to `degrade`, which is
+# right for the fan-in it was written for — triage running over three of four reviewers
+# beats a night that produces nothing. On a *chain* it means something else entirely: "run
+# the planner even though the thing in front of it did not succeed". A declined ticket is
+# safe either way, because a decline is not a failure and `releaseDependents` blocks on one
+# whatever the edge says. An evaluator that *crashed* is not, and on a `degrade` edge the
+# pipeline would go on to plan and implement a ticket nobody ever judged — which is the
+# whole thing this node exists to prevent, defeated by a default nobody looked at.
+#
+# The default is left as it is rather than made to depend on the shape of the graph: it is
+# the pipeline's decision surface, and one word in the file that says what you meant beats
+# a default that changes meaning when you add a second worker.
+# ---------------------------------------------------------------------------------------
 
 # How a modifier's patch is proved before it can be published (§9). Read from the blob at
 # the pinned base rather than from the workspace — a modifier can write to its checkout,

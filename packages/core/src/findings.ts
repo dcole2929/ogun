@@ -112,6 +112,58 @@ export const adjudicationSchema = z.discriminatedUnion('verdict', [
 ])
 export type Adjudication = z.infer<typeof adjudicationSchema>
 
+/**
+ * A node's answer to whether the work it was handed should go ahead (§4.13, ADR-0013).
+ *
+ * The scope evaluator is the first worker whose *product* is a decision rather than a
+ * description. A reviewer says what it found, a modifier says what it changed; a scope
+ * evaluator says yes or no about a ticket, and the rest of the cycle runs or does not run
+ * on the strength of it. That answer has to be a field rather than a sentence in `notes`,
+ * because something downstream has to act on it, and `releaseDependents` is not a person.
+ *
+ * **On the report document rather than in a file of its own.** The runner already reads
+ * one document off the sandbox, the schema lens already validates it, and the CLI already
+ * owns its shape (§4.10). A second output path would be a second thing to mount, a second
+ * thing to parse, and a second way for a run to be half-reported — a verdict written and
+ * the findings lost, or the reverse.
+ *
+ * **Not tied to one skill.** Any node that is the entry of a cycle may decline the cycle;
+ * a planner that cannot find a plan is answering the same question one stage later. So it
+ * lives beside `findings` and `adjudications` rather than in a scope-evaluator-shaped
+ * corner of the tree, and a document carrying no verdict is graded exactly as it was
+ * before this field existed.
+ */
+export const SCOPE_VERDICTS = ['admit', 'decline'] as const
+export type ScopeVerdict = (typeof SCOPE_VERDICTS)[number]
+
+export const scopeSchema = z.object({
+  verdict: z.enum(SCOPE_VERDICTS),
+  /**
+   * Why, in the evaluator's own words, and required on both verdicts.
+   *
+   * On a decline this is the whole product of the run, and very likely the only thing the
+   * ticket will ever produce: `source_emissions` is unique on `(project, ticket)` and a
+   * ticket edited afterwards is reported and **not** re-emitted (ADR-0013), so nothing
+   * automatic ever looks at that card again. A decline with no reason is not a terse
+   * result; it is a ticket that disappears.
+   *
+   * Required on an admit too, and that is the less obvious half. It records what the
+   * evaluator thought it was admitting, which is the first thing anybody wants when a
+   * pipeline three nodes later produces something nobody recognises.
+   *
+   * Prose, not a category. A closed set of decline reasons was considered and rejected: it
+   * would aggregate nicely and it would cost the only thing this text is for. The reason
+   * has one reader — the person who filed the ticket — and a label tells them nothing they
+   * can act on, where "it says the export is slow and never says how slow is acceptable"
+   * tells them exactly what to write next. `severity` is an enum because it *orders an
+   * inbox*; there is no inbox of declines to sort, so an enum here would buy a group-by
+   * nobody asked for and cost the specificity. And the moment there is a list, an agent
+   * picks the nearest label instead of saying the true thing.
+   */
+  reason: z.string().trim().min(1),
+})
+export type Scope = z.infer<typeof scopeSchema>
+
 export const findingsDocumentSchema = z.object({
   /**
    * A reviewer that looked and found nothing still reports. An empty array here and a
@@ -135,5 +187,15 @@ export const findingsDocumentSchema = z.object({
    * accepted it and nothing persisted it.
    */
   notes: z.string().optional(),
+  /**
+   * The verdict on whether this work should go ahead, when the node was asked for one.
+   *
+   * Optional because almost no node is asked. A reviewer and a modifier never carry it and
+   * are graded as they always were. A worker that *is* required to answer says so by
+   * declaring the `verdict` lens (§4.10), which is what turns a missing answer into a
+   * failed gate rather than into a silent `approved` that releases the rest of the
+   * pipeline over a ticket nobody judged.
+   */
+  scope: scopeSchema.optional(),
 })
 export type FindingsDocument = z.infer<typeof findingsDocumentSchema>

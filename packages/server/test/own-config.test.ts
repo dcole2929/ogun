@@ -77,6 +77,35 @@ test('a modifier could be admitted against this repository', () => {
  * The API refuses that combination when a worker is created through it. Nothing refuses it
  * in a file somebody edits by hand, and this is the file.
  */
+/**
+ * A worker whose product is a *verdict* has one failure nothing else catches: it produces a
+ * perfectly valid document that answers nothing, and the run is recorded `approved` — so
+ * its dependents are released and the rest of a ticket pipeline runs on a ticket nobody
+ * judged (§4.13). The `verdict` lens is what turns that into a failed gate, and it is
+ * declared per worker rather than defaulted, which means it is one line away from being
+ * quietly deleted.
+ *
+ * Written against the *skill* rather than against the worker's name, because the way this
+ * would actually be lost is a second binding — `security-review` is already a second
+ * binding of `adversarial-review`, and nobody copying that pattern would think to bring the
+ * `verify:` block along.
+ */
+test('every worker running scope-a-ticket is required to produce a verdict', () => {
+  const config = projectConfigSchema.parse(parseYaml(configText))
+  for (const [name, worker] of Object.entries(config.workers)) {
+    if (worker.skill !== 'scope-a-ticket') continue
+    const lenses = worker.verify?.expectations.map((l) => l.name) ?? []
+    assert.ok(
+      lenses.includes('verdict'),
+      `"${name}" judges tickets and does not declare the verdict lens, so a run that ` +
+        'answered nothing would release the pipeline behind it',
+    )
+    // It reads and decides; it writes nothing. A modifier here is an evaluator that can
+    // start doing the work it was asked to judge.
+    assert.notEqual(worker.permissions, 'modifier', `"${name}" must not be able to write`)
+  }
+})
+
 test('no modifier in this config runs outside a container', () => {
   const config = projectConfigSchema.parse(parseYaml(configText))
   for (const [name, worker] of Object.entries(config.workers)) {

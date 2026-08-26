@@ -170,6 +170,45 @@ mutation. A human moves the ticket.
   settles is where a source sits and what it may do, not what the pipeline downstream of it
   looks like.
 
+- **[amended] The scope evaluator is built, and building it needed a new outcome.** The
+  record above says it "produces a run, an outcome and a coverage row, so 'this ticket was
+  looked at and declined' is a recorded fact rather than a silence". That sentence turned
+  out to be describing something the taxonomy could not yet say. Every outcome that existed
+  got exactly one half of it right: `approved` records the judgement and then *releases the
+  dependents of the node that just refused them*, which produces the pipeline run the
+  evaluator exists to prevent; `skipped` claims no agent ran; `error` makes a worker doing
+  its job look like one somebody has to go and fix. So `declined` is a run outcome, a
+  coverage outcome and a cycle state, and the argument for each sits beside it in
+  `outcomes.ts`.
+
+  Three consequences of that are decisions rather than plumbing:
+
+  - **A decline does not feed the failure breaker.** It resets it, like a success, because
+    the worker did exactly what it exists to do. Counting one would mean three
+    badly-written tickets in a row switch a team's pipeline off, silently.
+  - **A decline blocks its dependents whatever `onDepFailure` says.** That edge answers
+    *what if this node broke*; a decline is not a break, it is the result. "Carry on
+    without them" and "carry on against them" are different permissions, and the sugar's
+    `degrade` default would otherwise plan and implement a ticket its own evaluator had
+    just refused.
+  - **A missing verdict is not a decline.** The worker declares a `verdict` lens, so a
+    document that answers nothing is a failed gate — which blocks the dependents *and*
+    counts against the worker. Reading silence as a quiet "no" would put a judgement nobody
+    made into the ledger, and this record's own idempotency rule then makes it permanent:
+    the ticket is never re-emitted, so nothing would ever look at that card again.
+
+  The verdict itself is **prose, not a category**, and that is the one part of this most
+  likely to be revisited. A closed set of decline reasons would aggregate; it would also
+  cost the only thing the text is for. The reason has one reader — the person who filed the
+  ticket — and a label tells them nothing they can act on, where "it asks for the export to
+  be faster and never says what fast enough would be" tells them exactly what to write next.
+  `severity` is an enum because it orders an inbox; there is no inbox of declines to sort.
+
+  Ogun's own `.ogun/config.yaml` gets the **worker and no source**, for the reason ADR-0012
+  gives about credentials pointed one way: a source is per project, and the only Linear
+  workspace within reach belongs to a different codebase. A disabled source would be the
+  same incoherent statement with a switch on it.
+
 - **The key comes from ADR-0012's store, consumed whole.** `readProjectSecret(slug,
   'linear')` is the seam, taken as a parameter of `pollSources` only so the tests need no
   `~/.ogun/config.json`. Its four states are carried through to four different refusal

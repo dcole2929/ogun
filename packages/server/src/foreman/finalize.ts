@@ -101,9 +101,20 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
    * runs the project's tests (§9) — so a `dispatched` that survived a failed gate is an
    * instruction to open a pull request from work whose suite is red. The patch is still
    * recorded below; what the gate withdraws is the claim that it is ready.
+   *
+   * `declined` is overruled on the same grounds, and it is worth saying why rather than
+   * leaving it to the list. A verdict travels in the same document the gate reads, so a
+   * declined run whose gate failed is a run whose *verdict* is the thing that failed the
+   * gate — an unparseable document, a hallucinated citation. Letting it stand would mean
+   * the one output that stops the rest of a pipeline is the one output nothing checked.
+   * The derived `changes-requested` also blocks the dependents, so the safe direction and
+   * the honest one agree here.
    */
   const outcome: RunOutcome =
-    gateFailed && (report.outcome === 'approved' || report.outcome === 'dispatched')
+    gateFailed &&
+    (report.outcome === 'approved' ||
+      report.outcome === 'dispatched' ||
+      report.outcome === 'declined')
       ? 'changes-requested'
       : report.outcome
 
@@ -152,9 +163,18 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
    * `changes-requested` stays excluded, and that is the point of listing outcomes rather
    * than negating the failures: it is what a gate failure derives to, and findings from a
    * run whose own output failed the gate have not earned the inbox.
+   *
+   * `declined` is listed for the same reason `dispatched` had to be added: the verdict
+   * decides what happens to the *cycle*, not what the node was allowed to have noticed.
+   * A scope evaluator is told to file none — its subject is a ticket, and a finding filed
+   * from a scope pass has none of a reviewer's evidence behind it — but "told to" and
+   * "silently discarded" are different, and this list is where the second one gets made
+   * by accident.
    */
   const reported =
-    outcome === 'approved' || outcome === 'dispatched' ? (report.findings?.findings ?? []) : []
+    outcome === 'approved' || outcome === 'dispatched' || outcome === 'declined'
+      ? (report.findings?.findings ?? [])
+      : []
   const raw = destination.withheld ? [] : reported
 
   /**
@@ -170,10 +190,24 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
    */
   const notes = report.findings?.notes?.trim()
 
+  /**
+   * `declined` lands on `skipped`, and the reason it is not a state of its own is that
+   * `jobs.state` is a *scheduling* concept: it answers "may a runner claim this" and "is
+   * this terminal", and it already has one value meaning "terminal, and the work this node
+   * was for did not happen". Which of the ways that came about belongs to `runs.outcome`
+   * and the coverage row, both of which say `declined` here, and `coverage.ran` separates
+   * a decline (an agent ran) from an admission refusal (none did). A fourth job state
+   * would put the same distinction in a third place, where the foreman's release walk
+   * would have to keep agreeing with the other two.
+   *
+   * What it buys is the behaviour the verdict is *for*: a dependent edged `block` sees a
+   * dependency that did not succeed and is skipped rather than queued, so the plan and
+   * implement nodes of a ticket pipeline never start on a ticket that was declined.
+   */
   const jobState: JobState =
     outcome === 'approved' || outcome === 'dispatched'
       ? 'succeeded'
-      : outcome === 'skipped'
+      : outcome === 'skipped' || outcome === 'declined'
         ? 'skipped'
         : 'failed'
 
@@ -183,18 +217,23 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
       ? 'errored'
       : outcome === 'skipped'
         ? 'refused'
-        : // A modifier reports no findings at all, so the finding count cannot separate
-          // "wrote a patch" from "read the code and left it alone". Without this the two
-          // nights are both `clean`, and the ledger stops being able to answer the only
-          // question anyone asks of a modifier.
-          outcome === 'dispatched'
-          ? 'changed'
-          : // What the run reported, not what reached the inbox. A reviewer feeding triage
-            // still found what it found; the ledger recording `clean` would be a lie that
-            // makes the coverage picture depend on whether triage has run yet.
-            reported.length > 0
-            ? 'found'
-            : 'clean'
+        : // Ran, judged the work it was handed, and refused it. Never `clean`: that value
+          // says a surface is covered, and a decline filed under it makes a declined
+          // ticket read as an examined one (§4.13).
+          outcome === 'declined'
+          ? 'declined'
+          : // A modifier reports no findings at all, so the finding count cannot separate
+            // "wrote a patch" from "read the code and left it alone". Without this the two
+            // nights are both `clean`, and the ledger stops being able to answer the only
+            // question anyone asks of a modifier.
+            outcome === 'dispatched'
+            ? 'changed'
+            : // What the run reported, not what reached the inbox. A reviewer feeding
+              // triage still found what it found; the ledger recording `clean` would be a
+              // lie that makes the coverage picture depend on whether triage has run yet.
+              reported.length > 0
+              ? 'found'
+              : 'clean'
 
   /**
    * Why the ledger row reads the way it does — and, when the graph could not be read,
@@ -613,7 +652,22 @@ export async function finalizeRun(db: Db, report: RunReport): Promise<FinalizeRe
                                then coalesce(${breakers.openedAt}, now()) else ${breakers.openedAt} end`,
           },
         })
-    } else if (jobState === 'succeeded') {
+    } else if (jobState === 'succeeded' || outcome === 'declined') {
+      /**
+       * A decline resets the breaker, and reading that off `outcome` rather than
+       * `jobState` is the whole reason this arm is not just `succeeded`.
+       *
+       * A declined run lands on `jobs.state = 'skipped'`, which takes neither branch —
+       * right for an admission refusal, where nothing ran and there is nothing to learn
+       * about the worker, and wrong here. This worker *did* run and did exactly what it
+       * exists to do. Leaving the count where it was means two errors in March and a
+       * fortnight of correct declines still latch the breaker on the next hiccup, and the
+       * evaluator stops being dispatched for a reason that is two months stale.
+       *
+       * The other direction is the one that would really hurt: counting a decline as a
+       * failure would open the breaker after three badly-written tickets in a row, so a
+       * team having a bad week at ticket-writing silently switches its own pipeline off.
+       */
       await tx
         .insert(breakers)
         .values({ workerId: job.workerId, consecutiveFailures: 0 })

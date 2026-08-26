@@ -3,6 +3,13 @@ import { Link } from 'react-router'
 import { api } from '../api.ts'
 import { duration, Empty, exact, Page, Pill, when } from '../ui.tsx'
 
+/**
+ * The result column is one line in a dense table, and a decline's reason is a sentence
+ * written for a person rather than a status word. Cut it here rather than letting it set
+ * the column width for every other row; the run page carries it whole.
+ */
+const truncate = (s: string): string => (s.length > 70 ? `${s.slice(0, 69)}…` : s)
+
 export function RunsPage() {
   const { data, isLoading, error } = useQuery({ queryKey: ['runs'], queryFn: api.runs })
   const runs = data?.runs ?? []
@@ -154,7 +161,12 @@ export function RunsPage() {
                       ? 'rejected by the gate'
                       : r.run.outcome === 'error'
                         ? 'failed'
-                        : '—'}
+                        : // The reason, not the word `declined` again — the pill beside it
+                          // already says that, and the sentence is the whole result of the
+                          // run (§4.13). Truncated here; the run page carries it whole.
+                          r.run.outcome === 'declined'
+                          ? truncate(r.run.detail ?? 'declined')
+                          : '—'}
                 </td>
                 <td className="muted">{duration(r.run.durationMs)}</td>
                 <td className="muted mono">

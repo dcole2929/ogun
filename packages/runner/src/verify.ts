@@ -449,6 +449,7 @@ const output = (tail: string[], stderr: string): string => {
 async function runToolLens(lens: Lens, input: VerifyInput): Promise<GateResult> {
   if (lens.name === 'schema' && !lens.command) return schemaCheck(input)
   if (lens.name === 'grounded' && !lens.command) return groundingCheck(input)
+  if (lens.name === VERDICT_LENS && !lens.command) return verdictCheck(input)
   if (!lens.command) {
     return { name: lens.name, method: 'tool', passed: false, detail: 'tool lens has no command' }
   }
@@ -473,6 +474,57 @@ async function runToolLens(lens: Lens, input: VerifyInput): Promise<GateResult> 
     method: 'tool',
     passed: code === 0,
     ...(code === 0 ? {} : { detail: `exited ${code}${output(tail, stderr)}` }),
+  }
+}
+
+/**
+ * Did a node that was asked for a verdict actually give one (§4.13)?
+ *
+ * Declared rather than default — `verify: { expectations: [{ name: verdict, method: tool }] }`
+ * — because only the worker's own stanza knows that its skill's product is a decision. A
+ * reviewer holding no verdict is an ordinary reviewer, not a broken one.
+ *
+ * It exists because of what the *absence* of a verdict would otherwise mean. A scope
+ * evaluator that wandered off, hit its timeout mid-thought, or simply forgot the last
+ * command in its skill leaves a document with findings and no `scope` block, and without
+ * this lens that run is `approved` — the node succeeds, its dependents are released, and
+ * the plan and implement stages run on a ticket nobody judged. Fail-open at exactly the
+ * gate whose whole job is to be the closed one.
+ *
+ * Failing here is deliberately *not* the same as declining. A missing verdict is not a
+ * quiet "no": it is a run that was asked one question and did not answer it, so it derives
+ * to `changes-requested`, blocks the dependents anyway, and counts toward the failure
+ * breaker — which is what should happen to a worker that keeps not answering. Recording
+ * silence as a decline would put a judgement in the ledger that nobody made, and the
+ * ticket would be refused for good on the strength of it (ADR-0013's emission ledger never
+ * re-emits).
+ */
+const VERDICT_LENS = 'verdict'
+
+function verdictCheck(input: VerifyInput): GateResult {
+  const parsed = findingsDocumentSchema.safeParse(input.output)
+  if (!parsed.success) {
+    return { name: VERDICT_LENS, method: 'tool', passed: false, detail: 'output is not parseable' }
+  }
+  const scope = parsed.data.scope
+  if (!scope) {
+    return {
+      name: VERDICT_LENS,
+      method: 'tool',
+      passed: false,
+      detail:
+        'this worker is required to reach a verdict and its document carries none. Write ' +
+        'the document again with a `scope` block: {"verdict": "admit"|"decline", ' +
+        '"reason": "..."}.',
+    }
+  }
+  return {
+    name: VERDICT_LENS,
+    method: 'tool',
+    passed: true,
+    // The verdict on the timeline, so the one sentence that decides whether the rest of a
+    // pipeline runs is legible from the run page without opening the ledger.
+    detail: `${scope.verdict}: ${scope.reason}`,
   }
 }
 
