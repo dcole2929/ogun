@@ -35,6 +35,9 @@ const MEANING: Record<string, string> = {
   pending: 'selected and queued — no runner has picked it up yet',
   found: 'ran, and reported findings',
   clean: 'ran, looked, and reported nothing — a result, not an absence',
+  // Falls back to this only when the reason went missing; a declined row normally shows
+  // the evaluator's own sentence, which is the whole point of the row.
+  declined: 'ran, judged the work it was handed, and refused it — the reason should be here',
   'gate-failed': 'ran, but the verify gate rejected its output, so nothing was persisted',
   errored: 'started and failed',
   refused: 'never ran: admission refused it — the breaker is open, or it is disabled',

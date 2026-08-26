@@ -43,6 +43,9 @@ const OUTCOME_TONE: Record<string, string> = {
   queued: 'blue',
   complete: 'green',
   degraded: 'yellow',
+  // Run outcome, coverage outcome and cycle state all use this word, and all three want
+  // the same tone: not green, because nothing went ahead; not red, because nothing broke.
+  declined: 'yellow',
   clean: 'green',
   found: 'blue',
   'gate-failed': 'red',

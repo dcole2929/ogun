@@ -1,0 +1,13 @@
+interface:
+  display_name: "Scope a Ticket"
+  short_description: "Decide whether a ticket is work this factory should attempt"
+  default_prompt: "Use the scope-a-ticket skill."
+policy:
+  # Never auto-triggered, and here the reason is sharper than the standing rule for a
+  # factory skill (§4.8). This skill is meaningless without a ticket: the ticket is
+  # appended to the job's prompt by the source, host-side, after a deterministic filter
+  # has already admitted it (ADR-0013). An agent reaching for this mid-task has no ticket
+  # to judge, so it would either judge nothing or go and find something to judge — which
+  # is ticket *selection* inside a sandbox, the one thing the whole shape of a source
+  # exists to prevent.
+  allow_implicit_invocation: false

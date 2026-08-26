@@ -1459,9 +1459,44 @@ true.
 ticket has to arrive somewhere, and picking the first node in array order would be right
 most nights and wrong in a way nobody could see.
 
-**Not built in this slice:** the scope-evaluation skill itself and the
-*ticket → plan → implement → review → draft PR* graph behind it (§9). A source today emits
-into whatever cycle a project names.
+**Built** as `skills/scope-a-ticket`, with `permissions: observer` — it reads and decides
+and writes nothing, and the read-only mount is what makes "do not do the work" a fact
+rather than an instruction. Three decisions in it are load-bearing:
+
+- **It declines for *kind*, not for difficulty.** The stages after it already decline for
+  difficulty and will have read the code far more closely. This one is the gate against the
+  unanswerable: a ticket that is a question, that names no checkable outcome, that is about
+  another repository, whose substance is a decision somebody has to make, that needs
+  something the sandbox does not have, that no one reviewable change can express, or that an
+  accepted ADR already answered. If the skill cannot name which of those it is, the verdict
+  is admit.
+- **Its verdict is a field, not prose.** `scope: { verdict, reason }` on the report document
+  (`findingsDocumentSchema`), because something downstream has to act on it and
+  `releaseDependents` is not a person. It is not tied to one skill — any entry node may
+  decline the cycle it starts.
+- **A missing verdict is not a decline.** The worker declares the `verdict` lens (§4.10), so
+  a document that answers nothing is a *failed gate* rather than a silent `approved` that
+  releases the pipeline. Recording silence as a judgement nobody made would refuse the
+  ticket for good, since the emission ledger never re-emits.
+
+**Where the answer lives.** `runs.outcome = declined` with the reason in `runs.detail`, and
+a `coverage` row whose outcome is `declined` and whose `reason` is that same sentence — so
+"what did Ogun decline last night, and why" is the coverage page, not a query somebody has
+to write. Three things about that are deliberate (§5.2's taxonomy): a decline is not
+`approved`, which would release the dependents and produce the exact outcome the evaluator
+exists to prevent; it is not `error`, which would blame a worker that did its job; and its
+coverage is not `clean`, which is the value that says a surface is *covered*. It does not
+feed the failure breaker either — a run of badly-written tickets is not a malfunctioning
+worker, and counting them would let a bad week at ticket-writing switch a pipeline off.
+
+**A decline blocks its dependents whatever `onDepFailure` says.** That edge answers "what if
+this node broke", and a decline is not a break — "carry on without them" and "carry on
+against them" are different permissions. `degrade` still governs an evaluator that genuinely
+failed, so a ticket pipeline written with the sugar should say `onDepFailure: block`.
+
+**Not built in this slice:** the *plan → implement → review → draft PR* graph behind the
+evaluator (§9). A source today emits into whatever cycle a project names, and the smallest
+useful one is the evaluator alone.
 
 **[open]** How PR lifecycle state is represented once modifier workers exist —
 GitHub is authoritative per §4.4, but the specific mechanism (labels, checks,
@@ -1750,7 +1785,14 @@ are the same row (principle 6). The rejection itself, and the decision to retry 
 with its reason, are `runner.note` events in the order they happened.
 
 **Outcome taxonomy** — never conflated:
-`approved | changes-requested | skipped (admission refused) | dispatched | error`
+`approved | changes-requested | skipped (admission refused) | dispatched | declined | error`
+
+`declined` is the worker's *answer*, not the harness's: it ran, the gate passed, and it said
+the work should not go ahead (§4.13). It is separate from the four beside it for the reason
+the list exists — `approved` would release the dependents of the node that just refused
+them, `skipped` claims nothing ran, and `error` makes a worker doing its job look like one
+that needs fixing. A cycle whose only non-success is a decline is graded `declined` rather
+than `failed` for the same reason.
 
 ### 5.3 Patch reconciliation
 
@@ -2128,9 +2170,39 @@ compile error rather than a convention. Idempotency is `source_emissions`, uniqu
 card in `Todo` becoming 288 cycle runs a day, since Ogun writes nothing back for the card to
 record. Read-only: the GraphQL document is a module constant, so the client cannot mutate.
 
-Also decided rather than built: **the scope evaluator is a worker**, and it is the entry
-node of the cycle a source feeds — which is what makes "this ticket was looked at and
-declined" a run with a coverage row instead of a silence (§4.13).
+Also done: **the scope evaluator** (§4.13, ADR-0013) — `skills/scope-a-ticket`, an
+`observer` worker and the entry node of the cycle a source feeds. It is the first worker in
+the fleet whose *product* is a decision rather than a description, and almost all of the
+work was in the taxonomy rather than the skill: "this ticket was looked at and declined" had
+to be recordable *and* had to stop the pipeline, and every outcome that already existed got
+exactly one of those two halves right. So `declined` is a run outcome, a coverage outcome
+and a cycle state, and the argument for each is in `outcomes.ts` beside it. It does not feed
+the failure breaker — a run of badly-written tickets is not a malfunctioning worker — and it
+blocks its dependents whatever `onDepFailure` says, because that edge answers "what if this
+node broke" and a decline is not a break.
+
+Two things in it were decided against the obvious implementation. The verdict is **prose,
+not a category**: a closed set of decline reasons would aggregate nicely and would cost the
+only thing the text is for, since its one reader is the person who filed the ticket and a
+label tells them nothing they can act on. And a **missing verdict is not a decline**: the
+worker declares a `verdict` lens, so a document that answers nothing fails the gate rather
+than releasing the pipeline — recording silence as a judgement nobody made would refuse that
+ticket for good, because the emission ledger never re-emits.
+
+The skill's own hardest line is the calibration: **decline for kind, not for difficulty.**
+An evaluator that admits everything is a rubber stamp with a model bill and one that
+declines everything is a very expensive `false`, and the thing that separates them is not
+strictness — it is that the stages downstream already decline for difficulty, having read
+the code far more closely. So this one is the gate against the unanswerable, and "if you
+cannot name which ground it is, you do not have a decline" is what keeps it there.
+
+**No `sources:` block in Ogun's own config, deliberately.** A source is per project, and the
+one Linear workspace this machine can reach belongs to a different codebase — so a source
+here would poll another project's tickets and open pull requests against Ogun about them.
+`enabled: false` would be the same incoherent statement waiting for somebody to switch it
+on. What is in the file instead is the worker, which a person can hand a ticket by hand with
+`ogun trigger`, and a worked example of what a real operator writes in the repository the
+tickets are actually about.
 
 Two things are honest gaps rather than oversights. **Nothing has run against a live Linear
 workspace** — there is no key on any machine here, so the client was built against responses
@@ -2152,8 +2224,11 @@ project either**, so the flow has never run end to end. `test/linear-oauth-fixtu
 records what the fixtures prove — request shapes, units, delimiters, failure classification,
 redaction — and what they cannot.
 
-Remaining: that pipeline, and write-back itself, which is what `comments:create` and the
-scope decision in ADR-0014 are waiting for.
+Remaining: the rest of the pipeline — *plan → implement → review → draft PR* behind the
+evaluator — and write-back itself, which is what `comments:create` and the scope decision in
+ADR-0014 are waiting for. Write-back is the one that would change what a decline is worth:
+today the reason lands in Ogun's own ledger and the card sits untouched in `Todo`, so the
+person who filed it learns nothing unless somebody goes and looks.
 
 **Explicit non-goals:** Kubernetes, multi-tenancy, RBAC, billing, graphical workflow
 canvas, auto-merge, agent memory, model auto-selection, remote runner mesh.

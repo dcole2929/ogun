@@ -18,7 +18,7 @@ import {
 } from './admission.ts'
 import { projectPolicies } from './policies.ts'
 
-const { coverage, cycleRuns, cycles, jobs, projects, skills, workers } = schema
+const { coverage, cycleRuns, cycles, jobs, projects, runs, skills, workers } = schema
 
 export type StartCycleRunInput = {
   cycleId: string
@@ -231,9 +231,40 @@ export async function startCycleRun(
 }
 
 /**
+ * The nodes of this cycle run whose worker judged the work and refused it (§4.13).
+ *
+ * Read from `runs` rather than inferred from `jobs`, because `jobs.state` deliberately does
+ * not carry it: a declined job is `skipped`, the same value an admission refusal gets, and
+ * which of the two it was lives on the run (see `finalizeRun`). One join is the price of
+ * not putting a scheduling state machine in charge of explaining why a worker said no.
+ */
+async function declinedNodes(db: Db, cycleRunId: string): Promise<Set<string>> {
+  const rows = await db
+    .select({ nodeKey: jobs.nodeKey })
+    .from(runs)
+    .innerJoin(jobs, eq(runs.jobId, jobs.id))
+    .where(and(eq(jobs.cycleRunId, cycleRunId), eq(runs.outcome, 'declined')))
+  return new Set(rows.map((r) => r.nodeKey))
+}
+
+/**
  * Release is per-node, not per-stage: a node unlocks as soon as *its* dependencies are
  * terminal, not when the whole preceding stage finishes. Otherwise a slow reviewer
  * stalls everything behind it (§5.1).
+ *
+ * **A decline blocks its dependents whatever the edge says, and `degrade` does not
+ * override it.** `degrade` answers one question — *what if this node broke?* — and triage
+ * running over three of four reviewers is the answer it was written for. A scope evaluator
+ * refusing a ticket did not break; it produced the result it exists to produce, and that
+ * result is an instruction about the rest of the graph. "Carry on without them" and "carry
+ * on against them" are not the same permission.
+ *
+ * Left to the edge, this would be silent and unrecoverable in the one direction that
+ * matters. `cycleSugarSchema` defaults `onDepFailure` to `degrade` — right for the fan-in
+ * it was written for — so the obvious ticket pipeline, `workers: [scope-a-ticket], then:
+ * plan`, would plan and implement a ticket its own evaluator had just refused, and open a
+ * draft pull request with the decline sitting in the ledger saying it should not exist.
+ * Nobody writing that config would see the bug in it.
  */
 export async function releaseDependents(db: Db, cycleRunId: string): Promise<string[]> {
   const all = await db.select().from(jobs).where(eq(jobs.cycleRunId, cycleRunId))
@@ -250,6 +281,7 @@ export async function releaseDependents(db: Db, cycleRunId: string): Promise<str
    * same run.
    */
   const definition = cycleDefinitionSchema.parse(cycleRun.definition)
+  const declined = await declinedNodes(db, cycleRunId)
 
   const released: string[] = []
   for (const job of all) {
@@ -259,7 +291,8 @@ export async function releaseDependents(db: Db, cycleRunId: string): Promise<str
     if (!deps.every(({ dep }) => dep && isTerminal(dep.state as JobState))) continue
 
     const blockedBy = deps.filter(
-      ({ edge, dep }) => edge.onDepFailure === 'block' && dep?.state !== 'succeeded',
+      ({ edge, dep }) =>
+        dep?.state !== 'succeeded' && (edge.onDepFailure === 'block' || declined.has(edge.from)),
     )
     if (blockedBy.length > 0) {
       await db
@@ -269,7 +302,17 @@ export async function releaseDependents(db: Db, cycleRunId: string): Promise<str
       await markCoverage(db, cycleRunId, job, {
         // `blocked` in its narrow sense: a dependency in this cycle did not succeed.
         outcome: 'blocked',
-        reason: `dependency ${blockedBy.map((b) => b.edge.from).join(', ')} did not succeed`,
+        // Which of the two it was, because they send a reader to different places. A
+        // dependency that failed is somebody's bug to go and find; one that declined is a
+        // decision, already explained on its own row, and this node not running is the
+        // decision working rather than a second thing that went wrong.
+        reason: blockedBy
+          .map((b) =>
+            declined.has(b.edge.from)
+              ? `dependency ${b.edge.from} declined the work`
+              : `dependency ${b.edge.from} did not succeed`,
+          )
+          .join('; '),
       })
       continue
     }
@@ -279,14 +322,38 @@ export async function releaseDependents(db: Db, cycleRunId: string): Promise<str
   return released
 }
 
-/** A cycle is complete when every node is terminal — not when all succeeded (§5.1). */
+/**
+ * A cycle is complete when every node is terminal — not when all succeeded (§5.1).
+ *
+ * **`declined` is a fourth grade, and it exists because the other three would each have
+ * lied about a ticket pipeline.** A scope evaluator that refuses a ticket is the first
+ * node that ends deliberately without succeeding (§4.13): its job lands on `skipped`, the
+ * plan and implement nodes behind it are blocked, and nothing in the run succeeded. Under
+ * `succeeded > 0 ? degraded : failed` that reads `failed` — so "the pipeline broke" and
+ * "Ogun looked at this ticket and said no" would be the same row, and only one of them is
+ * something for a person to go and fix. `complete` would be the opposite lie: it is what a
+ * night reads when the work got done.
+ *
+ * Only when nothing actually failed. A cycle that both declined something and had a node
+ * fall over keeps the failure in its grade, because the failure is the part somebody has
+ * to act on and a decline must never be able to hide one.
+ */
 export async function finalizeCycleIfDone(db: Db, cycleRunId: string): Promise<void> {
   const all = await db.select().from(jobs).where(eq(jobs.cycleRunId, cycleRunId))
   if (all.length === 0) return
   if (!all.every((j) => isTerminal(j.state as JobState))) return
 
   const succeeded = all.filter((j) => j.state === 'succeeded').length
-  const state = succeeded === all.length ? 'complete' : succeeded > 0 ? 'degraded' : 'failed'
+  const failed = all.filter((j) => j.state === 'failed').length
+  const declined = await declinedNodes(db, cycleRunId)
+  const state =
+    succeeded === all.length
+      ? 'complete'
+      : failed === 0 && declined.size > 0
+        ? 'declined'
+        : succeeded > 0
+          ? 'degraded'
+          : 'failed'
   await db
     .update(cycleRuns)
     .set({ state, endedAt: new Date() })

@@ -3,6 +3,7 @@ import { mkdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import {
   baseImage,
+  findingsDocumentSchema,
   parseFingerprint,
   projectImage,
   readPolicies,
@@ -896,6 +897,17 @@ export async function executeJob(
       )
     }
 
+    /**
+     * The node's own answer to whether the work it was handed should go ahead (§4.13).
+     *
+     * Read straight back out of the document the agent wrote, with the schema rather than
+     * a cast: this is the one field in the report whose value stops the rest of a cycle,
+     * and reading it off an unvalidated `any` would make a malformed block mean "admit"
+     * by way of `undefined`. A document with no `scope` — every reviewer and every
+     * modifier — leaves this undefined and the run is graded exactly as it was before.
+     */
+    const scope = findingsDocumentSchema.safeParse(output).data?.scope
+
     const report: RunReport = {
       runId: job.runId,
       /**
@@ -903,8 +915,22 @@ export async function executeJob(
        * A modifier that changed nothing is `approved` — it ran, the gate was satisfied,
        * and it decided nothing needed doing. Filing that as `dispatched` would put an
        * empty change in front of whoever built the PR step next.
+       *
+       * A decline outranks a patch, and the ordering is not an accident. The two together
+       * should be impossible — a scope evaluator runs on a read-only mount and produces no
+       * commits — but if it ever happens, it is a node that said "this should not be
+       * attempted" and then attempted it, and reading that as `dispatched` would open a
+       * draft pull request out of work its own author disowned. The `changes` row is still
+       * written; what it does not become is a publication.
        */
-      outcome: change?.patch ? 'dispatched' : 'approved',
+      outcome: scope?.verdict === 'decline' ? 'declined' : change?.patch ? 'dispatched' : 'approved',
+      /**
+       * On the run row, so the reason is beside the outcome wherever a run is listed
+       * rather than only in the coverage ledger. `finalizeRun` prefers this over its own
+       * gate summary, and there is no gate summary to lose here: a declined run's gates
+       * all passed.
+       */
+      ...(scope?.verdict === 'decline' ? { detail: scope.reason } : {}),
       durationMs: Date.now() - startedAt,
       rounds,
       ...(usage ? { usage } : {}),
@@ -921,7 +947,16 @@ export async function executeJob(
       evidence,
       dismissalChecks,
       ...(change ? { change: changeRecord(change, verdict.tests) } : {}),
-      coverage: { outcome: change?.patch ? 'changed' : 'clean' },
+      /**
+       * The reason travels with the ledger row, which is what makes "what did Ogun decline
+       * last night, and why" one look at the coverage page rather than a run detail
+       * somebody has to know to open. An *admit* is `clean`: the evaluator looked and found
+       * no reason to stop, which is the same shape of result as a reviewer finding nothing.
+       */
+      coverage:
+        scope?.verdict === 'decline'
+          ? { outcome: 'declined', reason: scope.reason }
+          : { outcome: change?.patch ? 'changed' : 'clean' },
       artifacts: [
         ...(transcriptRef ? [{ kind: 'transcript', ref: transcriptRef }] : []),
         // Both records, and they answer different questions: `artifacts` is "what files

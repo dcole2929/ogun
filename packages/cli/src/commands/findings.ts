@@ -84,6 +84,10 @@ export async function findingsWrite(args: string[]): Promise<void> {
         'a clean review (0 findings)'
       : `${n} finding${n === 1 ? '' : 's'}`,
     ...(verdicts > 0 ? [`${verdicts} verdict${verdicts === 1 ? '' : 's'}`] : []),
+    // Said back, because it is the one field in this document that decides what the rest
+    // of the cycle does — and an agent that meant to admit and typed `decline` has this
+    // one line between it and a ticket refused for good (§4.13).
+    ...(doc.data.scope ? [`a ${doc.data.scope.verdict === 'admit' ? 'verdict to admit' : 'decline'}`] : []),
   ]
   console.log(green(`recorded ${parts.join(' and ')} to ${target}`))
 
@@ -277,6 +281,23 @@ export function findingsSchema(): void {
     ].join('\n'),
   )
 
+  console.log(bold('\nscope') + dim('  — a verdict on whether this work should go ahead'))
+  console.log(
+    [
+      '  Only for a node that was asked for one — a scope evaluator judging a ticket. If',
+      '  your skill did not ask you for a verdict, leave this out entirely.',
+      '',
+      `  ${bold('admit')}     the work should go ahead. The rest of the cycle runs.`,
+      `  ${bold('decline')}   it should not. Everything downstream of this node is skipped,`,
+      '            and the run is recorded as `declined` — a result, not a failure.',
+      '',
+      '  `reason` is required either way, and on a decline it is the whole product of the',
+      '  run. Ogun writes nothing back to the ticket and never emits the same ticket',
+      '  twice, so nothing automatic will look at that card again: your sentence is all',
+      '  the person who filed it is ever going to get. Write it to them.',
+    ].join('\n'),
+  )
+
   console.log(bold('\nnotes') + dim('  — what a reader needs that is not a finding'))
   console.log(
     [
@@ -371,5 +392,9 @@ const EXAMPLE = `{
       "citations": [{ "path": "src/routes/runners.ts", "line": 168 }]
     }
   ],
+  "scope": {
+    "verdict": "decline",
+    "reason": "The ticket asks for the export to be faster and never says what fast enough is, so nothing here or in the suite could tell whether a change had done it."
+  },
   "notes": "security-review crashed, so nothing looked at the auth surface tonight."
 }`
