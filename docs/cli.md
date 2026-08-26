@@ -639,6 +639,61 @@ What ran for a project, what did not, and why. A worker that never ran and a wor
 ran and found nothing are different facts; the ledger records both, with the reason
 admission refused a job.
 
+### `ogun sources [--project <slug>] [--source <name>] [--ticket <key>]`
+
+Whether the outside world is still reaching this project. A source polls Linear on a
+cadence and turns admitted tickets into cycle runs (§4.13); every look is recorded,
+including the ones that found nothing and the ones that failed, because a dead key, a
+renamed team, a typo in `status:` and a genuinely quiet week are otherwise the same
+observation.
+
+It prints a **state** per source, not a log. There are ~288 polls a day per source, and a
+listing of them answers "what happened at 03:12" instead of "is this working".
+
+| state | means |
+|---|---|
+| `healthy` | polling, and the ledger has nothing to report |
+| `silent` | polling normally and matching nothing for over a week. **Not a failure** |
+| `failing` | asked Linear and got no answer — always with *which kind*, below |
+| `refused` | never reached Linear; something local, and the detail names the fix |
+| `overdue` | **nothing looked at all**, and no poll row says why |
+| `never-polled` | indexed, and its first poll has not come round yet |
+| `disabled` | switched off in `config.yaml` — not a fault |
+
+`overdue` is the one worth knowing about. It is the only state with no ledger row behind
+it, and the only evidence of two failures that are otherwise completely invisible: a
+control plane that is not running its poll loop, and a source whose stored config this
+build cannot parse — which the poller skips deliberately, silently, and forever.
+
+A `failing` source always says which kind, and the four are not degrees of one thing:
+
+| kind | remedy |
+|---|---|
+| `auth` | the credential. Nothing retries this into working — `ogun connect` |
+| `ratelimited` | Linear is throttling. It clears itself; raise `pollMinutes` if it does not |
+| `transport` | the network, or Linear. The next poll asks again |
+| `local` | Linear answered and this machine could not store the token |
+
+It reaches the control plane, unlike `ogun connect list` — the ledger is in postgres, not
+in this machine's `config.json`. That is itself part of the answer when it cannot connect:
+the poll loop runs *inside* the control-plane process, so a server that is down is also a
+server that is not polling.
+
+- `--project <slug>` — which project, when the current directory is not inside it.
+- `--source <name>` — one source in full: what it admits, the statuses its polls actually
+  saw, and the last 20 polls. The pairing is the point — `status: [To Do]` against a column
+  the team calls `Todo` is only visibly wrong when the two lists are side by side.
+- `--ticket <key>` — has this ticket already produced work? Ogun writes nothing back to
+  Linear (ADR-0004), so a ticket that has been completely dealt with sits in `Todo` with its
+  label on, looking exactly like one nothing ever saw. "It was emitted on Tuesday, into this
+  cycle run" is the answer to most of the questions a live source generates. A ticket with
+  no row is **not** one that was rejected: refusals are deliberately not recorded per
+  ticket, since a ticket refused today may be admitted next week.
+
+No positional arguments. `ogun coverage <project>` takes a bare word as the project, so
+`ogun sources tickets` is a plausible thing to type and could mean either a project or a
+source; it is refused rather than guessed at.
+
 ### `ogun findings list [--project <slug>] [--status <a,b>]`
 
 The finding inbox: severity, fingerprint, how many runs have seen it, and the title.

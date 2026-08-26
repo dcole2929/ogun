@@ -6,6 +6,7 @@ import { projectAdd, projectList, projectSync } from './commands/project.ts'
 import { connect, connectList, disconnect } from './commands/connect.ts'
 import { secretList, secretRm, secretSet } from './commands/secret.ts'
 import { coverage, runsList, trigger } from './commands/runs.ts'
+import { sourcesList } from './commands/sources.ts'
 import {
   checkCitations,
   findingsList,
@@ -256,6 +257,23 @@ try {
 
     case 'coverage':
       await coverage([sub, ...rest].filter(Boolean) as string[], serverUrl)
+      break
+
+    /**
+     * `ogun sources` — a listing noun at the top level, beside `workers`, `cycles` and
+     * `coverage`, and not `ogun source list`. A `source` namespace holding one listing
+     * would be the dead-weight noun `ogun project secret` and `ogun linear connect` were
+     * both taken apart for.
+     *
+     * The project comes from the ladder rather than from a positional, which is the
+     * settled convention (`project add`, `project sync`, `connect`, `secret`) and is why
+     * `ogun coverage <project>` beside it reads differently — that one predates it. A
+     * bare word here is not a project: `--source` and `--ticket` are the two narrowings
+     * this command has, and both name what they are.
+     */
+    case 'sources':
+    case 'source':
+      await sourcesList([sub, ...rest].filter(Boolean) as string[], serverUrl)
       break
 
     case 'findings':

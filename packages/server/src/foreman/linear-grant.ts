@@ -124,7 +124,16 @@ export type GrantDeps = {
 export type UsableGrant =
   | { state: 'ready'; credential: LinearCredential; expiresAt: number; refreshed: boolean }
   | { state: 'refused'; detail: string }
-  | { state: 'failed'; detail: string }
+  /**
+   * `kind` carries the same distinction `LinearUnavailable` carries one layer out, so that
+   * a renewal failure lands in the ledger classified rather than as an unclassified
+   * `failed`. `transport` is the token endpoint or the network and the next poll retries
+   * it; `local` is a renewal that *succeeded at Linear* and could not be written to this
+   * machine's config, where nothing about waiting helps and the store is what needs fixing.
+   * Telling an operator to wait for a store that will fail identically forever is the
+   * failure this field exists to avoid.
+   */
+  | { state: 'failed'; detail: string; kind: 'transport' | 'local' }
 
 /**
  * One refresh per project at a time, across the whole process.
@@ -258,17 +267,27 @@ async function refreshOnce(
      * to make visible one field over.
      */
     const permanent = err.kind === 'invalid-grant' || err.kind === 'config'
-    return {
-      state: permanent ? 'refused' : 'failed',
-      detail: permanent
-        ? `the ${provider} connection for "${projectSlug}" could not be renewed: ` +
-          `${err.message}. Nothing was deleted — reconnect from Settings, or ` +
-          `\`ogun connect ${provider} --project ${projectSlug}\``
-        : `could not renew the ${provider} access token for "${projectSlug}": ${err.message}. ` +
-          (grant.grantType === 'client_credentials'
-            ? 'Nothing was spent; the next poll asks again'
-            : 'The refresh token was kept; the next poll tries again'),
-    }
+    return permanent
+      ? {
+          state: 'refused',
+          detail:
+            `the ${provider} connection for "${projectSlug}" could not be renewed: ` +
+            `${err.message}. Nothing was deleted — reconnect from Settings, or ` +
+            `\`ogun connect ${provider} --project ${projectSlug}\``,
+        }
+      : {
+          state: 'failed',
+          // The token endpoint or the network, which is what `transport` means everywhere
+          // else in this slice. Nothing here is a fact about the credential itself: an
+          // `invalid-grant` took the branch above.
+          kind: 'transport',
+          detail:
+            `could not renew the ${provider} access token for "${projectSlug}": ` +
+            `${err.message}. ` +
+            (grant.grantType === 'client_credentials'
+              ? 'Nothing was spent; the next poll asks again'
+              : 'The refresh token was kept; the next poll tries again'),
+        }
   }
 
   try {
@@ -309,6 +328,14 @@ async function refreshOnce(
     const detail = err instanceof NoOAuthApp ? err.message : asMessage(err)
     return {
       state: 'failed',
+      /**
+       * `local`, not `transport`, and the ledger has to say which. Linear answered — the
+       * token exists — and this machine could not write it down. Waiting is what fixes a
+       * `transport` failure and is exactly what will not fix this one: a config.json that
+       * is unwritable at 3am is unwritable at 4am, and a surface that told an operator the
+       * next poll would retry would be describing a loop with no exit.
+       */
+      kind: 'local',
       detail:
         `renewed the ${provider} token for "${projectSlug}" and could not write it to this ` +
         `machine's config (${detail}). The poll was stopped rather than run on a token ` +

@@ -30,9 +30,19 @@ import type { LinearApi, TicketPage } from '../src/integrations/linear.ts'
  * What that does and does not prove: it proves this build parses the shape Linear
  * documents, that the filter reads the right end of a `blocks` relation, and that a rate
  * limit is not mistaken for a permanent error. It does *not* prove Linear's live server
- * behaves as documented. The first real key that reaches this project should be pointed at
- * `linearHttp` once, by hand, and any difference recorded by fixing the fixture rather than
- * the parser.
+ * behaves as documented.
+ *
+ * **[amended] That last check has now been done, once, by hand.** A `client_credentials`
+ * grant against a real workspace was pointed at `linearHttp`: a team's issues paged and
+ * parsed, the filter admitted the expected subset, and a deliberately bad key produced the
+ * documented `AUTHENTICATION_ERROR` envelope and was classified `auth`. No fixture needed
+ * correcting, which is the outcome this paragraph was hoping for and could not assume.
+ *
+ * The caveat that survives is narrower and still real: **live traffic exercised the happy
+ * path and one auth failure.** Nothing here has seen a real rate limit, a real transport
+ * failure, or a schema change, so those three fixtures remain recordings of the
+ * documentation rather than of Linear. A difference found later is still fixed in the
+ * fixture rather than in the parser.
  */
 const here = dirname(fileURLToPath(import.meta.url))
 
