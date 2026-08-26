@@ -299,6 +299,96 @@ missing.
   question as "what does this suite need to run". The closed set is spelled so that adding
   one later is a value rather than a redesign.
 
+## Amended: what the first real image cost, and what a compose file could not have told us
+
+The skill was written before a worked example existed. Its references described what the
+image has to be from Ogun's own single-service image plus reasoning over a compose file,
+and the honest expectation recorded below — that a reference describing a sandbox it cannot
+run in will go stale silently — turned out to understate the problem. It was not stale. It
+was *incomplete in ways only a green suite reveals*, and the gap between "the stack comes
+up" and "the suite passes" was two bugs.
+
+A four-service Supabase-shaped image now exists for a real repository and passes: 58 suites,
+500 tests, zero failures, one `--network none` container, 27 seconds, nothing on the host.
+It was built by hand against this skill's reference rather than by the worker, so the
+consequence below still stands. What it produced is two findings that are properties of
+*this sandbox contract*, not of that project, and both are now in the reference.
+
+### The bind mount is a different filesystem, and that is a property of §4.6
+
+`/workspace` is a bind mount of a host directory. Every path in a project image is on the
+image's overlay. `/home/dev/.cache` is a named volume. Three filesystems, and the
+consequence is not the obvious one about `EXDEV` — which `container.ts` already recorded —
+but that **a tool which co-locates a cache with its output will silently move the cache
+rather than fail.**
+
+Measured in the image that now passes:
+
+```
+$ pnpm store path                 # cwd = /workspace, a bind mount
+/workspace/.pnpm-store/v11        # 1.1 MB — not the 850 MB baked at /opt/pnpm/store
+
+$ pnpm store path                 # same image, cwd = /tmp/w, not a bind mount
+/opt/pnpm/store/v11
+```
+
+pnpm decides where its store goes by writing a temp file in the project directory and
+trying to hardlink it beside the store it would prefer; a cross-device link fails, so it
+walks up to the project's mountpoint and uses `<mountpoint>/.pnpm-store`. Nothing warns.
+The image's baked closure was ignored and the install went to the registry, which reads as
+"a bit slow" and never as an error. Naming the store on the command line —
+`--offline --store-dir=/opt/pnpm/store` — turned it into `reused 1036, downloaded 0, done
+in 3.5s`.
+
+This joins the finding this ADR's own branch already recorded, that `/home/dev/.cache` is
+a named volume and docker seeds a volume from the image only when the volume is empty — so
+a store baked at that path is invisible on any runner that has run a job before, and
+visible on a clean laptop. Two different mechanisms; one lesson, which the reference now
+teaches as the lesson rather than as its two instances: **anything an image bakes is only
+there if the runner is not mounting something over it and the tool is not choosing
+somewhere else.**
+
+It is recorded here rather than only in the skill because it constrains every project image
+ever written for this sandbox, **including Ogun's own**, which turned out to be subject to
+it. `ogun/project-ogun` sets `PNPM_HOME=/home/dev/.cache/pnpm` so that a nightly "does not
+re-download the world"; the volume contained a metadata cache and no store at all, because
+`pnpm install` in `/workspace` resolved its store to `/workspace/.pnpm-store/v10` every
+time and a fresh clone throws that away. So the cache volume — which §4.6 has asked for
+since it was written, and which `container.ts` spends thirty lines justifying the safety of
+— was not caching the thing it exists to cache, on the repository that wrote it.
+
+Three changes, and the third is the one that generalises. `container.ts`'s comment is
+corrected: the claim that the store "lands inside this volume, which is the intent" was
+true of the intent and never of the behaviour. Ogun's own `tests.command` now names
+`--store-dir`, which took the same install from `reused 0, downloaded 97` to
+`reused 97, downloaded 0`. And §4.6 states the three-filesystem property directly, because
+a rule about how to write a project image belongs where project images are specified rather
+than only in the skill that happens to write them.
+
+### A two-phase schema is two actors, and role-scoped state must name both
+
+The other bug was 327 of 500 tests failing on `permission denied for table`, from a
+`ALTER DEFAULT PRIVILEGES` stanza that was present, parsed, and carried a comment
+correctly predicting that exact failure if it were absent. It was written without
+`FOR ROLE`, and without that clause the defaults bind to whoever executes the file.
+
+The split that produced two roles is the right design and the reference now teaches it
+first. Vendor schema — the base bootstrap, the auth service's migrations, the storage
+service's migrations — comes out of pinned images, cannot change when a modifier edits the
+repository, and is baked into `$PGDATA` at build time. The repository's own migrations are
+**not** baked: they are replayed from `/workspace` on every container start, because a
+modifier is entitled to add a migration and a schema baked before it existed would hand
+that patch a green suite against a database missing its table. That is the exact failure a
+tests gate exists to catch, produced by the gate itself — the same argument this ADR makes
+for why the gate's suite runs on `--network none`.
+
+The cost of the split is that the two halves run as different roles, so anything scoped to
+"the role that created the object" has to name both. That is the general shape, and it is
+not only `ALTER DEFAULT PRIVILEGES`: per-role GUCs, per-role `search_path`, ownership, and
+`GRANT … ON ALL TABLES IN SCHEMA` (a snapshot, not a rule) all have the same trap. The
+reference teaches the split and its consequence in one section, because separating them is
+how somebody keeps the design and re-earns the bug.
+
 ## Consequences
 
 - **Nothing here has run end to end.** No repository has been containerised by this worker:
@@ -333,3 +423,20 @@ missing.
   reference goes stale silently. Nothing detects that today. The `OGUN_EGRESS_FORWARDER`
   check in the gate is the one property that is enforced rather than described, and the
   honest expectation is that it will not be the last one that needs to be.
+
+  The first real image amended this rather than confirming it. Staleness was the worry;
+  incompleteness was the problem. Both of the bugs above are things the reference *never
+  said*, in a document written by reasoning over a compose file, and neither produced an
+  error naming its cause — a package store that quietly moved, and a grant that applied to
+  the wrong half of a schema. A reference for a sandbox nobody can run in accumulates gaps
+  faster than it goes stale, and the only thing that closes one is a suite going green.
+  The second project containerised will find a third gap; the fix is to fold it back in
+  here the same way, not to expect the document to have been complete.
+
+- **The one property that could be enforced instead of described, and is not.** The store
+  finding is checkable: a project image could be asked, at build time, whether the cache it
+  baked is the cache its `tests.command` resolves to, and refuse otherwise. It is not,
+  because the check is per-package-manager and the gate is not — asking pnpm's question of
+  a Cargo project is how a gate starts refusing correct images. The measured install
+  duration in the pull request body is what a person has instead, and "the install took
+  four minutes" is the only signal that a baked store was ignored.

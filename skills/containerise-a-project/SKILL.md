@@ -1,6 +1,6 @@
 ---
 name: containerise-a-project
-description: Read a repository, work out what its test suite actually needs, and write the two files that make it workable by Ogun — `.ogun/Dockerfile` and the `tests:` block in `.ogun/config.yaml`. Or decline, and say what is in the way. Run by Ogun on request; not for interactive use.
+description: Read a repository, work out what its test suite actually needs, and write the files that make it workable by Ogun — `.ogun/Dockerfile`, whatever entrypoint and stack files it needs, and the `tests:` block in `.ogun/config.yaml`. Or decline, and say what is in the way. Run by Ogun on request; not for interactive use.
 ---
 
 # Containerise a project
@@ -28,18 +28,29 @@ Follow `references/containerising-a-project.md`. It owns what the image has to b
 the sandbox your files will run in actually looks like, how services get in, and how the
 work leaves this sandbox. This file owns the mission.
 
+It also carries two worked examples in full — a one-service image, and a real four-service
+one that runs 58 suites and 500 tests in 27 seconds under `--network none`. Read them
+before you write anything. Neither of those repositories is on the disk you are working on,
+so the excerpts in that file are the whole of the example; there is nothing to go and open.
+
 ## Mission
 
-**Two files. One image that builds. One command that runs this project's real suite
-inside it, with no network.**
+**One image that builds. One command that runs this project's real suite inside it, with
+no network.**
 
-That last clause is the whole difficulty and it is worth stating before you start. The
+"With no network" is the whole difficulty and it is worth stating before you start. The
 container that runs the suite gets `--network none` and a proxy socket allowing a small
 list of hosts — the model API and, usually, the package registry. There is no host to
 reach. So every service the suite talks to — a database, a cache, an emulator, an auth
 server — has to be **inside the image**, started before the suite runs. The Docker socket
 is never mounted, so `docker compose up` is not available to you and neither is anything
 else that starts a sibling container.
+
+Two files is the floor, not the shape. `.ogun/Dockerfile` and the `tests:` block are the
+minimum; a project with a stack in it also gets an entrypoint, a shared shell file the
+build and the entrypoint both source, and whatever config a service needs. All of them
+live under `.ogun/`, which is what the gate allows. The four-service worked example is
+seven files.
 
 ## You cannot run any of this, and that changes how you work
 
@@ -53,18 +64,47 @@ node, ripgrep and the agent CLIs, and none of this project's toolchain.
 So the loop is not the usual one:
 
 - **What you can do here**: read the repository, run `cat`, `ls`, `rg`; read the
-  lockfile, the CI workflow, the compose file, the test scripts; and write two files.
+  lockfile, the CI workflow, the compose file, the migrations, the tests themselves; and
+  write the files that go under `.ogun/`.
 - **What checks your work**: the host, after you exit. It builds your Dockerfile, then
   runs your `tests.command` inside the image it just built, on `--network none`. That is
   the gate, and it either publishes your patch or hands you its output and one more round.
-- **What that means for you**: the CI workflow and the compose file in this repository are
-  the closest thing to evidence you have. Read them as the record of what the suite
-  actually needs, because a person got them working. Do not guess at a service list.
+- **What that means for you**: the CI workflow and the compose file are the closest thing
+  to evidence you have about *versions, ports and credentials*, because a person got them
+  working. They are weaker evidence about *which services you need* — see the reading
+  order below, and derive that from what the suite calls. Either way, do not guess.
 
 **Your one round of feedback is expensive, so spend the first one well.** Write the whole
 thing — image, services, command — and make it as close to right as reading can get you.
 An intentionally minimal first attempt does not "test the pipeline"; it spends the only
 build you get on a Dockerfile you already know is incomplete.
+
+## The stack coming up is not the suite passing
+
+The first four-service image built against this reference got the whole stack healthy under
+`--network none` and still had two bugs between it and a green suite. Neither was guessable
+from a compose file, neither produced an error naming its cause, and both are in the
+reference now because they were not in it then.
+Know that they exist before you start, because the shape they share is the thing to watch
+for: **a container is not one machine, and a build is not one actor.**
+
+- **A cache you baked into the image is not necessarily the cache your command uses.**
+  `/workspace` is a bind mount and therefore a different filesystem from every path in your
+  image, and `/home/dev/.cache` is a named volume that hides whatever the image put under
+  it. A package manager that hardlinks its store into `node_modules` will notice the
+  cross-device link, silently relocate its store into the workspace, and go to the network
+  for a closure you already have. Nothing warns. Name the store on the command line, and
+  prove it once with an offline install — the reference's §6 is that whole story.
+- **State scoped to "the role that created this" binds to whichever role ran the file.**
+  Half your schema is baked at build time and half is replayed at entrypoint, which is the
+  right design and means two different roles create objects. A postgres
+  `ALTER DEFAULT PRIVILEGES` without `FOR ROLE` therefore silently applies to the wrong
+  half — 327 of 500 tests failing on `permission denied for table`, from a stanza that was
+  present and correct-looking. §5 of the reference.
+
+Both are cases of the same instruction: **write down what you are assuming is shared —
+a filesystem, a role, a user, a network — and check each one.** In here, most of them are
+not.
 
 ## What to read, and in what order
 
@@ -74,21 +114,36 @@ build you get on a Dockerfile you already know is incomplete.
    the single most valuable file in the repository for your purpose: it is somebody's
    working answer to "what does it take to run these tests on a machine that has nothing".
    Every `services:` block, every `apt-get`, every setup action is a requirement.
-3. **Existing Dockerfiles and compose files.** A `docker-compose.yml` with four services
-   in it is your service list, already discovered. Its images tell you the versions; its
-   environment blocks tell you the ports and credentials the suite expects; its
-   `depends_on` tells you the start order. What you cannot reuse is the *shape* — those
-   are sibling containers and you have one.
-4. **The package manager and its lockfile.** `pnpm-lock.yaml`, `package-lock.json`,
+3. **Existing Dockerfiles and compose files.** Its images tell you the versions; its
+   environment blocks tell you the ports and credentials the suite expects. What you
+   cannot reuse is the *shape* — those are sibling containers and you have one — and what
+   you should not reuse uncritically is the service list or the healthchecks. A compose
+   file serves a developer with a dashboard and a log pipeline as well as a test run, and
+   it can be wrong in ways nobody noticed: in the worked example, thirteen services were
+   four plus a router, and one of the four never started on the host at all because a
+   broken healthcheck on another service was blocking it.
+4. **The tests themselves, for the service list.** This is the step that separates a
+   working image from a plausible one, and it is a grep rather than a judgement: which
+   hosts, ports and URL prefixes does the suite actually call, and how many times each?
+   The answer is the service list. Every service you then drop needs one sentence naming
+   the thing in the suite that would have noticed — if you cannot write that sentence, you
+   have not finished checking.
+5. **Migrations and schema, if there is a database.** Grep them for the extensions they
+   ask for by name. That is usually a short list that stock packages cover, and it is what
+   decides whether you need a vendor's two-gigabyte database image or a distribution's.
+6. **The package manager and its lockfile.** `pnpm-lock.yaml`, `package-lock.json`,
    `uv.lock`, `Gemfile.lock`, `go.sum`, `Cargo.lock`. The lockfile names the manager, and
    `packageManager` in `package.json` or a `.tool-versions` file names its version. Pin
-   what you find; do not upgrade anything.
-5. **The test script itself.** `package.json` scripts, `Makefile`, `pyproject.toml`,
+   what you find; do not upgrade anything. Then find out where that manager keeps its
+   cache and how to make it say so on the command line, because you will need both.
+7. **The test script itself.** `package.json` scripts, `Makefile`, `pyproject.toml`,
    `justfile`. What does a developer type? That, plus whatever install step a fresh clone
    needs, is your `tests.command`.
-6. **Whatever the tests read at start-up.** `.env.example`, a `config/test.*`, a
+8. **Whatever the tests read at start-up.** `.env.example`, a `config/test.*`, a
    `jest.setup.ts`, `conftest.py`. This is where you find the environment variables the
-   suite needs and the URLs it expects to connect to.
+   suite needs and the URLs it expects to connect to — and, just as importantly, whether
+   the loader overrides the process environment or defers to it, which decides whether
+   your image's values or the checkout's win.
 
 ## Declining is a result, and here it is a common one
 
@@ -105,7 +160,12 @@ Decline, and say which of these it was:
   needs; a person may be able to point the tests at a local double, and that is their
   decision.
 - **The suite needs something that cannot go in an image.** A GPU, a device, a specific
-  kernel, a service with no distributable form.
+  kernel, a service with no distributable form. Push on this one before accepting it: a
+  service published only as a container image is very often a binary and some data files
+  you can `COPY --from` out of it, and even an interpreted one can come across with its own
+  interpreter. The reference's §4.3 works through a real case. What makes it a decline is
+  when getting it out means *compiling* something — at which point this repository has
+  quietly taken on a native build it now owns.
 - **The suite needs the network.** Tests that hit a live external API cannot pass on
   `--network none`, and the fix is a change to the tests rather than to the image.
 - **There is no suite.** A repository with no tests has nothing to gate a patch with. Say
@@ -133,6 +193,12 @@ behind is committed for you and becomes a pull request.
 - **Making the suite pass by running less of it.** Narrowing `tests.command` to the
   subdirectory that works is the same mistake as declaring `true`, one step less obvious.
   If only part of the suite can run in a container, that is a decline that names the part.
+- **Stubbing out the thing a test is about.** The in-image version of the same mistake, and
+  it hides better because the diff is a Dockerfile. Replacing a heavyweight component with
+  a smaller one is legitimate and often right — but only after you have grepped the suite
+  for what it asserts about the component, and it goes in the commit message that you did.
+  A dependency that is awkward to carry and that four tests exist to exercise is one you
+  carry.
 - **`.ogun/config.yaml` beyond the `tests:` block.** Workers, cycles, sources and policies
   are somebody's decisions about how this project is worked on. You are writing the one
   block that says how it is tested.
@@ -168,3 +234,9 @@ Say what the suite actually needs, what you put in the image and why, what you l
 and — if you declined — what is in the way. Somebody is going to read your Dockerfile and
 decide whether to trust it against every patch this project ever produces. Your note is
 what tells them how you arrived at it.
+
+Say the doubtful parts out loud too, because the person reading the build log next is the
+only one who can check them. What you assumed rather than verified. Which dropped service
+you were least sure about. Whether the install actually used the store you baked, and how
+you would know. A note that lists what to look at first is worth more than one that reports
+success.

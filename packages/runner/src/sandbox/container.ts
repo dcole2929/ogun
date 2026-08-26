@@ -597,12 +597,30 @@ export function buildRunArgs(opts: ContainerOptions, image: string): string[] {
    * where sharing turns out to be correct. Written down because it is not obvious, and
    * because the next person to audit this will otherwise re-derive it from scratch:
    *
-   *  - **Where the store actually is.** `PNPM_HOME=/home/dev/.cache/pnpm` in
-   *    `.ogun/Dockerfile`, and pnpm resolves `store-dir` from `$PNPM_HOME/store` before
-   *    anything else, so the content-addressable store lands at
-   *    `/home/dev/.cache/pnpm/store/v10` — inside this volume, which is the intent. The
-   *    metadata cache follows `$XDG_CACHE_HOME` / `~/.cache` and lands here too, by a
-   *    different rule that happens to agree.
+   *  - **Where the store actually is — and it is not here.** [corrected — ADR-0016] This
+   *    said that `PNPM_HOME=/home/dev/.cache/pnpm` in `.ogun/Dockerfile` puts the
+   *    content-addressable store at `/home/dev/.cache/pnpm/store/v10`, inside this volume,
+   *    "which is the intent". The intent, yes; the behaviour, no. pnpm picks its store by
+   *    writing a temp file in the *project* directory and trying to hardlink it beside the
+   *    store it would prefer; `/workspace` is a bind mount and this volume is a third
+   *    device, so the link fails with EXDEV and pnpm falls back to
+   *    `<the project's mountpoint>/.pnpm-store`. Measured in `ogun/project-ogun` with this
+   *    volume attached and cwd `/workspace`: `pnpm store path` answers
+   *    `/workspace/.pnpm-store/v10`, and the volume held `pnpm/metadata-v1.3` and no store
+   *    at all — so for as long as that was the whole configuration, this volume saved the
+   *    metadata round-trips (which do follow `$XDG_CACHE_HOME` / `~/.cache` and do land
+   *    here) and none of the tarballs, which is the thing it exists for.
+   *
+   *    What makes it save the tarballs is naming `--store-dir` in `tests.command`, since
+   *    an env var is a preference pnpm is free to reconsider and a flag is not. This
+   *    repository's own `.ogun/config.yaml` does that now, and the same install went from
+   *    `reused 0, downloaded 97` to `reused 97, downloaded 0`. A project image that does
+   *    not name it gets the fallback and no warning; there is no check for this, because
+   *    the question is per-package-manager and this code is not (ADR-0016).
+   *
+   *    The concurrency reasoning below is unaffected — it is about what happens when two
+   *    containers *do* share a store, which is exactly what a named `--store-dir`
+   *    produces, and is therefore load-bearing now rather than hypothetical.
    *  - **Why concurrent writers do not corrupt it.** pnpm writes each store file to a
    *    temporary path and renames it over the destination, and — this is the part that
    *    matters — the temporary name is *derived from the destination*

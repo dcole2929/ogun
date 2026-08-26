@@ -516,6 +516,33 @@ Base carries `claude`, `codex`, `git`, node. The project layer adds its toolchai
   `verify-store-integrity` is the backstop. `container.ts` records the caveats, the
   chief one being that this rests on a maintainer's statement rather than on pnpm's
   documentation.
+- **And mounting it is not the same as using it.** See the paragraph below: a cache
+  volume the tool does not choose, or an image-baked store hidden under it, is a
+  download every night that nobody sees.
+
+**A container is three filesystems, and nothing announces which one you are on.**
+[corrected — ADR-0016] `/` is the image's overlay, `/workspace` is a bind mount of a host
+directory, `/home/dev/.cache` is a named volume. This constrains **every** project image,
+which is why it is here rather than only in the skill that writes them:
+
+- **A named volume hides what the image baked under it.** Docker seeds a volume from the
+  image only when the volume is *empty*, so a store baked at `/home/dev/.cache/…` is
+  present on a clean machine and invisible on every runner that has run a job before.
+  Bake caches under `/opt`, which nothing mounts over.
+- **A tool that hardlinks its cache into its output will silently relocate the cache**
+  rather than fail, because the workspace and the image are different devices. pnpm writes
+  a temp file in the project directory, tries to hardlink it beside its preferred store,
+  and on `EXDEV` falls back to `<mountpoint>/.pnpm-store`. Measured in `ogun/project-ogun`,
+  which sets `PNPM_HOME=/home/dev/.cache/pnpm`: `pnpm store path` in `/workspace` answered
+  `/workspace/.pnpm-store/v10`, so the volume held a metadata cache and no store at all and
+  every run re-downloaded what the bullet above says it should not. The same image with a
+  working directory that is not a bind mount resolves to `PNPM_HOME`. The fix is to name
+  the store on the command line in `tests.command`, where no filesystem probe can overrule
+  it — this repository's own now does, and the same install went from `reused 0,
+  downloaded 97` to `reused 97, downloaded 0`.
+- **The failure mode is silence in both cases.** A cache that is ignored looks exactly like
+  a cache that works, only slower, and "slower" is invisible at 3am. The only proof is an
+  install run with the package manager's offline flag, reading its "downloaded 0" line.
 
 **The one file nobody wants to write can now be written by a worker.** [built —
 ADR-0016] A `.ogun/Dockerfile` demands knowing that this image is `FROM ogun/base` and
@@ -525,6 +552,14 @@ to be `dev` or patch extraction later trips over root-owned files in the workspa
 of that is knowledge a project's owner has any reason to have. `skills/containerise-a-project`
 carries it, and the `project-image` lens (§4.10) proves the result rather than trusting
 it — the only place in Ogun that ever checks that a project image works.
+
+Its reference now carries a real multi-service worked example rather than a reasoned-about
+one — thirteen compose services reduced to four and a router, 58 suites and 500 tests
+passing inside one `--network none` container — and the two bugs that stood between "the
+stack comes up" and "the suite passes". Both were properties of this sandbox rather than of
+that project: the filesystem split above, and a database schema that is baked in two phases
+and therefore created by two roles, so anything role-scoped has to name both. ADR-0016
+records what each cost.
 
 **The tag is keyed on the project slug**, `ogun/project-<slug>`, and on nothing about
 where the repo sits on a disk. `ogun image build <dir>` used to derive it from the

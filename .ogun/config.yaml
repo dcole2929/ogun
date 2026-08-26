@@ -318,8 +318,22 @@ cycles:
         to: implement
         onDepFailure: block
 
+# `--store-dir` is not decoration, and it is the only place this can be said (ADR-0016).
+# The runner mounts a named volume at /home/dev/.cache so a nightly does not re-download
+# the world, and `PNPM_HOME` in .ogun/Dockerfile was supposed to put the store inside it.
+# It does not: pnpm picks its store by trying to hardlink a temp file from the project
+# directory, /workspace is a bind mount and the volume is a third device, so the link fails
+# and pnpm quietly uses /workspace/.pnpm-store — which a fresh clone throws away every run.
+# Measured before and after this line, same image, same volume: `reused 0, downloaded 97`
+# became `reused 97, downloaded 0`. An env var is a preference pnpm may reconsider; a flag
+# is the answer.
+#
+# Deliberately not `--offline` as well. It is what proves the store is being used, and it
+# would fail a modifier that legitimately adds a dependency with a network error instead of
+# a test result. The store is a cache that makes the common case need no registry, not a
+# rule that forbids one.
 tests:
-  command: pnpm install --frozen-lockfile && pnpm -s test
+  command: pnpm install --frozen-lockfile --store-dir=/home/dev/.cache/pnpm/store && pnpm -s test
 
 # One block, two readers, and the difference matters (§4.9).
 policies:
