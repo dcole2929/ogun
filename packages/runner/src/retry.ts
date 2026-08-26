@@ -1,4 +1,5 @@
 import type { GateResult } from '@ogun/core'
+import { PROJECT_IMAGE_LENS } from './bootstrap.ts'
 import { REVIEW_LENS } from './review.ts'
 import { TESTS_LENS, type VerifyOutcome } from './verify.ts'
 
@@ -71,8 +72,15 @@ export const MAX_MODIFIER_ROUNDS = 2
  * apart on `review.ran` exactly as it does on `tests.ran`. A run that could not review
  * its diff — no runtime seam, no budget left, no verdict written — is a fact about the
  * run: another round produces another patch that also cannot be reviewed.
+ *
+ * `project-image` earns its place more strongly than either, because for that worker the
+ * retry is not an improvement on the loop — it *is* the loop. A containerise worker writes
+ * a Dockerfile it cannot build and a test command it cannot run: there is no docker socket
+ * in a sandbox (§4.6) and it is sitting in `ogun/base`, which has none of the toolchain it
+ * is describing. The gate is the only thing that ever tells it whether any of it works, so
+ * the round after the gate is its first and only sight of a build log.
  */
-const RETRYABLE_LENSES = new Set<string>([TESTS_LENS, REVIEW_LENS])
+const RETRYABLE_LENSES = new Set<string>([TESTS_LENS, REVIEW_LENS, PROJECT_IMAGE_LENS])
 
 export type RetryDecision =
   | { retry: false; reason: string }
@@ -98,6 +106,8 @@ export function retryDecision(input: {
   tests: VerifyOutcome['tests']
   /** Absent when this worker asked for no review of its diff, which is most of them. */
   review?: VerifyOutcome['review']
+  /** Absent for every worker that is not bootstrapping a project image, which is most of them. */
+  image?: VerifyOutcome['image']
   /** `deadline - Date.now()`, taken by the caller so this function is pure. */
   remainingMs: number
 }): RetryDecision {
@@ -119,7 +129,7 @@ export function retryDecision(input: {
    * tells them the cap was never the problem.
    */
   const permanent = failed
-    .map((g) => permanence(g, input.tests, input.review))
+    .map((g) => permanence(g, input.tests, input.review, input.image))
     .filter((r): r is string => r !== undefined)
   if (permanent.length > 0) {
     return {
@@ -152,13 +162,21 @@ export function retryDecision(input: {
    * `permanence` has already refused every case where no measurement exists, so this is a
    * backstop for a future retryable lens that fails without the suite having run at all.
    */
+  /**
+   * Absence and zero are kept apart, deliberately, and getting that wrong is a real bug
+   * rather than a style point: a suite that finished in under a millisecond measures `0`,
+   * which is a measurement, and folding it into "nothing measured" would refuse a second
+   * round to exactly the projects whose gate is cheapest to run again.
+   */
   const suiteMs = input.tests?.durationMs
-  if (suiteMs === undefined) {
+  const imageMs = input.image?.durationMs
+  if (suiteMs === undefined && imageMs === undefined) {
     return {
       retry: false,
       reason:
-        'no second attempt: nothing measured how long this project\'s suite takes, so the ' +
-        'gate\'s share of what remains could not be worked out',
+        'no second attempt: nothing measured what this gate costs to run again — no suite ' +
+        'and no image build finished — so the share of what remains that would have to be ' +
+        'held back for it could not be worked out',
     }
   }
 
@@ -181,16 +199,31 @@ export function retryDecision(input: {
    * that produces a second red patch and spends the rest of the budget doing it.
    */
   const reviewMs = input.review?.durationMs ?? 0
-  const reserveMs = suiteMs + reviewMs
-  if (input.remainingMs < suiteMs + reserveMs) {
+  const reserveMs = (suiteMs ?? 0) + reviewMs + (imageMs ?? 0)
+  /**
+   * What the *agent's* round has to be worth to be worth granting, and the one place a
+   * bootstrap run differs.
+   *
+   * For an ordinary modifier this is one suite run, per `references/making-a-change.md`
+   * §5. A bootstrap agent cannot run either half — no docker socket, and it is in
+   * `ogun/base` rather than in the image it is describing — so `imageMs` here is not "time
+   * for the agent to build". It is the floor that keeps a second round from being shorter
+   * than the gate that will judge it: a round given less time than one build takes is a
+   * round whose gate is refused for budget before it starts, which is a worse artefact
+   * than no round at all. A measurement rather than a constant, on the same grounds the
+   * reserve is.
+   */
+  const agentShareMs = (suiteMs ?? 0) + (imageMs ?? 0)
+  if (input.remainingMs < agentShareMs + reserveMs) {
     return {
       retry: false,
       reason:
         `no second attempt: ${Math.round(input.remainingMs / 1000)}s of the job's timeout ` +
         `remain and the gate needs ${Math.round(reserveMs / 1000)}s to judge a patch again ` +
-        `(the suite takes ${Math.round(suiteMs / 1000)}s` +
+        `(the suite takes ${Math.round((suiteMs ?? 0) / 1000)}s` +
+        (imageMs ? `, building the image ${Math.round(imageMs / 1000)}s` : '') +
         (reviewMs > 0 ? `, the review of the diff ${Math.round(reviewMs / 1000)}s` : '') +
-        '), on top of one suite run for the agent itself. A round the gate cannot finish ' +
+        `), on top of ${Math.round(agentShareMs / 1000)}s for the agent itself. A round the gate cannot finish ` +
         'judging produces "the suite never ran", or a diff nothing reviewed, which ' +
         'refuses to publish for a reason that looks like a broken harness rather than a ' +
         'bad patch',
@@ -227,6 +260,7 @@ const permanence = (
   gate: GateResult,
   tests: VerifyOutcome['tests'],
   review: VerifyOutcome['review'],
+  image: VerifyOutcome['image'],
 ): string | undefined => {
   if (!RETRYABLE_LENSES.has(gate.name)) {
     return `${gate.name} failed, and it is not a lens another round can repair`
@@ -237,6 +271,34 @@ const permanence = (
     }
     if (tests.durationMs === undefined) {
       return "the project's suite never finished, so nothing measured what the gate would need again"
+    }
+  }
+  /**
+   * The bootstrap gate, kept apart on exactly the tests lens's distinction: a build that
+   * *ran* and failed is a Dockerfile another round can fix, and everything before the
+   * build is a fact about what this run produced.
+   *
+   * The three cases below are all "nothing measured what a second gate would cost", and
+   * they are given three sentences rather than one because the repairs are unrelated —
+   * one is a patch that did not contain a Dockerfile, one is a job that needs longer, and
+   * the third is a suite that hung. A single "not retryable" would send whoever reads it
+   * to look at all three.
+   */
+  if (gate.name === PROJECT_IMAGE_LENS) {
+    if (image?.ran !== true) {
+      return (
+        'no image was built from this patch, so nothing measured what another round would ' +
+        'cost to judge — the reason above says what was missing'
+      )
+    }
+    if (image.durationMs === undefined) {
+      return 'the image build never finished, so nothing measured what the gate would need again'
+    }
+    if (tests?.ran === true && tests.durationMs === undefined) {
+      return (
+        "the proposed suite never finished inside the image, so nothing measured what the " +
+        'gate would need again'
+      )
     }
   }
   if (gate.name === REVIEW_LENS && review?.ran !== true) {
@@ -283,6 +345,17 @@ export function retryPrompt(input: {
   /** Workspace root as the *agent* sees it, which is not the host path (§5.1). */
   guestRoot: string
   outputPath: string
+  /**
+   * A `bootstrap: project-image` round, which is told something different at the end.
+   *
+   * The ordinary closing advice is "run the suite yourself while you still have time to
+   * act on what it says", and for this worker that is not merely unhelpful — it is
+   * impossible, and instructions an agent cannot follow are how a round gets spent
+   * looking for a docker socket that is not there. What it can do instead is read the
+   * build log it has just been handed, which is the first and only sight of one it will
+   * get.
+   */
+  bootstrap?: boolean
 }): string {
   const failed = input.gates.filter((g) => !g.passed)
   const minutes = Math.max(1, Math.round(input.agentBudgetMs / 60_000))
@@ -306,14 +379,32 @@ export function retryPrompt(input: {
     'round *and* the last one.',
     '',
     `You have about ${minutes} minute(s). That is what remains of the job's timeout minus`,
-    `the ${Math.round(input.reserveMs / 1000)}s the gate needs to run the suite again after`,
-    'you exit — it is not a fresh budget, and the gate does not get one either. Run the',
-    'suite yourself while you still have time to act on what it says.',
+    `the ${Math.round(input.reserveMs / 1000)}s the gate needs to judge a patch again after`,
+    'you exit — it is not a fresh budget, and the gate does not get one either.',
     '',
-    'If you cannot get it green, `git revert` your own commits so the tree matches the',
-    'base again and write your account of it to',
-    `${input.guestRoot}/${input.outputPath} with \`ogun findings write\`. A run that`,
-    'changed nothing and explained why is recorded as approved and is a better result than',
-    'a red patch nobody can publish.',
+    ...(input.bootstrap
+      ? [
+          'You cannot run any of this yourself: there is no docker socket in this sandbox',
+          'and you are in `ogun/base`, not in the image you are describing. The output',
+          'above is the only report you will get, and it is the whole of what the host saw.',
+          'Read it as a build log, change the Dockerfile or the test command, and commit.',
+          '',
+          'If this repository cannot be containerised — its suite needs a credential, or a',
+          'service nothing can put inside an image — `git revert` your own commits so the',
+          'tree matches the base again and write your account of it to',
+          `${input.guestRoot}/${input.outputPath} with \`ogun findings write\`, naming what`,
+          'is in the way. A clear decline is a result: somebody can act on it. A Dockerfile',
+          'that builds around the problem is a project registered with a gate that proves',
+          'nothing.',
+        ]
+      : [
+          'Run the suite yourself while you still have time to act on what it says.',
+          '',
+          'If you cannot get it green, `git revert` your own commits so the tree matches the',
+          'base again and write your account of it to',
+          `${input.guestRoot}/${input.outputPath} with \`ogun findings write\`. A run that`,
+          'changed nothing and explained why is recorded as approved and is a better result than',
+          'a red patch nobody can publish.',
+        ]),
   ].join('\n')
 }

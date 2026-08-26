@@ -204,6 +204,16 @@ export async function publishPatch(input: {
   tests: { run?: boolean; passed?: boolean }
   /** From the blob at `baseSha`. `undefined` means it could not be read, and refuses. */
   policies?: PinnedPolicies
+  /**
+   * What the `project-image` lens proved, when this is a containerisation patch
+   * (ADR-0016). Absent for every ordinary run.
+   *
+   * Threaded through rather than derived, because only the gate knows it and the gate is
+   * three files away by the time this runs. It reaches the pull request body and nowhere
+   * else — see `bodyFor` for what it changes and why the after-merge instruction has to be
+   * in front of whoever presses merge.
+   */
+  bootstrap?: { image: string; command: string; buildSeconds: number; suiteSeconds: number }
   remote: PublishRemote
 }): Promise<Publication> {
   const gate = refuseBefore(input)
@@ -351,6 +361,7 @@ export async function publishPatch(input: {
         branch,
         commits: subjects.length,
         log,
+        ...(input.bootstrap ? { bootstrap: input.bootstrap } : {}),
       }),
     })
     return { pr: { branch, url } }
@@ -509,6 +520,22 @@ function bodyFor(input: {
   branch: string
   commits: number
   log: string
+  /**
+   * Present only for a `bootstrap: project-image` run, and it changes two things.
+   *
+   * The standing line — "the project's suite passed on this tree" — is not what happened
+   * here and saying it would be the more misleading of the two available lies: the suite
+   * passed *inside an image this patch also proposes*, which is a stronger claim about the
+   * patch and a weaker one about the repository, and a reviewer has to be told which.
+   *
+   * And there is a step after the merge. Nothing in Ogun builds a project image (§4.6 is
+   * explicit that images are built at project-add time and never at 2am), so a merged
+   * Dockerfile with no `ogun image build` behind it leaves the *next* modifier failing on
+   * an image docker cannot find — an error about a thing nobody built, arriving days later
+   * on somebody who never saw this run. The pull request is where whoever merges it is
+   * standing, so the instruction goes here.
+   */
+  bootstrap?: { image: string; command: string; buildSeconds: number; suiteSeconds: number }
 }): string {
   const text = clean(input.log, { newlines: true }).slice(0, 50_000)
   const fence = '`'.repeat(Math.max(3, longestBacktickRun(text) + 1))
@@ -517,11 +544,32 @@ function bodyFor(input: {
     '',
     `- run \`${input.runId}\``,
     `- base \`${input.baseSha.slice(0, 12)}\` on \`${input.branch}\``,
-    `- ${input.commits} commit(s); the project's suite passed on this tree`,
+    input.bootstrap
+      ? `- ${input.commits} commit(s); \`${clean(input.bootstrap.command).slice(0, 200)}\` ` +
+        `passed in ${input.bootstrap.suiteSeconds}s inside the image this patch builds ` +
+        `(${input.bootstrap.buildSeconds}s to build), on \`--network none\``
+      : `- ${input.commits} commit(s); the project's suite passed on this tree`,
     '',
     'Nobody has read this. It is a draft because an agent wrote it and the only thing',
     "that has looked at it is the project's own test suite.",
     '',
+    ...(input.bootstrap
+      ? [
+          '**After merging this, build the image.** Nothing does it for you, on purpose:',
+          'images are built when a project is added, never during a run, so that a night',
+          'does not fail on a bad network. Until somebody runs it, every modifier job for',
+          'this project fails on an image docker cannot find.',
+          '',
+          '```',
+          `git pull && ogun image build . && ogun project sync .`,
+          '```',
+          '',
+          `The image the gate built (\`${clean(input.bootstrap.image).slice(0, 200)}\`) was`,
+          'deleted with the run — it was built from an unmerged branch, and an image nobody',
+          'has reviewed must not become the one the next patch is verified in.',
+          '',
+        ]
+      : []),
     'What the agent said it did, verbatim:',
     '',
     fence,

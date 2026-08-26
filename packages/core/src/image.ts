@@ -37,6 +37,26 @@ export const STAMP_LABEL = 'dev.ogun.sandbox-stamp'
 export const projectImage = (slug: string): string => `ogun/project-${slug}:latest`
 
 /**
+ * What the `project-image` lens tags the image it builds out of a patch (ADR-0016).
+ *
+ * **Not `projectImage(slug)`, and the difference is the whole point.** That tag is what
+ * every modifier job on this machine runs in, and this image was built from a Dockerfile
+ * an agent wrote minutes ago in a branch nobody has read. Writing it to `:latest` would
+ * mean a rejected patch's image quietly becoming the one the next night's modifier is
+ * verified in — a change to the machine made by a run that was refused. §4.6's rule that
+ * images are built at `ogun project add` and never at 2am is the same rule from the other
+ * side: the operator builds the image once the patch has been *merged*, and the pull
+ * request says so.
+ *
+ * Keyed on the run rather than only on the project so two gates cannot collide. A fixed
+ * `:candidate` would be one tag two concurrent jobs both build and both delete, and the
+ * loser's failure — an image that vanished between `build` and `run` — reads as a broken
+ * daemon rather than as a race.
+ */
+export const candidateImage = (slug: string, runId: string): string =>
+  `ogun/project-${slug}:candidate-${runId.slice(0, 12)}`
+
+/**
  * The one name for the substrate image, so that the string is written down once. Every
  * project's `.ogun/Dockerfile` is `FROM` this by hand, which is why it is a constant and
  * not a parameter — see `baseImage` below.

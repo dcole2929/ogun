@@ -257,6 +257,11 @@ jobsRoutes.post('/claim', async (c) => {
         // worker indexed before this field existed simply has none — which is also what a
         // worker that never declared one has, and is the safe direction to be wrong in.
         ...(config.connections === undefined ? {} : { connections: config.connections }),
+        // And again for `bootstrap:`, which the runner needs for three separate decisions
+        // — which image the job runs in, whether a missing pinned `tests.command` refuses
+        // it, and which lens grades its patch. A worker indexed before this field existed
+        // has none, and none means the ordinary modifier path.
+        ...(config.bootstrap === undefined ? {} : { bootstrap: config.bootstrap }),
         timeoutMs: Number(config.timeoutMs ?? 30 * 60_000),
         skillRef: found.worker.skillRef,
         verify: config.verify,

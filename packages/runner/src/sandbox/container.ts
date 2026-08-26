@@ -338,7 +338,28 @@ export function createContainerSandbox(opts: ContainerOptions): Sandbox {
       spawnJsonl(
         'docker',
         [
-          ...buildRunArgs(exec.raw ? verificationOptions(runOpts()) : runOpts(), image),
+          ...buildRunArgs(
+            exec.raw ? verificationOptions(runOpts()) : runOpts(),
+            /**
+             * The sandbox's own image, unless a verification command named another.
+             *
+             * `exec.image` is the `project-image` lens running a patch's proposed suite in
+             * the image that patch proposes (ADR-0016), and it inherits everything else
+             * this container gets — the read-write workspace mount, the gateway socket, the
+             * memory caps, and `--network none`. That last one is the reason the override
+             * lives here rather than in a second `docker run` written beside the gate: a
+             * suite proved against a service on the *host* has proved nothing that will be
+             * true at 3am, and every route out of a sandbox is already decided by this
+             * function.
+             *
+             * Honoured only on a `raw` exec, which is the only kind that has one: an
+             * agent-runtime invocation in an image that is not the sandbox's would be a run
+             * whose transcript describes a container nobody chose. The one caller always
+             * passes `raw`, so the guard is a statement of what the option means rather
+             * than a branch anything takes.
+             */
+            exec.raw && exec.image ? exec.image : image,
+          ),
           ...(exec.raw ? argv : containerCommand(opts.runtime, argv)),
         ],
         { timeoutMs: exec.timeoutMs ?? opts.timeoutMs },
