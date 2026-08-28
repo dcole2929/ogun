@@ -3,6 +3,7 @@ import { z } from 'zod'
 import { cycleConfigSchema } from './cycle.ts'
 import { sourceSchema } from './source.ts'
 import { egressSchema } from './egress.ts'
+import { envSchema, type EnvConfig } from './env.ts'
 import { CONNECTED_APPS } from '../connections.ts'
 
 export const RUNTIMES = ['claude', 'codex'] as const
@@ -355,6 +356,119 @@ export const testsSchema = z.object({
 export type TestsConfig = z.infer<typeof testsSchema>
 
 /**
+ * Whether this repository's application actually comes up, and reaches what it depends on.
+ *
+ * ### Why the test suite is not this
+ *
+ * Not "the suite does not touch the database" — heirchive-api's very much does, which is
+ * why its image runs a whole Supabase stack for the suite to meet. The gap is narrower and
+ * it is about *the application as it is deployed*. That repo's jest setup exports
+ * `NODE_TEST=true` and its `index.ts` skips `app.listen()` when it sees it, so no test
+ * there ever starts the server; the suite runs the TypeScript source through swc, where
+ * `start` runs `dist/`. Nothing in 500 passing tests builds the thing the way it ships,
+ * starts it the way it ships, or asks it a question over a socket.
+ *
+ * So this is not the gate that catches what the suite would have caught anyway. The
+ * failure that produced this block — a migration requiring `MONITOR_PASSWORD`, killing the
+ * stack in the entrypoint — took the suite down with it. What a boot gate adds there is a
+ * sentence instead of a wall: "the application never answered 200 at /readyz" rather than
+ * three hundred tests failing about a schema.
+ *
+ * ### It probes; it does not health-check
+ *
+ * Ogun supplies the waiting and the evidence, not the definition of ready. Projects that
+ * take this seriously already have the endpoint — heirchive-api's `/readyz` calls GoTrue's
+ * own `/auth/v1/health` and deliberately avoids querying a table, so readiness does not
+ * depend on the schema being migrated. Ogun asking "does it return 200 yet" is exactly the
+ * right amount of opinion to have about somebody else's application.
+ */
+export const bootProbeSchema = z
+  .object({
+    /**
+     * Loopback only, and refused otherwise.
+     *
+     * The sandbox is `--network none`; the stack under test is in the container, on
+     * localhost, which is the only place a probe can honestly reach. A URL naming any other
+     * host is one of two things, and both are worse than a refusal: an address nothing can
+     * route to, or — on the `egress: open` path, or through the gateway — a gate that goes
+     * green because *production* is up. A boot gate that can pass without the patch's own
+     * stack starting is not a weaker gate, it is a false one.
+     */
+    url: z
+      .string()
+      .refine(
+        (value) => {
+          let parsed: URL
+          try {
+            parsed = new URL(value)
+          } catch {
+            return false
+          }
+          if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false
+          return ['127.0.0.1', 'localhost', '[::1]', '::1'].includes(parsed.hostname)
+        },
+        {
+          error:
+            'a boot probe is an http(s) URL on loopback — `http://127.0.0.1:9000/readyz`. ' +
+            'The sandbox has no network, so any other host is either unreachable or ' +
+            'something outside this run, and a gate that can pass without this patch\'s ' +
+            'stack starting is worse than no gate',
+        },
+      ),
+    /** The status that means ready. 200 unless a project says otherwise. */
+    status: z.number().int().min(100).max(599).default(200),
+    /**
+     * How long readiness is waited for. Builds happen inside `command` on most projects,
+     * so the default is generous; the job's own deadline still bounds it.
+     */
+    timeoutMs: z.number().int().min(1_000).max(600_000).default(60_000),
+  })
+  .strict()
+
+export const bootSchema = z
+  .object({
+    /**
+     * Starts the application in the foreground. Run through a shell, like `tests.command`,
+     * and backgrounded by the gate — so `pnpm build && node dist/index.js` is the shape,
+     * and a command that daemonises itself and exits will be read as a crash.
+     */
+    command: z.string().min(1).optional(),
+    probe: bootProbeSchema.optional(),
+  })
+  .strict()
+  .check((ctx) => {
+    const boot = ctx.value
+    /**
+     * Both halves or neither. A `command:` with no `probe:` starts something and asks
+     * nothing, which is a gate that cannot fail; a `probe:` with no `command:` interrogates
+     * whatever the entrypoint happened to leave running, which is a gate that is not about
+     * the patch. Half of this block is always a mistake, and the half that is missing is
+     * always the half that was doing the work.
+     */
+    if (boot.command && !boot.probe) {
+      ctx.issues.push({
+        code: 'custom',
+        input: boot,
+        path: ['probe'],
+        message:
+          '`boot.command` needs a `boot.probe` to say when it worked. Starting the ' +
+          'application and never asking whether it came up is a gate that cannot fail',
+      })
+    }
+    if (boot.probe && !boot.command) {
+      ctx.issues.push({
+        code: 'custom',
+        input: boot,
+        path: ['command'],
+        message:
+          '`boot.probe` needs a `boot.command` to start what it probes. On its own it ' +
+          'grades whatever the image\'s entrypoint left running, which is not this patch',
+      })
+    }
+  })
+export type BootConfig = z.infer<typeof bootSchema>
+
+/**
  * What a project permits, as one `policies:` block in one file — and read by two
  * different processes, out of two different copies of that file.
  *
@@ -577,9 +691,69 @@ export const projectConfigSchema = z.object({
    */
   sources: z.record(z.string(), sourceSchema).default({}),
   tests: testsSchema.prefault({}),
+  /** Whether the application comes up and reaches what it needs (`bootSchema`). */
+  boot: bootSchema.prefault({}),
+  /**
+   * What the project's own stack needs in its environment before anything of the
+   * project's runs (`env.ts`). A peer of `tests:` for the same reason `tests:` is
+   * project-level: one repository has one way to bring itself up, and a per-worker
+   * environment is a knob whose only use is letting one worker's gate meet a database
+   * another worker's gate never got.
+   */
+  env: envSchema.prefault({}),
   policies: policiesSchema.prefault({}),
 })
 export type ProjectConfig = z.infer<typeof projectConfigSchema>
+
+/**
+ * The `boot:` block out of a `config.yaml`, on the same tolerant terms as its siblings.
+ *
+ * `undefined` for a file that does not parse *and* for a file that declares no `boot:`,
+ * because the two mean the same thing to the only caller: there is no boot gate to run.
+ * That is the safe direction here and the opposite of `readEnv`'s. A gate that cannot be
+ * established is a gate that does not run, which costs a check; an *environment* that
+ * cannot be established is a stack that starts wrong, which costs the run and lies about
+ * why.
+ */
+export function readBoot(yamlText: string): BootConfig | undefined {
+  let raw: unknown
+  try {
+    raw = parseYaml(yamlText)
+  } catch {
+    return undefined
+  }
+  const parsed = z.object({ boot: bootSchema.prefault({}) }).safeParse(raw)
+  if (!parsed.success) return undefined
+  return parsed.data.boot.command ? parsed.data.boot : undefined
+}
+
+/**
+ * The `env:` block out of a `config.yaml`, from text, on the same terms as
+ * `readTestCommand` and `readPolicies` and for the same reason: the runner reads the blob
+ * at the pinned base, which may have been written by a different build of Ogun than the
+ * one reading it, and a `workers:` block this build cannot parse must not decide whether
+ * the project's database gets a password.
+ *
+ * The asymmetry with its siblings is deliberate and runs the other way. They return
+ * `undefined` for "could not be established" and every caller takes the strict side, which
+ * for a *gate* means refusing. `env:` is not a gate — it is a prerequisite — so the two
+ * failures are told apart: `undefined` means the file did not parse at all, and the caller
+ * refuses the run; an empty object means the file parsed and declared nothing, which is
+ * the overwhelmingly common case and must start normally.
+ *
+ * A malformed `env:` block inside an otherwise valid file returns `undefined` rather than
+ * skipping the bad entry. Half an environment is the one outcome with no honest reading.
+ */
+export function readEnv(yamlText: string): EnvConfig | undefined {
+  let raw: unknown
+  try {
+    raw = parseYaml(yamlText)
+  } catch {
+    return undefined
+  }
+  const parsed = z.object({ env: envSchema.prefault({}) }).safeParse(raw)
+  return parsed.success ? parsed.data.env : undefined
+}
 
 /**
  * The test command out of a `config.yaml`, from text, without demanding the rest of the

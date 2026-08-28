@@ -1,6 +1,6 @@
 import { existsSync } from 'node:fs'
 import type { GateResult, Lens, RunEvent, VerifyConfig } from '@ogun/core'
-import { findingsDocumentSchema, parseFingerprint, PROJECT_CONFIG_PATH } from '@ogun/core'
+import { findingsDocumentSchema, parseFingerprint, PROJECT_CONFIG_PATH, PROJECT_DOCKERFILE_PATH, type BootConfig } from '@ogun/core'
 import {
   PROJECT_IMAGE_LENS,
   runProjectImageLens,
@@ -39,6 +39,12 @@ export type VerifyInput = {
    * report card, and it is one line of shell away in a workspace mounted read-write.
    */
   testCommand?: string
+  /**
+   * The project's `boot:` block, from the same pinned blob as `testCommand` and withheld
+   * for the same reason: a gate read out of the tree is a gate the agent just had write
+   * access to. Absent means the project declares no boot gate, which is most of them.
+   */
+  boot?: BootConfig
   /**
    * What the host read off the workspace's git history after extraction, for the lenses
    * that grade the *patch* rather than the tree (§4.10).
@@ -196,6 +202,12 @@ export async function runVerifyGate(input: VerifyInput): Promise<VerifyOutcome> 
       if (!checked.gate.passed) return outcome()
       continue
     }
+    if (lens.name === BOOT_LENS && !lens.command) {
+      const result = await bootCheck(input)
+      results.push(result)
+      if (!result.passed) return outcome()
+      continue
+    }
     if (PATCH_LENSES.has(lens.name) && !lens.command) {
       const result = patchLens(lens.name, input)
       results.push(result)
@@ -305,6 +317,7 @@ async function reviewCheck(
 
 /** The one lens whose command comes from the project rather than from the worker. */
 export const TESTS_LENS = 'tests'
+export const BOOT_LENS = 'boot'
 
 /**
  * Does any commit message in this patch close somebody's issue on merge (ADR-0009)?
@@ -379,6 +392,25 @@ function resolveLenses(input: VerifyInput): Lens[] {
           input.bootstrap
             ? { name: PROJECT_IMAGE_LENS, method: 'tool' }
             : { name: TESTS_LENS, method: 'tool' },
+          /**
+           * After the suite, and only when the project declared one.
+           *
+           * After, because the ordering rule on this list is cheapest-decisive-first and a
+           * boot gate is neither: it builds the application and then waits on a socket,
+           * where the suite has usually already found the same breakage for less. A patch
+           * whose tests fail does not need to be told its server also would not have
+           * started.
+           *
+           * Conditional where the tests lens is mandatory, and the asymmetry is honest.
+           * Every modifier is held to "does this break the repository" — a project that
+           * declines it declines modifiers entirely (§4.3). Not every application has a
+           * readiness endpoint to point at, and a mandatory gate most projects cannot
+           * satisfy is one everybody learns to route around. It is opt-in per project, in
+           * the repository, at the pinned commit; a worker cannot add or drop it.
+           */
+          ...(input.boot?.command && input.boot.probe
+            ? [{ name: BOOT_LENS, method: 'tool' as const }]
+            : []),
         ]
       : []
   if (config?.lensProfile === 'none') return [...mandatory, ...config.expectations]
@@ -512,6 +544,146 @@ async function testsCheck(
       detail: `\`${input.testCommand}\` passed in ${elapsed}s`,
     },
     tests: { ran: true, passed: true, durationMs: Date.now() - startedAt },
+  }
+}
+
+/**
+ * Shell-single-quote a value that came out of a repository file.
+ *
+ * The URL has already been through `new URL()` and restricted to loopback, so this is not
+ * where the safety lives — but it is a config-file string being pasted into a shell
+ * command, and the one place that is *obviously* fine is the place nobody re-checks after
+ * the schema changes.
+ */
+const shellQuote = (value: string): string => `'${value.replaceAll("'", `'\\''`)}'`
+
+/**
+ * Start the application, wait for its own readiness endpoint, and report what answered.
+ *
+ * ### Why this is one shell command rather than two execs
+ *
+ * The obvious shape is `exec(start)` without awaiting, then `exec(probe)` in a loop. It
+ * is worse in every way that matters here. The server has to outlive the exec that
+ * started it, so its lifetime stops being anything this function controls; the probe runs
+ * in a second shell that cannot see whether the first one's child is still alive, so a
+ * process that crashed on line one is indistinguishable from one that is still starting,
+ * and the gate spends its whole timeout finding that out. Composed into one script, `$!`
+ * is in scope: a crash is noticed the same second it happens, and the log of the thing
+ * that crashed is right there to quote.
+ *
+ * ### curl is required, and saying so beats guessing
+ *
+ * `wget` could stand in, but the two disagree about how to surface a status code, and
+ * busybox's `wget` disagrees with GNU's — three shells to write and one that ever gets
+ * exercised. A project that declares a boot gate is a project whose image `containerise-a-
+ * project` wrote, so the requirement is one line in a Dockerfile. Missing, it fails
+ * loudly rather than falling back to something that cannot tell 200 from 503, which is the
+ * distinction the gate exists for.
+ */
+async function bootCheck(input: VerifyInput): Promise<GateResult> {
+  const boot = input.boot
+  /** Unreachable: `resolveLenses` only adds this lens when both halves are present. */
+  if (!boot?.command || !boot.probe) {
+    return {
+      name: BOOT_LENS,
+      method: 'tool',
+      passed: false,
+      detail: 'no boot command and probe were pinned, so nothing here could start the application',
+    }
+  }
+
+  /**
+   * The probe's own patience, bounded by what is left of the job. The smaller wins and the
+   * message says which — "waited 60s" and "had 9s left" send a person to different places.
+   */
+  const remaining = input.deadline - Date.now()
+  if (remaining <= 0) {
+    return {
+      name: BOOT_LENS,
+      method: 'tool',
+      passed: false,
+      detail:
+        "the job's timeout was already spent when the boot gate began, so the application " +
+        'was never started — the patch is unproved rather than broken',
+    }
+  }
+  const budgetMs = Math.min(boot.probe.timeoutMs, remaining)
+  const attempts = Math.max(1, Math.floor(budgetMs / 1_000))
+  const url = shellQuote(boot.probe.url)
+  const expected = String(boot.probe.status)
+
+  /**
+   * `trap` rather than a `kill` before each `exit`: the shell is also killed from outside
+   * when the gate's own timeout fires, and a server left holding the port would meet the
+   * next exec in this container.
+   */
+  const script = [
+    'if ! command -v curl >/dev/null 2>&1; then echo OGUN_BOOT_NO_CURL; exit 1; fi',
+    `( ${boot.command} ) >/tmp/ogun-boot.log 2>&1 &`,
+    '__pid=$!',
+    'trap "kill $__pid 2>/dev/null" EXIT INT TERM',
+    '__code=000',
+    `__i=0; while [ $__i -lt ${attempts} ]; do`,
+    `  __code=$(curl -s -o /tmp/ogun-boot-body -w '%{http_code}' --max-time 5 ${url} 2>/dev/null || echo 000)`,
+    `  [ "$__code" = "${expected}" ] && { echo OGUN_BOOT_OK; exit 0; }`,
+    '  kill -0 $__pid 2>/dev/null || { echo "OGUN_BOOT_EXITED code=$__code"; break; }',
+    '  __i=$((__i+1)); sleep 1',
+    'done',
+    'echo "OGUN_BOOT_FAIL code=$__code"',
+    'echo "--- last response body ---"; head -c 400 /tmp/ogun-boot-body 2>/dev/null; echo',
+    'echo "--- output of the boot command ---"; tail -n 40 /tmp/ogun-boot.log 2>/dev/null',
+    'exit 1',
+  ].join('\n')
+
+  const startedAt = Date.now()
+  const handle = input.sandbox.exec(['sh', '-c', script], { timeoutMs: remaining, raw: true })
+  const tail: string[] = []
+  for await (const line of handle.lines) pushTail(tail, line)
+  const { code, stderr, timedOut } = await handle.done.catch((err: Error) => ({
+    code: 1,
+    stderr: err.message,
+    timedOut: false,
+  }))
+  const elapsed = Math.round((Date.now() - startedAt) / 1000)
+  const where = `\`${boot.probe.url}\``
+
+  const fail = (detail: string): GateResult => ({
+    name: BOOT_LENS,
+    method: 'tool',
+    passed: false,
+    detail,
+  })
+
+  if (tail.some((line) => line.includes('OGUN_BOOT_NO_CURL'))) {
+    return fail(
+      'this project declares a `boot:` gate and its image has no `curl`, which is what the ' +
+        'gate uses to tell a ready application from an unready one. Add it to ' +
+        `${PROJECT_DOCKERFILE_PATH}, or remove \`boot:\` from ${PROJECT_CONFIG_PATH}`,
+    )
+  }
+  if (timedOut) {
+    return fail(
+      `the application never answered ${expected} at ${where} in the ${elapsed}s that ` +
+        "remained of the job's timeout" + outputOf(tail, stderr),
+    )
+  }
+  if (code !== 0) {
+    const exited = tail.some((line) => line.includes('OGUN_BOOT_EXITED'))
+    return fail(
+      (exited
+        ? `\`${boot.command}\` exited before ${where} answered ${expected}`
+        : `${where} did not answer ${expected} within ${Math.round(budgetMs / 1_000)}s`) +
+        `, after ${elapsed}s` +
+        outputOf(tail, stderr),
+    )
+  }
+  return {
+    name: BOOT_LENS,
+    method: 'tool',
+    passed: true,
+    // The seconds are the point, the same way they are for the suite: a boot gate that
+    // passes in under a second is usually one answering from something already running.
+    detail: `the application answered ${expected} at ${where} after ${elapsed}s`,
   }
 }
 

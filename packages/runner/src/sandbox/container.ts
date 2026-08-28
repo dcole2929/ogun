@@ -561,6 +561,24 @@ export function buildRunArgs(opts: ContainerOptions, image: string): string[] {
     `${join(opts.hostWorkspace, '.ogun-out')}:${GUEST_WORKSPACE}/.ogun-out:rw`,
   ]
 
+  /**
+   * The project's own environment (`env:` in `.ogun/config.yaml`), resolved on the host by
+   * `resolveEnv` — literals, generated throwaways, and values out of the 0600 store.
+   *
+   * Pushed **first**, and that is the whole of the containment argument. `docker run` takes
+   * the last `--env` for a name, so whichever block is written second wins; everything
+   * below this line is Ogun's own — the egress socket, the proxy variables four TLS stacks
+   * trust, the connection placeholders, `OGUN_PERMISSIONS`. Written after the project's,
+   * a collision costs the project its value. Written before it, a project could hand
+   * itself a different `NODE_EXTRA_CA_CERTS` by typing four lines into a file a modifier
+   * is allowed to edit.
+   *
+   * `env.ts` refuses `OGUN_*` at parse time so that the common accident gets a sentence
+   * instead of silence. This ordering is why that refusal is a message and not the
+   * mechanism.
+   */
+  for (const [k, v] of Object.entries(opts.env ?? {})) args.push('--env', `${k}=${v}`)
+
   args.push(...egressArgs(opts))
 
   /**
@@ -652,7 +670,6 @@ export function buildRunArgs(opts: ContainerOptions, image: string): string[] {
   args.push('--volume', `ogun-cache-${opts.runtime}:/home/dev/.cache`)
 
   args.push('--env', `OGUN_PERMISSIONS=${opts.permissions}`)
-  for (const [k, v] of Object.entries(opts.env ?? {})) args.push('--env', `${k}=${v}`)
 
   args.push(image)
   return args

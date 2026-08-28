@@ -264,6 +264,52 @@ export async function readProjectSecret(
 }
 
 /**
+ * A secret by whatever name the project calls it, for `env: { secret: <name> }`.
+ *
+ * The sibling of `readProjectSecret`, and the differences are the reason it is a separate
+ * function rather than a widened parameter.
+ *
+ * It takes a `string`, not a `SecretName`. The closed set exists so that a name Ogun
+ * *polls under*, misspelled, is refused rather than stored to be silently unused — a rule
+ * about integration credentials, which `readProjectSecret` reads. A name here is legitimate
+ * exactly because the project's own `.ogun/config.yaml` asked for it by that spelling, so
+ * there is nothing for a closed set to protect: a typo is caught by the run refusing with
+ * the name printed, which is the same feedback a moment sooner.
+ *
+ * It never consults `oauth`. A grant is an access token with scopes and an expiry that the
+ * connect flow maintains; handing one to a project's stack as an environment variable
+ * would put a live, refreshable credential inside a sandbox, which ADR-0010 exists to
+ * prevent. `env:` reaches only the store a person typed into.
+ *
+ * `hasOwnProperty` rather than `in` or a bare index, because the name comes from a
+ * repository file. `secrets.<project>.constructor` is a plain lookup away from returning a
+ * function, and `ogun secret rm toString` once reported removing a secret that never
+ * existed for exactly this reason.
+ */
+export async function readNamedSecret(
+  projectSlug: string,
+  name: string,
+  path = localConfigPath(),
+): Promise<Secret | undefined> {
+  const store = await readStore(path)
+  /**
+   * `missing` is `undefined` — no store, no secret, and the caller's refusal ("nothing is
+   * stored under that name") is exactly right. `unreadable` throws, because the same
+   * refusal would be a lie: the value may well be sitting in the file, and sending someone
+   * to `ogun secret set` over a permissions error is how an afternoon disappears.
+   */
+  if (store.state === 'missing') return undefined
+  if (store.state === 'unreadable') throw new LocalConfigError(store.reason)
+
+  const forProject = store.config.secrets[projectSlug]
+  if (!forProject || !Object.prototype.hasOwnProperty.call(forProject, name)) return undefined
+
+  const stored = forProject[name]
+  if (typeof stored !== 'string' || stored.trim() === '') return undefined
+  return sealSecret(stored)
+}
+
+/**
  * Which secrets this machine holds, as names and states — never values.
  *
  * A list endpoint is where secrets leak, so the answer to "should anything list them" is
