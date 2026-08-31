@@ -75,18 +75,22 @@ const secretsIn = async (config: string): Promise<Record<string, Record<string, 
 
 // ── a name that is not an integration ─────────────────────────────────────
 
-test('a free-form name is stored, and the command says nothing reads it', async (t) => {
+test('a free-form name is stored, and the command names who could read it', async (t) => {
   /**
-   * The property: `ogun secret set stripe-webhook` **works**, and prints a line saying
-   * that nothing in this build reads that name.
+   * The property: `ogun secret set stripe-webhook` **works**, and prints the readers.
    *
    * Both halves matter and they pull against each other. The store has to accept arbitrary
    * names or it is not a store — that is the whole reversal. But `SECRET_NAMES` was a
    * closed set for a reason that does not go away: *"a secret nothing reads looks exactly
    * like one that works, right up until the night it mattered."* A free-form store cannot
    * refuse, so the fact moves from a refusal to a sentence at the one moment somebody is
-   * looking at the screen — and it names the set Ogun *does* poll under, which for a set
-   * of one is also the did-you-mean.
+   * looking at the screen.
+   *
+   * It names the readers rather than asserting there are none. `env: { secret: <name> }`
+   * reads whatever a project's config asks for, and this command has never seen that file
+   * — the old wording, *"nothing in this build reads a secret named …"*, was a confident
+   * claim about a repository on some branch somewhere. Listing both readers keeps the
+   * did-you-mean (the polled set is right above the name you typed) without the claim.
    */
   const config = await machineKnowing(t, { ogun: '/does/not/matter' })
 
@@ -96,8 +100,11 @@ test('a free-form name is stored, and the command says nothing reads it', async 
   assert.equal((await secretsIn(config)).ogun!['stripe-webhook'], HMAC)
   assert.equal(((await stat(config)).mode & 0o777).toString(8), '600')
 
-  assert.match(set.stdout, /Nothing in this build reads a secret named stripe-webhook/)
-  assert.match(set.stdout, /linear/)
+  assert.match(set.stdout, /Check that stripe-webhook is one of them/)
+  assert.match(set.stdout, /a poll Ogun runs itself — linear/)
+  assert.match(set.stdout, /env: \{ secret: stripe-webhook \}.* in a project's \.ogun\/config\.yaml/)
+  // And no claim about a file this command has not read.
+  assert.ok(!/[Nn]othing in this build reads/.test(set.stdout), set.stdout)
   // The value itself never comes back — only a count.
   assert.ok(!`${set.stdout}${set.stderr}`.includes(HMAC), set.stdout)
   assert.match(set.stdout, new RegExp(`${HMAC.length} characters`))
@@ -118,7 +125,7 @@ test('a name Ogun does poll under draws no such warning', async (t) => {
 
   assert.equal(set.code, 0, set.stderr)
   assert.equal((await secretsIn(config)).ogun!.linear, KEY)
-  assert.ok(!/Nothing in this build reads/.test(set.stdout), set.stdout)
+  assert.ok(!/Check that .* is one of them/.test(set.stdout), set.stdout)
 })
 
 test('a name is whatever the project calls it, including SCREAMING_SNAKE_CASE', async (t) => {
@@ -141,7 +148,7 @@ test('a name is whatever the project calls it, including SCREAMING_SNAKE_CASE', 
     assert.equal(set.code, 0, `${name}: ${set.stderr}`)
     assert.equal((await secretsIn(config)).ogun![name], HMAC, name)
     // Case is kept exactly: `DATABASE_URL` and `database_url` are two names.
-    assert.match(set.stdout, new RegExp(`reads a secret named ${name}`))
+    assert.match(set.stdout, new RegExp(`Check that ${name} is one of them`))
   }
 })
 
@@ -168,7 +175,7 @@ test('a name that is a pasted key is stored, and the line that says so is the wa
 
   assert.equal(set.code, 0, set.stderr)
   assert.equal((await secretsIn(config)).ogun![KEY], HMAC)
-  assert.match(set.stdout, /Nothing in this build reads a secret named lin_api_/)
+  assert.match(set.stdout, /Check that lin_api_[^ ]* is one of them/)
   // The VALUE is still never echoed, whatever the name is.
   assert.ok(!`${set.stdout}${set.stderr}`.includes(HMAC), set.stdout)
 })
@@ -572,7 +579,7 @@ test('the listing says what reads each value, and never what it is', async (t) =
 
   const listed = await ogun(['secret', 'list'], config)
   assert.equal(listed.code, 0, listed.stderr)
-  assert.match(listed.stdout, /stripe-webhook\s+set\s+nothing in this build/)
+  assert.match(listed.stdout, /stripe-webhook\s+set\s+a project's env: \{ secret: … \}/)
   assert.match(listed.stdout, /ogun\s+linear\s+set\s+the linear poll/)
   assert.match(listed.stdout, /other\s+linear\s+set\s+nothing — the linear grant wins/)
   assert.ok(!listed.stdout.includes(KEY), listed.stdout)

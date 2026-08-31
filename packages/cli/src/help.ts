@@ -653,10 +653,12 @@ const topics: Record<string, Topic> = {
         'overwritten is gone: a rotation window belongs to whoever issued the value, and ' +
         'two live values in one store means that when something 401s nothing can say which ' +
         'one it used. The confirmation still says whether it stored or REPLACED.',
-      'If nothing in this build reads the name, it says so — after storing it, not instead ' +
-        'of storing it. Ogun polls under: linear. Anything else is stored for whatever ' +
-        'reads it, and the line is there so "nothing reads this" is something you are told ' +
-        'now rather than something you infer from a failure later.',
+      'A name outside the set Ogun polls under prints the two things that read a stored ' +
+        'secret — after storing it, not instead of storing it. Ogun polls under: linear; a ' +
+        'project can also name one in `env: { secret: <name> }` in its .ogun/config.yaml. ' +
+        'The line is there so a name that matches neither is something you notice now, ' +
+        'with the polled set printed right above what you typed, rather than something you ' +
+        'infer from a failure later.',
       'A name that IS an integration is refused when that project already has a working ' +
         'OAuth grant, because a grant wins over a key and the value would sit in the file ' +
         'being read by nothing. `ogun disconnect <name>` first. This is the same refusal ' +
@@ -696,11 +698,12 @@ const topics: Record<string, Topic> = {
     usage: ['ogun secret list [--project <slug>]'],
     notes: [
       'The READ BY column is the point. `the linear poll` is a value something in this ' +
-        'build actually authenticates with; `nothing in this build` is a value stored under ' +
-        'a name nothing reads — which is fine for a secret some other tool consumes, and is ' +
-        'a typo the rest of the time; `nothing — the linear grant wins` is a key sitting ' +
-        'behind an OAuth grant, in red, because rotating it would change something nothing ' +
-        'reads. `ogun connect list` says the same about the same row.',
+        'build authenticates with; `a project\'s env: { secret: … }` is a name only a ' +
+        'repository can claim — whether one does is in its .ogun/config.yaml, which this ' +
+        'command does not read, and a typo lands here too; `nothing — the linear grant ' +
+        'wins` is a key sitting behind an OAuth grant, in red, because rotating it would ' +
+        'change something nothing reads. `ogun connect list` says the same about the same ' +
+        'row.',
       'It lists the whole machine unless --project narrows it, for the reason `connect ' +
         'list` does: a listing that answered for wherever the shell was standing would ' +
         'report an empty store on a machine holding four projects\' credentials.',
