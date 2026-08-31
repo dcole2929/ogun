@@ -5,20 +5,18 @@ import {
   envSchema,
   generate,
   projectConfigSchema,
-  readBoot,
   readEnv,
   resolveEnv,
 } from '../src/config/index.ts'
 
 /**
- * `env:` and `boot:` exist because of one afternoon: a migration requiring
- * `MONITOR_PASSWORD` landed in heirchive-api, the project image had no such variable, and
- * every job on that project began dying in the entrypoint with a Postgres exception — the
- * suite never ran, so nothing said "the stack did not start".
+ * `env:` exists because of one afternoon: a migration requiring `MONITOR_PASSWORD` landed
+ * in heirchive-api, the project image was a snapshot pinned before it and had no such
+ * variable, and every job on that project began dying in the entrypoint with a Postgres
+ * exception before its first command ran.
  *
- * These tests are shaped around the two failure modes that produced that, not around the
- * happy path: a declaration that is accepted and quietly does nothing, and a gate that can
- * go green without the thing under test having started.
+ * These tests are shaped around the failure mode that produced that, not around the happy
+ * path: a declaration that is accepted and then quietly does nothing.
  */
 
 const config = (yaml: string) =>
@@ -127,26 +125,4 @@ test('resolveEnv builds its result without a prototype to inherit from', async (
   const resolved = await resolveEnv(config('env:\n  A: 1\n').env, noSecrets)
   if (resolved.state !== 'resolved') return assert.fail('expected resolved')
   assert.equal(Object.getPrototypeOf(resolved.env), null)
-})
-
-test('boot: needs both halves, because either alone is a gate that cannot fail', () => {
-  const probe = '  probe:\n    url: http://127.0.0.1:9000/readyz\n'
-  assert.equal(readBoot(`boot:\n  command: node dist/index.js\n${probe}`)?.probe?.status, 200)
-  assert.throws(() => config('boot:\n  command: node dist/index.js\n'))
-  assert.throws(() => config(`boot:\n${probe}`))
-})
-
-test('a boot probe must be loopback, so the gate cannot pass because production is up', () => {
-  const withUrl = (url: string) => `boot:\n  command: x\n  probe:\n    url: ${url}\n`
-  for (const url of ['http://127.0.0.1:9000/readyz', 'http://localhost:9000/x', 'https://[::1]/x']) {
-    assert.doesNotThrow(() => config(withUrl(url)), url)
-  }
-  for (const url of ['https://prod.example.com/health', 'http://10.0.0.5/x', 'file:///etc/passwd', 'notaurl']) {
-    assert.throws(() => config(withUrl(url)), url)
-  }
-})
-
-test('readBoot answers undefined for a project that declares no boot gate', () => {
-  assert.equal(readBoot('tests:\n  command: pnpm test\n'), undefined)
-  assert.equal(readBoot('\tnot: [valid'), undefined)
 })

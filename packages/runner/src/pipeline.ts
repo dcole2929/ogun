@@ -10,7 +10,6 @@ import {
   PROJECT_CONFIG_PATH,
   PROJECT_DOCKERFILE_PATH,
   readPolicies,
-  readBoot,
   readEnv,
   readNamedSecret,
   readTestCommand,
@@ -407,13 +406,6 @@ export async function executeJob(
      * and every observer and reviewer on a repository with no `.ogun/config.yaml` at all
      * has to keep working.
      */
-    /**
-     * The project's boot gate, if it declared one. `undefined` covers both "no `boot:`"
-     * and "the file did not parse", because a gate that cannot be read is one that does
-     * not run — see `readBoot` for why that direction is the safe one here and the wrong
-     * one for `env:` three lines down.
-     */
-    const boot = pinned === undefined ? undefined : readBoot(pinned)
     const declaredEnv = pinned === undefined ? {} : readEnv(pinned)
     if (declaredEnv === undefined) {
       return await refuse(
@@ -904,13 +896,6 @@ export async function executeJob(
         lineCountOf: (path) => countLines(workspace.path, path),
         sandbox,
         ...(testCommand ? { testCommand } : {}),
-        /**
-         * The project's boot gate, from the same pinned blob as the test command. Absent
-         * for the projects that declare none, which is most of them, and absent for a
-         * bootstrap run: the image that gate would start the application in is the thing
-         * that run is still writing.
-         */
-        ...(boot && !job.bootstrap ? { boot } : {}),
         ...(change?.facts ? { patch: change.facts } : {}),
         deadline,
         round,
