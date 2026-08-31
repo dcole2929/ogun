@@ -3,6 +3,7 @@ import { z } from 'zod'
 import { cycleConfigSchema } from './cycle.ts'
 import { sourceSchema } from './source.ts'
 import { egressSchema } from './egress.ts'
+import { envSchema, type EnvConfig } from './env.ts'
 import { CONNECTED_APPS } from '../connections.ts'
 
 export const RUNTIMES = ['claude', 'codex'] as const
@@ -577,9 +578,45 @@ export const projectConfigSchema = z.object({
    */
   sources: z.record(z.string(), sourceSchema).default({}),
   tests: testsSchema.prefault({}),
+  /**
+   * What the project's own stack needs in its environment before anything of the
+   * project's runs (`env.ts`). A peer of `tests:` for the same reason `tests:` is
+   * project-level: one repository has one way to bring itself up, and a per-worker
+   * environment is a knob whose only use is letting one worker's gate meet a database
+   * another worker's gate never got.
+   */
+  env: envSchema.prefault({}),
   policies: policiesSchema.prefault({}),
 })
 export type ProjectConfig = z.infer<typeof projectConfigSchema>
+
+/**
+ * The `env:` block out of a `config.yaml`, from text, on the same terms as
+ * `readTestCommand` and `readPolicies` and for the same reason: the runner reads the blob
+ * at the pinned base, which may have been written by a different build of Ogun than the
+ * one reading it, and a `workers:` block this build cannot parse must not decide whether
+ * the project's database gets a password.
+ *
+ * The asymmetry with its siblings is deliberate and runs the other way. They return
+ * `undefined` for "could not be established" and every caller takes the strict side, which
+ * for a *gate* means refusing. `env:` is not a gate — it is a prerequisite — so the two
+ * failures are told apart: `undefined` means the file did not parse at all, and the caller
+ * refuses the run; an empty object means the file parsed and declared nothing, which is
+ * the overwhelmingly common case and must start normally.
+ *
+ * A malformed `env:` block inside an otherwise valid file returns `undefined` rather than
+ * skipping the bad entry. Half an environment is the one outcome with no honest reading.
+ */
+export function readEnv(yamlText: string): EnvConfig | undefined {
+  let raw: unknown
+  try {
+    raw = parseYaml(yamlText)
+  } catch {
+    return undefined
+  }
+  const parsed = z.object({ env: envSchema.prefault({}) }).safeParse(raw)
+  return parsed.success ? parsed.data.env : undefined
+}
 
 /**
  * The test command out of a `config.yaml`, from text, without demanding the rest of the

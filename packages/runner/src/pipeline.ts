@@ -10,7 +10,11 @@ import {
   PROJECT_CONFIG_PATH,
   PROJECT_DOCKERFILE_PATH,
   readPolicies,
+  readEnv,
+  readNamedSecret,
   readTestCommand,
+  resolveEnv,
+  LocalConfigError,
   verifySchema,
   writeSecretFile,
   type ClaimedJob,
@@ -386,6 +390,62 @@ export async function executeJob(
     }
 
     /**
+     * The environment this project's own stack needs, resolved before the container that
+     * will hold it exists (`env.ts`).
+     *
+     * Read from the pinned blob for the same reason as everything else on this path, but
+     * the consequence is sharper here than for the gates around it. This is the *only*
+     * declaration a modifier can make that a later run of that modifier's own patch
+     * depends on — a migration that needs `MONITOR_PASSWORD` and the line declaring
+     * `MONITOR_PASSWORD` arrive in the same commit, and both take effect on the run
+     * *after* the one that wrote them. That is the honest behaviour and worth knowing:
+     * the container is created once, before the agent starts, from the base commit.
+     *
+     * `undefined` means the pinned file exists and its `env:` block does not parse, which
+     * refuses. An absent file is `{}` and starts normally — most projects declare none,
+     * and every observer and reviewer on a repository with no `.ogun/config.yaml` at all
+     * has to keep working.
+     */
+    const declaredEnv = pinned === undefined ? {} : readEnv(pinned)
+    if (declaredEnv === undefined) {
+      return await refuse(
+        `the \`env:\` block in ${PROJECT_CONFIG_PATH} at ${workspace.sha.slice(0, 12)} could ` +
+          'not be read, so the environment this project says it needs cannot be established. ' +
+          'A stack started with half an environment fails later and blames something else.',
+      )
+    }
+    /**
+     * `expose()` at the wire, and this is the wire: the values are about to become
+     * `docker run --env` arguments. One call site, as `Secret` intends.
+     *
+     * `LocalConfigError` is caught rather than thrown through, so an unreadable
+     * `~/.ogun/config.json` refuses this run with its own reason instead of killing the
+     * loop with a stack trace.
+     */
+    const resolvedEnv = await resolveEnv(declaredEnv, async (name) =>
+      (await readNamedSecret(job.projectSlug, name))?.expose(),
+    ).catch((err: Error) =>
+      err instanceof LocalConfigError
+        ? ({ state: 'refused', reason: err.message } as const)
+        : ({ state: 'refused', reason: `the secret store could not be read: ${err.message}` } as const),
+    )
+    if (resolvedEnv.state === 'refused') return await refuse(resolvedEnv.reason)
+    /**
+     * Names only, never values — including for the generated ones, whose whole point is
+     * that nothing needs to know them. This line is how a person reading the timeline sees
+     * that a variable was set at all, which is the question they will actually have when a
+     * stack comes up empty.
+     */
+    if (Object.keys(resolvedEnv.env).length > 0) {
+      console.log(
+        `[runner] env from ${PROJECT_CONFIG_PATH}: ` +
+          Object.entries(resolvedEnv.sources)
+            .map(([name, source]) => `${name} (${source})`)
+            .join(', '),
+      )
+    }
+
+    /**
      * Whether the project already had an image at the commit this workspace was pinned to.
      *
      * Only a bootstrap run asks, and only so the gate can say which of two runs this was:
@@ -483,6 +543,12 @@ export async function executeJob(
       // has already refused the run if this is `false` and the sandbox needed it `true`,
       // so the throw inside `createSandbox` is the backstop rather than the message.
       allowSandboxDowngrade: downgrade.allow,
+      /**
+       * The project's own `env:`, already resolved. Pushed into the container ahead of
+       * every variable Ogun sets — see `containerArgs`, where the ordering is the
+       * containment and the `OGUN_*` refusal in `env.ts` is only the message.
+       */
+      ...(Object.keys(resolvedEnv.env).length === 0 ? {} : { env: resolvedEnv.env }),
       // Absent is not "unrestricted" — it resolves to the default allowlist for the
       // runtime, inside the sandbox (§4.6).
       ...(job.egress === undefined ? {} : { egress: job.egress }),
