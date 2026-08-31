@@ -399,10 +399,11 @@ export async function listProjectSecrets(
  * The protection `SECRET_NAMES` gave is not abandoned, it is applied where it is true.
  * `connect` still validates the integration against the closed set, because there the
  * failure is exact: a name Ogun polls under, misspelled, is a live credential nothing ever
- * reads. `secret set` cannot borrow that argument, so what survives without a closed set
- * is a line at the moment of storing that says in as many words when nothing in this build
- * reads the name just written. See `requireSecretName` in the CLI, which also carries why
- * the *shape* rule that briefly sat beside it is gone.
+ * reads. `secret set` cannot borrow that argument — `env: { secret: <name> }` reads
+ * whatever a project's config asks for, and no closed set could know those names. What
+ * survives is a line at the moment of storing that prints both readers and lets the person
+ * match; see `requireSecretName` in the CLI, which also carries why the *shape* rule that
+ * briefly sat beside it is gone.
  *
  * ### A name is a key in a plain object, so it can be `constructor`
  *

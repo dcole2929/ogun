@@ -5,6 +5,7 @@ import {
   listProjectSecrets,
   loadLocalConfig,
   localConfigPath,
+  PROJECT_CONFIG_PATH,
   readOAuthApp,
   SECRET_NAMES,
   setProjectSecret,
@@ -122,30 +123,40 @@ export async function secretSet(args: string[]): Promise<void> {
   })
 
   /**
-   * What replaces the closed set: say so, now, when nothing reads it.
+   * What replaces the closed set: name the readers, and let the person match.
    *
-   * `SECRET_NAMES` used to refuse this outright, and the sentence it was refusing for is
-   * still true — *"a secret nothing reads looks exactly like one that works, right up
-   * until the night it mattered"*. A free-form store cannot refuse, so it moves the fact
-   * from a refusal to a statement at the one moment somebody is looking: `linaer`, typed
-   * at 1am, prints this line instead of silence.
+   * `SECRET_NAMES` used to refuse an unknown name outright, and the sentence it was
+   * refusing for is still true — *"a secret nothing reads looks exactly like one that
+   * works, right up until the night it mattered"*. A free-form store cannot refuse, so the
+   * fact moves from a refusal to a statement at the one moment somebody is looking:
+   * `linaer`, typed at 1am, prints something instead of silence.
    *
-   * The known names are listed rather than a spelling distance being computed, and while
-   * there is one integration that *is* the whole of a "did you mean". If the set ever grows
-   * past what fits on a line, a nearest-match is worth the twelve lines; it is not worth
-   * them for a list of one.
+   * ### It used to assert a negative, and `env:` made that false
    *
-   * ### It echoes the name, and now that is the only thing standing where the shape was
+   * The line was *"Nothing in this build reads a secret named linaer"*, which was true
+   * exactly as long as the integration poll was the only reader. `env: { secret: <name> }`
+   * in a project's `.ogun/config.yaml` is a second one, and it reads whatever name that
+   * file asks for — so the old sentence became a confident claim about a file this command
+   * has never seen.
    *
-   * This used to be justified by the shape rule — the branch was only reachable for a name
-   * `NAME_SHAPE` had passed, which a pasted API key could not be. That rule is gone, so a
-   * key pasted into the name slot reaches this line and is printed. Echoing it is still
-   * right, and the reason is that **a name is not a secret**: it is a key in a 0600 JSON
-   * file, a row in `ogun secret list`, and the word you type at `ogun secret rm`. It is
-   * already visible everywhere a name is visible. Withholding it *here* would remove the
-   * one sentence that makes the accident noticeable — `Nothing in this build reads a
-   * secret named lin_api_9f3…` is exactly what somebody who put the key in the wrong
-   * position needs to read — while changing nothing about where the string ended up.
+   * Going and *looking* at the file is the wrong repair. It would put a repository read
+   * behind a local write, for the sake of a warning, and give a different answer depending
+   * on which branch happened to be checked out. So the line stops asserting anything about
+   * this name and names the two readers instead: one is a closed set the operator can
+   * check at a glance, the other is a spelling only their config knows. Matching them up
+   * is a job for the person who just typed the name, and it takes them a second.
+   *
+   * The known names are listed rather than a spelling distance being computed. If the set
+   * ever grows past what fits on a line, a nearest-match is worth the twelve lines; it is
+   * not worth them for a list of one.
+   *
+   * ### It echoes the name
+   *
+   * A key pasted into the name slot reaches this line and is printed. That is still right:
+   * **a name is not a secret**. It is a key in a 0600 JSON file, a row in `ogun secret
+   * list`, and the word you type at `ogun secret rm` — already visible everywhere a name
+   * is visible. Withholding it here would remove the one sentence that makes the accident
+   * noticeable, while changing nothing about where the string ended up.
    *
    * A refusal is the other way round, and `requireSecretName` still withholds: a refusal
    * has stored nothing, so the string is not yet a name and quoting it back would be the
@@ -153,13 +164,12 @@ export async function secretSet(args: string[]): Promise<void> {
    */
   if (!isSecretName(name)) {
     console.log(
-      yellow(`  Nothing in this build reads a secret named ${name}.`) +
-        dim(
-          `\n  Ogun polls under: ${SECRET_NAMES.join(', ')} — \`ogun connect <integration>\`` +
-            ' configures those.\n  It is stored either way. This line exists so that ' +
-            '"nothing reads it" is something\n  you are told now, rather than something ' +
-            'you infer from an unauthenticated poll.',
-        ),
+      dim('  Two things read a stored secret. Check that ') +
+        name +
+        dim(' is one of them:') +
+        `\n    ${dim('·')} a poll Ogun runs itself — ${SECRET_NAMES.join(', ')}` +
+        dim(` (\`ogun connect <integration>\` sets those up)`) +
+        `\n    ${dim('·')} \`env: { secret: ${name} }\` in a project's ${PROJECT_CONFIG_PATH}`,
     )
   }
 }
@@ -341,7 +351,18 @@ const readBy = (project: string, name: string, shadowed: Set<string>): string =>
     return red(`nothing — the ${name} grant wins`)
   }
   if (isSecretName(name)) return green(`the ${name} poll`)
-  return yellow('nothing in this build')
+  /**
+   * Not `nothing in this build` any more, and not a lookup either.
+   *
+   * A name outside the closed set is read by `env: { secret: … }` in a project's config,
+   * or by nothing — and which one is true lives in a repository this command has not read
+   * and should not read to fill in a table cell. So the cell says where the answer is
+   * rather than guessing at it, and without repeating the NAME column back at itself. Dim
+   * rather than yellow: an `env:` name is now an ordinary
+   * thing to have stored, and a warning colour on the common case is a warning nobody
+   * reads.
+   */
+  return dim("a project's env: { secret: … }")
 }
 
 /**
