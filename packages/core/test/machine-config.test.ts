@@ -136,3 +136,64 @@ test('a secret file is never written through a symlink', async (t) => {
   assert.ok(!(await lstat(path)).isSymbolicLink(), 'the link should have been replaced')
   assert.equal(await modeOf(path), '600')
 })
+
+/**
+ * The rotation setting a detached daemon reads. Two spellings because this file has two
+ * kinds of reader: everything downstream wants bytes, and a person editing it by hand
+ * wants to write the size they mean.
+ */
+test('a log size is accepted as bytes or as a size with a unit', async (t) => {
+  for (const [written, expected] of [
+    ['20MB', 20 * 1024 * 1024],
+    ['512kb', 512 * 1024],
+    ['1gb', 1024 * 1024 * 1024],
+    ['4096', 4096],
+    [4096, 4096],
+  ] as const) {
+    const { path, cleanup } = await withConfig({ logs: { maxBytes: written } })
+    t.after(cleanup)
+    assert.equal((await loadLocalConfig(path)).logs.maxBytes, expected, String(written))
+  }
+})
+
+/**
+ * A malformed size is a schema error naming the field, not a silent fallback to the
+ * default. Rotation is the kind of setting nobody looks at again after they set it, so
+ * `"20 megs"` quietly meaning 20MB-because-we-gave-up is how somebody ends up certain
+ * they configured something they did not.
+ */
+test('a size that is not a size is refused, and the field is named', async (t) => {
+  const { path, cleanup } = await withConfig({ logs: { maxBytes: '20 megs' } })
+  t.after(cleanup)
+  await assert.rejects(
+    () => loadLocalConfig(path),
+    (err: Error) => {
+      assert.match(err.message, /logs\.maxBytes/)
+      return true
+    },
+  )
+})
+
+/**
+ * `.default({})` on this block would hand back the literal `{}` — zod does not run a
+ * default through the schema — leaving `logs.dir` undefined for the overwhelmingly common
+ * config that never mentions logging, and taking `expandPaths` into
+ * `undefined.startsWith`. It is a `prefault` for exactly that reason.
+ */
+test('a config that says nothing about logging still gets every log default', async (t) => {
+  const { path, cleanup } = await withConfig({ projects: {} })
+  t.after(cleanup)
+  const { logs } = await loadLocalConfig(path)
+  assert.equal(logs.dir, join(homedir(), '.ogun/logs'))
+  assert.equal(logs.maxBytes, 20 * 1024 * 1024)
+  assert.equal(logs.keep, 5)
+})
+
+/** The default is written as a tilde, so omitting the block must not skip expansion. */
+test('the default log directory is expanded, with or without a config file', async (t) => {
+  const { path, cleanup } = await withConfig({})
+  t.after(cleanup)
+  assert.ok(!(await loadLocalConfig(path)).logs.dir.startsWith('~'))
+  // And the path where there is no file at all, which used to skip expandPaths entirely.
+  assert.ok(!(await loadLocalConfig(join(path, 'missing.json'))).logs.dir.startsWith('~'))
+})

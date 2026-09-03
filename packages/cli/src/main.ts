@@ -21,7 +21,13 @@ import { workersList } from './commands/workers.ts'
 import { cyclesList, cyclesShow } from './commands/cycles.ts'
 import { runnerInit, runnerInvite, runnerJoin } from './commands/runner.ts'
 import { tokenRotate, tokenShow } from './commands/token.ts'
-import { runnerStart, serverStart } from './commands/serve.ts'
+import {
+  daemonLogs,
+  daemonStatus,
+  daemonStop,
+  runnerStart,
+  serverStart,
+} from './commands/serve.ts'
 import { dbDown, dbMigrate, dbStatus, dbUp } from './commands/db.ts'
 import { init } from './commands/init.ts'
 
@@ -103,7 +109,10 @@ try {
   switch (command) {
     case 'runner':
       if (sub === 'doctor') await doctor(serverUrl)
-      else if (sub === 'start') runnerStart(rest)
+      else if (sub === 'start') await runnerStart(rest)
+      else if (sub === 'stop') await daemonStop('runner', rest)
+      else if (sub === 'status') await daemonStatus('runner')
+      else if (sub === 'logs') await daemonLogs('runner', rest)
       else if (sub === 'init') await runnerInit(rest)
       else if (sub === 'invite') await runnerInvite(rest, serverUrl)
       else if (sub === 'join') await runnerJoin(rest)
@@ -208,9 +217,13 @@ try {
     case 'server':
       // `server` and `server start` are the same command, so a leading flag is an
       // argument to it and not a mistyped subcommand: `ogun server --port 8080` must
-      // reach the server rather than being reported as an unknown subcommand.
-      if (sub === undefined || sub === 'start') serverStart(rest)
-      else if (sub.startsWith('-')) serverStart([sub, ...rest])
+      // reach the server rather than being reported as an unknown subcommand. That is
+      // also what makes the bare `ogun server -d` work without `start`.
+      if (sub === undefined || sub === 'start') await serverStart(rest)
+      else if (sub === 'stop') await daemonStop('server', rest)
+      else if (sub === 'status') await daemonStatus('server')
+      else if (sub === 'logs') await daemonLogs('server', rest)
+      else if (sub.startsWith('-')) await serverStart([sub, ...rest])
       else unknownSub('server', sub)
       break
 

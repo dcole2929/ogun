@@ -127,6 +127,10 @@ should not have to carry an argument list.
 Unknown flags are refused rather than ignored. `ogun server --prot 8080` used to start on
 7777 and say so in a line nobody reads twice.
 
+`-d` runs it in the background and returns. See
+[Running in the background](#running-in-the-background) below, which covers both
+processes.
+
 | | |
 |---|---|
 | `OGUN_PORT` | listen port (7777) — `--port` wins over it |
@@ -150,6 +154,95 @@ store one, pointing at `ogun connect <integration>` instead. This variable is ho
 who has put nginx or Caddy in front says otherwise. It is not read as a header —
 `x-forwarded-proto` is written by whoever is talking to us, which on a plain-HTTP LAN is
 the client, and a guard a request can switch off is not a guard.
+
+### Running in the background
+
+`ogun server start` and `ogun runner start` run in the foreground and stop with Ctrl-C.
+`-d` detaches instead: the process gets its own session, its output goes to a file, and
+the command returns.
+
+```
+ogun server start -d              # background
+ogun server logs -f               # watch it
+ogun server status                # is it up
+ogun server stop                  # stop it
+```
+
+The same four for `ogun runner`.
+
+**Foreground is the default because a supervisor wants it that way.** systemd's
+`Type=simple`, supervisord's `nodaemon` and a container entrypoint all want a process that
+runs in the foreground and dies when told; a program that backgrounds itself has to be
+talked out of it, which is what nginx's `daemon off;` is for and why `dockerd` dropped its
+own `-d` years ago. So `-d` is additive, and §8 of `architecture.md` still holds: on a
+machine that has a supervisor, use it.
+
+**`&` is not this.** Backgrounding a job in a shell cuts neither of the two cords tying a
+process to its terminal: it is still a child of the shell, so closing the terminal SIGHUPs
+it, and its stdout is still the terminal's, which is why it keeps logging into your
+prompt. `-d` calls `setsid` and redirects both streams.
+
+**A crashed daemon stays dead.** `-d` detaches, it does not supervise. Nothing restarts
+it, `ogun server status` is how you find out, and restart-on-crash and start-on-boot
+remain the host's job. On a machine nobody logs into, that is the answer rather than this.
+
+**It waits to see whether the thing actually came up.** Node cannot `fork(2)`, so
+detaching means spawning a fresh process and letting go of it — and the moment you let go,
+a crash three hundred milliseconds later is invisible. Printing a pid for a process that
+is already gone is the worst thing a `-d` flag can do, because the next thing you do is
+walk away. So `-d` waits out a settling window, and for the server also waits for
+`/api/health` to answer, and reports a failed start with the last lines of the log
+instead.
+
+| | |
+|---|---|
+| `~/.ogun/server.pid` | the backgrounded process, removed when it stops |
+| `~/.ogun/logs/server.log` | its output, rolled over at `logs.maxBytes` |
+
+A foreground run writes to its terminal and creates neither.
+
+#### Why there is a process in the way of the log
+
+The obvious detach hands the server an open file descriptor and walks away. That works,
+and it is unrotatable: the CLI that opened the file has exited, so nothing is left that
+could ever close it and start a new one, and the log grows until the disk is full. So one
+small process stays — `daemon-host.ts` — which owns the log file, pumps the real process's
+output into it, and rolls it over. Docker keeps `dockerd` in the path of a container's
+output for the same reason, and supervisord's `logfile_maxbytes` is a property of
+supervisord rather than of the program it runs.
+
+Rotation is configured in `~/.ogun/config.json`:
+
+```json
+{
+  "logs": {
+    "dir": "~/.ogun/logs",
+    "maxBytes": "20MB",
+    "keep": 5
+  }
+}
+```
+
+`maxBytes` takes either a count of bytes or a size with a unit, because this file is
+hand-edited and `20971520` is not a number anyone should have to recognise on sight. A
+malformed size is a schema error naming the field rather than a silent fallback to the
+default — rotation is the kind of setting nobody looks at again, so `"20 megs"` quietly
+meaning 20MB-because-we-gave-up is how you end up certain you configured something you did
+not. `keep: 0` truncates instead of keeping backups.
+
+#### Stopping
+
+`stop` sends SIGTERM and waits. On timeout it says so rather than escalating, which
+matters most for the runner: SIGTERM there means stop claiming and let in-flight jobs
+finish, and a job is an agent inside a container that can legitimately take many minutes.
+A SIGKILL would abandon that container mid-run and leave the control plane a claim to
+sweep, so `--force` is a thing you say rather than something a timeout decides for you.
+
+A pidfile is only believed if the process it names is both alive **and** still the daemon
+that wrote it. Pids get recycled, and the machine this is most used on recycles them
+constantly — a WSL distro stops with its Windows host, stranding a pidfile, and the next
+boot starts numbering from the bottom again. Signalling on liveness alone means stopping
+whatever inherited the number.
 
 ### `ogun runner init`
 
