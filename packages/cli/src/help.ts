@@ -156,11 +156,43 @@ const topics: Record<string, Topic> = {
 
   server: {
     summary: 'start the control plane: API, web UI, and the foreman',
-    usage: ['ogun server [--port <n>]'],
+    usage: [
+      'ogun server start [-d] [--port <n>]',
+      'ogun server stop [--force] [--timeout <seconds>]',
+      'ogun server status',
+      'ogun server logs [-f] [-n <lines>]',
+    ],
     where:
       'One machine, and it stays running. Runners connect outward to it; it never ' +
       'dials a runner, which is what lets a laptop behind NAT be one.',
+    subcommands: [
+      ['start', 'run it — in the foreground, or with -d in the background'],
+      ['stop', 'ask a backgrounded one to shut down'],
+      ['status', 'is it up, since when, and where its log is'],
+      ['logs', 'what a backgrounded one has written'],
+    ],
+    flags: [
+      [
+        '-d, --detach',
+        'run in the background and return. Output goes to ~/.ogun/logs/server.log ' +
+          'instead of your terminal, since a detached process has none',
+      ],
+      ['--port <n>', 'listen port, winning over OGUN_PORT'],
+    ],
     notes: [
+      'Foreground is the default, and -d is additive. A supervisor wants a process ' +
+        'that runs in the foreground and dies when told — systemd Type=simple, ' +
+        "supervisord's nodaemon, a container entrypoint — which is why nginx needs " +
+        '`daemon off;` and why dockerd dropped its own -d years ago. Use -d on a ' +
+        'workstation; use a supervisor on a machine that has one.',
+      'A crashed daemon stays dead. -d detaches, it does not supervise: nothing ' +
+        'restarts it, and `ogun server status` is how you find out. Restart-on-crash ' +
+        'and start-on-boot remain the host\'s job.',
+      '`ogun server` and `ogun server start` are the same command, so `ogun server -d` ' +
+        'works too.',
+      '-d does not return until the server has answered /api/health, so a control ' +
+        'plane that cannot reach postgres is reported as a failed start with the last ' +
+        'lines of its log — rather than as a pid that is already gone.',
       '--port is the one flag, because a second control plane on one machine is a real ' +
         'thing to want. Everything else is environment: those are properties of the ' +
         'machine rather than of one invocation, and a systemd unit should not have to ' +
@@ -180,16 +212,75 @@ const topics: Record<string, Topic> = {
     touches: [
       [LOCAL_CONFIG, 'stores the admin token, the first time it binds beyond localhost'],
       ['the database', 'schedules cycles, sweeps stale claims, reconciles coverage'],
+      ['~/.ogun/server.pid', 'with -d only — removed when it stops'],
+      ['~/.ogun/logs/server.log', 'with -d only — rolls over at logs.maxBytes'],
     ],
-    see: ['ogun token show', 'ogun runner invite'],
+    see: ['ogun server status', 'ogun token show', 'ogun runner invite'],
+  },
+
+  'server stop': {
+    summary: 'stop a backgrounded control plane',
+    usage: ['ogun server stop [--force] [--timeout <seconds>]'],
+    where: 'On the machine running it. A foreground one stops with Ctrl-C instead.',
+    flags: [
+      ['--force', 'SIGKILL immediately, without waiting for a clean shutdown'],
+      ['--timeout <seconds>', 'how long to wait before reporting it is still going (30)'],
+    ],
+    notes: [
+      'SIGTERM, then wait. On timeout it says so rather than escalating — killing a ' +
+        'process that asked for a moment to shut down is a decision, not a default, ' +
+        'and --force is how you make it.',
+    ],
+    see: ['ogun server status', 'ogun server logs'],
+  },
+
+  'server status': {
+    summary: 'whether a backgrounded control plane is up',
+    usage: ['ogun server status'],
+    notes: [
+      'Exits non-zero when it is not running, so it works as a check in a script.',
+      'A pidfile is only believed if the process it names is both alive and still an ' +
+        'ogun server. Pids get recycled — a WSL distro that stops with its Windows host ' +
+        'strands a pidfile on every shutdown — and signalling on liveness alone means ' +
+        'stopping whatever inherited the number.',
+      'Says nothing about a foreground run, which belongs to the terminal it was ' +
+        'started in.',
+    ],
+    see: ['ogun server logs', 'ogun server stop'],
+  },
+
+  'server logs': {
+    summary: 'what a backgrounded control plane has written',
+    usage: ['ogun server logs [-f] [-n <lines>]'],
+    flags: [
+      ['-f, --follow', 'keep printing as it is written, like tail -f'],
+      ['-n, --lines <n>', 'how many lines to show first (50)'],
+    ],
+    notes: [
+      'Only a backgrounded run writes here. A foreground one writes to its terminal, ' +
+        'which is the whole difference between the two modes.',
+      '-f survives a rollover: when the file shrinks it starts again at the top of the ' +
+        'new one, rather than quietly following a renamed file nothing writes to.',
+      'Rotation is set by the logs block in ~/.ogun/config.json — maxBytes takes ' +
+        'either a count or a size like "20MB", and keep is how many rolled files to ' +
+        'hold beside the live one.',
+    ],
+    touches: [],
+    see: ['ogun server status'],
   },
 
   runner: {
     summary: 'this machine as a runner, and enrolling others',
-    usage: ['ogun runner init | start | doctor | invite | join <url> --token <t>'],
+    usage: [
+      'ogun runner init | start [-d] | stop | status | logs | doctor',
+      'ogun runner invite | join <url> --token <t>',
+    ],
     subcommands: [
       ['init', 'register this machine with a control plane on this same machine'],
       ['start', 'claim jobs and execute them — the process that does the work'],
+      ['stop', 'ask a backgrounded one to shut down'],
+      ['status', 'is it up, since when, and where its log is'],
+      ['logs', 'what a backgrounded one has written'],
       ['doctor', 'what this machine can actually run'],
       ['invite', 'on the CONTROL PLANE — mint a join token for another machine'],
       ['join', 'on the NEW MACHINE — paste what invite printed'],
@@ -198,6 +289,52 @@ const topics: Record<string, Topic> = {
       'init and join do the same thing. init is the one-box case; join is the version ' +
         'that has to present a token because it is talking across a network.',
     ],
+  },
+
+  'runner stop': {
+    summary: 'stop a backgrounded runner',
+    usage: ['ogun runner stop [--force] [--timeout <seconds>]'],
+    flags: [
+      ['--force', 'SIGKILL immediately, abandoning any job that is mid-flight'],
+      ['--timeout <seconds>', 'how long to wait before reporting it is still draining (30)'],
+    ],
+    notes: [
+      'SIGTERM means stop claiming and let in-flight jobs finish, so a runner with work ' +
+        'in hand will still be going when the timeout passes. That is the design, not a ' +
+        'hang: a job is an agent inside a container and can legitimately take many ' +
+        'minutes.',
+      'Which is why it never escalates on its own. A SIGKILL abandons a container ' +
+        'mid-run and leaves the control plane a claim to sweep, so --force is a thing ' +
+        'you say rather than something the timeout decides for you.',
+    ],
+    see: ['ogun runner status', 'ogun runner logs'],
+  },
+
+  'runner status': {
+    summary: 'whether a backgrounded runner is up',
+    usage: ['ogun runner status'],
+    notes: [
+      'Exits non-zero when it is not running, so it works as a check in a script.',
+      'Whether this machine can run anything is a different question, and ' +
+        '`ogun runner doctor` is the one that answers it.',
+    ],
+    see: ['ogun runner doctor', 'ogun runner logs'],
+  },
+
+  'runner logs': {
+    summary: 'what a backgrounded runner has written',
+    usage: ['ogun runner logs [-f] [-n <lines>]'],
+    flags: [
+      ['-f, --follow', 'keep printing as it is written, like tail -f'],
+      ['-n, --lines <n>', 'how many lines to show first (50)'],
+    ],
+    notes: [
+      'Only a backgrounded run writes here. A foreground one writes to its terminal.',
+      'This is the runner process, not a job. What one job did is `ogun runs` and the ' +
+        'run detail in the UI.',
+    ],
+    touches: [],
+    see: ['ogun runner status', 'ogun runs'],
   },
 
   'runner init': {
@@ -234,13 +371,24 @@ const topics: Record<string, Topic> = {
 
   'runner start': {
     summary: 'claim jobs and execute them',
-    usage: ['ogun runner start'],
+    usage: ['ogun runner start [-d]'],
     where:
       'On each runner machine, for as long as you want work done. Nothing runs without ' +
       'it — triggering a worker only queues a job.',
+    flags: [
+      [
+        '-d, --detach',
+        'run in the background and return. Output goes to ~/.ogun/logs/runner.log ' +
+          'instead of your terminal, since a detached process has none',
+      ],
+    ],
     notes: [
-      'No flags: everything it needs is in ~/.ogun/config.json, written by `runner ' +
-        'init` or `runner join`.',
+      'Foreground is the default, and a crashed daemon stays dead — -d detaches, it ' +
+        'does not supervise. On a machine nobody logs into, run it under systemd or ' +
+        'launchd instead, which is what the foreground default is for.',
+      'Everything else it needs is in ~/.ogun/config.json, written by `runner init` or ' +
+        '`runner join`. -d is read by the launcher and never reaches the runner, which ' +
+        'is why it does not collide with the rule below.',
       'On Ctrl-C or SIGTERM it stops claiming and lets in-flight jobs finish. The ' +
         'stale-claim sweep exists for crashes, not for a clean stop.',
       'A job is only offered to a runner advertising every label it requires, so a ' +
@@ -1260,10 +1408,12 @@ ${bold('setup')}
   ogun image build [project-dir]   build ogun/base, or a project image
 
 ${bold('running it')}
-  ogun server                      start the control plane and web UI
+  ogun server start [-d]           start the control plane and web UI
   ogun runner init [--name]        make this machine a runner for it
-  ogun runner start                start a runner on this machine
+  ogun runner start [-d]           start a runner on this machine
   ogun runner doctor               what this machine can actually run
+  ogun server|runner stop          stop one started with -d
+  ogun server|runner status|logs   is it up, and what has it written
 
 ${bold('adding a machine')}
   ogun runner invite               on the CONTROL PLANE — mints a join token

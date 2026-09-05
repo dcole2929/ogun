@@ -6,6 +6,41 @@ import { z } from 'zod'
 const expandHome = (p: string): string => (p.startsWith('~/') ? join(homedir(), p.slice(2)) : p)
 
 /**
+ * A byte count written either as a number or as `"20MB"`.
+ *
+ * Two spellings because this file has two kinds of reader. Everything downstream wants
+ * bytes, and a person editing `~/.ogun/config.json` by hand wants to write the size they
+ * mean — so the parse happens once, here, and `LocalConfig` only ever carries the number.
+ *
+ * A malformed size is a schema error naming the field rather than a silent fallback to
+ * the default. Rotation is the kind of setting nobody looks at again after they set it,
+ * so `"20 megs"` quietly meaning 20MB-because-we-gave-up is how a person ends up certain
+ * they configured something they did not.
+ */
+const SIZE = /^\s*(\d+(?:\.\d+)?)\s*(b|kb|mb|gb)?\s*$/i
+
+const UNIT: Record<string, number> = {
+  '': 1,
+  b: 1,
+  kb: 1024,
+  mb: 1024 * 1024,
+  gb: 1024 * 1024 * 1024,
+}
+
+const sizeInBytes = (fallback: number) =>
+  z
+    .union([
+      z.number().int().positive(),
+      z.string().regex(SIZE, 'expected a number of bytes or a size like "20MB"'),
+    ])
+    .default(fallback)
+    .transform((value) => {
+      if (typeof value === 'number') return value
+      const [, amount, unit = ''] = SIZE.exec(value) as RegExpExecArray
+      return Math.round(Number(amount) * (UNIT[unit.toLowerCase()] as number))
+    })
+
+/**
  * `~/.ogun/config.json` — everything this *machine* knows, in one file.
  *
  * There were two: `projects.json` for the server's path map and `runner.json` for the
@@ -29,6 +64,44 @@ export const localConfigSchema = z.object({
       token: z.string().nullish().transform((v) => v ?? undefined),
     })
     .default({ token: undefined }),
+
+  /**
+   * Where a detached `ogun server start -d` writes, and when that file rolls over.
+   *
+   * A detached process has no terminal, so its output goes to a file — and a file nothing
+   * rotates is a disk-filler with a six-month fuse. Docker answers this with `max-size`
+   * and `max-file` on the log driver, supervisord with `logfile_maxbytes`; this is the
+   * same setting under Ogun's own name, because the alternative is a `server.log` that is
+   * fine until the morning it is not.
+   *
+   * `maxBytes` takes either a count of bytes or a size with a unit — `"20MB"` — because
+   * this file is hand-edited and `20971520` is not a number anyone should have to
+   * recognise on sight. Both normalise to bytes before anything reads them.
+   *
+   * Nothing here touches a foreground run. `ogun server start` writes to your terminal,
+   * which is the whole difference between the two modes.
+   */
+  logs: z
+    .object({
+      dir: z.string().default('~/.ogun/logs'),
+      maxBytes: sizeInBytes(20 * 1024 * 1024),
+      /**
+       * How many rolled files to keep beside the live one — `server.log.1` … `.5`. Zero
+       * truncates on rollover instead of renaming, for a machine where the log is worth
+       * bounding but not worth keeping.
+       */
+      keep: z.number().int().min(0).default(5),
+    })
+    /**
+     * `prefault`, not `default`. Zod 4's `.default()` hands back the literal it was given
+     * without running it through the object schema, so `.default({})` on a block whose
+     * every field has its own default yields exactly `{}` — and `logs.dir` is then
+     * `undefined` for the overwhelmingly common case of a config file that never mentions
+     * logging. `expandPaths` would take that straight into `undefined.startsWith`.
+     * `prefault` parses the default, which is what this block needs and what reading
+     * `.default({})` would lead you to assume it already did.
+     */
+    .prefault({}),
 
   /**
    * A project's own API keys, keyed by project slug and then by secret name (ADR-0012).
@@ -127,12 +200,18 @@ const expandPaths = (config: LocalConfig): LocalConfig => ({
   projects: Object.fromEntries(
     Object.entries(config.projects).map(([slug, path]) => [slug, expandHome(path)]),
   ),
+  logs: { ...config.logs, dir: expandHome(config.logs.dir) },
   ...(config.runner ? { runner: { ...config.runner, scratch: expandHome(config.runner.scratch) } } : {}),
 })
 
 export async function loadLocalConfig(path = localConfigPath()): Promise<LocalConfig> {
   const text = await readFile(path, 'utf8').catch(() => null)
-  if (text === null) return localConfigSchema.parse({})
+  // Expanded on the no-file path too. It used to return the bare parse, which was
+  // harmless while every defaulted path was empty — `projects` is `{}` and `runner` is
+  // absent — and stopped being harmless the moment a *default* carried a `~`: a machine
+  // with no config.json at all would have taken `~/.ogun/logs` literally and created a
+  // directory named `~` in whatever cwd the command happened to run from.
+  if (text === null) return expandPaths(localConfigSchema.parse({}))
   return parseLocalConfig(text, path)
 }
 

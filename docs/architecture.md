@@ -2145,7 +2145,13 @@ Four constraints hold on any host and shape real decisions:
   `onMissed` exists at all (§4.2).
 - **Restarts happen.** Run the server and runner under whatever supervises services on
   that host — systemd, launchd, a Windows service — so they come back on their own.
-  Nothing in Ogun depends on which.
+  Nothing in Ogun depends on which. `ogun server start -d` and `ogun runner start -d`
+  detach without one, for the workstation case where installing a supervisor to run two
+  processes is out of proportion; that is a convenience and not a competing answer.
+  **It detaches, it does not supervise** — a crashed daemon stays dead and `status` is
+  how you find out. Both commands stay foreground by default precisely because that is
+  what a supervisor wants (`Type=simple`, `nodaemon`, a container entrypoint), which is
+  what keeps this constraint true rather than half-true.
 - **Memory is the binding constraint on concurrency.** A container running an agent plus
   a project's test suite is not small, and a virtualised host often has far less RAM than
   the machine it runs on. `maxConcurrentJobs` defaults to 2; raise the host's memory
