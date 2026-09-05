@@ -97,6 +97,7 @@ export async function projectSync(args: string[], serverUrl: string): Promise<vo
 
   const result = (await res.json()) as {
     removed?: string[]
+    removedSkills?: string[]
     overriddenSchedules?: string[]
     unmetRequirements?: Array<{ worker: string; missing: string[] }>
     registeredRunners?: number
@@ -142,6 +143,12 @@ export async function projectSync(args: string[], serverUrl: string): Promise<vo
    */
   for (const source of result.sources ?? []) {
     console.log(dim(`source ${cyan(source.name)}: linear → ${source.cycle}`))
+  }
+  // Said out loud for the same reason a removed worker is: a sync that deletes quietly
+  // is a sync you cannot check. A skill leaving the index un-binds every worker that
+  // named it, which is a bigger consequence than the one line it used to get.
+  if (result.removedSkills?.length) {
+    console.log(dim(`removed (no longer on disk): ${result.removedSkills.join(', ')}`))
   }
   if (result.removed?.length) {
     console.log(dim(`removed (gone from config.yaml): ${result.removed.join(', ')}`))
