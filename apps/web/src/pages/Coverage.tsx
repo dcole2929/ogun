@@ -3,6 +3,7 @@ import { useQuery } from '@tanstack/react-query'
 import { Link } from 'react-router'
 import { api, type SourceEmission, type SourceReport } from '../api.ts'
 import { Empty, exact, Page, Pill, when } from '../ui.tsx'
+import { useProjectScope } from '../scope.tsx'
 
 /**
  * The coverage ledger (principle 6).
@@ -47,13 +48,18 @@ const MEANING: Record<string, string> = {
   'not-selected': 'not part of this batch',
 }
 
-export function CoveragePage() {
-  const { data: projects } = useQuery({ queryKey: ['projects'], queryFn: api.projects })
-  const slug = projects?.projects[0]?.slug
+/**
+ * One project's ledger. Split out of `CoveragePage` when the project scope arrived.
+ *
+ * The page used to be this function with `const slug = projects[0].slug` at the top — a
+ * stand-in for a selector that did not exist, and with two projects registered it meant
+ * the second project's coverage could not be reached from the UI at all. That is the
+ * quiet half of the same gap that made built-in skills appear twice.
+ */
+function ProjectCoverage({ slug, heading }: { slug: string; heading: boolean }) {
   const { data } = useQuery({
     queryKey: ['coverage', slug],
-    queryFn: () => api.coverage(slug!),
-    enabled: Boolean(slug),
+    queryFn: () => api.coverage(slug),
   })
   const rows = data?.coverage ?? []
 
@@ -68,8 +74,7 @@ export function CoveragePage() {
    */
   const { data: notes } = useQuery({
     queryKey: ['run-notes', slug],
-    queryFn: () => api.runNotes(slug!),
-    enabled: Boolean(slug),
+    queryFn: () => api.runNotes(slug),
   })
   const noteFor = new Map((notes?.notes ?? []).map((n) => [n.runId, n]))
 
@@ -90,8 +95,7 @@ export function CoveragePage() {
    */
   const { data: sources } = useQuery({
     queryKey: ['sources', slug],
-    queryFn: () => api.sources(slug!),
-    enabled: Boolean(slug),
+    queryFn: () => api.sources(slug),
   })
 
   /**
@@ -113,10 +117,12 @@ export function CoveragePage() {
   )
 
   return (
-    <Page
-      title="Coverage"
-      subtitle="Whether the factory actually looked — not what it found."
-    >
+    <>
+      {heading && (
+        <div className="scope-section">
+          <h2>{slug}</h2>
+        </div>
+      )}
       <div className="card" style={{ marginBottom: 20 }}>
         <p style={{ marginTop: 0, fontSize: 13 }}>
           <Link to="/runs">Runs</Link> shows what happened, one row per attempt. This shows
@@ -222,6 +228,33 @@ export function CoveragePage() {
           </tbody>
         </table>
       )}
+    </>
+  )
+}
+
+/**
+ * The page: the scope decides which ledgers are on it.
+ *
+ * One section per project when the scope is "All projects", one when a project is
+ * selected — the same shape Workers uses, so the two pages answer "which project?" the
+ * same way.
+ */
+export function CoveragePage() {
+  const { projects, slug: scope, isAll } = useProjectScope()
+  const shown = isAll ? projects : projects.filter((p) => p.slug === scope)
+
+  return (
+    <Page title="Coverage" subtitle="Whether the factory actually looked — not what it found.">
+      {projects.length === 0 && (
+        <Empty>
+          no projects registered
+          <br />
+          <span className="muted mono">ogun project sync</span>
+        </Empty>
+      )}
+      {shown.map((p) => (
+        <ProjectCoverage key={p.id} slug={p.slug} heading={isAll} />
+      ))}
     </Page>
   )
 }

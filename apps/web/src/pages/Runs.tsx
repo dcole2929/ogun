@@ -1,7 +1,9 @@
+import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Link } from 'react-router'
 import { api } from '../api.ts'
-import { duration, Empty, exact, Page, Pill, when } from '../ui.tsx'
+import { Choice, duration, Empty, exact, Filters, matches, Page, Pill, Search, when } from '../ui.tsx'
+import { useProjectScope } from '../scope.tsx'
 
 /**
  * The result column is one line in a dense table, and a decline's reason is a sentence
@@ -11,12 +13,44 @@ import { duration, Empty, exact, Page, Pill, when } from '../ui.tsx'
 const truncate = (s: string): string => (s.length > 70 ? `${s.slice(0, 69)}…` : s)
 
 export function RunsPage() {
+  const { filter } = useProjectScope()
+  const [query, setQuery] = useState('')
+  const [outcome, setOutcome] = useState('all')
   const { data, isLoading, error } = useQuery({ queryKey: ['runs'], queryFn: api.runs })
-  const runs = data?.runs ?? []
-  const pending = data?.pending ?? []
+
+  /**
+   * Scoped in the browser rather than by refetching. `/api/runs` takes a `?project=` but
+   * this page asks for `?limit=50` — a scoped request would return the last 50 runs *of
+   * that project*, which is a different list from "this project's runs among the last
+   * 50", and switching scope would silently change how far back the page reaches.
+   */
+  const inScope = <T extends { project: { slug: string } }>(rows: T[]): T[] =>
+    filter === undefined ? rows : rows.filter((r) => r.project.slug === filter)
+
+  const allRuns = inScope(data?.runs ?? [])
+  const pending = inScope(data?.pending ?? [])
+  const runs = allRuns.filter(
+    (r) =>
+      matches(query, r.worker.name, r.project.slug, r.run.outcome, r.run.detail, r.run.notes) &&
+      (outcome === 'all' || r.run.outcome === outcome),
+  )
+  const outcomes = [...new Set(allRuns.map((r) => r.run.outcome).filter(Boolean))].sort()
 
   return (
     <Page title="Runs" subtitle="Every execution attempt, including the ones that went nowhere.">
+      <Filters count={runs.length} total={allRuns.length} noun="runs">
+        <Search value={query} onChange={setQuery} placeholder="worker, outcome, detail…" />
+        <Choice
+          label="Outcome"
+          value={outcome}
+          onChange={setOutcome}
+          options={[
+            ['all', 'any'],
+            ...outcomes.map((o) => [o, o] as [string, string]),
+          ]}
+        />
+      </Filters>
+
       {error && <p className="error">{String(error)}</p>}
       {isLoading && <Empty>loading…</Empty>}
 
@@ -120,7 +154,14 @@ export function RunsPage() {
         </>
       )}
 
-      {!isLoading && runs.length === 0 && pending.length === 0 && (
+      {!isLoading && allRuns.length > 0 && runs.length === 0 && (
+        <Empty>
+          nothing matches
+          <br />
+          <span className="muted">{allRuns.length} runs in this scope — try a wider filter</span>
+        </Empty>
+      )}
+      {!isLoading && allRuns.length === 0 && pending.length === 0 && (
         <Empty>
           no runs yet — trigger one from <Link to="/workers">Workers</Link>
         </Empty>

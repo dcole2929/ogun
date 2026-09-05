@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '../api.ts'
-import { Empty, exact, Page, when } from '../ui.tsx'
+import { Choice, Empty, exact, Filters, matches, Page, Search, when } from '../ui.tsx'
 
 /**
  * One control plane, N machines.
@@ -18,7 +18,24 @@ export function RunnersPage() {
     queryFn: api.runners,
     refetchInterval: 10_000,
   })
-  const runners = data?.runners ?? []
+  const [query, setQuery] = useState('')
+  const [state, setState] = useState('all')
+
+  /**
+   * Not project-scoped, deliberately. A runner serves every project on the control plane
+   * — its labels say what it can do, not what it is for — so scoping this page to one
+   * would be scoping it to nothing. It still gets a filter bar, because a machine list is
+   * a list.
+   */
+  const all = data?.runners ?? []
+  const runners = all.filter(
+    (r) =>
+      matches(query, r.name, r.labels.join(' ')) &&
+      (state === 'all' ||
+        (state === 'online' ? r.online && !r.revokedAt : false) ||
+        (state === 'offline' ? !r.online && !r.revokedAt : false) ||
+        (state === 'revoked' ? Boolean(r.revokedAt) : false)),
+  )
   const live = runners.filter((r) => r.online)
   const revoked = runners.filter((r) => r.revokedAt)
 
@@ -34,6 +51,21 @@ export function RunnersPage() {
         )
       }
     >
+      <Filters count={runners.length} total={all.length} noun="runners">
+        <Search value={query} onChange={setQuery} placeholder="name, label…" />
+        <Choice
+          label="State"
+          value={state}
+          onChange={setState}
+          options={[
+            ['all', 'any'],
+            ['online', 'online'],
+            ['offline', 'offline'],
+            ['revoked', 'revoked'],
+          ]}
+        />
+      </Filters>
+
       {adding && (
         <EnrollForm
           addresses={data?.addresses ?? []}
@@ -44,7 +76,14 @@ export function RunnersPage() {
       )}
 
       {isLoading && <Empty>loading…</Empty>}
-      {!isLoading && runners.length === 0 && !adding && (
+      {!isLoading && all.length > 0 && runners.length === 0 && (
+        <Empty>
+          nothing matches
+          <br />
+          <span className="muted">{all.length} runners registered — try a wider filter</span>
+        </Empty>
+      )}
+      {!isLoading && all.length === 0 && !adding && (
         <Empty>
           no runners
           <br />

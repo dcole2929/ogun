@@ -29,6 +29,130 @@ export const Empty = ({ children }: { children: ReactNode }) => (
   <div className="empty">{children}</div>
 )
 
+/**
+ * The filter bar every list page carries, directly under its title.
+ *
+ * One component rather than each page laying out its own controls, because the value of
+ * a filter row is that it is in the same place on every page — a search box that moves
+ * between Skills and Workers is a search box you hunt for. `count` is part of it for the
+ * same reason: a filtered list that does not say it is filtered looks like a short list,
+ * and "3 of 47" is the difference between "nothing matched" and "nothing is there".
+ */
+export function Filters({
+  count,
+  total,
+  noun,
+  children,
+}: {
+  count?: number
+  total?: number
+  noun?: string
+  children: ReactNode
+}) {
+  const filtered = count !== undefined && total !== undefined && count !== total
+  return (
+    <div className="filters">
+      {children}
+      {count !== undefined && total !== undefined && (
+        <span className="muted filter-count">
+          {filtered ? `${count} of ${total}` : `${total}`} {noun ?? ''}
+        </span>
+      )}
+    </div>
+  )
+}
+
+/**
+ * A search box that clears itself.
+ *
+ * The clear button is not decoration: this is the one control on the page that can hide
+ * every row, and a page that looks empty for a reason sitting in an input you have
+ * scrolled past is the most confusing state a filter can produce.
+ */
+export function Search({
+  value,
+  onChange,
+  placeholder,
+}: {
+  value: string
+  onChange: (value: string) => void
+  placeholder?: string
+}) {
+  return (
+    <div className="search">
+      <input
+        type="text"
+        value={value}
+        placeholder={placeholder ?? 'search…'}
+        onChange={(e) => onChange(e.target.value)}
+      />
+      {value !== '' && (
+        <button type="button" className="clear" title="clear" onClick={() => onChange('')}>
+          ×
+        </button>
+      )}
+    </div>
+  )
+}
+
+/**
+ * An active filter that did not come from this bar — set by a link from somewhere else.
+ *
+ * It has to be visible and it has to be removable. A filter applied by a URL and not
+ * shown is a page that is quietly lying about how much it is displaying, which is the
+ * one thing a filter bar exists to prevent.
+ */
+export function Chip({ label, value, onClear }: { label: string; value: string; onClear: () => void }) {
+  return (
+    <span className="chip">
+      <span className="muted">{label}</span>
+      <strong>{value}</strong>
+      <button type="button" title="show everything again" onClick={onClear}>
+        ×
+      </button>
+    </span>
+  )
+}
+
+/** A labelled `<select>` for the filter bar, so the label sits with its control. */
+export function Choice({
+  label,
+  value,
+  onChange,
+  options,
+}: {
+  label: string
+  value: string
+  onChange: (value: string) => void
+  options: Array<[value: string, label: string]>
+}) {
+  return (
+    <label className="choice">
+      <span>{label}</span>
+      <select value={value} onChange={(e) => onChange(e.target.value)}>
+        {options.map(([v, l]) => (
+          <option key={v} value={v}>
+            {l}
+          </option>
+        ))}
+      </select>
+    </label>
+  )
+}
+
+/**
+ * Case-insensitive substring match across several fields.
+ *
+ * Deliberately not fuzzy. These lists are tens of rows, not thousands, and a fuzzy match
+ * that surfaces `plan-a-ticket` for the query `scope` costs more than it saves — the
+ * whole point of typing is to narrow.
+ */
+export const matches = (query: string, ...fields: Array<string | null | undefined>): boolean => {
+  const q = query.trim().toLowerCase()
+  if (q === '') return true
+  return fields.some((f) => (f ?? '').toLowerCase().includes(q))
+}
+
 const OUTCOME_TONE: Record<string, string> = {
   approved: 'green',
   dispatched: 'green',

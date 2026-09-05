@@ -1,8 +1,10 @@
+import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Link, useParams } from 'react-router'
 import { api } from '../api.ts'
-import { Empty, Page, Pill } from '../ui.tsx'
+import { Choice, Empty, Filters, matches, Page, Pill, Search } from '../ui.tsx'
 import { Markdown } from '../Markdown.tsx'
+import { useProjectScope } from '../scope.tsx'
 
 /**
  * A skill is the durable artifact; a worker is a thin binding of one to a runtime
@@ -10,16 +12,74 @@ import { Markdown } from '../Markdown.tsx'
  * points at never runs, and that is invisible if you show the two lists separately.
  */
 export function SkillsPage() {
-  const { data, isLoading } = useQuery({ queryKey: ['skills'], queryFn: () => api.skills() })
-  const skills = data?.skills ?? []
+  const { filter, isAll } = useProjectScope()
+  const [query, setQuery] = useState('')
+  const [origin, setOrigin] = useState('all')
+  const [bound, setBound] = useState('all')
+
+  const { data, isLoading } = useQuery({
+    queryKey: ['skills', filter ?? 'all'],
+    queryFn: () => api.skills(filter),
+  })
+  const all = data?.skills ?? []
+
+  /**
+   * A built-in is indexed once per project, so with the scope on "All projects" the same
+   * skill legitimately appears once per project it is registered for. That is the row the
+   * scope exists to collapse — selecting a project is what makes this list read as "the
+   * skills this project has" rather than as a list with duplicates in it.
+   */
+  const skills = all.filter(
+    (s) =>
+      matches(
+        query,
+        s.skill.name,
+        s.skill.displayName,
+        s.skill.shortDescription,
+        s.skill.sourcePath,
+        s.workers.map((w) => w.name).join(' '),
+      ) &&
+      (origin === 'all' || s.skill.origin === origin) &&
+      (bound === 'all' ||
+        (bound === 'bound' ? s.workers.length > 0 : s.workers.length === 0)),
+  )
+
+  const origins = [...new Set(all.map((s) => s.skill.origin))].sort()
 
   return (
     <Page
       title="Skills"
       subtitle="The instructions a worker runs. Edited in the repo, indexed here."
     >
+      <Filters count={skills.length} total={all.length} noun="skills">
+        <Search value={query} onChange={setQuery} placeholder="name, description, path, worker…" />
+        <Choice
+          label="Origin"
+          value={origin}
+          onChange={setOrigin}
+          options={[['all', 'any'], ...origins.map((o) => [o, o] as [string, string])]}
+        />
+        <Choice
+          label="Bound"
+          value={bound}
+          onChange={setBound}
+          options={[
+            ['all', 'any'],
+            ['bound', 'used by a worker'],
+            ['unbound', 'used by nothing'],
+          ]}
+        />
+      </Filters>
+
       {isLoading && <Empty>loading…</Empty>}
-      {!isLoading && skills.length === 0 && (
+      {!isLoading && all.length > 0 && skills.length === 0 && (
+        <Empty>
+          nothing matches
+          <br />
+          <span className="muted">{all.length} skills are indexed — try a wider filter</span>
+        </Empty>
+      )}
+      {!isLoading && all.length === 0 && (
         <Empty>
           no skills indexed
           <br />
@@ -48,7 +108,14 @@ export function SkillsPage() {
                     </span>
                   )}
                 </div>
-                <div className="mono muted">{s.skill.sourcePath}</div>
+                <div className="mono muted">
+                  {isAll && s.project?.slug && (
+                    <span className="pill" style={{ marginRight: 6 }}>
+                      {s.project.slug}
+                    </span>
+                  )}
+                  {s.skill.sourcePath}
+                </div>
                 {s.skill.shortDescription && (
                   <p className="muted" style={{ margin: '8px 0 0', fontSize: 13 }}>
                     {s.skill.shortDescription}
