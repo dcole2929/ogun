@@ -118,6 +118,19 @@ workersRoutes.get('/', async (c) => {
       // prompt of its own is not a worker with no prompt — it inherits the skill's, and
       // showing a blank field invites exactly the question "why has this one got none?"
       skillPrompt: skills.defaultPrompt,
+      /**
+       * Where the skill this worker binds came from — `builtin`, `machine` or `project`.
+       *
+       * Off the join that was already here for the prompt, so it costs nothing. It is on
+       * the worker rather than left to the client because "is this worker running one of
+       * Ogun's own disciplines or something this repo wrote?" is a question about the
+       * worker, and answering it in the browser would mean fetching every skill to look
+       * one field up.
+       *
+       * Null when `skillId` is null — the worker names a skill that is not indexed, which
+       * is a real state after a rename that has not been synced.
+       */
+      skillOrigin: skills.origin,
     })
     .from(workers)
     .innerJoin(projects, eq(projects.id, workers.projectId))

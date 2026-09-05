@@ -13,7 +13,9 @@ import { RunsPage } from '../src/pages/Runs.tsx'
 import { CoveragePage } from '../src/pages/Coverage.tsx'
 import { RunnersPage } from '../src/pages/Runners.tsx'
 import { SettingsPage } from '../src/pages/Settings.tsx'
+import { Notifications, troublesFrom } from '../src/Notifications.tsx'
 import type { LinearOauth, SystemInfo } from '../src/api.ts'
+import { ProjectScopeProvider } from '../src/scope.tsx'
 
 /**
  * A smoke test, not a snapshot. It renders every page with no data and no server, which
@@ -32,6 +34,42 @@ const render = (el: ReactElement, seed?: (qc: QueryClient) => void): string => {
     </QueryClientProvider>,
   )
 }
+
+/** The same, with the project scope set — the state every page is in once one is picked. */
+const renderScoped = (
+  el: ReactElement,
+  scope: string,
+  seed?: (qc: QueryClient) => void,
+  /** The URL to render at, for a page that reads its own search params. */
+  at = '/',
+): string => {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  seed?.(qc)
+  return renderToString(
+    <QueryClientProvider client={qc}>
+      <MemoryRouter initialEntries={[at]}>
+        <ProjectScopeProvider initial={scope}>{el}</ProjectScopeProvider>
+      </MemoryRouter>
+    </QueryClientProvider>,
+  )
+}
+
+const TWO_PROJECTS = { projects: [{ id: '1', slug: 'ogun' }, { id: '2', slug: 'heirchive-api' }] }
+
+/** One indexed skill, as `/api/skills` returns it. */
+const skillRow = (name: string, project: string) => ({
+  skill: {
+    id: `${project}-${name}`,
+    name,
+    origin: 'builtin',
+    sourcePath: `/repo/skills/${name}`,
+    displayName: null,
+    shortDescription: null,
+    allowImplicitInvocation: false,
+  },
+  project: { slug: project },
+  workers: [],
+})
 
 test('every page renders with no data', () => {
   for (const [name, el] of [
@@ -415,4 +453,271 @@ test('markdown never emits markup from its source', () => {
   // The safe ones still work, or the escaping would be useless.
   assert.match(html, /href="https:\/\/example\.com"/)
   assert.match(html, /href="\.\/references\/running-a-review\.md"/)
+})
+
+/**
+ * The duplicate that started this. A built-in skill is indexed once per project — the
+ * unique key is `(project_id, name)` — so `scope-a-ticket` is two rows the moment two
+ * projects are registered, with the same source path and the same version hash.
+ *
+ * The list showed every row, so it read as a bug in the data. It was a missing filter.
+ */
+test('a project scope collapses the same built-in skill down to that project', () => {
+  const seed = (qc: QueryClient) => {
+    qc.setQueryData(['projects'], TWO_PROJECTS)
+    qc.setQueryData(['skills', 'all'], {
+      skills: [skillRow('scope-a-ticket', 'ogun'), skillRow('scope-a-ticket', 'heirchive-api')],
+    })
+    qc.setQueryData(['skills', 'ogun'], { skills: [skillRow('scope-a-ticket', 'ogun')] })
+  }
+
+  // Counted by card link rather than by name: exactly one per rendered row, and it does
+  // not move when the card's markup does.
+  const rows = (html: string) => html.match(/href="\/skills\//g)?.length ?? 0
+
+  const unscoped = renderScoped(<SkillsPage />, 'all', seed)
+  assert.equal(rows(unscoped), 2, 'across all projects it is listed once per project')
+
+  const scoped = renderScoped(<SkillsPage />, 'ogun', seed)
+  assert.equal(rows(scoped), 1, 'scoped to one project, one row')
+  assert.ok(!scoped.includes('heirchive-api'), 'and nothing from the other project')
+})
+
+/**
+ * The quiet half of the same gap. `CoveragePage` opened with
+ * `const slug = projects[0]?.slug` — a stand-in for a selector that did not exist — so
+ * with two projects registered the second one's coverage could not be reached at all.
+ * Not a duplicate: a page that silently showed you the wrong project's data.
+ */
+test('coverage follows the scope rather than showing whichever project sorts first', () => {
+  const seed = (qc: QueryClient) => {
+    qc.setQueryData(['projects'], TWO_PROJECTS)
+    qc.setQueryData(['sources', 'heirchive-api'], sourcesPayload())
+  }
+
+  const scoped = renderScoped(<CoveragePage />, 'heirchive-api', seed)
+  assert.match(scoped, /HEI-42/, "the selected project's ledger is the one rendered")
+
+  // And the first project is still reachable, which is the half that already worked.
+  const first = renderScoped(<CoveragePage />, 'ogun', seed)
+  assert.ok(!first.includes('HEI-42'), "another project's data does not leak into it")
+})
+
+/**
+ * A scope pinned to a project that has since been removed must not render an empty app
+ * with no explanation — the worst failure available to a control whose job is to narrow.
+ */
+test('a scope naming a project that no longer exists falls back to all', () => {
+  const html = renderScoped(<SkillsPage />, 'deleted-project', (qc) => {
+    qc.setQueryData(['projects'], TWO_PROJECTS)
+    qc.setQueryData(['skills', 'all'], { skills: [skillRow('triage', 'ogun')] })
+  })
+  assert.match(html, /triage/, 'it shows everything rather than nothing')
+})
+
+/**
+ * Runners is outside the project scope on purpose: a runner serves every project, so
+ * scoping the page to one would be scoping it to nothing. It still filters.
+ */
+test('runners ignores the project scope and filters on its own terms', () => {
+  const runners = {
+    runners: [
+      { id: 'a', name: 'desktop', labels: ['claude', 'docker'], online: true, revokedAt: null },
+      { id: 'b', name: 'laptop', labels: ['codex'], online: false, revokedAt: null },
+    ],
+    addresses: [],
+    tokenRequired: false,
+    reachabilityWarning: null,
+  }
+  const scoped = renderScoped(<RunnersPage />, 'ogun', (qc) => {
+    qc.setQueryData(['projects'], TWO_PROJECTS)
+    qc.setQueryData(['runners'], runners)
+  })
+  assert.match(scoped, /desktop/, 'a project scope hides no machine')
+  assert.match(scoped, /laptop/)
+})
+
+/** One worker row, as `/api/workers` returns it. */
+const workerRow = (
+  name: string,
+  over: { permissions?: string; sandbox?: string; skillOrigin?: string | null } = {},
+) => ({
+  worker: {
+    id: name,
+    name,
+    skillRef: name,
+    runtime: 'claude',
+    modelRole: 'reviewer',
+    permissions: over.permissions ?? 'reviewer',
+    sandbox: over.sandbox ?? 'container',
+    enabled: true,
+    versionHash: 'h',
+    config: {},
+  },
+  project: { slug: 'ogun' },
+  skillOrigin: over.skillOrigin === undefined ? 'builtin' : over.skillOrigin,
+  breaker: null,
+  schedule: null,
+  nextRun: null,
+  drivenBy: null,
+  effectivePrompt: { text: '', source: 'skill' as const },
+})
+
+const WORKERS = {
+  workers: [
+    workerRow('adversarial-review'),
+    workerRow('fix-a-finding', { permissions: 'modifier' }),
+    workerRow('scope-a-ticket', { permissions: 'observer' }),
+    workerRow('local-thing', { sandbox: 'worktree', skillOrigin: 'project' }),
+    workerRow('renamed', { skillOrigin: null }),
+  ],
+  editable: { ogun: false },
+  hashes: {},
+  policies: {},
+  allowSandboxDowngrade: {},
+}
+
+const seedWorkers = (qc: QueryClient) => {
+  qc.setQueryData(['projects'], TWO_PROJECTS)
+  qc.setQueryData(['allWorkers', 'ogun'], WORKERS)
+}
+
+/**
+ * The three axes that are worker properties rather than runner ones: what a run is
+ * allowed to do, how it is isolated, and whether the skill behind it is one of Ogun's or
+ * one this repo wrote.
+ */
+test('workers filter by role, sandbox and where the skill came from', () => {
+  const page = renderScoped(<WorkersPage />, 'ogun', seedWorkers)
+  for (const name of ['adversarial-review', 'fix-a-finding', 'local-thing', 'renamed']) {
+    assert.match(page, new RegExp(name), `${name} is listed unfiltered`)
+  }
+
+  // The options are derived from the rows, so a value nothing has is never offered — and
+  // every value something has is.
+  for (const option of ['observer', 'modifier', 'worktree', 'container']) {
+    assert.match(page, new RegExp(`value="${option}"`), `${option} is offered as a filter`)
+  }
+  assert.match(page, /value="unindexed"/, 'a worker whose skill is not indexed is filterable')
+  assert.match(page, /this repo's|this repo&#x27;s/, "a project skill's origin is offered in words")
+})
+
+/**
+ * A filter that empties a section must not offer to create a worker. The project may be
+ * full of them, and inviting a second `adversarial-review` is how duplicates get made.
+ */
+test('an emptied section says it is filtered rather than offering to create', () => {
+  const html = renderScoped(<WorkersPage />, 'ogun', (qc) => {
+    qc.setQueryData(['projects'], TWO_PROJECTS)
+    qc.setQueryData(['allWorkers', 'ogun'], { ...WORKERS, workers: [] })
+  })
+  assert.match(html, /no workers yet/, 'a genuinely empty project still invites one')
+})
+
+/**
+ * The tray replaced a stack of tinted boxes in the sidebar. The behaviour worth pinning
+ * is not the styling — it is that the collapsed line says how much is wrong without the
+ * detail, and that nothing is lit when nothing is.
+ */
+test('the notifications tray summarises without spilling detail into the sidebar', () => {
+  const status = {
+    runnersOnline: 0,
+    drifted: ['ogun', 'heirchive-api'],
+    breakers: [{ worker: 'security-review', project: 'ogun', failures: 3 }],
+    sources: [],
+  }
+  // Server rendering splits an interpolated value from the text beside it with an empty
+  // comment, so assertions about what a reader sees have to ignore those.
+  const html = render(<Notifications />, (qc) => qc.setQueryData(['status'], status)).replaceAll(
+    '<!-- -->',
+    '',
+  )
+
+  assert.match(html, /4 problems/, 'the collapsed line counts everything')
+  // Two of the four stop work outright; the drifted pair still runs the old definition.
+  assert.match(html, /2 stopped/, 'and separates the ones where nothing is running')
+  assert.ok(
+    !html.includes('consecutive failures'),
+    'the explanatory sentences stay in the panel, which is closed',
+  )
+})
+
+test('nothing is lit when nothing is wrong', () => {
+  const html = render(<Notifications />, (qc) =>
+    qc.setQueryData(['status'], { runnersOnline: 2, drifted: [], breakers: [], sources: [] }),
+  )
+  assert.match(html, /All clear/)
+  assert.ok(!html.includes('class="tray-trigger lit'), 'the trigger is not lit')
+  assert.match(html, /disabled/, 'and there is no panel to open')
+})
+
+/**
+ * The bug the tray had once the app grew a hard project scope: a notification about
+ * another project navigated you to a page that then filtered out the very thing you
+ * clicked. Two halves — the link has to carry the project, and it has to name the worker
+ * so the destination can put it in front of you.
+ */
+test('a notification names the project and the worker it is about', () => {
+  const troubles = troublesFrom({
+    runnersOnline: 0,
+    drifted: ['heirchive-api'],
+    breakers: [{ worker: 'security-review', project: 'heirchive-api', failures: 3 }],
+    sources: [
+      { project: 'ogun', source: 'linear', state: 'failing', kind: 'auth', detail: null },
+    ],
+  })
+
+  const by = (fragment: string) => troubles.find((t) => t.key.startsWith(fragment))
+
+  // Every project-specific entry carries its project, so following it moves the scope.
+  assert.equal(by('breaker')?.project, 'heirchive-api')
+  assert.equal(by('drift')?.project, 'heirchive-api')
+  assert.equal(by('source')?.project, 'ogun')
+
+  // And the machine-wide one deliberately does not: Runners is outside the scope, so
+  // there is nothing to move, and moving it would be a side effect nobody asked for.
+  assert.equal(by('runners')?.project, undefined)
+
+  // The halted worker is named in the URL rather than leaving you to find it.
+  assert.equal(by('breaker')?.to, '/workers?focus=security-review')
+})
+
+/**
+ * `focus` overrides the rest of the bar rather than combining with it. Arriving from a
+ * notification with a stale `Role` filter still set would otherwise land you on a page
+ * that hides the worker the tray just told you was halted.
+ */
+test('a focused worker survives filters that would otherwise hide it', () => {
+  const seed = (qc: QueryClient) => {
+    qc.setQueryData(['projects'], TWO_PROJECTS)
+    qc.setQueryData(['allWorkers', 'ogun'], WORKERS)
+  }
+
+  const focused = renderScoped(
+    <WorkersPage />,
+    'ogun',
+    seed,
+    '/workers?focus=scope-a-ticket',
+  )
+  assert.match(focused, /scope-a-ticket/, 'the worker asked for is shown')
+  assert.ok(!focused.includes('adversarial-review'), 'and the rest of the list is not')
+  // It must also be visible *as* a filter, or the page is quietly lying about how much
+  // it is showing.
+  assert.match(focused, /class="chip"/, 'the focus is shown as a removable chip')
+  assert.ok(!focused.includes('placeholder="name, skill, model'), 'the overridden controls go')
+})
+
+/** A focus naming a worker in another project says so, rather than rendering nothing. */
+test('a focus that matches nothing in scope explains itself', () => {
+  const html = renderScoped(
+    <WorkersPage />,
+    'ogun',
+    (qc) => {
+      qc.setQueryData(['projects'], TWO_PROJECTS)
+      qc.setQueryData(['allWorkers', 'ogun'], WORKERS)
+    },
+    '/workers?focus=something-else',
+  )
+  assert.match(html, /is not in this project/)
+  assert.match(html, /All projects/, 'and says where to look instead')
 })

@@ -1,7 +1,8 @@
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, type FindingRow } from '../api.ts'
-import { Empty, exact, Page, Pill, Severity, when } from '../ui.tsx'
+import { Choice, Empty, exact, Filters, matches, Page, Pill, Search, Severity, when } from '../ui.tsx'
+import { useProjectScope } from '../scope.tsx'
 
 const SEVERITY_ORDER = ['critical', 'high', 'medium', 'low', 'info']
 
@@ -16,10 +17,13 @@ export function FindingsPage() {
   // factory has said, not only what is still outstanding — a fixed finding you want to
   // re-read should not require knowing which filter hides it.
   const [status, setStatus] = useState(ALL_STATUSES)
+  const [query, setQuery] = useState('')
+  const [severity, setSeverity] = useState('all')
+  const { filter, isAll } = useProjectScope()
   const qc = useQueryClient()
   const { data, isLoading, error } = useQuery({
-    queryKey: ['findings', status],
-    queryFn: () => api.findings({ status }),
+    queryKey: ['findings', status, filter ?? 'all'],
+    queryFn: () => api.findings({ status, ...(filter ? { project: filter } : {}) }),
   })
 
   const setStatusMutation = useMutation({
@@ -27,29 +31,60 @@ export function FindingsPage() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ['findings'] }),
   })
 
-  const findings = [...(data?.findings ?? [])].sort((a, b) => {
+  const all = [...(data?.findings ?? [])].sort((a, b) => {
     const s = SEVERITY_ORDER.indexOf(a.finding.severity) - SEVERITY_ORDER.indexOf(b.finding.severity)
     return s !== 0 ? s : b.finding.updatedAt.localeCompare(a.finding.updatedAt)
   })
+  const findings = all.filter(
+    (f) =>
+      matches(
+        query,
+        f.finding.title,
+        f.finding.body,
+        f.finding.path,
+        f.finding.fingerprint,
+        f.worker?.name,
+      ) && (severity === 'all' || f.finding.severity === severity),
+  )
 
   return (
     <Page
       title="Findings"
       subtitle="One row per issue, not per sighting. Dismissing something keeps it dismissed."
-      actions={
-        <select value={status} onChange={(e) => setStatus(e.target.value)}>
-          <option value={ALL_STATUSES}>all</option>
-          <option value="open,triaged">open</option>
-          <option value="fixed">fixed</option>
-          <option value="wontfix">wontfix</option>
-          <option value="duplicate">duplicate</option>
-          <option value="gated,overflow">gated &amp; overflow</option>
-        </select>
-      }
     >
+      <Filters count={findings.length} total={all.length} noun="findings">
+        <Search value={query} onChange={setQuery} placeholder="title, body, path, fingerprint…" />
+        <Choice
+          label="Status"
+          value={status}
+          onChange={setStatus}
+          options={[
+            [ALL_STATUSES, 'all'],
+            ['open,triaged', 'open'],
+            ['fixed', 'fixed'],
+            ['wontfix', 'wontfix'],
+            ['duplicate', 'duplicate'],
+            ['gated,overflow', 'gated & overflow'],
+          ]}
+        />
+        <Choice
+          label="Severity"
+          value={severity}
+          onChange={setSeverity}
+          options={[['all', 'any'], ...SEVERITY_ORDER.map((s) => [s, s] as [string, string])]}
+        />
+      </Filters>
+
       {error && <p className="error">{String(error)}</p>}
       {isLoading && <Empty>loading…</Empty>}
-      {!isLoading && findings.length === 0 && (
+      {!isLoading && all.length > 0 && findings.length === 0 && (
+        <Empty>
+          nothing matches
+          <br />
+          <span className="muted">{all.length} findings in this scope — try a wider filter</span>
+        </Empty>
+      )}
+      {!isLoading && all.length === 0 && (
         <Empty>
           nothing here.
           <br />
@@ -64,6 +99,7 @@ export function FindingsPage() {
         <Finding
           key={f.finding.id}
           row={f}
+          showProject={isAll}
           onStatus={(next) => setStatusMutation.mutate({ id: f.finding.id, next })}
           busy={setStatusMutation.isPending}
         />
@@ -74,10 +110,12 @@ export function FindingsPage() {
 
 function Finding({
   row,
+  showProject,
   onStatus,
   busy,
 }: {
   row: FindingRow
+  showProject: boolean
   onStatus: (status: string) => void
   busy: boolean
 }) {
@@ -110,6 +148,7 @@ function Finding({
           )}
         </div>
         <div className="muted" style={{ whiteSpace: 'nowrap', fontSize: 12 }}>
+          {showProject && `${row.project.slug} · `}
           {row.worker?.name ?? 'unknown'} ·{' '}
           <span title={exact(f.updatedAt)}>{when(f.updatedAt)}</span>
         </div>

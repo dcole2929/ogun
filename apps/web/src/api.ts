@@ -232,6 +232,13 @@ export type WorkerRow = {
     config: Record<string, unknown>
   }
   project: { slug: string }
+  /**
+   * Where the bound skill came from — `builtin` for one of Ogun's own disciplines,
+   * `project` for one this repo wrote, `machine` for `~/.ogun/skills`. Null when the
+   * worker names a skill that is not indexed, which is what a rename that has not been
+   * synced looks like.
+   */
+  skillOrigin: string | null
   /** Null when this worker has never failed. */
   breaker: { consecutiveFailures: number; openedAt: string | null } | null
   /** Null when the worker has no `schedule:` — it only runs when triggered. */
