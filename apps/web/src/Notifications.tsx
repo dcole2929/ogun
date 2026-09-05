@@ -133,7 +133,19 @@ export function Notifications() {
 
       <button
         type="button"
-        className={`tray-trigger${troubles.length > 0 ? ' lit' : ''}${open ? ' open' : ''}`}
+        /**
+         * Severity is carried by the dot rather than by a second count beside the label.
+         *
+         * "2 problems" with a "1 stopped" badge did not fit: at the default 200px the
+         * badge pushed the label into "2 proble…", so the only part that was legible was
+         * the part that was cut. The sidebar is the narrowest column on screen and this
+         * is the one line in it that must always read cleanly — a colour costs no width,
+         * and the breakdown is one click away in the panel.
+         */
+        className={
+          `tray-trigger${troubles.length > 0 ? ' lit' : ''}` +
+          `${stopped > 0 ? ' stopped' : ''}${open ? ' open' : ''}`
+        }
         aria-expanded={open}
         aria-haspopup="dialog"
         disabled={troubles.length === 0}
@@ -145,11 +157,6 @@ export function Notifications() {
             ? 'All clear'
             : `${troubles.length} ${troubles.length === 1 ? 'problem' : 'problems'}`}
         </span>
-        {/* The count that matters is the one where nothing is running, so it is the one
-            shown separately when the two differ. */}
-        {stopped > 0 && troubles.length !== stopped && (
-          <span className="tray-badge">{stopped} stopped</span>
-        )}
       </button>
     </div>
   )
