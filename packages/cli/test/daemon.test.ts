@@ -196,3 +196,28 @@ test('the host records what it launched, and the log carries the exit', async (t
   assert.match(log, /SIGTERM — asking server to stop/, 'and so is the shutdown')
   assert.match(log, /server exited/)
 })
+
+/**
+ * The bound has to hold for a single write larger than the whole budget.
+ *
+ * A chunk off the pipe is up to 64KB and has nothing to do with a line, so rolling over
+ * and *then* writing the chunk whole let one write exceed `maxBytes` by any amount. It
+ * passed in isolation, where output arrives a line at a time, and failed in a loaded
+ * suite where chunks coalesce — so it is pinned here with one oversized write rather
+ * than left to timing.
+ */
+test('one write larger than maxBytes still leaves a bounded file', async (t) => {
+  const { dir, logFile } = await sandbox(t, { maxBytes: '4kb', keep: 2 })
+  const entry = join(dir, 'oneshot.ts')
+  // A single 50KB console.log — one write, twelve times the budget.
+  await writeFile(
+    entry,
+    "console.log('x'.repeat(50_000))\nsetInterval(() => {}, 1000)\n",
+  )
+  await startDetached({ name: 'server', entry, args: [] })
+
+  assert.ok(
+    (await stat(logFile)).size <= 4096,
+    'the live file respects maxBytes however the bytes arrived',
+  )
+})

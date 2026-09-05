@@ -79,11 +79,29 @@ class RollingLog {
     this.queue = this.queue.then(() => this.append(chunk)).catch(() => {})
   }
 
+  /**
+   * Written up to the boundary, rolled, and continued — rather than rolling and then
+   * writing the whole chunk.
+   *
+   * A chunk here is whatever came off the pipe, which is up to 64KB and has nothing to do
+   * with a line. Rolling first and then writing it whole means one chunk can exceed
+   * `maxBytes` by any amount: `maxBytes: "2kb"` against a 64KB chunk produced a 64KB
+   * file, so the one thing the setting promises did not hold. It survived its first test
+   * run because small chunks arrive one line at a time, and failed under a loaded suite
+   * where they coalesce — the shape of bug that reaches production looking flaky.
+   *
+   * Splitting costs nothing that was not already lost: these bytes are not line-aligned
+   * to begin with, so a chunk boundary already falls mid-line wherever the pipe decided.
+   */
   private async append(chunk: string | Buffer): Promise<void> {
-    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
-    if (this.size + buf.byteLength > this.maxBytes) await this.rollover()
-    await this.handle?.write(buf)
-    this.size += buf.byteLength
+    let rest = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+    while (rest.byteLength > 0) {
+      if (this.size >= this.maxBytes) await this.rollover()
+      const slice = rest.subarray(0, this.maxBytes - this.size)
+      await this.handle?.write(slice)
+      this.size += slice.byteLength
+      rest = rest.subarray(slice.byteLength)
+    }
   }
 
   /**
