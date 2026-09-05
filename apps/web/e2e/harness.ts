@@ -46,6 +46,27 @@ export async function serveDist(): Promise<{ url: string; stop: () => Promise<vo
   }
 }
 
+/**
+ * Wait until the page has stopped changing on its own.
+ *
+ * The shell mounting is not the same as the page being finished: the status query feeding
+ * the tray and the list query feeding the page land afterwards, at whatever moment the
+ * event loop gets to them. A screenshot taken before them is a picture of a page still
+ * assembling itself — which is how two of six screenshots differed between runs while
+ * being the same size to the byte, and how an earlier hand-run capture showed
+ * "0 workers" on a page that had two.
+ *
+ * `networkidle` covers the requests; the two animation frames after it cover the render
+ * they cause. Assertions want this as much as the camera does — a test that reads the DOM
+ * mid-flight is a flake waiting for a slow machine.
+ */
+export async function settle(page: Page): Promise<void> {
+  await page.waitForLoadState('networkidle')
+  await page.evaluate(
+    () => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))),
+  )
+}
+
 export type Harness = {
   page: Page
   url: string
@@ -93,6 +114,7 @@ export async function open(
   // Every page's first paint is a loading state; the scope selector is the shell, so its
   // arrival means the app has mounted and the projects query has landed.
   await page.waitForSelector('.scope select, .empty', { timeout: 15_000 })
+  await settle(page)
 
   return {
     page,

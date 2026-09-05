@@ -184,6 +184,25 @@ The one thing they catch that nothing else can is layout. `2 problems` beside a
 width, so a test that measures `scrollWidth` against `clientWidth` is the only kind that
 could have seen it.
 
+#### Screenshots
+
+`pnpm test:e2e` also writes `docs/screenshots/`, which is **committed**. `pnpm
+screenshots` regenerates them without running the assertions.
+
+**A change to the UI belongs in a pull request as a picture.** Fixed filenames,
+overwritten rather than accumulated, so changing the UI changes the file and GitHub
+renders a before/after image diff in *Files changed*. This repository is private, so
+linking to an image host is not available — and the image diff is the better review
+anyway. Regenerate them in any branch that touches the interface, and say in the PR body
+which ones moved.
+
+They are a review aid, not an assertion: nothing fails when they change. They are stable
+run to run on one machine — fixed viewport, animations off, no caret, and fixtures
+carrying no clock, because a relative timestamp is a pixel difference every day — but
+font rendering is a property of the machine, so another distribution will produce
+different bytes for an identical UI. Regenerate rather than hand-edit, and expect a
+first-run diff on a new box.
+
 ### Running in the background
 
 `ogun server start` and `ogun runner start` run in the foreground and stop with Ctrl-C.
