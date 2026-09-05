@@ -1,5 +1,5 @@
 import { Hono } from 'hono'
-import { and, desc, eq, inArray } from 'drizzle-orm'
+import { and, desc, eq, inArray, not } from 'drizzle-orm'
 import { z } from 'zod'
 import { schema } from '@ogun/core/db'
 import type { Db } from '@ogun/core/db'
@@ -165,6 +165,38 @@ async function applySync(db: Db, body: SyncPayload) {
   }
 
   /**
+   * A skill that is no longer on disk loses its row.
+   *
+   * The upsert above already overwrites wholesale, "including nulling fields that
+   * disappeared", on the grounds that this row is an index of a file and a stale half of
+   * it is worse than none. A row for a skill that has been deleted is the same argument
+   * one level up: a stale *whole* is worse still, because nothing about it looks stale.
+   * `fix-a-finding` outlived its own deletion by two syncs, indexed and bound to nothing,
+   * indistinguishable in the UI from a skill somebody had simply not wired up yet.
+   *
+   * A worker that still names it keeps its `skillRef` and loses `skillId` — the foreign
+   * key is `ON DELETE SET NULL` — so it reports as a worker whose skill is not indexed,
+   * which is exactly what it is, and is filterable as such on the Workers page.
+   *
+   * The empty case follows `reindexProject`'s removal of workers, deliberately: no names
+   * means no name restriction, so a project that discovers nothing indexes nothing. It is
+   * not reachable in practice — `discoverSkills` is always given Ogun's own built-in root
+   * — and an exception for it would mean a project could never lose its last skill.
+   */
+  const names = body.skills.map((s) => s.name)
+  const dropped = await db
+    .delete(skills)
+    .where(
+      and(
+        eq(skills.projectId, project.id),
+        // `inArray` with an empty list is not valid SQL, which is why this is a ternary
+        // rather than a plain condition — the same shape the worker removal uses.
+        names.length > 0 ? not(inArray(skills.name, names)) : undefined,
+      ),
+    )
+    .returning({ name: skills.name })
+
+  /**
    * Recorded here rather than in `reindexProject`, because this is where the skills are
    * — that function never sees them. A UI worker edit therefore leaves this column alone,
    * which is correct: editing a worker does not change a skill.
@@ -192,6 +224,7 @@ async function applySync(db: Db, body: SyncPayload) {
     project: { id: project.id, slug: project.slug },
     workers: Object.keys(indexed),
     skills: [...skillIds.keys()],
+    removedSkills: dropped.map((d) => d.name),
     removed,
     overriddenSchedules,
     /**
