@@ -1,47 +1,247 @@
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Link, useNavigate } from 'react-router'
+import { Link, useNavigate, useSearchParams } from 'react-router'
 import { api, type WorkerRow } from '../api.ts'
-import { Empty, exact, Page, Pill, when } from '../ui.tsx'
+
+type WorkersResponse = Awaited<ReturnType<typeof api.allWorkers>>
+import { Chip, Choice, Empty, exact, Filters, matches, Page, Pill, Search, when } from '../ui.tsx'
+import { useProjectScope } from '../scope.tsx'
 import { describeSchedule } from '../ScheduleField.tsx'
 import { WorkerForm } from './WorkerForm.tsx'
 
+/** `builtin` is the schema's word for it; these are the reader's. */
+const SKILL_ORIGIN: Record<string, string> = {
+  builtin: 'built-in',
+  project: "this repo's",
+  machine: 'machine-local',
+}
+
 export function WorkersPage() {
-  const { data: projects } = useQuery({ queryKey: ['projects'], queryFn: api.projects })
-  const list = projects?.projects ?? []
+  const { projects, slug: scope, isAll, filter } = useProjectScope()
+  const [query, setQuery] = useState('')
+  const [runtime, setRuntime] = useState('all')
+  const [state, setState] = useState('all')
+  const [role, setRole] = useState('all')
+  const [sandbox, setSandbox] = useState('all')
+  const [skill, setSkill] = useState('all')
+
+  /**
+   * One worker, named in the URL — how the notifications tray points at a halted one.
+   *
+   * It overrides the rest of the bar rather than combining with it. Arriving from a
+   * notification with `Role: observer` still set from ten minutes ago would otherwise
+   * land you on a page that hides the very worker you clicked to see, which is the same
+   * failure the project scope had and is worse here: the tray told you something is
+   * halted and the page shows you nothing wrong.
+   */
+  const [params, setParams] = useSearchParams()
+  const focus = params.get('focus')
+  const clearFocus = () => {
+    const next = new URLSearchParams(params)
+    next.delete('focus')
+    setParams(next, { replace: true })
+  }
+
+  // One section when a project is selected, every project when it is not.
+  const shown = isAll ? projects : projects.filter((p) => p.slug === scope)
+
+  /**
+   * One query for the whole page, sliced per section below.
+   *
+   * The sections used to fetch their own, which left the filter bar unable to say how
+   * many rows it was hiding without every section reporting its counts back up. Worse,
+   * the bar's own options are derived from the data — a "Sandbox: worktree" choice is
+   * worth offering only when some worker actually uses it — and a facet cannot be
+   * computed from rows that have not been fetched yet.
+   */
+  const { data } = useQuery({
+    queryKey: ['allWorkers', filter ?? 'all'],
+    queryFn: () => api.allWorkers(filter),
+  })
+  const all = data?.workers ?? []
+  const rows = focus
+    ? all.filter((row) => row.worker.name === focus)
+    : all.filter(
+    (row) =>
+      matches(
+        query,
+        row.worker.name,
+        row.worker.skillRef,
+        row.worker.modelRole,
+        row.worker.runtime,
+      ) &&
+      (runtime === 'all' || row.worker.runtime === runtime) &&
+      (state === 'all' || (state === 'enabled') === row.worker.enabled) &&
+      (role === 'all' || row.worker.permissions === role) &&
+      (sandbox === 'all' || row.worker.sandbox === sandbox) &&
+      (skill === 'all' ||
+        (skill === 'unindexed' ? row.skillOrigin === null : row.skillOrigin === skill)),
+      )
+
+  /**
+   * Options come from the rows rather than from the schema's enums.
+   *
+   * Two reasons, and the second is the one that decided it. A copy of
+   * `PERMISSION_PROFILES` in the browser is a server constant with a second
+   * implementation, which is the mistake this file already carries a comment about for
+   * the breaker threshold. And offering a value nothing has is offering a filter whose
+   * only outcome is an empty list.
+   */
+  const facet = (of: (row: (typeof all)[number]) => string | null): string[] =>
+    [...new Set(all.map(of).filter((v): v is string => v !== null))].sort()
 
   return (
     <Page
       title="Workers"
       subtitle="A skill plus a runtime, a model, a permission profile, and a sandbox. Defined in .ogun/config.yaml."
     >
-      {list.length === 0 && (
+      <Filters count={rows.length} total={all.length} noun="workers">
+        {focus ? (
+          // The other controls are not merely inactive, they are overridden — rendering
+          // them beside a filter that ignores them would invite you to adjust something
+          // that does nothing.
+          <Chip label="showing" value={focus} onClear={clearFocus} />
+        ) : (
+          <>
+        <Search value={query} onChange={setQuery} placeholder="name, skill, model…" />
+        <Choice
+          label="Runtime"
+          value={runtime}
+          onChange={setRuntime}
+          options={[
+            ['all', 'any'],
+            ...facet((r) => r.worker.runtime).map((v) => [v, v] as [string, string]),
+          ]}
+        />
+        <Choice
+          label="State"
+          value={state}
+          onChange={setState}
+          options={[
+            ['all', 'any'],
+            ['enabled', 'enabled'],
+            ['disabled', 'disabled'],
+          ]}
+        />
+        {/*
+          The permission profile, which is what "role" means for a worker: an observer
+          reads, a reviewer reports, a modifier writes files. It is the field that decides
+          what a run is allowed to do, so it is the one worth filtering on.
+        */}
+        <Choice
+          label="Role"
+          value={role}
+          onChange={setRole}
+          options={[
+            ['all', 'any'],
+            ...facet((r) => r.worker.permissions).map((v) => [v, v] as [string, string]),
+          ]}
+        />
+        <Choice
+          label="Sandbox"
+          value={sandbox}
+          onChange={setSandbox}
+          options={[
+            ['all', 'any'],
+            ...facet((r) => r.worker.sandbox).map((v) => [v, v] as [string, string]),
+          ]}
+        />
+        {/*
+          Built-in means one of Ogun's own disciplines; project means this repo wrote it.
+          `unindexed` is not a fourth kind of skill — it is a worker naming one the index
+          does not have, which is what an unsynced rename looks like and is worth being
+          able to list on purpose.
+        */}
+        <Choice
+          label="Skill"
+          value={skill}
+          onChange={setSkill}
+          options={[
+            ['all', 'any'],
+            ...facet((r) => r.skillOrigin).map(
+              (v) => [v, SKILL_ORIGIN[v] ?? v] as [string, string],
+            ),
+            ...(all.some((r) => r.skillOrigin === null)
+              ? ([['unindexed', 'not indexed']] as Array<[string, string]>)
+              : []),
+          ]}
+        />
+          </>
+        )}
+      </Filters>
+
+      {projects.length === 0 && (
         <Empty>
           no projects registered
           <br />
           <span className="muted mono">ogun project sync</span>
         </Empty>
       )}
-      {list.map((p) => (
-        <ProjectWorkers key={p.id} slug={p.slug} />
+      {/*
+        While something is narrowing the list, a project with no matches is dropped rather
+        than rendered as an empty section. Unfiltered it stays: "no workers yet" is worth
+        seeing, and it is where you go to create one. Focused on a single worker, every
+        other project would otherwise render a section saying nothing matched — noise
+        around the one row you asked for.
+      */}
+      {shown
+        .filter((p) => rows.length === all.length || rows.some((r) => r.project.slug === p.slug))
+        .map((p) => (
+        <ProjectWorkers
+          key={p.id}
+          slug={p.slug}
+          heading={isAll}
+          workers={rows.filter((r) => r.project.slug === p.slug)}
+          filtered={rows.length !== all.length}
+          meta={data}
+        />
       ))}
+      {/* Everything was narrowed away — said once for the page, not once per project. */}
+      {all.length > 0 && rows.length === 0 && (
+        <Empty>
+          {focus ? (
+            <>
+              <span className="mono">{focus}</span> is not in this project
+              <br />
+              <span className="muted">it may belong to another one — try All projects</span>
+            </>
+          ) : (
+            'nothing matches the filters above'
+          )}
+        </Empty>
+      )}
     </Page>
   )
 }
 
-function ProjectWorkers({ slug }: { slug: string }) {
+function ProjectWorkers({
+  slug,
+  heading,
+  workers,
+  filtered,
+  meta,
+}: {
+  slug: string
+  heading: boolean
+  /** Already filtered by the bar above; this renders what it is given. */
+  workers: WorkerRow[]
+  /** Whether the bar is hiding anything, so an empty section can say which kind of empty. */
+  filtered: boolean
+  /**
+   * Everything on the response that is not a worker row: which projects this control
+   * plane can edit, their config hashes, their policies. All keyed by slug, all from the
+   * same request the rows came from — so this section never re-fetches what the page has
+   * already got.
+   */
+  meta: WorkersResponse | undefined
+}) {
   const qc = useQueryClient()
   const navigate = useNavigate()
   const [creating, setCreating] = useState(false)
   const [editing, setEditing] = useState<string | null>(null)
 
-  const { data } = useQuery({
-    queryKey: ['allWorkers', slug],
-    queryFn: () => api.allWorkers(slug),
-  })
-  const workers = data?.workers ?? []
-  const editable = data?.editable[slug] ?? false
-  const hash = data?.hashes[slug]
+  const editable = meta?.editable[slug] ?? false
+  const hash = meta?.hashes[slug]
   /**
    * The breaker threshold this project's config actually asks for, from the server.
    *
@@ -52,7 +252,7 @@ function ProjectWorkers({ slug }: { slug: string }) {
    * place. `undefined` means we have not been told, and the sentence below says less
    * rather than guessing.
    */
-  const breakerThreshold = data?.policies[slug]?.policies.failureBreakerThreshold
+  const breakerThreshold = meta?.policies[slug]?.policies.failureBreakerThreshold
   /**
    * Whether this project's config.yaml permits a modifier on the `worktree` sandbox.
    *
@@ -61,7 +261,7 @@ function ProjectWorkers({ slug }: { slug: string }) {
    * Undefined means the control plane cannot read the file, in which case the form has
    * nothing to write to anyway.
    */
-  const allowSandboxDowngrade = data?.allowSandboxDowngrade[slug] ?? false
+  const allowSandboxDowngrade = meta?.allowSandboxDowngrade[slug] ?? false
 
   const { data: projects } = useQuery({ queryKey: ['projects'], queryFn: api.projects })
   const drift = projects?.projects.find((p) => p.slug === slug)?.drift
@@ -85,7 +285,9 @@ function ProjectWorkers({ slug }: { slug: string }) {
 
   return (
     <>
-      <div className="spread" style={{ alignItems: 'center', marginTop: 26 }}>
+      {/* The heading still earns its place when only one project is shown — it carries
+          the New worker button, and names what the scope resolved to. */}
+      <div className="spread" style={{ alignItems: 'center', marginTop: heading ? 26 : 0 }}>
         <h2 style={{ margin: 0 }}>{slug}</h2>
         {!creating && !editing && editable && (
           <button className="primary" onClick={() => setCreating(true)}>
@@ -145,10 +347,21 @@ function ProjectWorkers({ slug }: { slug: string }) {
         />
       )}
 
+      {/*
+        Two different empties. "No workers" invites you to create one; "nothing matches"
+        must not, because the project may be full of workers the bar is hiding — and an
+        invitation to create a second `adversarial-review` is how duplicates get made.
+      */}
       {workers.length === 0 && !creating && (
         <Empty>
-          no workers yet — create one here, or add it to{' '}
-          <span className="mono">.ogun/config.yaml</span> and sync
+          {filtered ? (
+            'no workers here match the filters above'
+          ) : (
+            <>
+              no workers yet — create one here, or add it to{' '}
+              <span className="mono">.ogun/config.yaml</span> and sync
+            </>
+          )}
         </Empty>
       )}
 
