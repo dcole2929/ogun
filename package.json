@@ -17,7 +17,8 @@
     "ogun": "node --env-file-if-exists=.env packages/cli/src/main.ts",
     "web": "pnpm --filter @ogun/web dev",
     "test": "node --test --test-concurrency=1 packages/*/test/*.test.ts && pnpm --filter @ogun/web test",
-    "init": "node packages/cli/src/main.ts init"
+    "init": "node packages/cli/src/main.ts init",
+    "test:e2e": "pnpm --filter @ogun/web test:e2e"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

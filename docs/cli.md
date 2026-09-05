@@ -155,6 +155,35 @@ who has put nginx or Caddy in front says otherwise. It is not read as a header �
 `x-forwarded-proto` is written by whoever is talking to us, which on a plain-HTTP LAN is
 the client, and a guard a request can switch off is not a guard.
 
+### Browser tests
+
+`pnpm test` renders every page with `renderToString`, which only ever sees a first
+paint — a panel that has not been opened, a handle nobody dragged, a link nobody
+clicked. Every bug in that territory lives *after* an interaction, which is why a
+notification that sent you to a page scoped to the wrong project shipped with the suite
+green.
+
+`pnpm test:e2e` drives the built bundle in headless Chromium. It is separate from
+`pnpm test` on purpose: it needs a ~115MB browser that a runner has no reason to carry,
+and the unit suite has to stay runnable anywhere.
+
+```
+npx playwright install chromium   # once per machine
+pnpm test:e2e
+```
+
+The API is stubbed from `apps/web/e2e/fixtures.ts` rather than served by a real control
+plane. These are tests about interaction — a panel that opens, a handle that drags, a
+link that changes what the next page shows — and none of that is a claim about the
+server; running a database to assert it would make them slower and flakier without
+making them truer. What is *not* stubbed is the bundle: they load the same files
+`ogun server` serves.
+
+The one thing they catch that nothing else can is layout. `2 problems` beside a
+`1 stopped` badge rendered correct markup and read as `2 proble…` at the default sidebar
+width, so a test that measures `scrollWidth` against `clientWidth` is the only kind that
+could have seen it.
+
 ### Running in the background
 
 `ogun server start` and `ogun runner start` run in the foreground and stop with Ctrl-C.
