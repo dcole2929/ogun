@@ -10,7 +10,8 @@
     "typecheck": "tsc -p tsconfig.json",
     "test": "esbuild test/render.test.tsx --bundle --platform=node --format=cjs --outfile=test-build/render.test.cjs --log-level=error && node --test test-build/render.test.cjs",
     "test:e2e": "pnpm build && node --test --test-concurrency=1 e2e/*.test.ts && node e2e/screenshots.ts",
-    "screenshots": "pnpm build && node e2e/screenshots.ts"
+    "screenshots": "pnpm build && node e2e/screenshots.ts",
+    "screenshots:publish": "pnpm screenshots && node e2e/publish.ts"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.66.0",

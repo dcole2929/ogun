@@ -186,22 +186,33 @@ could have seen it.
 
 #### Screenshots
 
-`pnpm test:e2e` also writes `docs/screenshots/`, which is **committed**. `pnpm
-screenshots` regenerates them without running the assertions.
+**A change to the UI belongs in a pull request as a picture.** `pnpm screenshots`
+captures the set and publishes it; paste the markdown it prints into the PR.
 
-**A change to the UI belongs in a pull request as a picture.** Fixed filenames,
-overwritten rather than accumulated, so changing the UI changes the file and GitHub
-renders a before/after image diff in *Files changed*. This repository is private, so
-linking to an image host is not available — and the image diff is the better review
-anyway. Regenerate them in any branch that touches the interface, and say in the PR body
-which ones moved.
+The images are *not* committed. `docs/screenshots/` is gitignored, and publishing pushes
+the files to an orphan `screenshots` branch — no parent, force-pushed, so only the current
+set is reachable and superseded blobs are reclaimed by gc. `main` never references them
+and its history never grows a binary. `gh-pages` is the same trick for the same reason.
 
-They are a review aid, not an assertion: nothing fails when they change. They are stable
-run to run on one machine — fixed viewport, animations off, no caret, and fixtures
-carrying no clock, because a relative timestamp is a pixel difference every day — but
-font rendering is a property of the machine, so another distribution will produce
-different bytes for an identical UI. Regenerate rather than hand-edit, and expect a
-first-run diff on a new box.
+The branch exists because a private repository has exactly one image host whose auth a
+reviewer's browser already carries: GitHub. There is no API for real attachments — the
+endpoint the web UI uses is session and CSRF gated, `gh` has no command for it, and there
+is no REST route or GraphQL mutation. An external object store would mean credentials, a
+bill, and an unreleased interface on someone else's disk.
+
+Link them as `github.com/<owner>/<repo>/blob/screenshots/<file>.png?raw=1`, which is what
+the publish step prints. That form is **not** routed through camo, so the reviewer's own
+session authenticates it; a `raw.githubusercontent.com` link *is* camo'd, camo has no
+credential, and it renders broken for everyone.
+
+The trade is that the branch is not a history: publishing again replaces what was there,
+so a link in an old pull request goes stale. The picture is for the review happening now.
+If a before/after has to survive, put both images in the comment while both are current.
+
+They are stable run to run on one machine — fixed viewport, animations off, no caret, and
+fixtures carrying no clock, since a relative timestamp is a pixel difference every day —
+but font rendering is machine-specific, so another distribution produces different bytes
+for an identical UI.
 
 ### Running in the background
 

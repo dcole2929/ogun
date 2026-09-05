@@ -18,7 +18,8 @@
     "web": "pnpm --filter @ogun/web dev",
     "test": "node --test --test-concurrency=1 packages/*/test/*.test.ts && pnpm --filter @ogun/web test",
     "init": "node packages/cli/src/main.ts init",
-    "test:e2e": "pnpm --filter @ogun/web test:e2e"
+    "test:e2e": "pnpm --filter @ogun/web test:e2e",
+    "screenshots": "pnpm --filter @ogun/web screenshots:publish"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
