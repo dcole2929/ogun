@@ -36,3 +36,8 @@ coverage/
 images/base/cli/
 apps/web/dist/
 apps/web/test-build/
+
+# Screenshots are published to the orphan `screenshots` branch, not committed here —
+# see docs/cli.md. Keeping them in the working tree would put a binary in main's history
+# on every UI change, which is the thing the orphan branch exists to avoid.
+docs/screenshots/

@@ -155,6 +155,65 @@ who has put nginx or Caddy in front says otherwise. It is not read as a header �
 `x-forwarded-proto` is written by whoever is talking to us, which on a plain-HTTP LAN is
 the client, and a guard a request can switch off is not a guard.
 
+### Browser tests
+
+`pnpm test` renders every page with `renderToString`, which only ever sees a first
+paint — a panel that has not been opened, a handle nobody dragged, a link nobody
+clicked. Every bug in that territory lives *after* an interaction, which is why a
+notification that sent you to a page scoped to the wrong project shipped with the suite
+green.
+
+`pnpm test:e2e` drives the built bundle in headless Chromium. It is separate from
+`pnpm test` on purpose: it needs a ~115MB browser that a runner has no reason to carry,
+and the unit suite has to stay runnable anywhere.
+
+```
+npx playwright install chromium   # once per machine
+pnpm test:e2e
+```
+
+The API is stubbed from `apps/web/e2e/fixtures.ts` rather than served by a real control
+plane. These are tests about interaction — a panel that opens, a handle that drags, a
+link that changes what the next page shows — and none of that is a claim about the
+server; running a database to assert it would make them slower and flakier without
+making them truer. What is *not* stubbed is the bundle: they load the same files
+`ogun server` serves.
+
+The one thing they catch that nothing else can is layout. `2 problems` beside a
+`1 stopped` badge rendered correct markup and read as `2 proble…` at the default sidebar
+width, so a test that measures `scrollWidth` against `clientWidth` is the only kind that
+could have seen it.
+
+#### Screenshots
+
+**A change to the UI belongs in a pull request as a picture.** `pnpm screenshots`
+captures the set and publishes it; paste the markdown it prints into the PR.
+
+The images are *not* committed. `docs/screenshots/` is gitignored, and publishing pushes
+the files to an orphan `screenshots` branch — no parent, force-pushed, so only the current
+set is reachable and superseded blobs are reclaimed by gc. `main` never references them
+and its history never grows a binary. `gh-pages` is the same trick for the same reason.
+
+The branch exists because a private repository has exactly one image host whose auth a
+reviewer's browser already carries: GitHub. There is no API for real attachments — the
+endpoint the web UI uses is session and CSRF gated, `gh` has no command for it, and there
+is no REST route or GraphQL mutation. An external object store would mean credentials, a
+bill, and an unreleased interface on someone else's disk.
+
+Link them as `github.com/<owner>/<repo>/blob/screenshots/<file>.png?raw=1`, which is what
+the publish step prints. That form is **not** routed through camo, so the reviewer's own
+session authenticates it; a `raw.githubusercontent.com` link *is* camo'd, camo has no
+credential, and it renders broken for everyone.
+
+The trade is that the branch is not a history: publishing again replaces what was there,
+so a link in an old pull request goes stale. The picture is for the review happening now.
+If a before/after has to survive, put both images in the comment while both are current.
+
+They are stable run to run on one machine — fixed viewport, animations off, no caret, and
+fixtures carrying no clock, since a relative timestamp is a pixel difference every day —
+but font rendering is machine-specific, so another distribution produces different bytes
+for an identical UI.
+
 ### Running in the background
 
 `ogun server start` and `ogun runner start` run in the foreground and stop with Ctrl-C.

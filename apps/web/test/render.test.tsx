@@ -634,8 +634,9 @@ test('the notifications tray summarises without spilling detail into the sidebar
   )
 
   assert.match(html, /4 problems/, 'the collapsed line counts everything')
-  // Two of the four stop work outright; the drifted pair still runs the old definition.
-  assert.match(html, /2 stopped/, 'and separates the ones where nothing is running')
+  // Two of the four stop work outright, and that is carried by the dot rather than by a
+  // second count beside the label — which did not fit. See the e2e test that measures it.
+  assert.match(html, /tray-trigger lit stopped/, 'the trigger says something is stopped')
   assert.ok(
     !html.includes('consecutive failures'),
     'the explanatory sentences stay in the panel, which is closed',
