@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, readdir, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { parse as parseYaml } from 'yaml'
-import { eq } from 'drizzle-orm'
+import { and, eq } from 'drizzle-orm'
 import { schema } from '@ogun/core/db'
 import { startHarness, type Harness } from './harness.ts'
 import { ConfigConflict, createLocalConfigStore, workerToYamlBlock } from '../src/config-store.ts'
@@ -773,5 +773,109 @@ cycles:
     const text = await readFile(configPath, 'utf8')
     assert.match(text, /workers: \[reviewer-a, reviewer-b\]/)
     assert.match(text, /then: triage/)
+  })
+})
+
+/**
+ * The same bug as the cycles one above, one block over, and worse.
+ *
+ * `reindexProject` treats the file as the whole truth and deletes any source the file
+ * does not mention — but `ConfigFile` did not carry `sources:` at all, so every UI edit
+ * told it there were none. Editing one worker deleted the project's Linear sources: the
+ * row, the poll cursor, all of it, while the `sources:` block sat in config.yaml looking
+ * healthy.
+ *
+ * Worse than the cycles case because of what the symptom looks like. A dropped schedule
+ * stops a nightly run somebody notices the next morning; a dropped source stops an
+ * integration whose only signal is tickets arriving, and nothing arriving is also what a
+ * quiet week looks like. It would have been found by someone asking why Linear had gone
+ * silent, weeks later.
+ */
+describe('a ui edit does not disturb the sources in the same file', () => {
+  const slug = 'srcs'
+  const SOURCE_CONFIG = `project:
+  name: ${slug}
+  defaultBranch: main
+
+workers:
+  scope:
+    skill: review
+
+sources:
+  tickets:
+    kind: linear
+    cycle: scope
+    team: ENG
+    pollMinutes: 7
+    filter:
+      status: [Todo]
+`
+
+  let h: Harness
+  let root = ''
+
+  // Scoped to this project: the harness database is shared across the describes in this
+  // file, so an unscoped select picks up another one's rows and tests something else.
+  const projectId = async (): Promise<string> =>
+    (await h.db.query.projects.findFirst({ where: eq(schema.projects.slug, slug) }))!.id
+
+  const sourcesNow = async (): Promise<string[]> =>
+    (await h.db.select().from(schema.sources))
+      .filter((s) => s.projectId === id)
+      .map((s) => s.name)
+      .sort()
+
+  let id = ''
+
+  before(async () => {
+    root = await mkdtemp(join(tmpdir(), 'ogun-srcs-'))
+    await mkdir(join(root, '.ogun'), { recursive: true })
+    await writeFile(join(root, '.ogun', 'config.yaml'), SOURCE_CONFIG)
+    // A skill on disk, or the worker edit is refused before it reaches the file.
+    await mkdir(join(root, '.agents', 'skills', 'review'), { recursive: true })
+    await writeFile(
+      join(root, '.agents', 'skills', 'review', 'SKILL.md'),
+      '---\nname: review\ndescription: a review skill\n---\n\nReview the code.\n',
+    )
+    const mapPath = join(root, 'projects.json')
+    await writeFile(mapPath, JSON.stringify({ projects: { [slug]: root } }))
+    h = await startHarness(createLocalConfigStore(mapPath))
+    await h.fetch(`/api/projects/${slug}/sync-local`, { method: 'POST' })
+    id = await projectId()
+  })
+
+  after(async () => {
+    await h.stop()
+  })
+
+  test('the source survives a worker edit, with its cursor', async () => {
+    assert.deepEqual(await sourcesNow(), ['tickets'], 'indexed by the sync')
+
+    // A cursor, so the test can tell "survived" from "deleted and recreated" — the second
+    // would re-poll immediately and spend a rate limit on every keystroke.
+    const polledAt = new Date('2026-01-01T00:00:00.000Z')
+    await h.db
+      .update(schema.sources)
+      .set({ lastPolledAt: polledAt })
+      .where(eq(schema.sources.projectId, id))
+
+    const worker = await h.db.query.workers.findFirst({
+      where: and(eq(schema.workers.projectId, id), eq(schema.workers.name, 'scope')),
+    })
+    assert.ok(worker, 'this project has the worker the edit is about')
+    const res = await h.fetch(`/api/workers/${worker.id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ enabled: false }),
+    })
+    assert.equal(res.status, 200, await res.text())
+
+    assert.deepEqual(await sourcesNow(), ['tickets'], 'the source is still there')
+    const row = await h.db.query.sources.findFirst({
+      where: eq(schema.sources.projectId, id),
+    })
+    assert.equal(row?.lastPolledAt?.toISOString(), polledAt.toISOString(), 'and so is its cursor')
+    // The definition came back off the file rather than being invented by the edit.
+    assert.equal((row?.config as { pollMinutes: number }).pollMinutes, 7)
   })
 })

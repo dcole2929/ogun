@@ -9,6 +9,7 @@ import {
   workerSchema,
   type CycleDefinition,
   type Policies,
+  type SourceConfig,
   type WorkerConfig,
 } from '@ogun/core'
 
@@ -73,6 +74,23 @@ export type ConfigFile = {
    */
   cycles: Record<string, CycleDefinition>
   /**
+   * The `sources:` block, for exactly the reason the cycles comment above gives.
+   *
+   * It was missing, and the consequence was the same one, one block over and worse:
+   * `reindexProject` deletes every source the file does not mention, so a `ConfigFile`
+   * that omitted them told it every source was gone. Editing one worker from the UI
+   * therefore deleted the project's Linear sources — the poll cursor, the row, all of it
+   * — and the symptom was a factory that silently stopped hearing about tickets, which is
+   * indistinguishable from a quiet week.
+   *
+   * Worse than the cycles case because a cycle leaves its `cycles:` block visible in the
+   * file to contradict the database, and so does this one, but nothing *reads* a cycle on
+   * a timer: a deleted schedule stops a nightly run somebody notices the next morning. A
+   * deleted source stops an integration whose entire signal is tickets arriving, and
+   * nothing arrives when it is working correctly on a slow week either.
+   */
+  sources: Record<string, SourceConfig>
+  /**
    * The whole `policies:` block, including the pinned-blob half — because this *is* the
    * file, not a copy of it.
    *
@@ -136,6 +154,7 @@ export function createLocalConfigStore(projectMapPath?: string): ConfigStore {
       hash: hashOf(text),
       workers: parsed.workers,
       cycles: expand(parsed.cycles),
+      sources: parsed.sources,
       policies: parsed.policies,
     }
   }
@@ -201,6 +220,7 @@ export function createLocalConfigStore(projectMapPath?: string): ConfigStore {
           hash: hashOf(next),
           workers: parsed.data.workers,
           cycles: expand(parsed.data.cycles),
+          sources: parsed.data.sources,
           policies: parsed.data.policies,
         }
       }),
