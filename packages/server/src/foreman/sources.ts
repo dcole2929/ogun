@@ -4,7 +4,6 @@ import type { Db } from '@ogun/core/db'
 import {
   admitsTicket,
   cycleDefinitionSchema,
-  readProjectSecret,
   remoteNarrowing,
   sourceSchema,
   ticketBrief,
@@ -23,6 +22,7 @@ import {
   type LinearCredential,
 } from '../integrations/linear.ts'
 import { usableGrant } from './linear-grant.ts'
+import { projectLinearCredential } from '../integrations/linear-credential.ts'
 import { fleetCredentials } from './admission.ts'
 import { startCycleRun } from './cycles.ts'
 
@@ -357,50 +357,33 @@ export async function pollSource(
   if (!project) return refuse('this source belongs to no project')
 
   /**
-   * Which credential, decided in `readProjectSecret` and nowhere else (ADR-0014).
-   *
-   * An OAuth grant wins over a personal API key, and the reasoning for that lives with the
-   * function that applies it rather than being restated — the point of putting precedence
-   * in one place is that this file cannot hold a second opinion about it.
+   * Which credential, and whether it is usable right now — `projectLinearCredential`,
+   * which is this preamble after the Sources editor became its second caller. The
+   * precedence rule it applies (ADR-0014: a grant beats a key) is the one thing two call
+   * sites must not decide separately.
    */
-  const key = await (deps.secrets ?? readProjectSecret)(project.slug, 'linear')
-
-  let credential: LinearCredential
-  if (key.state === 'granted') {
-    /**
-     * The refresh, immediately before the request that needs the token, because a token
-     * that lasts 24 hours and a poller that wakes at 3am never coincide by accident. See
-     * `linear-grant.ts` for why this is not a timer and not a reaction to a 401.
-     */
-    const usable = await (deps.grant ?? usableGrant)(project.slug, 'linear', key.grant)
-    if (usable.state === 'refused') return refuse(usable.detail)
-    if (usable.state === 'failed') {
-      return record({
-        source: row.name,
-        outcome: 'failed',
-        // Taken from the grant rather than guessed at here. `usableGrant` is the only
-        // thing that knows whether the token endpoint was unreachable or the write to this
-        // machine's store failed, and those two want opposite advice.
-        kind: usable.kind,
-        seen: 0,
-        admitted: 0,
-        emitted: [],
-        trimmed: 0,
-        truncated: false,
-        detail: usable.detail,
-      })
-    }
-    credential = usable.credential
-  } else if (key.state === 'present') {
-    /**
-     * `expose()` at the wire and nowhere else — the one place per consumer ADR-0012 asks
-     * for. The value goes straight into the client that puts it in a header; it is never
-     * held in a variable this function logs, records, or puts in a `source_polls` row.
-     */
-    credential = { kind: 'api-key', token: key.secret.expose() }
-  } else {
-    return refuse(missingKey(project.slug, key))
+  const resolved = await projectLinearCredential(project.slug, {
+    ...(deps.secrets ? { secrets: deps.secrets } : {}),
+    ...(deps.grant ? { grant: deps.grant } : {}),
+  })
+  if (resolved.state === 'refused') return refuse(resolved.detail)
+  if (resolved.state === 'failed') {
+    return record({
+      source: row.name,
+      outcome: 'failed',
+      // Carried rather than re-derived: only the resolver knows whether the token
+      // endpoint was unreachable or the write to this machine's store failed, and those
+      // two want opposite advice.
+      kind: resolved.kind,
+      seen: 0,
+      admitted: 0,
+      emitted: [],
+      trimmed: 0,
+      truncated: false,
+      detail: resolved.detail,
+    })
   }
+  const credential = resolved.credential
 
   const api = (deps.linear ?? ((c: LinearCredential) => linearHttp({ credential: c })))(credential)
 
@@ -415,7 +398,7 @@ export async function pollSource(
     let result
     try {
       result = await api.issues({
-        filter: remoteNarrowing(config.team),
+        filter: remoteNarrowing(config.conditions.team),
         first: PAGE_SIZE,
         after,
       })
@@ -563,59 +546,11 @@ export async function pollSource(
     ...detailFor({
       seen,
       admitted: admitted.length,
-      team: config.team,
+      team: config.conditions.team,
       notes: [...edited, ...failures],
       truncated,
     }),
   })
-}
-
-/**
- * The ways a credential can be missing, each with the sentence that fixes it.
- *
- * Written out per state rather than templated, because the whole value of
- * `readProjectSecret` returning a state per remedy is lost the moment they share a
- * message. The `unreadable` case is the one that matters most and reads least like a
- * credential problem: the store is broken — a config.json mangled by an unrelated edit —
- * and the key is very likely still in it, so telling somebody to go and set one would send
- * them to overwrite a file that is already failing to parse.
- *
- * `unconnected` is the one ADR-0014 added, and it is the same mistake one step further
- * along: an operator who has registered an OAuth application and not finished the
- * authorization has done most of the work, and telling them to paste a personal API key
- * sends them backwards to the credential they were migrating off.
- */
-function missingKey(
-  slug: string,
-  key: Exclude<ProjectSecret, { state: 'present' } | { state: 'granted' }>,
-): string {
-  const set = `\`ogun connect linear --project ${slug}\``
-  switch (key.state) {
-    case 'unconnected':
-      return (
-        `"${slug}" has a linear oauth application registered (client ${key.clientId}) and ` +
-        'nobody has finished the authorization, so there is nothing to poll with. Connect ' +
-        `it from Settings, or run \`ogun connect linear --project ${slug}\``
-      )
-    case 'malformed':
-      return (
-        `the linear oauth entry for "${slug}" is not a shape this build can read ` +
-        `(${key.reason}). The store itself is fine — this one project needs reconnecting`
-      )
-    case 'absent':
-      return `"${slug}" is not connected to linear on this machine — run ${set}`
-    case 'empty':
-      return (
-        `the linear api key for "${slug}" is set to an empty value, which the write path ` +
-        `refuses to create — something wrote a blank over it. Run ${set} --api-key again`
-      )
-    case 'unreadable':
-      return (
-        `this machine's secret store could not be read (${key.reason}), so the linear key ` +
-        `for "${slug}" could not be looked up — it is probably still there, and the store ` +
-        'is what needs fixing'
-      )
-  }
 }
 
 /**
@@ -630,7 +565,8 @@ function missingKey(
 function detailFor(input: {
   seen: Ticket[]
   admitted: number
-  team: string
+  /** Every team the source names — plural since `conditions.team` became a list. */
+  team: string[]
   notes: string[]
   truncated: boolean
 }): { detail?: string } {
@@ -657,7 +593,8 @@ function detailFor(input: {
    */
   if (input.seen.length === 0) {
     parts.push(
-      `read no tickets at all for team "${input.team}" — either no issue in that team ` +
+      `read no tickets at all for team${input.team.length > 1 ? 's' : ''} ` +
+      `"${input.team.join(', ')}" — either no issue in that team ` +
         'matched the remote query, or the team key is not one this workspace has, or the ' +
         'grant cannot see it (an app-token grant reaches only public teams; `ogun connect ' +
         'list` says which grant this project uses)',

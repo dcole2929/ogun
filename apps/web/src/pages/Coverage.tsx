@@ -4,6 +4,7 @@ import { Link } from 'react-router'
 import { api, type SourceEmission, type SourceReport } from '../api.ts'
 import { Empty, exact, Page, Pill, when } from '../ui.tsx'
 import { useProjectScope } from '../scope.tsx'
+import { ConditionSummary } from './Sources.tsx'
 
 /**
  * The coverage ledger (principle 6).
@@ -411,17 +412,12 @@ function SourceDetail({ source }: { source: SourceReport }) {
        * lists are next to each other — otherwise it is a source that polls forever,
        * matches nothing, and reports success.
        */}
-      {source.filter ? (
+      {source.conditions ? (
         <p className="muted" style={{ margin: '0 0 6px' }}>
-          admits: status <strong>{source.filter.status.join(', ')}</strong>
-          {source.filter.labels.length > 0 && (
-            <> · labels {source.filter.labels.join(' + ')}</>
-          )}
-          {source.filter.excludeLabels.length > 0 && (
-            <> · not {source.filter.excludeLabels.join(', ')}</>
-          )}
-          {source.filter.notBlocked && <> · not blocked</>}
-          {' · '}team {source.team || '?'} · every {source.pollMinutes}m
+          {/* The same sentence the Sources page renders, from the same component: two
+              renderings of one rule are two things that can disagree about it. */}
+          admits: <ConditionSummary conditions={source.conditions} /> · every{' '}
+          {source.pollMinutes}m · <Link to="/sources">edit</Link>
         </p>
       ) : (
         <p className="error" style={{ margin: '0 0 6px' }}>

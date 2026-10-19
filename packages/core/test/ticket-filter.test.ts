@@ -7,6 +7,7 @@ import {
   ticketBrief,
   ticketDigest,
   ticketFilterOf,
+  usesLegacyShape,
   type Ticket,
   type TicketFilter,
 } from '../src/index.ts'
@@ -36,11 +37,16 @@ const ticket = (over: Partial<Ticket> = {}): Ticket => ({
 })
 
 const filter = (over: Partial<TicketFilter> = {}): TicketFilter => ({
+  team: ['ENG'],
   status: ['Todo'],
-  labels: ['ogun'],
-  excludeLabels: [],
+  label: { all_of: ['ogun'], any_of: [], none_of: [] },
   notBlocked: true,
   ...over,
+})
+
+/** Overrides one arm of the label condition without restating the other two. */
+const labels = (over: Partial<TicketFilter['label']>): Partial<TicketFilter> => ({
+  label: { all_of: [], any_of: [], none_of: [], ...over },
 })
 
 describe('the deterministic ticket filter', () => {
@@ -69,7 +75,7 @@ describe('the deterministic ticket filter', () => {
      * source and a broken one look identical.
      */
     const verdict = admitsTicket(
-      filter({ status: [' todo '], labels: ['OGUN'] }),
+      filter({ status: [' todo '], ...labels({ all_of: ['OGUN'] }) }),
       ticket({ status: 'Todo', labels: ['ogun'] }),
     )
     assert.equal(verdict.admitted, true)
@@ -83,7 +89,7 @@ describe('the deterministic ticket filter', () => {
      * in, so the naive `some()` is the bug this protects against.
      */
     const verdict = admitsTicket(
-      filter({ labels: ['ogun', 'ready'] }),
+      filter(labels({ all_of: ['ogun', 'ready'] })),
       ticket({ labels: ['ogun'] }),
     )
     assert.equal(verdict.admitted, false)
@@ -92,7 +98,7 @@ describe('the deterministic ticket filter', () => {
 
   it('refuses a ticket carrying an excluded label even when everything else matches', () => {
     const verdict = admitsTicket(
-      filter({ excludeLabels: ['needs-design'] }),
+      filter(labels({ none_of: ['needs-design'] })),
       ticket({ labels: ['ogun', 'needs-design'] }),
     )
     assert.equal(verdict.admitted, false)
@@ -146,7 +152,7 @@ describe('the deterministic ticket filter', () => {
      * `hasBlockedByRelations` counts a relation to an issue that closed in March where the
      * rule above does not. This test is the tripwire on that refactor.
      */
-    assert.deepEqual(remoteNarrowing('ENG'), { team: { key: { eq: 'ENG' } } })
+    assert.deepEqual(remoteNarrowing(['ENG']), { team: { key: { in: ['ENG'] } } })
   })
 })
 
@@ -249,9 +255,9 @@ describe('the sources: block', () => {
       },
     })
     assert.deepEqual(ticketFilterOf(source), {
+      team: ['ENG'],
       status: ['Todo'],
-      labels: ['ogun'],
-      excludeLabels: ['needs-design'],
+      label: { all_of: ['ogun'], any_of: [], none_of: ['needs-design'] },
       notBlocked: false,
     })
   })
@@ -272,5 +278,159 @@ describe('the sources: block', () => {
     })
     assert.equal('onMissed' in parsed, false)
     assert.equal(parsed.pollMinutes, 5)
+  })
+})
+
+/**
+ * `conditions:`, and the three label questions the old `labels` / `excludeLabels` pair
+ * could not ask separately.
+ */
+describe('the conditions grammar', () => {
+  it('admits on any_of when the ticket carries one of them, not all', () => {
+    const verdict = admitsTicket(
+      filter(labels({ any_of: ['admin', 'agent-ready'] })),
+      ticket({ labels: ['agent-ready'] }),
+    )
+    assert.equal(verdict.admitted, true, 'one of the set is enough')
+  })
+
+  it('refuses when the ticket carries none of the any_of set, and says so', () => {
+    const verdict = admitsTicket(
+      filter(labels({ any_of: ['admin', 'agent-ready'] })),
+      ticket({ labels: ['chore'] }),
+    )
+    assert.equal(verdict.admitted, false)
+    assert.match(
+      verdict.admitted === false ? verdict.reason : '',
+      /carries none of: admin, agent-ready/,
+    )
+  })
+
+  /**
+   * The clause that would be wrong by default. `[].some(...)` is `false`, so an unguarded
+   * `any_of` rejects every ticket for a source that gates on status alone — which is what
+   * every config written before this existed does.
+   */
+  it('an empty any_of means not asked, never matches-nothing', () => {
+    const verdict = admitsTicket(filter(labels({})), ticket({ labels: [] }))
+    assert.equal(verdict.admitted, true, 'a source gating purely on status still fires')
+  })
+
+  it('all_of and any_of are both required when both are written', () => {
+    const condition = labels({ all_of: ['ogun'], any_of: ['admin', 'agent-ready'] })
+    assert.equal(
+      admitsTicket(filter(condition), ticket({ labels: ['ogun', 'admin'] })).admitted,
+      true,
+    )
+    assert.equal(
+      admitsTicket(filter(condition), ticket({ labels: ['admin'] })).admitted,
+      false,
+      'any_of matching does not excuse a missing all_of',
+    )
+    assert.equal(
+      admitsTicket(filter(condition), ticket({ labels: ['ogun'] })).admitted,
+      false,
+      'and all_of matching does not excuse an unmatched any_of',
+    )
+  })
+
+  it('none_of still wins over everything else', () => {
+    const verdict = admitsTicket(
+      filter(labels({ any_of: ['admin'], none_of: ['needs-design'] })),
+      ticket({ labels: ['admin', 'needs-design'] }),
+    )
+    assert.equal(verdict.admitted, false)
+  })
+
+  /**
+   * Team became a condition rather than only a narrowing, and the local rule has to check
+   * it: `StringComparator.in` is case-sensitive where this folds case, so the remote read
+   * can now disagree with the rule in the hiding direction.
+   */
+  it('checks the team locally, folding case, across several of them', () => {
+    const several = filter({ team: ['EXC', 'HEI'] })
+    assert.equal(admitsTicket(several, ticket({ team: 'HEI' })).admitted, true)
+    assert.equal(admitsTicket(several, ticket({ team: 'exc' })).admitted, true, 'case folds')
+
+    const verdict = admitsTicket(several, ticket({ team: 'OPS' }))
+    assert.equal(verdict.admitted, false)
+    assert.match(verdict.admitted === false ? verdict.reason : '', /team "OPS" is not one of/)
+  })
+
+  it('narrows the read to every team it names', () => {
+    assert.deepEqual(remoteNarrowing(['EXC', 'HEI']), {
+      team: { key: { in: ['EXC', 'HEI'] } },
+    })
+  })
+
+  it('parses the documented shape', () => {
+    const source = sourceSchema.parse({
+      kind: 'linear',
+      cycle: 'ticket',
+      conditions: {
+        team: ['EXC', 'HEI'],
+        status: ['Todo'],
+        label: { any_of: ['admin', 'agent-ready'], none_of: ['needs-design'] },
+      },
+    })
+    assert.deepEqual(ticketFilterOf(source), {
+      team: ['EXC', 'HEI'],
+      status: ['Todo'],
+      label: { all_of: [], any_of: ['admin', 'agent-ready'], none_of: ['needs-design'] },
+      notBlocked: true,
+    })
+  })
+
+  /**
+   * A config that omits `label:` entirely is the common case, and `prefault` rather than
+   * `default` is what makes its three arms arrive as empty arrays instead of as an
+   * undefined the rule would take into `undefined.filter`.
+   */
+  it('fills every arm of label when the block is absent', () => {
+    const source = sourceSchema.parse({
+      kind: 'linear',
+      cycle: 'ticket',
+      conditions: { team: ['ENG'], status: ['Todo'] },
+    })
+    assert.deepEqual(source.conditions.label, { all_of: [], any_of: [], none_of: [] })
+  })
+})
+
+/**
+ * The shape written before the rename, still parsed.
+ *
+ * Refusing it would not produce an error anybody sees: `pollSources` skips a stored row
+ * it cannot parse, so an un-migrated source would become a poller that silently stopped
+ * — the exact failure this slice exists to be legible about.
+ */
+describe('a source written in the old shape', () => {
+  const legacy = {
+    kind: 'linear' as const,
+    cycle: 'ticket',
+    team: 'ENG',
+    filter: { status: ['Todo'], labels: ['ogun'], excludeLabels: ['wip'], notBlocked: false },
+  }
+
+  it('is translated rather than refused', () => {
+    const source = sourceSchema.parse(legacy)
+    assert.deepEqual(ticketFilterOf(source), {
+      team: ['ENG'],
+      status: ['Todo'],
+      label: { all_of: ['ogun'], any_of: [], none_of: ['wip'] },
+      notBlocked: false,
+    })
+  })
+
+  it('is recognisable, so sync can say so at the one moment somebody is looking', () => {
+    assert.equal(usesLegacyShape(legacy), true)
+    assert.equal(
+      usesLegacyShape({ kind: 'linear', cycle: 'ticket', conditions: { team: ['ENG'] } }),
+      false,
+    )
+  })
+
+  it('still refuses a filter with no status, which was never defaultable', () => {
+    const parsed = sourceSchema.safeParse({ kind: 'linear', cycle: 'ticket', team: 'ENG' })
+    assert.equal(parsed.success, false, 'no status anywhere is still a parse failure')
   })
 })

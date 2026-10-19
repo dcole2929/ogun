@@ -144,6 +144,27 @@ export async function projectSync(args: string[], serverUrl: string): Promise<vo
   for (const source of result.sources ?? []) {
     console.log(dim(`source ${cyan(source.name)}: linear → ${source.cycle}`))
   }
+  /**
+   * Said here because it is the only place it can be said.
+   *
+   * The old `team:` + `filter:` shape is translated into `conditions:` rather than
+   * refused, since a stored source this build cannot parse is one `pollSources` skips —
+   * a poller that silently stops, which is worse than any config error. The cost of that
+   * kindness is that nothing ever tells you, so this does, at the one moment somebody is
+   * looking at this file.
+   */
+  if (loaded.legacySources.length > 0) {
+    console.log(
+      yellow(
+        `\n${loaded.legacySources.join(', ')}: still written as \`team:\` + \`filter:\``,
+      ) +
+        dim(
+          '\n  Still polling — the old shape is translated. Rewrite as `conditions:` when' +
+            '\n  convenient; `labels:` becomes `label.all_of` and `excludeLabels:`' +
+            '\n  becomes `label.none_of`, and `team:` moves inside as a list.',
+        ),
+    )
+  }
   // Said out loud for the same reason a removed worker is: a sync that deletes quietly
   // is a sync you cannot check. A skill leaving the index un-binds every worker that
   // named it, which is a bigger consequence than the one line it used to get.

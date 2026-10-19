@@ -2,7 +2,7 @@ import { createServer, type Server } from 'node:http'
 import { readFile } from 'node:fs/promises'
 import { extname, join, normalize } from 'node:path'
 import { chromium, type Browser, type Page } from 'playwright'
-import { ROUTES, SKILLS, WORKERS } from './fixtures.ts'
+import { CYCLES, LINEAR_OPTIONS, ROUTES, SKILLS, SOURCES, WORKERS } from './fixtures.ts'
 
 const DIST = new URL('../dist/', import.meta.url).pathname
 
@@ -101,6 +101,13 @@ export async function open(
     if (project && url.pathname === '/api/workers') {
       body = { ...WORKERS, workers: WORKERS.workers.filter((w) => w.project.slug === project) }
     }
+
+    // Per-project paths, which carry the slug in the path rather than the query.
+    if (/\/api\/projects\/[^/]+\/sources$/.test(url.pathname)) body = SOURCES
+    if (/\/api\/projects\/[^/]+\/cycles$/.test(url.pathname)) body = CYCLES
+    if (/\/api\/projects\/[^/]+\/linear-options$/.test(url.pathname))
+      // An override wins, so a test can show the editor with its suggestions missing.
+      body = overrides['/api/linear-options'] ?? LINEAR_OPTIONS
 
     if (body === undefined) return route.fulfill({ status: 404, body: '{}' })
     return route.fulfill({

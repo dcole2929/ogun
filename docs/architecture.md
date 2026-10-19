@@ -1497,15 +1497,34 @@ sources:
   tickets:
     kind: linear
     cycle: ticket-pipeline   # the cycle each admitted ticket starts
-    team: ENG
     pollMinutes: 5
     maxPerPoll: 3
-    filter:
-      status: [Todo]
-      labels: [ogun]         # all of them, not any
-      excludeLabels: [needs-design]
+    conditions:
+      team: [ENG]            # any of them; also what the poll asks Linear for
+      status: [Todo]         # any of them
+      label:
+        all_of: [ogun]       # every one must be present
+        any_of: [admin, agent-ready]   # at least one
+        none_of: [needs-design]
       notBlocked: true
 ```
+
+The spelling follows one rule: **a bare list where only one reading exists, named
+operators where two do.** A ticket has one team and one status, so a list of either can
+only mean "any of these". It has many labels, so `[admin, agent-ready]` is genuinely
+ambiguous between all and any — which the previous `labels:` key resolved silently in
+favour of *all* while its own comment conceded the two "genuinely differ".
+
+The shape before this — a top-level `team:` beside a `filter:` block with `labels` and
+`excludeLabels` — is still parsed and lifted into `conditions`, because a stored source
+this build cannot parse is one `pollSources` **skips**, and a poller that silently stops
+is worse than any config error. `ogun project sync` names the sources still written that
+way, since nothing else would.
+
+`team` moving inside `conditions` also moved it from being *only* a remote narrowing to
+being a condition the local rule re-checks. `StringComparator.in` is case-sensitive where
+`admitsTicket` folds case, so a list makes the read capable of hiding a ticket the rule
+would have admitted — and hiding is the direction that is invisible forever.
 
 What it emits is a `CycleRun`, created through the same `startCycleRun` that cron and the
 manual trigger call — so admission, the breaker, `maxConcurrentModifiers`, the credential

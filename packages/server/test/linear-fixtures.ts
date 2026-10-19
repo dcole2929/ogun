@@ -43,6 +43,16 @@ import type { LinearApi, TicketPage } from '../src/integrations/linear.ts'
  * failure, or a schema change, so those three fixtures remain recordings of the
  * documentation rather than of Linear. A difference found later is still fixed in the
  * fixture rather than in the parser.
+ *
+ * **[amended] `options.json` is different, and better: it is a real response**, captured
+ * from `api.linear.app` on 2026-10-19 with a `client_credentials` grant, and not
+ * transcribed from the schema. Two things were added to the recording by hand and are the
+ * only invented parts of it — a second team `EXC`, with a `Todo` of its own and an
+ * `Icebox`, and a team-scoped `admin` label. A single-team workspace cannot exercise the
+ * narrowing or the duplicate-name case, and a fixture that cannot distinguish "narrowed
+ * correctly" from "returned everything" proves nothing about either. The real half still
+ * carries what matters: Linear really does return workspace labels with `team: null`, and
+ * really does return workflow states in storage order rather than any useful one.
  */
 const here = dirname(fileURLToPath(import.meta.url))
 

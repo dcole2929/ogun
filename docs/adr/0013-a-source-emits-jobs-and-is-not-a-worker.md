@@ -91,6 +91,12 @@ node.
 constant and is not a parameter of anything, so there is no way to ask the client to send a
 mutation. A human moves the ticket.
 
+*[amended]* There are **two** documents now — the poll's, and the one the Sources editor
+uses to ask what the workspace calls its teams, statuses and labels. Both are still module
+constants, the function that sends them is private to the client module, and neither method
+on the two public interfaces takes a query. The property this paragraph asserts is "no
+caller can choose the document", not "there is exactly one", and it holds unchanged.
+
 ## Considered Options
 
 - **A source as a worker with a polling skill.** Rejected, and it is the option §4.13's one

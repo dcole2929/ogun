@@ -84,10 +84,62 @@ const ISSUES_QUERY = `query OgunSourcePoll($filter: IssueFilter!, $first: Int!, 
   }
 }`
 
+/**
+ * The second document, and the only other one: what the Sources editor offers as
+ * suggestions.
+ *
+ * **Why these three are one document rather than three.** `visibleTeams` in
+ * `linear-oauth.ts` deliberately splits its query out of `identify`'s, and the reasoning
+ * there does not transfer: that split protects a *connect* — a schema change in a
+ * reassurance query must not take down the identity it is attached to. These three fields
+ * have one consumer and one purpose, and a half-filled picker that silently offers teams
+ * and no labels is harder to read than one that visibly offers nothing and says why. One
+ * document means one answer, which the endpoint reports as reachable or not.
+ *
+ * Measured against the real workspace rather than estimated: complexity 1245, which is
+ * well inside the budget for something fetched when a form opens rather than on a timer.
+ *
+ * 250 is Linear's page cap. There is no pagination here and that is a decision, not an
+ * omission — these feed a dropdown next to a free-text box, so the failure mode of a
+ * workspace with 251 labels is that the 251st is typed rather than picked.
+ */
+const OPTIONS_QUERY = `query OgunLinearOptions {
+  teams(first: 100) { nodes { key name } }
+  workflowStates(first: 250) { nodes { name type team { key } } }
+  issueLabels(first: 250) { nodes { name team { key } } }
+}`
+
 export type TicketPage = {
   tickets: Ticket[]
   /** The cursor to pass as `after` for the next page, when there is one. */
   next: string | undefined
+}
+
+/**
+ * The workspace's own vocabulary: what a team, a status and a label are actually called.
+ *
+ * Teams carry a `name` as well as a `key` because `HEI` is what the config stores and
+ * "Heirchive" is what a person recognises; a picker that shows only one of them is either
+ * unreadable or writes the wrong value.
+ *
+ * A state's `type` is Linear's fixed vocabulary and the `name` is whatever the team called
+ * the column — the same distinction `ISSUES_QUERY` draws, for the same reason. The config
+ * matches on the name, so the name is what gets written; the type is carried so a picker
+ * can group `Todo` under "unstarted" and put `Done` and `Canceled` where nobody picks them
+ * by accident.
+ *
+ * `team` is nullable on a label and that is Linear's model, not a missing join: a label
+ * can belong to one team or to the whole workspace. Every label in the workspace this was
+ * built against is workspace-level.
+ */
+export type LinearTeamOption = { key: string; name: string }
+export type LinearStateOption = { name: string; type: string; team: string }
+export type LinearLabelOption = { name: string; team: string | null }
+
+export type LinearOptions = {
+  teams: LinearTeamOption[]
+  states: LinearStateOption[]
+  labels: LinearLabelOption[]
 }
 
 /**
@@ -97,6 +149,12 @@ export type TicketPage = {
  * workflow states, a mutation for later — would be an interface whose extra surface no
  * test covers and no caller needs, sitting in the file that is supposed to be the narrow
  * part.
+ *
+ * **[amended]** The editor's suggestions are a second document on the same socket, and
+ * they went into `LinearOptionsApi` below rather than here. The note above is the reason:
+ * `pollSources` cannot call `options()` and its fakes should not have to implement one.
+ * Two interfaces over one implementation costs a `&` at the one place that needs both,
+ * and keeps the poll's seam exactly as narrow as the thing it tests.
  */
 export type LinearApi = {
   /**
@@ -112,6 +170,26 @@ export type LinearApi = {
     first: number
     after?: string | undefined
   }): Promise<TicketPage>
+}
+
+/**
+ * What the Sources editor needs to offer suggestions instead of a blank text box.
+ *
+ * Separate from `LinearApi` so the poll's fakes stay the shape the poll uses. The one
+ * caller that needs both takes `LinearApi & LinearOptionsApi`, which is what `linearHttp`
+ * returns.
+ */
+export type LinearOptionsApi = {
+  /**
+   * Every team, workflow state and label this credential can see.
+   *
+   * Throws `LinearUnavailable` on the same three terms `issues` does. The caller is a
+   * request a person is waiting on rather than a ledger, so what it does with the throw is
+   * different — it reports the reason beside an empty list and the form stays usable —
+   * but the distinction between a rejected credential, a rate limit and a dead socket is
+   * worth exactly as much there.
+   */
+  options(): Promise<LinearOptions>
 }
 
 /**
@@ -165,38 +243,72 @@ const issueSchema = z.object({
   inverseRelations: z.object({ nodes: z.array(relationNodeSchema) }),
 })
 
-const responseSchema = z.object({
-  /**
-   * `nullish`, not `optional`, and the difference is not pedantry: a GraphQL error
-   * response carries `"data": null` beside its `errors` rather than omitting the key. A
-   * schema that only tolerated absence failed to parse every error Linear sends, so an
-   * expired key and a rate limit both arrived as "the body was not a GraphQL response" —
-   * two remedies collapsed into a third that was wrong. Found by the fixtures, which is
-   * what fixtures are for.
-   */
-  data: z
-    .object({
-      issues: z.object({
-        pageInfo: z.object({ hasNextPage: z.boolean(), endCursor: z.string().nullable() }),
-        nodes: z.array(issueSchema),
-      }),
-    })
-    .nullish(),
-  /**
-   * GraphQL puts failures here with a 200 as often as not, so this is checked before
-   * `data` rather than after the status code. `extensions.code` is where Linear puts
-   * `RATELIMITED` and `AUTHENTICATION_ERROR`; it is optional because a transport-level
-   * error has neither.
-   */
-  errors: z
-    .array(
-      z.object({
-        message: z.string(),
-        extensions: z.object({ code: z.string().optional() }).optional(),
-      }),
-    )
-    .optional(),
-})
+/**
+ * GraphQL puts failures here with a 200 as often as not, so this is checked before
+ * `data` rather than after the status code. `extensions.code` is where Linear puts
+ * `RATELIMITED` and `AUTHENTICATION_ERROR`; it is optional because a transport-level
+ * error has neither.
+ */
+const errorsSchema = z
+  .array(
+    z.object({
+      message: z.string(),
+      extensions: z.object({ code: z.string().optional() }).optional(),
+    }),
+  )
+  .optional()
+
+/**
+ * The GraphQL envelope, around whichever `data` the document asked for.
+ *
+ * A function because there are two documents and the envelope is the half that is
+ * identical — and because the `nullish` below is the sort of detail that gets copied
+ * subtly wrong the second time. `nullish`, not `optional`, and the difference is not
+ * pedantry: a GraphQL error response carries `"data": null` beside its `errors` rather
+ * than omitting the key. A schema that only tolerated absence failed to parse every error
+ * Linear sends, so an expired key and a rate limit both arrived as "the body was not a
+ * GraphQL response" — two remedies collapsed into a third that was wrong. Found by the
+ * fixtures, which is what fixtures are for.
+ */
+const envelope = <T extends z.ZodTypeAny>(data: T) =>
+  z.object({ data: data.nullish(), errors: errorsSchema })
+
+const responseSchema = envelope(
+  z.object({
+    issues: z.object({
+      pageInfo: z.object({ hasNextPage: z.boolean(), endCursor: z.string().nullable() }),
+      nodes: z.array(issueSchema),
+    }),
+  }),
+)
+
+/**
+ * `team` is non-null on a workflow state (every state belongs to a team) and nullable on
+ * a label (a label belongs to a team or to the workspace). Both are claims about Linear's
+ * schema rather than defensive habits, on the same terms as `issueSchema` above.
+ */
+const optionsResponseSchema = envelope(
+  z.object({
+    teams: z.object({ nodes: z.array(z.object({ key: z.string(), name: z.string() })) }),
+    workflowStates: z.object({
+      nodes: z.array(
+        z.object({
+          name: z.string(),
+          type: z.string(),
+          team: z.object({ key: z.string() }),
+        }),
+      ),
+    }),
+    issueLabels: z.object({
+      nodes: z.array(
+        z.object({
+          name: z.string(),
+          team: z.object({ key: z.string() }).nullable(),
+        }),
+      ),
+    }),
+  }),
+)
 
 /** One GraphQL issue node, flattened to the value the filter and the prompt work on. */
 export function toTicket(node: z.infer<typeof issueSchema>): Ticket {
@@ -271,98 +383,135 @@ export const describeCredential = (credential: LinearCredential): string =>
 /**
  * The only implementation that touches the network.
  */
-export function linearHttp(options: LinearHttpOptions): LinearApi {
+export function linearHttp(options: LinearHttpOptions): LinearApi & LinearOptionsApi {
   const endpoint = options.endpoint ?? LINEAR_ENDPOINT
   const doFetch = options.fetch ?? globalThis.fetch
 
+  /**
+   * One request, and every way it can fail to be a GraphQL result.
+   *
+   * Private to this function, and `document` being a parameter of it is not the thing the
+   * header warns about: the only two arguments it is ever called with are the two module
+   * constants above, and `LinearApi` exposes no way to reach it. What it buys is that the
+   * rate-limit-is-a-400 case, the `AUTHENTICATION_ERROR`-with-a-200 case and the
+   * HTML-error-page case have one implementation rather than one per document — these are
+   * precisely the branches that get written correctly once and then abbreviated on the
+   * copy.
+   */
+  const send = async <T extends z.ZodTypeAny>(
+    document: string,
+    schema: T,
+    variables?: Record<string, unknown>,
+  ): Promise<z.infer<T>> => {
+    let response: Response
+    try {
+      response = await doFetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          // Raw for a personal key, `Bearer` for an OAuth token. See
+          // `authorizationHeader`; getting it backwards is a silent 401.
+          authorization: authorizationHeader(options.credential),
+        },
+        body: JSON.stringify({ query: document, ...(variables ? { variables } : {}) }),
+      })
+    } catch (err) {
+      throw new LinearUnavailable('transport', `could not reach ${endpoint}: ${asMessage(err)}`)
+    }
+
+    const text = await response.text()
+    let parsed: { data?: unknown; errors?: { message: string; extensions?: { code?: string } }[] }
+    try {
+      parsed = envelope(schema).parse(JSON.parse(text))
+    } catch (err) {
+      /**
+       * A body that is neither a GraphQL result nor a GraphQL error. In practice this is
+       * an HTML error page from something in front of the API, and the useful half is
+       * the status code plus a short prefix of the body — the whole thing is a megabyte
+       * of markup and it lands in a database column.
+       */
+      throw new LinearUnavailable(
+        'transport',
+        `${response.status} from ${endpoint}, and the body was not a GraphQL response ` +
+          `(${asMessage(err)}): ${text.slice(0, 200)}`,
+      )
+    }
+
+    if (parsed.errors && parsed.errors.length > 0) {
+      const codes = parsed.errors.map((e) => e.extensions?.code).filter(Boolean)
+      const message = parsed.errors.map((e) => e.message).join('; ')
+      /**
+       * Linear answers a rate limit with a **400** and a `RATELIMITED` code in the body,
+       * not a 429, so a client switching on the status alone reads it as a permanent bad
+       * request and a poll would record "your query is wrong" every five minutes while
+       * the actual remedy was to wait. The remaining-requests header is included because
+       * it is the number that tells you whether the cadence is the problem.
+       */
+      if (codes.includes('RATELIMITED')) {
+        const remaining = response.headers.get('x-ratelimit-requests-remaining')
+        throw new LinearUnavailable(
+          'ratelimited',
+          `linear rate limit: ${message}` +
+            (remaining === null ? '' : ` (${remaining} requests left this window)`),
+        )
+      }
+      if (codes.includes('AUTHENTICATION_ERROR') || response.status === 401) {
+        /**
+         * Which credential, by name. A project can hold a personal key and an OAuth
+         * grant at the same time — the key is the documented fallback, and connecting
+         * does not remove it — so "linear rejected the api key" on a project that is
+         * actually authenticating with a grant sends an operator to rotate something
+         * nothing reads. The name comes from the credential this client was built with,
+         * which is the only thing that knows.
+         */
+        throw new LinearUnavailable(
+          'auth',
+          `linear rejected ${describeCredential(options.credential)}: ${message}`,
+        )
+      }
+      throw new LinearUnavailable('transport', `linear returned an error: ${message}`)
+    }
+
+    if (parsed.data === undefined || parsed.data === null) {
+      throw new LinearUnavailable(
+        'transport',
+        `${response.status} from ${endpoint} with neither data nor errors`,
+      )
+    }
+
+    return parsed.data as z.infer<T>
+  }
+
   return {
     async issues({ filter, first, after }) {
-      let response: Response
-      try {
-        response = await doFetch(endpoint, {
-          method: 'POST',
-          headers: {
-            'content-type': 'application/json',
-            // Raw for a personal key, `Bearer` for an OAuth token. See
-            // `authorizationHeader`; getting it backwards is a silent 401.
-            authorization: authorizationHeader(options.credential),
-          },
-          body: JSON.stringify({
-            query: ISSUES_QUERY,
-            variables: { filter, first, ...(after ? { after } : {}) },
-          }),
-        })
-      } catch (err) {
-        throw new LinearUnavailable('transport', `could not reach ${endpoint}: ${asMessage(err)}`)
-      }
-
-      const text = await response.text()
-      let parsed: z.infer<typeof responseSchema>
-      try {
-        parsed = responseSchema.parse(JSON.parse(text))
-      } catch (err) {
-        /**
-         * A body that is neither a GraphQL result nor a GraphQL error. In practice this is
-         * an HTML error page from something in front of the API, and the useful half is
-         * the status code plus a short prefix of the body — the whole thing is a megabyte
-         * of markup and it lands in a database column.
-         */
-        throw new LinearUnavailable(
-          'transport',
-          `${response.status} from ${endpoint}, and the body was not a GraphQL response ` +
-            `(${asMessage(err)}): ${text.slice(0, 200)}`,
-        )
-      }
-
-      if (parsed.errors && parsed.errors.length > 0) {
-        const codes = parsed.errors.map((e) => e.extensions?.code).filter(Boolean)
-        const message = parsed.errors.map((e) => e.message).join('; ')
-        /**
-         * Linear answers a rate limit with a **400** and a `RATELIMITED` code in the body,
-         * not a 429, so a client switching on the status alone reads it as a permanent bad
-         * request and a poll would record "your query is wrong" every five minutes while
-         * the actual remedy was to wait. The remaining-requests header is included because
-         * it is the number that tells you whether the cadence is the problem.
-         */
-        if (codes.includes('RATELIMITED')) {
-          const remaining = response.headers.get('x-ratelimit-requests-remaining')
-          throw new LinearUnavailable(
-            'ratelimited',
-            `linear rate limit: ${message}` +
-              (remaining === null ? '' : ` (${remaining} requests left this window)`),
-          )
-        }
-        if (codes.includes('AUTHENTICATION_ERROR') || response.status === 401) {
-          /**
-           * Which credential, by name. A project can hold a personal key and an OAuth
-           * grant at the same time — the key is the documented fallback, and connecting
-           * does not remove it — so "linear rejected the api key" on a project that is
-           * actually authenticating with a grant sends an operator to rotate something
-           * nothing reads. The name comes from the credential this client was built with,
-           * which is the only thing that knows.
-           */
-          throw new LinearUnavailable(
-            'auth',
-            `linear rejected ${describeCredential(options.credential)}: ${message}`,
-          )
-        }
-        throw new LinearUnavailable('transport', `linear returned an error: ${message}`)
-      }
-
-      if (!parsed.data) {
-        throw new LinearUnavailable(
-          'transport',
-          `${response.status} from ${endpoint} with neither data nor errors`,
-        )
-      }
-
-      const page = parsed.data.issues
+      const data = await send(ISSUES_QUERY, responseSchema.shape.data.unwrap().unwrap(), {
+        filter,
+        first,
+        ...(after ? { after } : {}),
+      })
+      const page = data.issues
       return {
         tickets: page.nodes.map(toTicket),
         // `hasNextPage` decides, not the presence of a cursor: Linear returns an
         // `endCursor` on the last page too, and following it forever is a poll that never
         // finishes.
         next: page.pageInfo.hasNextPage ? (page.pageInfo.endCursor ?? undefined) : undefined,
+      }
+    },
+
+    async options() {
+      const data = await send(OPTIONS_QUERY, optionsResponseSchema.shape.data.unwrap().unwrap())
+      return {
+        teams: data.teams.nodes,
+        states: data.workflowStates.nodes.map((s) => ({
+          name: s.name,
+          type: s.type,
+          team: s.team.key,
+        })),
+        labels: data.issueLabels.nodes.map((l) => ({
+          name: l.name,
+          team: l.team?.key ?? null,
+        })),
       }
     },
   }

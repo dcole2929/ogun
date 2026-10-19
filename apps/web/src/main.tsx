@@ -11,6 +11,7 @@ import { FindingsPage } from './pages/Findings.tsx'
 import { WorkersPage } from './pages/Workers.tsx'
 import { CoveragePage } from './pages/Coverage.tsx'
 import { SkillDetailPage, SkillsPage } from './pages/Skills.tsx'
+import { SourcesPage } from './pages/Sources.tsx'
 import { RunnersPage } from './pages/Runners.tsx'
 import { TokenGate } from './TokenGate.tsx'
 import { SettingsPage } from './pages/Settings.tsx'
@@ -52,6 +53,9 @@ function Shell() {
           <NavLink to="/runs">Runs</NavLink>
           <NavLink to="/workers">Workers</NavLink>
           <NavLink to="/skills">Skills</NavLink>
+          {/* Beside Workers and Skills because it is the third thing config.yaml
+              defines, and above Coverage because Coverage reports on what it does. */}
+          <NavLink to="/sources">Sources</NavLink>
           <NavLink to="/coverage">Coverage</NavLink>
           <div className="nav-break">this machine</div>
           <NavLink to="/runners">Runners</NavLink>
@@ -70,6 +74,7 @@ function Shell() {
           <Route path="/workers" element={<WorkersPage />} />
           <Route path="/skills" element={<SkillsPage />} />
           <Route path="/skills/:project/:name" element={<SkillDetailPage />} />
+          <Route path="/sources" element={<SourcesPage />} />
           <Route path="/coverage" element={<CoveragePage />} />
           <Route path="/runners" element={<RunnersPage />} />
           <Route path="/settings" element={<SettingsPage />} />

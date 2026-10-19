@@ -1,0 +1,145 @@
+{
+  "data": {
+    "teams": {
+      "nodes": [
+        {
+          "key": "HEI",
+          "name": "Heirchive"
+        },
+        {
+          "key": "EXC",
+          "name": "Excelsior"
+        }
+      ]
+    },
+    "workflowStates": {
+      "nodes": [
+        {
+          "name": "In Review",
+          "type": "started",
+          "team": {
+            "key": "HEI"
+          }
+        },
+        {
+          "name": "Backlog",
+          "type": "backlog",
+          "team": {
+            "key": "HEI"
+          }
+        },
+        {
+          "name": "Canceled",
+          "type": "canceled",
+          "team": {
+            "key": "HEI"
+          }
+        },
+        {
+          "name": "Duplicate",
+          "type": "duplicate",
+          "team": {
+            "key": "HEI"
+          }
+        },
+        {
+          "name": "In Progress",
+          "type": "started",
+          "team": {
+            "key": "HEI"
+          }
+        },
+        {
+          "name": "Todo",
+          "type": "unstarted",
+          "team": {
+            "key": "HEI"
+          }
+        },
+        {
+          "name": "Done",
+          "type": "completed",
+          "team": {
+            "key": "HEI"
+          }
+        },
+        {
+          "name": "Todo",
+          "type": "unstarted",
+          "team": {
+            "key": "EXC"
+          }
+        },
+        {
+          "name": "Icebox",
+          "type": "backlog",
+          "team": {
+            "key": "EXC"
+          }
+        }
+      ]
+    },
+    "issueLabels": {
+      "nodes": [
+        {
+          "name": "Phase 5",
+          "team": null
+        },
+        {
+          "name": "Phase 4",
+          "team": null
+        },
+        {
+          "name": "Phase 3",
+          "team": null
+        },
+        {
+          "name": "Phase 2",
+          "team": null
+        },
+        {
+          "name": "MVP",
+          "team": null
+        },
+        {
+          "name": "design",
+          "team": null
+        },
+        {
+          "name": "infrastructure",
+          "team": null
+        },
+        {
+          "name": "fullstack",
+          "team": null
+        },
+        {
+          "name": "backend",
+          "team": null
+        },
+        {
+          "name": "frontend",
+          "team": null
+        },
+        {
+          "name": "Bug",
+          "team": null
+        },
+        {
+          "name": "Feature",
+          "team": null
+        },
+        {
+          "name": "Improvement",
+          "team": null
+        },
+        {
+          "name": "admin",
+          "team": {
+            "key": "EXC"
+          }
+        }
+      ]
+    }
+  }
+}
