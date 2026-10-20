@@ -396,6 +396,38 @@ export type SourceState =
  * a poll that could not look, a poll that looked and matched nothing, and a poll loop that
  * was never started.
  */
+export type SourceConditions = {
+  team: string[]
+  status: string[]
+  label: { all_of: string[]; any_of: string[]; none_of: string[] }
+  notBlocked: boolean
+}
+
+/**
+ * What the workspace calls its own teams, statuses and labels.
+ *
+ * `reachable` is the field to read first. The lists are always present and always the
+ * right type, so a form can render them without a guard — but empty-and-unreachable
+ * ("linear rejected the oauth access token") and empty-and-reachable ("this workspace has
+ * no labels") are different sentences to put under a picker, and only this flag separates
+ * them.
+ */
+export type LinearOptions = {
+  teams: Array<{ key: string; name: string }>
+  states: Array<{ name: string; type: string; team: string }>
+  labels: Array<{ name: string; team: string | null }>
+  reachable: boolean
+  reason: string | null
+}
+
+/** Only the fields a cycle picker needs; the endpoint returns a good deal more. */
+export type CycleOption = {
+  id: string
+  name: string
+  /** True for the one-node cycle every worker owns — the same name as the worker. */
+  standalone: boolean
+}
+
 export type SourceReport = {
   id: string
   project: string
@@ -404,14 +436,12 @@ export type SourceReport = {
   cycle: string
   enabled: boolean
   pollMinutes: number
-  team: string
+  maxPerPoll: number
+  maxPages: number
+  /** Every team this source names. A list since `conditions.team` became one. */
+  team: string[]
   /** Null when the stored config is not a shape this build can parse — itself a fault. */
-  filter: {
-    status: string[]
-    labels: string[]
-    excludeLabels: string[]
-    notBlocked: boolean
-  } | null
+  conditions: SourceConditions | null
   health: {
     state: SourceState
     kind: SourceFailureKind | null
@@ -479,6 +509,36 @@ export const api = {
     json<{ sources: SourceReport[]; emissions: SourceEmission[]; ticket: string | null }>(
       `/api/projects/${slug}/sources`,
     ),
+  /** Write a source back to `.ogun/config.yaml`. Returns every source, freshly read. */
+  saveSource: (
+    slug: string,
+    name: string,
+    body: {
+      cycle: string
+      pollMinutes: number
+      maxPerPoll: number
+      maxPages: number
+      enabled: boolean
+      conditions: SourceConditions
+      expectedHash?: string
+    },
+  ) =>
+    json<{ sources: SourceReport[]; config: { path: string; hash: string } }>(
+      `/api/projects/${slug}/sources/${name}`,
+      {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      },
+    ),
+  /**
+   * Suggestions for the Sources editor. Never throws for a credential problem — see the
+   * route: every failure is a 200 with `reachable: false` and a reason, because a source
+   * whose credential is dead is the one most likely to need editing.
+   */
+  linearOptions: (slug: string) =>
+    json<LinearOptions>(`/api/projects/${slug}/linear-options`),
+  cycles: (slug: string) => json<{ cycles: CycleOption[] }>(`/api/projects/${slug}/cycles`),
   runNotes: (slug: string) => json<{ notes: RunNote[] }>(`/api/runs/notes?project=${slug}`),
   runs: () =>
     json<{

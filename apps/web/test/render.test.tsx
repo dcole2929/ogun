@@ -11,6 +11,7 @@ import { WorkersPage } from '../src/pages/Workers.tsx'
 import { FindingsPage } from '../src/pages/Findings.tsx'
 import { RunsPage } from '../src/pages/Runs.tsx'
 import { CoveragePage } from '../src/pages/Coverage.tsx'
+import { labelSuggestions, SourcesPage, stateSuggestions } from '../src/pages/Sources.tsx'
 import { RunnersPage } from '../src/pages/Runners.tsx'
 import { SettingsPage } from '../src/pages/Settings.tsx'
 import { Notifications, troublesFrom } from '../src/Notifications.tsx'
@@ -78,6 +79,7 @@ test('every page renders with no data', () => {
     ['findings', <FindingsPage />],
     ['runs', <RunsPage />],
     ['coverage', <CoveragePage />],
+    ['sources', <SourcesPage />],
     ['runners', <RunnersPage />],
     ['settings', <SettingsPage />],
   ] as const) {
@@ -721,4 +723,90 @@ test('a focus that matches nothing in scope explains itself', () => {
   )
   assert.match(html, /is not in this project/)
   assert.match(html, /All projects/, 'and says where to look instead')
+})
+
+/**
+ * The status picker offers HEI's columns to a HEI source, and not EXC's.
+ *
+ * A workflow state belongs to a team, so a picker that ignores the source's teams
+ * suggests values that cannot ever match — it would be helping somebody write the exact
+ * silent-empty-poll this whole surface exists to prevent.
+ */
+test('statuses are narrowed to the teams the source names', () => {
+  const options = {
+    teams: [
+      { key: 'HEI', name: 'Heirchive' },
+      { key: 'EXC', name: 'Excelsior' },
+    ],
+    states: [
+      { name: 'Todo', type: 'unstarted', team: 'HEI' },
+      { name: 'In Progress', type: 'started', team: 'HEI' },
+      { name: 'Icebox', type: 'backlog', team: 'EXC' },
+    ],
+    labels: [],
+    reachable: true,
+    reason: null,
+  }
+
+  assert.deepEqual(
+    stateSuggestions(options, ['HEI']).map((s) => s.value),
+    ['Todo', 'In Progress'],
+  )
+  // No team chosen yet is not a reason to offer an empty dropdown.
+  assert.deepEqual(
+    stateSuggestions(options, []).map((s) => s.value).sort(),
+    ['Icebox', 'In Progress', 'Todo'],
+  )
+  // The config matches teams ignoring case, so the picker has to as well.
+  assert.deepEqual(
+    stateSuggestions(options, ['hei']).map((s) => s.value),
+    ['Todo', 'In Progress'],
+  )
+})
+
+/**
+ * Two teams with a column of the same name are one suggestion, because the rule matches
+ * on the name — two identical rows would be a dropdown implying a distinction the filter
+ * cannot make.
+ */
+test('statuses are deduplicated by name and ordered by how likely they are to be wanted', () => {
+  const suggestions = stateSuggestions(
+    {
+      teams: [],
+      states: [
+        { name: 'Done', type: 'completed', team: 'HEI' },
+        { name: 'Todo', type: 'unstarted', team: 'HEI' },
+        { name: 'Todo', type: 'unstarted', team: 'EXC' },
+      ],
+      labels: [],
+      reachable: true,
+      reason: null,
+    },
+    [],
+  )
+  assert.deepEqual(
+    suggestions.map((s) => s.value),
+    ['Todo', 'Done'],
+  )
+  assert.deepEqual(
+    suggestions.map((s) => s.group),
+    ['not started', 'done'],
+  )
+})
+
+/** A label can belong to a team or to the workspace, and the team is worth showing. */
+test('labels carry their team when they have one', () => {
+  assert.deepEqual(
+    labelSuggestions({
+      teams: [],
+      states: [],
+      labels: [
+        { name: 'agent-ready', team: null },
+        { name: 'admin', team: 'HEI' },
+      ],
+      reachable: true,
+      reason: null,
+    }),
+    [{ value: 'admin', hint: 'HEI' }, { value: 'agent-ready' }],
+  )
 })

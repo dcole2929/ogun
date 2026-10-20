@@ -237,7 +237,7 @@ describe('what a poll ledger says about a source', () => {
 
     const report = await healthOfSource('unreadable')
     assert.equal(report.health.state, 'overdue')
-    assert.equal(report.filter, null, 'a filter that would not parse is null, not invented')
+    assert.equal(report.conditions, null, 'conditions that would not parse are null, not invented')
     assert.match(report.health.detail!, /not a shape this build can read/)
     assert.match(report.health.remedy!, /ogun project sync/)
   })
@@ -259,8 +259,8 @@ describe('what a poll ledger says about a source', () => {
     const silent = await healthOfSource('quiet-week')
     assert.equal(silent.health.state, 'silent')
     assert.match(silent.health.remedy!, /not a failure/)
-    // The diagnosis needs both halves, so the filter has to arrive with it.
-    assert.deepEqual(silent.filter?.status, ['Todo'])
+    // The diagnosis needs both halves, so the conditions have to arrive with it.
+    assert.deepEqual(silent.conditions?.status, ['Todo'])
     assert.match(silent.health.detail!, /In Progress/)
 
     const { row: busy } = await source('quiet-hour')
@@ -409,7 +409,10 @@ describe('what a poll ledger says about a source', () => {
    * The emission row is the only record anywhere that anything happened.
    */
   test('a ticket lookup is by the key a person types, and is scoped to the project', async () => {
-    const { row, config } = await source('emitting')
+    // The team has to match the source's: `admitsTicket` now checks it locally, where it
+    // used to be only a remote narrowing. The mismatch was always there in this fixture
+    // and was always wrong; nothing looked.
+    const { row, config } = await source('emitting', { team: 'HEI' })
     const wanted: Ticket = {
       id: 'b2f9a1c4-4c37-4d3e-9a41-000000000901',
       identifier: 'HEI-42',

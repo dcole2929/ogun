@@ -103,7 +103,20 @@ export type SourceReport = {
   cycle: string
   enabled: boolean
   pollMinutes: number
-  team: string
+  /**
+   * The two caps, on the wire because the editor writes them back and a form that cannot
+   * read a field it saves will overwrite it with whatever it guessed.
+   *
+   * They were missing until a page was pointed at a real server rather than at a fixture.
+   * The card read "at most  per poll" with a hole where the number goes, and the editor
+   * seeded its input with the string "undefined" — which would have been saved over a
+   * perfectly good cap by anyone who opened the form. The e2e fixture had both fields, so
+   * every test passed; nothing that stubs its own server can catch this.
+   */
+  maxPerPoll: number
+  maxPages: number
+  /** Every team this source names. A list since `conditions.team` became one. */
+  team: string[]
   /**
    * The deterministic filter as configured.
    *
@@ -113,7 +126,7 @@ export type SourceReport = {
    * column called `Todo` is a source that polls forever, matches nothing and reports
    * success, and the two halves of that diagnosis were in two different places.
    */
-  filter: SourceConfig['filter'] | null
+  conditions: SourceConfig['conditions'] | null
   health: SourceHealth
 }
 
@@ -256,7 +269,12 @@ export async function sourceHealth(
      * threw on it would fail to report the one source it most needs to report.
      */
     const parsed = sourceSchema.safeParse(source.config)
+    // The fallbacks are `sourceSchema`'s own defaults, repeated here because a config
+    // that will not parse has no defaults to read — a number is still better than a hole
+    // in the sentence the card renders.
     const pollMinutes = parsed.success ? parsed.data.pollMinutes : 5
+    const maxPerPoll = parsed.success ? parsed.data.maxPerPoll : 3
+    const maxPages = parsed.success ? parsed.data.maxPages : 4
 
     return {
       id: source.id,
@@ -266,8 +284,10 @@ export async function sourceHealth(
       cycle: source.cycleName,
       enabled: source.enabled,
       pollMinutes,
-      team: parsed.success ? parsed.data.team : '',
-      filter: parsed.success ? parsed.data.filter : null,
+      maxPerPoll,
+      maxPages,
+      team: parsed.success ? parsed.data.conditions.team : [],
+      conditions: parsed.success ? parsed.data.conditions : null,
       health: healthOf({
         slug: project.slug,
         name: source.name,

@@ -228,13 +228,15 @@ cycles:
 #       tickets:
 #         kind: linear
 #         cycle: scope-a-ticket   # or a named cycle — see below
-#         team: ENG
 #         pollMinutes: 5
 #         maxPerPoll: 3
-#         filter:
-#           status: [Todo]
-#           labels: [ogun]        # all of them, not any
-#           excludeLabels: [needs-design]
+#         conditions:
+#           team: [ENG]           # any of them
+#           status: [Todo]        # any of them
+#           label:
+#             all_of: [ogun]      # every one
+#             any_of: [admin, agent-ready]
+#             none_of: [needs-design]
 #           notBlocked: true
 #
 # plus `ogun secret set <project> linear` or `ogun connect linear <project>` for the

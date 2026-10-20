@@ -155,6 +155,64 @@ who has put nginx or Caddy in front says otherwise. It is not read as a header �
 `x-forwarded-proto` is written by whoever is talking to us, which on a plain-HTTP LAN is
 the client, and a guard a request can switch off is not a guard.
 
+### Editing a source
+
+`sources:` is the third thing `.ogun/config.yaml` defines and was the only one with no
+surface at all. Coverage could say whether a source was *healthy*; nothing could say what
+it was looking for, and changing a poll interval or a status list meant editing yaml on
+the machine holding the repo.
+
+The **Sources** page reads and writes it. Saving goes through the same path a worker edit
+does — write the file, reindex, compare-and-swap on the file's hash so two concurrent
+edits are a 409 rather than a silent loss — because the file is the definition and the
+database is an index of it.
+
+Two behaviours worth knowing:
+
+- **Saving migrates a legacy source.** The node is replaced wholesale rather than key by
+  key, which is the opposite of what the worker edit does. A worker edit preserves
+  comments on untouched keys; a source may still carry `team:` and `filter:`, and setting
+  keys individually would leave those sitting beside the new `conditions:` block. The lift
+  only reads the old keys when `conditions` is absent, so a half-migrated node is a file
+  whose meaning depends on which block the reader notices. The cost is any comment inside
+  that one source.
+- **The poll cursor survives.** An edit does not re-poll immediately, which would be a
+  rate limit spent per keystroke. Same reason `syncSources` has always preserved
+  `lastPolledAt`.
+
+Creating a source is still a file edit: it needs a credential as well as a definition, and
+the page says so rather than offering a form that produces a source nothing can authorise.
+
+#### The pickers
+
+Teams, statuses and labels are matched against Linear's own vocabulary, and a typo in one
+is invisible: `status: [To Do]` against a column named `Todo` parses, stores, polls, reads
+forty tickets and admits none of them. Nothing fails. So the editor asks Linear what the
+workspace actually calls things — `GET /api/projects/:slug/linear-options`, one GraphQL
+document, fetched when the editor opens rather than on page load — and offers them.
+
+**The list is an aid, never an authority.** Every field also takes a typed value, and that
+is not politeness: of the two projects connected on the machine this was built on, one had
+a grant that had expired 24 days earlier and answered `AUTHENTICATION_ERROR`. A strict
+dropdown would have made that source — the one most in need of attention — uneditable. A
+private team the app token cannot see has the same shape. The endpoint therefore answers
+**200 with `reachable: false` and a reason** for every failure, rather than an error
+status, and the form says so once at the top and stays usable.
+
+A value that is not in a *reachable* list is marked with a dashed outline. That is the
+typo catcher, and it is a mark rather than a refusal because a column renamed yesterday
+looks exactly like a misspelling and only a person knows which. When the list could not be
+fetched nothing is marked — an unreachable list would otherwise paint every value as
+suspect at the moment there is no way to check any of them.
+
+Statuses are narrowed to the teams the source names, because a workflow state belongs to a
+team and offering EXC's columns to a HEI source is help toward a condition that can never
+match. **Cycle is different**: that list is local, out of the same file being edited, so it
+is a `<select>` of the project's cycles and workers — every worker is a one-node cycle
+(§5.1) — with `Type a name…` for a cycle added since the last sync. The server refuses an
+unknown cycle with a 400, which is the right answer, because unlike a status a cycle
+cannot be created by typing it.
+
 ### Browser tests
 
 `pnpm test` renders every page with `renderToString`, which only ever sees a first

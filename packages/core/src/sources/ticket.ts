@@ -89,14 +89,44 @@ export type AdmittedTicket = Ticket & { readonly [passedTheFilter]: true }
  * every criterion added here is a judgement that has escaped the scope evaluator.
  */
 export type TicketFilter = {
+  /**
+   * Team keys. At least one, and checked here as well as narrowed on remotely.
+   *
+   * It used to be only a narrowing — a top-level `team:` that scoped the query and was
+   * never re-tested locally — which was safe while it was one exact key. A list is not:
+   * `StringComparator.in` is case-sensitive and this rule folds case, so the remote read
+   * and the local rule can now disagree about `eng` versus `ENG`. The rule below is the
+   * one that decides, which is the same reason `remoteNarrowing` carries no other
+   * condition.
+   */
+  team: string[]
   /** Workflow state names. At least one, or the source fires on the whole team. */
   status: string[]
-  /** Labels that must **all** be present. */
-  labels: string[]
-  /** Labels that, if present, exclude the ticket. */
-  excludeLabels: string[]
+  label: LabelCondition
   /** Whether an unresolved `blocks` relation excludes the ticket. */
   notBlocked: boolean
+}
+
+/**
+ * The three label questions, asked separately because they are three different questions.
+ *
+ * This replaced `labels` (all must be present) and `excludeLabels`. The old pair was not
+ * missing a case so much as hiding one: `labels` silently meant *all*, the schema's own
+ * comment admitted the two readings "genuinely differ once there are two labels", and
+ * nothing in the spelling told you which you had written. A team wanting "any of these
+ * three" had to write three sources.
+ *
+ * Named rather than positional, and empty means "not asked" rather than "matches
+ * nothing": a source gating purely on status leaves all three empty, which is the common
+ * case and must not be an accidental reject-everything.
+ */
+export type LabelCondition = {
+  /** Every one must be present. */
+  all_of: string[]
+  /** At least one must be present. */
+  any_of: string[]
+  /** None may be present. */
+  none_of: string[]
 }
 
 export type TicketVerdict =
@@ -143,6 +173,18 @@ const RESOLVED_STATE_TYPES = new Set(['completed', 'canceled', 'duplicate'])
  * something outside the row it is about.
  */
 export function admitsTicket(filter: TicketFilter, ticket: Ticket): TicketVerdict {
+  /**
+   * Team first, because it is the broadest and because the remote narrowing is no longer
+   * a reliable stand-in for it (see `TicketFilter.team`).
+   */
+  const teams = filter.team.map(fold)
+  if (!teams.includes(fold(ticket.team))) {
+    return {
+      admitted: false,
+      reason: `team "${ticket.team}" is not one of: ${filter.team.join(', ')}`,
+    }
+  }
+
   const statuses = filter.status.map(fold)
   if (!statuses.includes(fold(ticket.status))) {
     return {
@@ -152,7 +194,8 @@ export function admitsTicket(filter: TicketFilter, ticket: Ticket): TicketVerdic
   }
 
   const labels = new Set(ticket.labels.map(fold))
-  const missing = filter.labels.filter((label) => !labels.has(fold(label)))
+
+  const missing = filter.label.all_of.filter((label) => !labels.has(fold(label)))
   if (missing.length > 0) {
     return {
       admitted: false,
@@ -160,7 +203,25 @@ export function admitsTicket(filter: TicketFilter, ticket: Ticket): TicketVerdic
     }
   }
 
-  const excluded = filter.excludeLabels.filter((label) => labels.has(fold(label)))
+  /**
+   * Empty means "not asked", not "matches nothing".
+   *
+   * The guard is the whole correctness of this clause: `[].some(...)` is `false`, so
+   * without it a source that gates purely on status — the common case, and what every
+   * existing config does — would reject every ticket it saw and report each one as
+   * missing a label nobody wrote down.
+   */
+  if (filter.label.any_of.length > 0) {
+    const matched = filter.label.any_of.some((label) => labels.has(fold(label)))
+    if (!matched) {
+      return {
+        admitted: false,
+        reason: `carries none of: ${filter.label.any_of.join(', ')}`,
+      }
+    }
+  }
+
+  const excluded = filter.label.none_of.filter((label) => labels.has(fold(label)))
   if (excluded.length > 0) {
     return {
       admitted: false,
@@ -203,9 +264,16 @@ export function admitsTicket(filter: TicketFilter, ticket: Ticket): TicketVerdic
  * obvious home and one rule about what may go in it: only a condition implied by
  * `admitsTicket` for *every* possible ticket — a property somebody has to be able to state
  * out loud before they add a line here.
+ *
+ * `in` rather than `eq` since a source may name several teams, and that is exactly where
+ * the case-sensitivity above stops being theoretical: one key spelled `eng` in config
+ * against `ENG` on the board narrows away every ticket in that team, silently, while the
+ * local rule would have folded the case and admitted them. `admitsTicket` re-checks the
+ * team for that reason — the narrowing is still only a narrowing, and it is now one that
+ * can be wrong in the hiding direction.
  */
-export function remoteNarrowing(team: string): Record<string, unknown> {
-  return { team: { key: { eq: team } } }
+export function remoteNarrowing(teams: string[]): Record<string, unknown> {
+  return { team: { key: { in: teams } } }
 }
 
 /**
@@ -226,7 +294,7 @@ export function remoteNarrowing(team: string): Record<string, unknown> {
  */
 export function ticketDigest(ticket: Ticket): string {
   return createHash('sha256')
-    .update([ticket.title, ticket.status, ticket.description].join(' '))
+    .update([ticket.title, ticket.status, ticket.description].join(' '))
     .digest('hex')
     .slice(0, 16)
 }

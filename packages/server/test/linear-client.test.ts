@@ -266,3 +266,72 @@ describe('the linear client', () => {
     assert.match(err.message, /502/)
   })
 })
+
+describe('the options document', () => {
+  it('turns a workspace into teams, states and labels', async () => {
+    sent = []
+    serving(200, await fixtureText('options'))
+    const options = await client().options()
+
+    assert.deepEqual(options.teams, [
+      { key: 'HEI', name: 'Heirchive' },
+      { key: 'EXC', name: 'Excelsior' },
+    ])
+
+    /**
+     * Flattened from `team { key }` to a string, because every consumer compares it to a
+     * team key out of config.yaml and a nested object at that comparison is a `.key` that
+     * one of them will forget.
+     */
+    assert.deepEqual(
+      options.states.filter((s) => s.team === 'EXC'),
+      [
+        { name: 'Todo', type: 'unstarted', team: 'EXC' },
+        { name: 'Icebox', type: 'backlog', team: 'EXC' },
+      ],
+    )
+
+    /**
+     * `team: null` is Linear's model rather than a missing join — a label belongs to one
+     * team or to the whole workspace — and collapsing the two would scope a workspace
+     * label to whichever team happened to be read first.
+     */
+    assert.deepEqual(
+      options.labels.filter((l) => l.name === 'admin' || l.name === 'MVP'),
+      [{ name: 'MVP', team: null }, { name: 'admin', team: 'EXC' }],
+    )
+  })
+
+  it('is a second fixed document, not a parameter', async () => {
+    /**
+     * The read-only guarantee survived gaining a second document, and this is the
+     * assertion that says so: `options()` takes no arguments, and what goes out is a
+     * query named for what it does. A client that could be handed a document could be
+     * handed a mutation.
+     */
+    sent = []
+    serving(200, await fixtureText('options'))
+    await client().options()
+
+    const body = sent[0]?.body as { query: string; variables?: unknown }
+    assert.match(body.query, /^query OgunLinearOptions/)
+    assert.equal(body.variables, undefined)
+  })
+
+  it('classifies a rejected credential the same way a poll does', async () => {
+    /**
+     * The editor shows this sentence beside an empty picker rather than recording it, but
+     * the distinction it needs is identical: "linear rejected the oauth access token"
+     * sends somebody to reconnect, and "rate limit" sends them to wait. Sharing `send`
+     * is what makes that true rather than hoped for.
+     */
+    serving(200, await fixtureText('error-authentication'))
+    const err = await oauthClient('lin_oauth_dead', 'Heirchive')
+      .options()
+      .then(() => null, (e: unknown) => e)
+
+    assert.ok(err instanceof LinearUnavailable)
+    assert.equal(err.kind, 'auth')
+    assert.match(err.message, /oauth access token for Heirchive/)
+  })
+})

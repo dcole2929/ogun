@@ -436,3 +436,71 @@ button.danger:hover:not(:disabled) { border-color: var(--red); }
 
 /* Long project slugs and status sentences ellipse rather than forcing the column wider. */
 .nav a, .brand small { overflow: hidden; text-overflow: ellipsis; }
+
+/* token picker — a list of values, a dropdown of what the workspace calls them, and a
+   text box for when the dropdown is empty or wrong. See TokenPicker.tsx. */
+.field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; }
+.field.wide { grid-column: 1 / -1; }
+.field > .field-label { color: var(--muted); }
+.field > small { color: var(--muted); font-size: 11px; line-height: 1.45; }
+.picker { position: relative; }
+.picker-values {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 5px;
+  padding: 5px 6px; border-radius: 6px;
+  border: 1px solid var(--line); background: var(--bg);
+}
+.picker-values:focus-within { border-color: var(--accent); }
+/* The text box is the flexible remainder of the row, so it sits after the chips and
+   still accepts a click anywhere to the right of the last one. */
+.picker-values input[type='text'] {
+  flex: 1 1 7ch; min-width: 7ch; width: auto;
+  border: none; background: none; padding: 2px 2px;
+}
+.picker-values input[type='text']:focus { outline: none; border: none; }
+.picker-toggle {
+  border: none; background: none; color: var(--muted);
+  padding: 0 4px; font-size: 11px; line-height: 1; margin-left: auto;
+}
+.picker-toggle:hover:not(:disabled) { color: var(--text); border: none; }
+/* A value the workspace does not have. Not an error — a column renamed yesterday looks
+   exactly like a typo, and only a person knows which.
+
+   A DASHED border rather than a different colour. The first attempt tinted it `--yellow`
+   beside a chip tinted `--accent`, which are #d9b23a and #d98b3a: one hue step apart, and
+   in a screenshot the marked chip was indistinguishable from the four unmarked ones next
+   to it. A border style carries at any hue and survives a colour-blind reader, which a
+   10% tint of an adjacent hue does not. */
+.chip.chip-unknown {
+  border-style: dashed;
+  border-color: var(--muted);
+  background: none;
+}
+.chip.chip-unknown::before { content: '?'; color: var(--muted); font-size: 11px; }
+.picker-list {
+  position: absolute; z-index: 20; left: 0; right: 0; top: calc(100% + 4px);
+  max-height: 230px; overflow-y: auto;
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: 6px; padding: 4px;
+  box-shadow: 0 10px 24px rgb(0 0 0 / 28%);
+}
+.picker-group {
+  margin: 6px 0 2px; padding: 0 7px;
+  font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted);
+}
+.picker-option {
+  display: flex; justify-content: space-between; align-items: baseline; gap: 10px;
+  width: 100%; text-align: left;
+  padding: 5px 7px; border: none; border-radius: 4px; background: none; font-size: 13px;
+}
+.picker-option > .muted { font-size: 11px; }
+/* The highlight is a filled row on a plain list. Inverted — a plain row on a filled
+   list — it reads as a hole rather than as a selection. */
+.picker-option.active { background: var(--panel-2); border: none; }
+.picker-note { margin: 0; padding: 7px; font-size: 11px; color: var(--muted); line-height: 1.45; }
+/* A button that is really a link: an action inside a sentence, where a bordered control
+   would break the line it is explaining. */
+.linklike {
+  border: none; background: none; padding: 0;
+  color: var(--accent); font: inherit; text-decoration: underline;
+}
+.linklike:hover:not(:disabled) { border: none; color: var(--accent); }

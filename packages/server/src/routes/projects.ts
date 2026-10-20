@@ -4,6 +4,7 @@ import { z } from 'zod'
 import { schema } from '@ogun/core/db'
 import type { Db } from '@ogun/core/db'
 import {
+  conditionsSchema,
   controlPlanePoliciesSchema,
   cycleDefinitionSchema,
   sourceSchema,
@@ -11,6 +12,9 @@ import {
 } from '@ogun/core'
 import { discoverSkills, expandCycle, hashSkillSet, loadProjectConfig } from '@ogun/core'
 import { builtinSkillsRoot, driftAcross } from '../drift.ts'
+import { ConfigConflict, ConfigUnreachable } from '../config-store.ts'
+import { linearHttp } from '../integrations/linear.ts'
+import { projectLinearCredential } from '../integrations/linear-credential.ts'
 import { reindexProject } from '../reindex.ts'
 import { recentEmissions, recentPolls, sourceHealth } from '../source-health.ts'
 import { parseSchedule } from '../foreman/scheduler.ts'
@@ -513,6 +517,97 @@ projectsRoutes.get('/:slug/coverage', async (c) => {
  * legitimately in that state, and it is the answer the UI needs in order to render nothing
  * rather than an error.
  */
+/**
+ * `PATCH /api/projects/:slug/sources/:name` — edit a source from the UI.
+ *
+ * Writes `.ogun/config.yaml` and reindexes, on exactly the terms the worker routes use:
+ * the file is the definition, the database is an index of it, and a compare-and-swap on
+ * the file's hash makes two concurrent edits fail loudly rather than one of them vanish.
+ *
+ * **The node is replaced wholesale rather than key by key**, which is the opposite of
+ * what the worker edit does and is deliberate. A worker edit sets each key individually
+ * so a comment somebody wrote against an untouched field survives; a source may still be
+ * in the old `team:` + `filter:` shape, and setting keys individually would leave those
+ * keys sitting beside the new `conditions:` block. The lift reads the old shape when
+ * `conditions` is absent, so a half-migrated node is not merely untidy — it is a file
+ * whose meaning depends on which of two blocks the reader notices. Saving from the UI
+ * migrates it, and the cost is any comment inside that one source.
+ */
+/**
+ * What the UI may change about a source. `kind` is absent on purpose — there is one
+ * value, the route writes it, and a field with one option is a field that teaches
+ * somebody there are two.
+ */
+const sourceEditSchema = z.object({
+  cycle: z.string().min(1),
+  pollMinutes: z.number().int().positive().max(1440),
+  maxPerPoll: z.number().int().positive().max(50),
+  maxPages: z.number().int().positive().max(20),
+  enabled: z.boolean(),
+  conditions: conditionsSchema,
+  /** Compare-and-swap on the file, so a concurrent edit is a 409 and not a silent loss. */
+  expectedHash: z.string().optional(),
+})
+
+projectsRoutes.patch('/:slug/sources/:name', async (c) => {
+  const { db, config } = c.var.ctx
+  const slug = c.req.param('slug')
+  const name = c.req.param('name')
+
+  const project = await db.query.projects.findFirst({ where: eq(projects.slug, slug) })
+  if (!project) return c.json({ error: 'no such project' }, 404)
+
+  const body = sourceEditSchema.safeParse(await c.req.json())
+  if (!body.success) {
+    return c.json({ error: body.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ') }, 400)
+  }
+  const { expectedHash, ...fields } = body.data
+
+  /**
+   * The cycle, checked here rather than left to the poll.
+   *
+   * `pollSource` already refuses a source whose cycle does not exist, and records why —
+   * but that refusal happens every five minutes in a table, where this one happens once,
+   * in front of the person who just typed it. The poll's check stays: config.yaml can be
+   * edited by hand and a cycle can be deleted after this was saved.
+   */
+  const cycle = await db.query.cycles.findFirst({
+    where: and(eq(cycles.projectId, project.id), eq(cycles.name, fields.cycle)),
+  })
+  if (!cycle) {
+    return c.json(
+      { error: `no worker or cycle named "${fields.cycle}" in this project` },
+      400,
+    )
+  }
+
+  try {
+    const file = await config.mutate(slug, expectedHash, (doc) => {
+      doc.setIn(['sources', name], { kind: 'linear', ...fields })
+    })
+    await reindexProject(db, slug, file)
+    return c.json({
+      sources: await sourceHealth(db, { projectId: project.id }),
+      config: { path: file.path, hash: file.hash },
+    })
+  } catch (err) {
+    if (err instanceof ConfigConflict) {
+      return c.json({ error: 'config.yaml changed since you loaded it — reload and retry' }, 409)
+    }
+    if (err instanceof ConfigUnreachable) {
+      return c.json(
+        {
+          error:
+            `this control plane has no local path for "${slug}". ` +
+            'Run `ogun project sync` on the machine holding the repo.',
+        },
+        409,
+      )
+    }
+    throw err
+  }
+})
+
 projectsRoutes.get('/:slug/sources', async (c) => {
   const { db } = c.var.ctx
   const project = await db.query.projects.findFirst({
@@ -545,4 +640,56 @@ projectsRoutes.get('/:slug/sources', async (c) => {
      */
     ticket: ticket ?? null,
   })
+})
+
+/**
+ * What the workspace calls its own teams, statuses and labels — so the Sources editor can
+ * offer them instead of a blank text box.
+ *
+ * **Why this is a 200 with a reason rather than an error status.** The suggestions are an
+ * aid to a form, not the form's content. Every way this can fail — the project is not
+ * connected, the grant lapsed, Linear is down, the token is rate-limited — is a reason to
+ * type the value by hand, and none of them is a reason the editor should refuse to open.
+ * A 4xx or 5xx here would make the client's error path the thing that decides whether a
+ * source can be edited, which is exactly backwards: a source whose credential is dead is
+ * the one most likely to need editing. So the shape is always the same, `reachable` says
+ * whether to believe the lists, and `reason` is the sentence to show beside them.
+ *
+ * Verified against the two real grants on this machine, which is also where the design
+ * came from: one answered, and one had expired 24 days earlier and returned
+ * `AUTHENTICATION_ERROR`. Had the dropdown been authoritative, that second source would
+ * have been uneditable.
+ *
+ * On demand rather than on page load. This is the first outbound Linear call the UI can
+ * cause, and it costs a round trip and some of an hourly budget the poller is also
+ * spending, so it happens when somebody opens the editor and not when they look at a list.
+ */
+projectsRoutes.get('/:slug/linear-options', async (c) => {
+  const { db } = c.var.ctx
+  const project = await db.query.projects.findFirst({
+    where: eq(projects.slug, c.req.param('slug')),
+  })
+  if (!project) return c.json({ error: 'no such project' }, 404)
+
+  const empty = { teams: [], states: [], labels: [] }
+
+  const resolved = await projectLinearCredential(project.slug)
+  if (resolved.state !== 'ready') {
+    return c.json({ ...empty, reachable: false, reason: resolved.detail })
+  }
+
+  try {
+    const options = await linearHttp({ credential: resolved.credential }).options()
+    return c.json({ ...options, reachable: true, reason: null })
+  } catch (err) {
+    /**
+     * `LinearUnavailable` already distinguishes a rejected credential from a rate limit
+     * from a dead socket, and the three want different sentences. They are not collapsed
+     * into "could not reach Linear" here for the reason the class exists: an operator
+     * reading "rate limited" waits, and an operator reading "linear rejected the oauth
+     * access token" reconnects.
+     */
+    const detail = err instanceof Error ? err.message : String(err)
+    return c.json({ ...empty, reachable: false, reason: detail })
+  }
 })

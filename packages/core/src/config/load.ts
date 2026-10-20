@@ -4,6 +4,7 @@ import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { parse as parseYaml } from 'yaml'
 import { projectConfigSchema, type ProjectConfig } from './project.ts'
+import { usesLegacyShape } from './source.ts'
 import { skillAgentConfigSchema, type SkillAgentConfig } from './skill.ts'
 
 export const expandHome = (p: string): string =>
@@ -27,6 +28,17 @@ export type LoadedProject = {
   config: ProjectConfig
   /** Hash of the raw config text — what worker.versionHash is derived from. */
   configHash: string
+  /**
+   * Sources still written as a top-level `team:` beside a `filter:` block.
+   *
+   * Computed off the raw yaml, because by the time the schema has run they are
+   * indistinguishable: `sourceSchema` lifts the old shape into `conditions` so that an
+   * un-migrated source keeps polling rather than becoming a row `pollSources` silently
+   * skips. The translation is the right default and it is also why nobody would ever
+   * find out — so the names come back here, and `ogun project sync` says them at the one
+   * moment somebody is looking at this file.
+   */
+  legacySources: string[]
 }
 
 /** Reads .ogun/config.yaml fresh. Config is never cached: an edit takes effect on the
@@ -34,8 +46,12 @@ export type LoadedProject = {
 export async function loadProjectConfig(root: string): Promise<LoadedProject> {
   const configPath = join(root, '.ogun', 'config.yaml')
   const text = await readFile(configPath, 'utf8')
-  const config = projectConfigSchema.parse(parseYaml(text))
-  return { root, configPath, config, configHash: hashContent(text) }
+  const raw = parseYaml(text) as { sources?: Record<string, unknown> } | null
+  const config = projectConfigSchema.parse(raw)
+  const legacySources = Object.entries(raw?.sources ?? {})
+    .filter(([, source]) => usesLegacyShape(source))
+    .map(([name]) => name)
+  return { root, configPath, config, configHash: hashContent(text), legacySources }
 }
 
 /**
