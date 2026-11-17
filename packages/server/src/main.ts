@@ -4,7 +4,7 @@ import { createApp } from './app.ts'
 import { createContext } from './context.ts'
 import { localConfigPath } from '@ogun/core'
 import { assertBindIsSafe, InsecureBind, LOCAL_BINDS, resolveAuth } from './auth.ts'
-import { reconcileCoverage, sweepStaleClaims } from './foreman/sweep.ts'
+import { reconcileCoverage, reconcileStalledCycles, sweepStaleClaims } from './foreman/sweep.ts'
 import { tick } from './foreman/scheduler.ts'
 import { pollSources } from './foreman/sources.ts'
 
@@ -145,6 +145,9 @@ const sweep = setInterval(() => {
   reconcileCoverage(ctx.db)
     .then((n) => n > 0 && console.log(`[foreman] reconciled ${n} stale coverage row(s)`))
     .catch((err) => console.error('[foreman] coverage reconcile failed', err))
+  reconcileStalledCycles(ctx.db)
+    .then((n) => n > 0 && console.log(`[foreman] unstuck ${n} stalled cycle run(s)`))
+    .catch((err) => console.error('[foreman] cycle reconcile failed', err))
 }, 60_000)
 sweep.unref()
 

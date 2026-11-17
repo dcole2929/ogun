@@ -6,6 +6,7 @@ import { cycleConfigSchema, expandCycle } from '@ogun/core'
 import { startHarness } from './harness.ts'
 import { startCycleRun } from '../src/foreman/cycles.ts'
 import { finalizeRun } from '../src/foreman/finalize.ts'
+import { reconcileStalledCycles } from '../src/foreman/sweep.ts'
 
 /**
  * A scope evaluator's verdict, and what the rest of a cycle does about it (§4.13,
@@ -361,4 +362,176 @@ describe('a scope verdict decides what the rest of the cycle does', () => {
       .where(eq(schema.cycleRuns.id, cycleRunId))
     assert.equal(cycleRun!.state, 'failed')
   })
+
+  /**
+   * The same chain, declined at the **entry** node instead of the middle one.
+   *
+   * This is the case the test above cannot reach and the one that broke in production.
+   * `releaseDependents` read the jobs table once and walked that snapshot, so the pass
+   * that resolved `plan` still saw `plan` as `blocked` when it looked at `implement` —
+   * one edge further out, never reconsidered, and nothing would ever call the sweep again
+   * because the only caller is a job finishing and no job had one left to finish.
+   *
+   * Two nodes hid it completely: the dependent of the node that just ended is always
+   * resolved by the first pass. It needs a third node to show, which is why the pipeline
+   * ran for weeks before anyone saw eleven jobs stuck on `blocked`.
+   */
+  test('an evaluator declining stops the whole chain behind it, not just the next node', async () => {
+    const { cycleRunId } = await startCycleRun(db, { cycleId: chainCycleId, trigger: 'test' })
+    await report(cycleRunId, 'scope', 'decline')
+
+    assert.equal((await jobFor(cycleRunId, 'plan')).state, 'skipped', 'the next node')
+    assert.equal(
+      (await jobFor(cycleRunId, 'implement')).state,
+      'skipped',
+      'and the one behind it — blocked here is the bug, not a slower path to the same place',
+    )
+
+    const cov = await coverageFor(cycleRunId, 'implement')
+    assert.equal(cov.outcome, 'blocked')
+    assert.match(cov.reason ?? '', /dependency plan did not succeed/)
+
+    /**
+     * And the run closes. A cycle whose last node never leaves `blocked` never satisfies
+     * `finalizeCycleIfDone`, so it reports `running` for as long as the database lives —
+     * which is how twenty-seven of them accumulated, the oldest two months old.
+     */
+    const [cycleRun] = await db
+      .select()
+      .from(schema.cycleRuns)
+      .where(eq(schema.cycleRuns.id, cycleRunId))
+    assert.equal(cycleRun!.state, 'declined')
+    assert.ok(cycleRun!.endedAt, 'and it has an end time')
+  })
+
+  /**
+   * The other way a node reaches a terminal state without a job ever running: admission
+   * refuses it at creation.
+   *
+   * `releaseDependents` is called from `finalizeRun`, and `finalizeRun` is reached by a
+   * job that *ran*. A cycle refused before it started therefore had nothing that would
+   * ever look at the nodes behind the refusal — they were written `blocked` and left. The
+   * three oldest stuck runs on the machine this was written against are exactly this: a
+   * lapsed credential, `scope` refused at admission, `plan` waiting on it ever since.
+   *
+   * Disabling the worker is the cheapest refusal that does not need a credential fixture;
+   * `startCycleRun` turns `enabled: false` into the same `skipped` job and `refused`
+   * coverage row every other refusal produces.
+   */
+  test('a cycle refused before it starts does not leave its other nodes waiting', async () => {
+    await db
+      .update(schema.workers)
+      .set({ enabled: false })
+      .where(eq(schema.workers.id, workerIds.get('scope')!))
+    try {
+      const { cycleRunId } = await startCycleRun(db, { cycleId: chainCycleId, trigger: 'test' })
+
+      assert.equal((await jobFor(cycleRunId, 'scope')).state, 'skipped', 'refused at admission')
+      assert.equal((await jobFor(cycleRunId, 'plan')).state, 'skipped')
+      assert.equal((await jobFor(cycleRunId, 'implement')).state, 'skipped')
+
+      const [cycleRun] = await db
+        .select()
+        .from(schema.cycleRuns)
+        .where(eq(schema.cycleRuns.id, cycleRunId))
+      assert.ok(cycleRun!.endedAt, 'a run that can never move is over, and says so')
+    } finally {
+      await db
+        .update(schema.workers)
+        .set({ enabled: true })
+        .where(eq(schema.workers.id, workerIds.get('scope')!))
+    }
+  })
+
+  /**
+   * The reconciliation, against a cycle stalled by hand.
+   *
+   * Both fixes above are at the source, and neither helps the runs that were already
+   * stuck when they shipped. This is what repairs those — and what catches a control
+   * plane killed between a job going terminal and the sweep that follows it, which no
+   * amount of correctness in `releaseDependents` can prevent.
+   *
+   * The stall is constructed rather than provoked: put `implement` back to `blocked`
+   * behind a terminal `plan` and nothing in the system has a reason to look at it again.
+   */
+  test('the sweep unsticks a cycle nothing else will look at again', async () => {
+    const { cycleRunId } = await startCycleRun(db, { cycleId: chainCycleId, trigger: 'test' })
+    await report(cycleRunId, 'scope', 'decline')
+
+    await db
+      .update(schema.jobs)
+      .set({ state: 'blocked' })
+      .where(
+        and(eq(schema.jobs.cycleRunId, cycleRunId), eq(schema.jobs.nodeKey, 'implement')),
+      )
+    await db
+      .update(schema.cycleRuns)
+      .set({ state: 'running', endedAt: null })
+      .where(eq(schema.cycleRuns.id, cycleRunId))
+
+    const moved = await reconcileStalledCycles(db)
+    assert.ok(moved >= 1, 'it found the stalled cycle')
+    assert.equal((await jobFor(cycleRunId, 'implement')).state, 'skipped')
+
+    const [cycleRun] = await db
+      .select()
+      .from(schema.cycleRuns)
+      .where(eq(schema.cycleRuns.id, cycleRunId))
+    assert.ok(cycleRun!.endedAt, 'and closed it')
+
+    /**
+     * Idempotent, because it runs every sixty seconds forever. A second pass over a
+     * cycle it has already repaired must find nothing to do rather than re-reporting it.
+     */
+    const [, again] = [await reconcileStalledCycles(db), await jobFor(cycleRunId, 'implement')]
+    assert.equal(again.state, 'skipped')
+  })
+
+  /**
+   * The second shape of the same stall: every job terminal and the run never closed.
+   *
+   * The first version of the sweep required a `blocked` job and missed this entirely.
+   * Sixteen `nightly` runs were in it on the machine this was written against — three
+   * reviewers all refused at admission, nothing left to finish, nothing to call the
+   * finalizer, and `running` on every row since September. Asking whether the cycle can
+   * still move rather than what its jobs look like is what catches both.
+   */
+  test('the sweep closes a run whose jobs all ended without it', async () => {
+    await db
+      .update(schema.workers)
+      .set({ enabled: false })
+      .where(eq(schema.workers.id, workerIds.get('scope')!))
+    let cycleRunId = ''
+    try {
+      ;({ cycleRunId } = await startCycleRun(db, { cycleId: chainCycleId, trigger: 'test' }))
+    } finally {
+      await db
+        .update(schema.workers)
+        .set({ enabled: true })
+        .where(eq(schema.workers.id, workerIds.get('scope')!))
+    }
+
+    // Reopen it, so the row looks the way those sixteen did: all jobs terminal, no end.
+    await db
+      .update(schema.cycleRuns)
+      .set({ state: 'running', endedAt: null })
+      .where(eq(schema.cycleRuns.id, cycleRunId))
+
+    const jobStates = await db
+      .select({ state: schema.jobs.state })
+      .from(schema.jobs)
+      .where(eq(schema.jobs.cycleRunId, cycleRunId))
+    assert.ok(
+      jobStates.every((j) => j.state === 'skipped'),
+      'the fixture is the one being described — nothing blocked, everything terminal',
+    )
+
+    assert.ok((await reconcileStalledCycles(db)) >= 1)
+    const [cycleRun] = await db
+      .select()
+      .from(schema.cycleRuns)
+      .where(eq(schema.cycleRuns.id, cycleRunId))
+    assert.ok(cycleRun!.endedAt, 'closed, with no blocked job anywhere to point at')
+  })
 })
+
