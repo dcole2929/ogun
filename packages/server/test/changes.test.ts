@@ -301,6 +301,51 @@ describe('a published patch fills in its branch and pull request', () => {
   })
 
   /**
+   * And the list carries it, not only the run page.
+   *
+   * `GET /api/runs` aggregated a findings count and nothing else, so a night's patches
+   * were invisible until each `dispatched` run was opened in turn — the one output of this
+   * factory that a person has to go and act on, and the only one not on the page that
+   * exists to say what was produced.
+   *
+   * `branch` and `prUrl` travel separately from `changed` on purpose. A `changes` row with
+   * no branch is a patch that was produced and *not* published (§4.4) — the publisher
+   * refused, or has not run — and through a single nullable url that row is
+   * indistinguishable from a run that produced no patch at all. It is the row most worth
+   * noticing, so the two cases are kept apart in the payload rather than in the reader's
+   * head.
+   */
+  test('the runs list carries the pull request, and says when there is a patch with none', async () => {
+    const published = await finish(dispatched)
+    await send(`/api/runs/${published}/published`, {
+      branch: 'ogun/fixer/aa11bb22cc33',
+      prUrl: 'https://github.com/o/r/pull/412',
+    })
+    const unpublished = await finish(dispatched)
+
+    const res = await h.fetch('/api/runs?limit=50')
+    const body = (await res.json()) as {
+      runs: Array<{
+        run: { id: string }
+        produced: { findings: number; changed: boolean; branch: string | null; prUrl: string | null }
+      }>
+    }
+    const row = (id: string) => body.runs.find((r) => r.run.id === id)?.produced
+
+    assert.deepEqual(row(published), {
+      findings: 0,
+      changed: true,
+      branch: 'ogun/fixer/aa11bb22cc33',
+      prUrl: 'https://github.com/o/r/pull/412',
+    })
+    assert.deepEqual(
+      row(unpublished),
+      { findings: 0, changed: true, branch: null, prUrl: null },
+      'a patch with nowhere to see it is still a patch, and the list must be able to say so',
+    )
+  })
+
+  /**
    * The gate the runner cannot be the judge of. `finalizeRun` derives a `dispatched` with
    * a failed gate down to `changes-requested`, and a runner announcing a pull request for
    * such a run is either confused or lying. Either way the row must not say the work was

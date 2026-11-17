@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react'
+import { useState, type ReactNode } from 'react'
 
 export function Page({
   title,
@@ -198,9 +198,109 @@ const OUTCOME_TONE: Record<string, string> = {
   ok: 'green',
 }
 
+/**
+ * What each status word means, in one sentence, for a reader who has met it on a row.
+ *
+ * ### Why this exists
+ *
+ * The taxonomy is the point of the system and it is unguessable from the outside.
+ * `declined`, `error`, `changes-requested` and `skipped` are four different facts that a
+ * reader with no context will read as four words for "it didn't work" — and the whole
+ * reason `packages/core/src/outcomes.ts` keeps them apart is that they send a person to
+ * four different places. A word nobody can decode is a word that gets collapsed in the
+ * reader's head, which defeats the taxonomy just as thoroughly as collapsing it in the
+ * database would.
+ *
+ * ### Why the text is duplicated here
+ *
+ * `outcomes.ts` is the source of truth and these sentences are condensed from its doc
+ * comments — not invented, and not to be edited away from it. They are *copied* because
+ * `apps/web` deliberately does not depend on `@ogun/core`: that package re-exports zod,
+ * the config loader and the Linear client, none of which belongs in a browser bundle, and
+ * the one thing wanted from it is prose. What keeps the copy honest is a test rather than
+ * a convention — `render.test.tsx` imports `RUN_OUTCOMES` and `JOB_STATES` from core and
+ * fails if either grows a value with no sentence here, so adding an outcome and forgetting
+ * this file is a red suite rather than a pill nobody can read.
+ */
+export const STATUS_HELP: Record<string, string> = {
+  // Run outcomes (§5.2), in the order `RUN_OUTCOMES` declares them.
+  approved: 'The worker ran, the verify gate passed, and its findings — possibly zero — were persisted.',
+  'changes-requested':
+    'The worker ran and the verify gate rejected its output, so nothing was persisted. The gate’s word, not the worker’s: a finding that fails its own schema or cites a file that does not exist is worse than none.',
+  skipped:
+    'Admission refused the job before any agent ran — the failure breaker is open, or the worker is disabled. Nothing was looked at and nothing was spent.',
+  dispatched: 'A modifier ran and left a patch. Whether that patch was published is a separate fact.',
+  declined:
+    'The worker ran, the gate passed, and its answer was no — so the work it was asked about must not go ahead. A result, not a failure: nothing broke and nothing is wrong with the worker. Everything downstream of it in the cycle was skipped.',
+  error: 'The harness or the agent failed. Somebody has to go and fix this one.',
+
+  // Job states. A row shows one of these when a job has no run to show an outcome for.
+  blocked: 'Waiting on another node in its cycle. It is released when every dependency has gone terminal, or skipped when one of them did not succeed.',
+  queued: 'Admitted and waiting for a runner to claim it. Not the same as clean, and not the same as about to start.',
+  claimed: 'A runner has taken the job and has not started the agent yet.',
+  running: 'The agent is working now. The run page streams its tool calls live.',
+  succeeded: 'The job finished and released whatever depends on it.',
+  failed: 'The job ended badly. Its dependents were skipped or blocked depending on the edge.',
+}
+
+/**
+ * `title` from `STATUS_HELP`, on every pill in the app rather than on the Runs page.
+ *
+ * The same six words appear on Coverage, on Findings and in the run header, and a
+ * definition that is only available where somebody thought to add a legend is one a reader
+ * learns not to look for. Pills with no entry — a finding's status, a source's health —
+ * get no tooltip rather than a wrong one.
+ */
 export const Pill = ({ value }: { value: string }) => (
-  <span className={`pill ${OUTCOME_TONE[value] ?? ''}`}>{value}</span>
+  <span className={`pill ${OUTCOME_TONE[value] ?? ''}`} title={STATUS_HELP[value]}>
+    {value}
+  </span>
 )
+
+/**
+ * The key: every status word on this page with its definition, behind a disclosure.
+ *
+ * Open by default was tried on paper and rejected — it is twelve rows of prose above the
+ * table somebody came to read, and the second visit it is in the way. A tooltip alone was
+ * also not enough: it answers "what does *this* word mean" and never "what are the
+ * possible answers", which is the question somebody filtering by outcome is actually
+ * asking.
+ *
+ * `values` is what the page has, in the order the page wants them, so the key explains the
+ * vocabulary of the surface it sits on rather than every status Ogun has. A word present
+ * in no row is left out: it cannot be scanned for and it pads the one thing the reader is
+ * trying to find.
+ */
+export function StatusKey({ values, label }: { values: string[]; label?: string }) {
+  const [open, setOpen] = useState(false)
+  const defined = values.filter((v) => STATUS_HELP[v] !== undefined)
+  if (defined.length === 0) return null
+
+  return (
+    <div className="key">
+      <button
+        type="button"
+        className="linklike"
+        aria-expanded={open}
+        onClick={() => setOpen(!open)}
+      >
+        {open ? 'hide' : (label ?? 'what do these mean?')}
+      </button>
+      {open && (
+        <dl className="key-list">
+          {defined.map((v) => (
+            <div key={v}>
+              <dt>
+                <Pill value={v} />
+              </dt>
+              <dd className="muted">{STATUS_HELP[v]}</dd>
+            </div>
+          ))}
+        </dl>
+      )}
+    </div>
+  )
+}
 
 const SEVERITY_TONE: Record<string, string> = {
   critical: 'red',
@@ -236,5 +336,19 @@ export const duration = (ms: number | null): string => {
   if (ms === null) return '—'
   if (ms < 1000) return `${ms}ms`
   if (ms < 60_000) return `${Math.round(ms / 1000)}s`
+  /**
+   * Hours roll over, and that is not cosmetic any more.
+   *
+   * This only ever formatted a *finished* run's `durationMs`, where minutes are the whole
+   * range — a worker is capped at sixty of them. It now also formats the elapsed time of
+   * a run still going, which has no cap at all, and the first screenshot of that read
+   * `180m 0s`. Seconds are dropped past the hour for the same reason they are kept below
+   * it: at three minutes the seconds are the interesting digit, and at three hours they
+   * are noise in a column somebody is scanning.
+   */
+  if (ms >= 3_600_000) {
+    const hours = Math.floor(ms / 3_600_000)
+    return `${hours}h ${Math.round((ms % 3_600_000) / 60_000)}m`
+  }
   return `${Math.floor(ms / 60_000)}m ${Math.round((ms % 60_000) / 1000)}s`
 }

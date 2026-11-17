@@ -169,6 +169,48 @@ th {
 td { padding: 9px 12px 9px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
 tbody tr:hover { background: var(--panel); }
 
+/*
+ * A table row that goes somewhere, or opens.
+ *
+ * Both halves are needed and neither is sufficient. The hover tint says "this row is a
+ * target" — but only once you are already on it, which does not help somebody deciding
+ * whether there is anything to click at all; the chevron column says the same thing
+ * before the mouse moves, and is the reason this is not just a wider hit area on an
+ * otherwise inert-looking table. Neither is the accessible path: see `useRowNav` in
+ * Runs.tsx for the real link each row keeps.
+ *
+ * `--panel-2` rather than the `--panel` every row already gets on hover, so a clickable
+ * row is distinguishable from a hovered one in a table where some rows are neither.
+ */
+.rowlink { cursor: pointer; }
+.rowlink:hover { background: var(--panel-2); }
+.chev-cell { width: 1%; text-align: right; padding-right: 2px; white-space: nowrap; }
+/* Quiet until the row is under the cursor, but not invisible: at `--line` it was the same
+   colour as the row borders and vanished into them in the light theme. */
+.chev { color: color-mix(in srgb, var(--muted) 45%, transparent); font-size: 15px; line-height: 1; }
+.rowlink:hover .chev { color: var(--accent); }
+.chev-button { border: none; background: none; padding: 1px 5px; line-height: 1; }
+.chev-button:hover:not(:disabled) { border: none; }
+/* Keyboard focus has to be visible on a control whose entire content is one glyph. */
+.chev-button:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; border-radius: 4px; }
+
+/*
+ * A link that leaves the app, inside a row that is itself a click target.
+ *
+ * `a { color: inherit; text-decoration: none }` is right everywhere else — a row whose
+ * whole surface navigates should not be striped with blue — but it made the pull request
+ * on a dispatched run look exactly like the text in every other cell, which is the one
+ * thing in the list that goes somewhere other than the run page. The arrow says that much
+ * before the colour is noticed, and survives a reader who cannot see the colour at all.
+ */
+.extlink { color: var(--blue); text-decoration: underline; text-underline-offset: 2px; }
+.extlink::after { content: ' ↗'; font-size: 10px; text-decoration: none; }
+
+/* The panel an expandable row opens into. Its own row spanning every column, so a
+   sentence inside it is not laid out against a nine-column grid. */
+.panel-row:hover { background: transparent; }
+.panel-row > td { padding: 2px 0 14px; }
+
 .mono { font-family: var(--mono); font-size: 12px; }
 .muted { color: var(--muted); }
 .pill {
@@ -383,6 +425,24 @@ button.danger:hover:not(:disabled) { border-color: var(--red); }
   padding: 0 4px; font-size: 14px; line-height: 1;
 }
 .chip button:hover { color: var(--text); border: none; }
+
+/*
+ * The status key — the definitions of the words in the rows, behind a disclosure under
+ * the filter bar. See `StatusKey` in ui.tsx for why it is closed by default.
+ *
+ * Narrow on purpose: these are sentences, and a definition set across the full 1100px of
+ * the main column is one your eye loses the start of. The negative top margin pulls the
+ * trigger up against the filter bar it belongs to rather than leaving it floating between
+ * that and the first heading.
+ */
+.key { margin: -8px 0 18px; font-size: 12px; }
+.key-list {
+  margin: 10px 0 0; display: grid; gap: 8px 0; max-width: 84ch;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+  padding: 13px 15px;
+}
+.key-list > div { display: grid; grid-template-columns: 148px 1fr; gap: 12px; align-items: baseline; }
+.key-list dd { margin: 0; font-size: 12.5px; line-height: 1.5; }
 
 .choice { display: flex; align-items: center; gap: 6px; font-size: 12px; }
 .choice > span { color: var(--muted); white-space: nowrap; }

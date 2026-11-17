@@ -47,9 +47,38 @@ export type SystemInfo = {
   counts: { projects: number; runs: number; openFindings: number; queuedJobs: number }
 }
 
+/** One node a waiting job is held by, and what has become of it. */
+export type JobDependency = {
+  nodeKey: string
+  /** Null when no job exists for that node key at all — reported, never assumed away. */
+  state: string | null
+  /**
+   * Whether that state is one a job cannot leave (`succeeded`, `failed`, `skipped`).
+   *
+   * Computed on the server from core's `isTerminal`, because the release rule is "every
+   * dependency has gone terminal" and the browser must not own a second copy of the
+   * job-state vocabulary. What it buys the page: a dependency still running is a job that
+   * will move on its own, and a job still `blocked` behind dependencies that have all
+   * gone terminal is one nothing is going to move.
+   */
+  terminal: boolean
+}
+
 export type PendingJob = {
-  job: { id: string; nodeKey: string; state: string; createdAt: string }
+  job: {
+    id: string
+    nodeKey: string
+    state: string
+    createdAt: string
+    cycleRunId: string
+    /** Node keys, snapshotted when the job was created — not the live graph. */
+    dependsOn: string[]
+  }
   requires: string[]
+  /** The cycle this job is a node of, by its snapshotted name. */
+  cycle: { name: string }
+  /** `dependsOn`, in order, each with the state of the sibling job that key names. */
+  dependencies: JobDependency[]
   worker: { id: string; name: string }
   project: { slug: string }
   /**
@@ -67,8 +96,20 @@ export type PendingJob = {
 }
 
 export type RunSummary = {
-  /** Only on the list; the detail route returns the full `produced` breakdown. */
-  produced?: { findings: number }
+  /**
+   * Only on the list; the detail route returns the full `produced` breakdown.
+   *
+   * `changed` rather than `prUrl !== null`, because a patch that exists and was not
+   * published is the row worth noticing and the two look identical through a nullable
+   * url. A `changes` row with no branch means the publisher refused or has not run
+   * (§4.4) — work done and nothing to open.
+   */
+  produced?: {
+    findings: number
+    changed: boolean
+    branch: string | null
+    prUrl: string | null
+  }
   run: {
     id: string
     outcome: string | null
@@ -95,6 +136,24 @@ export type RunSummary = {
   project: { slug: string }
 }
 
+/**
+ * Whether a run is still going — one rule, because two pages ask and they must not
+ * disagree about the same row.
+ *
+ * `endedAt === null` on its own is the obvious test and it is wrong about exactly one
+ * row, in the direction that matters. A run whose runner died never reports, so it has no
+ * `endedAt` and no outcome, and the sweep moves its job to `failed`: on that reading it
+ * is indistinguishable from a run that started four seconds ago. The list would give it a
+ * pulsing dot and a clock counting up days after it stopped, and the run page would hold
+ * a refetch and an `EventSource` open on a stream that will never produce another frame.
+ * An absence shown as a dash is a gap; an absence shown as "running" is a claim.
+ *
+ * So: the run has not ended *and* its job is somewhere the queue can still move it.
+ */
+const IN_FLIGHT = new Set(['queued', 'claimed', 'running'])
+export const isInFlight = (r: Pick<RunSummary, 'run' | 'job'> | undefined): boolean =>
+  r !== undefined && r.run.endedAt === null && IN_FLIGHT.has(r.job.state)
+
 export type RunEventRow = {
   id: string
   seq: number
@@ -103,7 +162,14 @@ export type RunEventRow = {
   payload: Record<string, unknown>
 }
 
-export type RunDetail = RunSummary & {
+/**
+ * `Omit<…, 'produced'>` rather than a plain intersection: the two routes put different
+ * things under that key — a count on the list, the breakdown here — and intersecting them
+ * produced a type claiming both at once. `findings` was `number & Array<…>`, and once the
+ * list's version grew a `prUrl` the detail type would have advertised a field the detail
+ * route does not send, which typechecks and is `undefined` at runtime.
+ */
+export type RunDetail = Omit<RunSummary, 'produced'> & {
   events: RunEventRow[]
   artifacts: Array<{ id: string; kind: string; ref: string; bytes: number | null }>
   /**

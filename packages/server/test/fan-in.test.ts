@@ -340,6 +340,69 @@ describe('triage fan-in', () => {
   })
 
   /**
+   * The queue view's account of the one row this cycle shape always produces.
+   *
+   * `triage` is `blocked` from the moment the run starts, and the Runs page said
+   * "waiting on a dependency" for it — a pill naming neither the node nor what became of
+   * it, on the one page where that is the whole question. Two reviewers that have not
+   * started and a reviewer that declined put a job in the same words, and the second is
+   * the one somebody has to act on.
+   *
+   * `terminal` travels with each dependency because the release rule is "every dependency
+   * has gone terminal" (`releasePass`). A browser re-deriving that from a string
+   * comparison would be a second copy of `JOB_STATES` living in a bundle, and the page
+   * needs the distinction: a dependency still running releases this job on its own, and
+   * one already terminal with the job still `blocked` does not.
+   */
+  test('a blocked node reports which dependencies hold it, and what became of them', async () => {
+    const { cycleRunId } = await startCycleRun(db, { cycleId, trigger: 'test' })
+
+    type Pending = {
+      job: { nodeKey: string; state: string; cycleRunId: string; dependsOn: string[] }
+      cycle: { name: string }
+      dependencies: Array<{ nodeKey: string; state: string | null; terminal: boolean }>
+    }
+    const triage = async (): Promise<Pending> => {
+      const res = await h.fetch('/api/runs?limit=1')
+      const body = (await res.json()) as { pending: Pending[] }
+      const row = body.pending.find(
+        (p) => p.job.cycleRunId === cycleRunId && p.job.nodeKey === 'triage',
+      )
+      assert.ok(row, 'the blocked triage node is missing from the queue entirely')
+      return row
+    }
+
+    const waiting = await triage()
+    assert.equal(waiting.job.state, 'blocked')
+    assert.equal(waiting.cycle.name, 'nightly', 'the cycle snapshot, so a rename still reads')
+    assert.deepEqual(
+      [...waiting.dependencies].sort((a, b) => a.nodeKey.localeCompare(b.nodeKey)),
+      [
+        { nodeKey: 'reviewer-a', state: 'queued', terminal: false },
+        { nodeKey: 'reviewer-b', state: 'queued', terminal: false },
+      ],
+      'both reviewers, by node key, each with the state it is actually in',
+    )
+
+    // One of them finishes. The row must now distinguish the dependency that is done from
+    // the one that is not — which is exactly what the single pill could not do.
+    await finish(cycleRunId, 'reviewer-a', [])
+    const half = await triage()
+    assert.equal(half.job.state, 'blocked', 'one of two is not a release')
+    const states = Object.fromEntries(half.dependencies.map((d) => [d.nodeKey, d]))
+    assert.deepEqual(states['reviewer-a'], {
+      nodeKey: 'reviewer-a',
+      state: 'succeeded',
+      terminal: true,
+    })
+    assert.deepEqual(states['reviewer-b'], {
+      nodeKey: 'reviewer-b',
+      state: 'queued',
+      terminal: false,
+    })
+  })
+
+  /**
    * The guard that decides staging reads the run's frozen definition, and it used to
    * answer "I cannot read this" with the same value as "nothing depends on this node" —
    * which is publish. A reviewer feeding triage would then put its raw findings in the
@@ -405,6 +468,7 @@ describe('triage fan-in', () => {
       'a night withheld because nobody could read the graph must not read as a normal fan-in',
     )
   })
+
 })
 
 /**

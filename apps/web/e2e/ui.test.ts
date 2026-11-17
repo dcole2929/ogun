@@ -1,8 +1,8 @@
 import { strict as assert } from 'node:assert'
 import { after, before, describe, test } from 'node:test'
 import type { Page } from 'playwright'
-import { open, type Harness } from './harness.ts'
-import { ALL_CLEAR } from './fixtures.ts'
+import { open, settle, type Harness } from './harness.ts'
+import { ALL_CLEAR, RUNS } from './fixtures.ts'
 
 /**
  * The tray is a toggle, and these tests share one browser for speed — so a test that
@@ -228,5 +228,212 @@ describe('the sidebar', () => {
     const { page } = h
     await page.dblclick('.resizer')
     assert.ok(Math.abs((await width()) - 200) < 2, 'back to 200')
+  })
+})
+
+/**
+ * The Runs list, which is almost entirely interaction.
+ *
+ * Every item here is a thing `renderToString` cannot reach: a row that navigates, a row
+ * that opens in place, a disclosure that is reachable from the keyboard, and the two ways
+ * a row-wide click handler breaks a table that was working — swallowing a nested link and
+ * eating a text selection. The markup for all of it is correct in the server-rendered
+ * tests and none of those four is asserted by them.
+ */
+describe('the runs list', () => {
+  let h: Harness
+  before(async () => (h = await open('/runs', { '/api/runs': RUNS })))
+  after(async () => h.stop())
+
+  /** Back to the list between tests, since half of these navigate away from it. */
+  const onList = async (page: Page): Promise<void> => {
+    if (!page.url().endsWith('/runs')) {
+      await page.goto(`${h.url}/runs`)
+      await page.waitForSelector('table')
+      await settle(page)
+    }
+  }
+
+  /**
+   * The complaint: "if you click the timestamp 3h ago you get to the details page. that's
+   * not good ui." So a click on the worker's name — the middle of the row, nowhere near
+   * the link — has to arrive at the same place.
+   */
+  test('a click anywhere in a run row opens that run', async () => {
+    const { page } = h
+    await onList(page)
+    await page.click('tr:has(a[href="/runs/run-approved"]) td:nth-child(3)')
+    await page.waitForURL(/\/runs\/run-approved$/)
+    // And the page it reached is a real one, not a row id handed to a route that 404s.
+    // `settle` first: the url changes before React has swapped the page, so asserting on
+    // the heading immediately reads the list's own `<h1>` and passes for the wrong reason.
+    await settle(page)
+    assert.match((await page.textContent('h1')) ?? '', /adversarial-review/)
+  })
+
+  /**
+   * The affordance, which is the other half of the complaint — "or we should add some
+   * icon that makes it clear there is something to click". A hover tint is invisible
+   * until the cursor is already on the row, so the chevron is what has to be there before
+   * anybody moves the mouse.
+   */
+  test('every run row shows that it goes somewhere before it is hovered', async () => {
+    const { page } = h
+    await onList(page)
+    const rows = await page.locator('tbody tr.rowlink').count()
+    assert.equal(await page.locator('tbody .chev').count(), rows, 'one chevron per row')
+    assert.ok(rows >= 4, `expected the fixture's rows, got ${rows}`)
+  })
+
+  /**
+   * The guard that makes a row-wide click handler safe to add to a table people read.
+   *
+   * Dragging across a cell to copy a commit sha ends in a `click` on the row. Without the
+   * selection check in `useRowNav` that click navigates, the page unmounts and the
+   * selection goes with it — so the one thing a dense table of shas and branch names is
+   * for stops working the moment the rows become clickable.
+   */
+  test('selecting text in a row copies it rather than navigating away', async () => {
+    const { page } = h
+    await onList(page)
+    // The finished table specifically, by the link only its rows carry — `tr.rowlink`
+    // also matches the waiting rows above it, whose third cell holds a different name.
+    const cell = (await page
+      .locator('tr:has(a[href^="/runs/"]) td:nth-child(3)')
+      .first()
+      .boundingBox())!
+    // `cell.y + 10` rather than the middle of the cell: cells are top-aligned and a row
+    // whose result column wrapped is twice as tall as its text, so a drag through the
+    // vertical centre selects nothing and the test passes without testing anything.
+    await page.mouse.move(cell.x + 2, cell.y + 10)
+    await page.mouse.down()
+    await page.mouse.move(cell.x + cell.width - 2, cell.y + 10, { steps: 8 })
+    await page.mouse.up()
+
+    assert.ok(page.url().endsWith('/runs'), `navigated away to ${page.url()}`)
+    const selected = await page.evaluate(() => window.getSelection()?.toString() ?? '')
+    assert.match(selected, /adversarial/, 'the selection survived the click that ended it')
+  })
+
+  /**
+   * The gesture the selection guard cannot catch, and the reason the `.mono` cells are
+   * not part of the click target.
+   *
+   * A double-click's first click arrives before the browser has selected the word under
+   * it, so it is indistinguishable from a plain click — the row would navigate out from
+   * under somebody copying a commit sha, which is what the sha column is for.
+   */
+  test('double-clicking a value meant for copying selects it rather than navigating', async () => {
+    const { page } = h
+    await onList(page)
+    // Positioned near the top of the cell for the same reason the drag above is: cells
+    // are top-aligned, so the element's centre can be below its own text.
+    await page
+      .locator('tr:has(a[href^="/runs/"]) td.mono')
+      .last()
+      .dblclick({ position: { x: 12, y: 8 } })
+
+    assert.ok(page.url().endsWith('/runs'), `navigated away to ${page.url()}`)
+    const selected = await page.evaluate(() => window.getSelection()?.toString() ?? '')
+    assert.match(selected, /^[0-9a-f]{7}$/, `expected a sha, selected "${selected}"`)
+  })
+
+  /**
+   * The other guard. The pull request is an `<a>` inside a row that is itself a click
+   * target, and without the `closest('a')` check the row handler wins — so the one link
+   * on the page that leaves the app navigates to the run page instead, which looks like a
+   * broken link rather than like a bug in a row handler.
+   */
+  test('the pull request link in a row is not swallowed by the row', async () => {
+    const { page } = h
+    await onList(page)
+    const pr = page.locator('a[href^="https://github.com"]')
+    assert.equal(await pr.count(), 1)
+    assert.equal(await pr.textContent(), '#412', 'the number, not a url filling the column')
+    assert.equal(await pr.getAttribute('target'), '_blank')
+
+    // Clicked with the new tab suppressed, so what is asserted is that *this* page did
+    // not move — which is exactly what the row handler would have done.
+    await pr.evaluate((el) => el.removeAttribute('target'))
+    await page.evaluate(() => {
+      document.addEventListener('click', (e) => e.preventDefault(), { capture: true, once: true })
+    })
+    await pr.click()
+    assert.ok(page.url().endsWith('/runs'), `the row handler hijacked the link: ${page.url()}`)
+  })
+
+  /**
+   * A pending job has no run, so there is no `/runs/:id` for it and inventing one would
+   * be worse than the bare pill it replaces. It opens in place instead, and the panel has
+   * to carry the things the row cannot: the cycle, the dependency, and its state.
+   */
+  test('a waiting row opens in place instead of navigating to a run that does not exist', async () => {
+    const { page } = h
+    await onList(page)
+    const row = page.locator('tr:has(.chev-button)')
+    await row.locator('td:nth-child(3)').click()
+
+    await page.waitForSelector('.panel-row')
+    const panel = (await page.textContent('.panel-row')) ?? ''
+    assert.match(panel, /ticket/, 'the cycle it is a node of')
+    assert.match(panel, /plan/, 'the dependency, by node key')
+    assert.match(panel, /skipped/, 'and what became of it')
+    assert.ok(page.url().endsWith('/runs'), 'nothing navigated')
+
+    // And it closes again, so the row is a disclosure rather than a one-way door.
+    await row.locator('td:nth-child(3)').click()
+    await page.waitForSelector('.panel-row', { state: 'detached' })
+  })
+
+  /** The disclosure is a real button, so it works without a mouse. */
+  test('the waiting row disclosure is reachable from the keyboard', async () => {
+    const { page } = h
+    await onList(page)
+    await page.locator('.chev-button').focus()
+    assert.equal(await page.locator('.chev-button').getAttribute('aria-expanded'), 'false')
+    await page.keyboard.press('Enter')
+    await page.waitForSelector('.panel-row')
+    assert.equal(await page.locator('.chev-button').getAttribute('aria-expanded'), 'true')
+    await page.keyboard.press('Enter')
+    await page.waitForSelector('.panel-row', { state: 'detached' })
+  })
+
+  /**
+   * The key. Closed by default — twelve definitions above the table is in the way on
+   * every visit after the first — and the definitions in it are the ones `outcomes.ts`
+   * documents, including the distinction that file exists for.
+   */
+  test('the status key explains the words in the rows, on request', async () => {
+    const { page } = h
+    await onList(page)
+    assert.equal(await page.locator('.key-list').count(), 0, 'closed to begin with')
+
+    await page.click('.key button')
+    await page.waitForSelector('.key-list')
+    const key = (await page.textContent('.key-list')) ?? ''
+    // The four that are deliberately not interchangeable, each in its own words.
+    assert.match(key, /its answer was no/, 'declined is a result, not a failure')
+    assert.match(key, /harness or the agent failed/, 'error is somebody going to fix it')
+    assert.match(key, /verify gate rejected its output/, 'changes-requested is the gate')
+    assert.match(key, /A modifier ran and left a patch/, 'dispatched produced something')
+
+    // Only the words on the page. A key listing outcomes no row has is padding between a
+    // reader and the one definition they came for — and `skipped` is the clearest case,
+    // since admission refuses before a run exists, so no row here can carry it.
+    assert.ok(!key.includes('Admission refused the job'), 'nothing on this page was skipped')
+  })
+
+  /** An active run has to read as active in a list of fifty finished ones. */
+  test('a run in flight is the row that is moving', async () => {
+    const { page } = h
+    await onList(page)
+    const live = page.locator('tbody tr:has(.live)')
+    assert.equal(await live.count(), 1)
+    assert.match((await live.textContent()) ?? '', /nothing recorded yet/)
+    // The pulse is a real animation rather than a static dot, which is the entire point.
+    const name = await page.locator('tbody .live').first().evaluate(
+      (el) => getComputedStyle(el, '::before').animationName,
+    )
+    assert.equal(name, 'pulse')
   })
 })

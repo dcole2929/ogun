@@ -3,13 +3,14 @@ import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
 import { renderToString } from 'react-dom/server'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { MemoryRouter } from 'react-router'
+import { MemoryRouter, Route, Routes } from 'react-router'
 import type { ReactElement } from 'react'
 import { Markdown } from '../src/Markdown.tsx'
 import { SkillsPage } from '../src/pages/Skills.tsx'
 import { WorkersPage } from '../src/pages/Workers.tsx'
 import { FindingsPage } from '../src/pages/Findings.tsx'
 import { RunsPage } from '../src/pages/Runs.tsx'
+import { RunDetailPage } from '../src/pages/RunDetail.tsx'
 import { CoveragePage } from '../src/pages/Coverage.tsx'
 import { labelSuggestions, SourcesPage, stateSuggestions } from '../src/pages/Sources.tsx'
 import { RunnersPage } from '../src/pages/Runners.tsx'
@@ -17,6 +18,14 @@ import { SettingsPage } from '../src/pages/Settings.tsx'
 import { Notifications, troublesFrom } from '../src/Notifications.tsx'
 import type { LinearOauth, SystemInfo } from '../src/api.ts'
 import { ProjectScopeProvider } from '../src/scope.tsx'
+import { duration, STATUS_HELP } from '../src/ui.tsx'
+/**
+ * Reached by relative path rather than through `@ogun/core`'s package name, on purpose.
+ * `apps/web` has no dependency on that package and must not grow one — the bundle does
+ * not want zod or a database driver — but this test file is bundled by esbuild for node,
+ * so it can read the one module whose contents the UI is claiming to reproduce.
+ */
+import { JOB_STATES, RUN_OUTCOMES } from '../../../packages/core/src/outcomes.ts'
 
 /**
  * A smoke test, not a snapshot. It renders every page with no data and no server, which
@@ -809,4 +818,285 @@ test('labels carry their team when they have one', () => {
     }),
     [{ value: 'admin', hint: 'HEI' }, { value: 'agent-ready' }],
   )
+})
+
+/**
+ * Runs — the list, against data rather than an empty first paint.
+ *
+ * Everything below was broken or absent in a way `renderToString` can see: a row whose
+ * only click target was four characters of relative time, a pill naming neither the
+ * dependency nor its state, a run in flight rendered as a finished one with every column
+ * empty, and a pull request that existed on the detail route and nowhere a person
+ * scanning the list would find it.
+ */
+
+const runRow = (
+  over: Record<string, unknown> = {},
+  produced: Record<string, unknown> = {},
+  job: Record<string, unknown> = {},
+) => ({
+  run: {
+    id: 'r1',
+    outcome: 'approved',
+    detail: null,
+    notes: null,
+    startedAt: '2026-10-16T12:00:00.000Z',
+    endedAt: '2026-10-16T12:04:00.000Z',
+    durationMs: 240_000,
+    rounds: 1,
+    repoSha: 'abcdef1234567890',
+    runtime: 'claude',
+    model: 'sonnet',
+    inputTokens: 1200,
+    outputTokens: 300,
+    ...over,
+  },
+  job: { id: 'j1', nodeKey: 'review', state: 'succeeded', cycleRunId: 'cr1', ...job },
+  worker: { id: 'w1', name: 'adversarial-review' },
+  project: { slug: 'ogun' },
+  produced: { findings: 2, changed: false, branch: null, prUrl: null, ...produced },
+})
+
+const pendingRow = (over: Record<string, unknown> = {}) => ({
+  job: {
+    id: 'pj1',
+    nodeKey: 'implement',
+    state: 'blocked',
+    createdAt: '2026-10-16T11:00:00.000Z',
+    cycleRunId: 'cr9',
+    dependsOn: ['plan'],
+  },
+  requires: ['claude', 'docker'],
+  cycle: { name: 'ticket' },
+  dependencies: [{ nodeKey: 'plan', state: 'skipped', terminal: true }],
+  worker: { id: 'w2', name: 'implement' },
+  project: { slug: 'ogun' },
+  reach: 'claimable',
+  missing: [],
+  ...over,
+})
+
+const runsPayload = (over: Record<string, unknown> = {}) => ({
+  runs: [runRow()],
+  pending: [],
+  onlineRunners: 1,
+  liveRunners: 1,
+  ...over,
+})
+
+/**
+ * The complaint that started this: the timestamp was the only thing in the row you could
+ * click. The link stays — it is the keyboard path and the only accessible one — and what
+ * is asserted here is that the row advertises itself as a target, which is what was
+ * missing.
+ */
+test('a run row is marked as clickable and still carries a real link', () => {
+  const html = renderScoped(<RunsPage />, 'all', (qc) =>
+    qc.setQueryData(['runs'], runsPayload()),
+  )
+  assert.match(html, /href="\/runs\/r1"/, 'the row still has a real link to the run')
+  assert.match(html, /class="rowlink"/, 'the row is marked as a click target')
+  assert.match(html, /class="chev"/, 'and says so before the cursor arrives')
+})
+
+/**
+ * `waiting on a dependency` named neither the node nor what became of it, on the one page
+ * where that is the entire question. The data was always a join away.
+ */
+test('a blocked job names the dependency it is waiting on and its state', () => {
+  const html = renderScoped(<RunsPage />, 'all', (qc) =>
+    qc.setQueryData(['runs'], runsPayload({ pending: [pendingRow()] })),
+  )
+  assert.match(html, /waiting on plan \(skipped\)/)
+  assert.doesNotMatch(html, /waiting on a dependency/, 'the bare pill is gone')
+})
+
+/**
+ * And the distinction that pill could not make. A dependency that is still running will
+ * release this job on its own; one that has already gone terminal will not, and the two
+ * were the same sentence.
+ */
+test('a dependency still in flight is not reported as a job going nowhere', () => {
+  const moving = renderScoped(<RunsPage />, 'all', (qc) =>
+    qc.setQueryData(['runs'], runsPayload({
+      pending: [
+        pendingRow({ dependencies: [{ nodeKey: 'plan', state: 'running', terminal: false }] }),
+      ],
+    })),
+  )
+  assert.match(moving, /waiting on plan \(running\)/)
+  assert.doesNotMatch(moving, /already finished/)
+
+  const stuck = renderScoped(<RunsPage />, 'all', (qc) =>
+    qc.setQueryData(['runs'], runsPayload({ pending: [pendingRow()] })),
+  )
+  assert.match(stuck, /already finished/)
+  assert.match(stuck, /blocked<\/strong> behind dependencies that have already finished/)
+})
+
+/** A pending job has no run, so the row opens instead of navigating. */
+test('a waiting row offers a disclosure rather than a link to a run that does not exist', () => {
+  const html = renderScoped(<RunsPage />, 'all', (qc) =>
+    qc.setQueryData(['runs'], runsPayload({ pending: [pendingRow()] })),
+  )
+  assert.match(html, /aria-expanded="false"/)
+  assert.match(html, /show what implement is waiting for/)
+  assert.doesNotMatch(html, /href="\/runs\/pj1"/, 'no invented run id')
+})
+
+/**
+ * An in-flight run had no outcome, no duration and no result, so it rendered as a row of
+ * dashes — indistinguishable from a run that finished having produced nothing.
+ */
+test('a run in flight reads as running rather than as finished and empty', () => {
+  const html = renderScoped(<RunsPage />, 'all', (qc) =>
+    qc.setQueryData(
+      ['runs'],
+      runsPayload({
+        runs: [
+          runRow(
+            { outcome: null, endedAt: null, durationMs: null, repoSha: null },
+            {},
+            { state: 'running' },
+          ),
+        ],
+      }),
+    ),
+  )
+  assert.match(html, /class="live"/, 'the same pulsing marker the run page uses')
+  assert.match(html, /nothing recorded yet/, 'and says why its result column is empty')
+})
+
+/**
+ * The pull request, in the list. It was on the run page and only there, so finding which
+ * of last night's patches need reviewing meant opening each `dispatched` run in turn.
+ */
+test("a dispatched run's pull request is scannable from the list", () => {
+  const html = renderScoped(<RunsPage />, 'all', (qc) =>
+    qc.setQueryData(
+      ['runs'],
+      runsPayload({
+        runs: [
+          runRow(
+            { outcome: 'dispatched' },
+            {
+              changed: true,
+              branch: 'ogun/implement/3f2a',
+              prUrl: 'https://github.com/Heirchive/heirchive-api/pull/412',
+            },
+          ),
+        ],
+      }),
+    ),
+  )
+  assert.match(html, /href="https:\/\/github\.com\/Heirchive\/heirchive-api\/pull\/412"/)
+  assert.match(html, /#412/, 'as a number, not a url filling the column')
+})
+
+/**
+ * A patch that exists and that nobody can see is the row most worth noticing, and a
+ * missing link renders it as nothing at all (§4.4).
+ */
+test('a patch that was never published says so instead of rendering blank', () => {
+  const html = renderScoped(<RunsPage />, 'all', (qc) =>
+    qc.setQueryData(
+      ['runs'],
+      runsPayload({
+        runs: [runRow({ outcome: 'dispatched' }, { changed: true })],
+      }),
+    ),
+  )
+  assert.match(html, /patch, not published/)
+})
+
+/** The key is closed until asked for; twelve definitions above the table is in the way. */
+test('the status key is offered and not forced', () => {
+  const html = renderScoped(<RunsPage />, 'all', (qc) =>
+    qc.setQueryData(['runs'], runsPayload()),
+  )
+  assert.match(html, /what do these mean\?/)
+  assert.doesNotMatch(html, /class="key-list"/)
+})
+
+/**
+ * The one thing keeping the glossary honest.
+ *
+ * `apps/web` deliberately does not depend on `@ogun/core` — it would drag zod, the config
+ * loader and the Linear client into a browser bundle for the sake of some prose — so
+ * `STATUS_HELP` is a copy of what `outcomes.ts` documents. A copy maintained by
+ * convention rots: somebody adds an outcome, the taxonomy grows a word, and the UI shows
+ * a pill no reader can decode while every test passes. This imports the vocabularies
+ * directly and fails instead.
+ */
+test('every outcome and job state core declares has a definition in the UI', () => {
+  for (const value of [...RUN_OUTCOMES, ...JOB_STATES]) {
+    assert.ok(
+      STATUS_HELP[value],
+      `${value} is in core's vocabulary with no sentence in STATUS_HELP — see ui.tsx`,
+    )
+  }
+})
+
+/**
+ * The run page showed no Result section at all while a run was in flight, so the page you
+ * land on after pressing run has a gap where the answer goes. There is nothing to show,
+ * and that is a fact about the write path rather than an absence to leave unexplained.
+ */
+test('a running run detail says why its result is empty instead of omitting it', () => {
+  const html = renderScoped(
+    <Routes>
+      <Route path="/runs/:id" element={<RunDetailPage />} />
+    </Routes>,
+    'all',
+    (qc) =>
+      qc.setQueryData(['run', 'r1'], {
+        ...runRow({ outcome: null, endedAt: null, durationMs: null }, {}, { state: 'running' }),
+        produced: { findings: [], suppressed: [], promoted: [], changes: [] },
+        events: [],
+        artifacts: [],
+      }),
+    '/runs/r1',
+  )
+  assert.match(html, /Result/, 'the heading is there while the run is going')
+  assert.match(html, /still running/)
+  assert.match(html, /Nothing is recorded as produced yet/)
+})
+
+/**
+ * The row that made `endedAt === null` the wrong test on its own.
+ *
+ * A run whose runner died never reports, so it has no `endedAt` and no outcome, and the
+ * sweep moves its job to `failed`. Reading only the run, that row is indistinguishable
+ * from one that started four seconds ago — so it would carry a pulsing dot and a clock
+ * counting up, days after it stopped. An absence rendered as a dash is a gap; an absence
+ * rendered as "running" is a claim, and the wrong one.
+ */
+test('a run abandoned by its runner is not reported as still going', () => {
+  const html = renderScoped(<RunsPage />, 'all', (qc) =>
+    qc.setQueryData(
+      ['runs'],
+      runsPayload({
+        runs: [
+          runRow({ outcome: null, endedAt: null, durationMs: null }, {}, { state: 'failed' }),
+        ],
+      }),
+    ),
+  )
+  assert.doesNotMatch(html, /class="live"/, 'nothing is in flight here')
+  assert.match(html, /pill red[^>]*>failed/, 'the job state is what there is to say')
+})
+
+/**
+ * `duration` grew an hours branch when it started formatting elapsed time on a run that
+ * has not finished. A finished run is capped at its worker's `timeoutMs`; a running one
+ * is capped by nothing, and the first screenshot of the in-flight row read `180m 0s`.
+ */
+test('a duration past an hour reads in hours', () => {
+  assert.equal(duration(null), '—')
+  assert.equal(duration(450), '450ms')
+  assert.equal(duration(45_000), '45s')
+  assert.equal(duration(7 * 60_000), '7m 0s')
+  assert.equal(duration(59 * 60_000), '59m 0s')
+  assert.equal(duration(3 * 3_600_000), '3h 0m')
+  assert.equal(duration(3 * 3_600_000 + 25 * 60_000), '3h 25m')
 })
