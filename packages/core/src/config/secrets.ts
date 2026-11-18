@@ -98,7 +98,18 @@ import type { LinearGrantType } from '../integrations/linear-oauth.ts'
  * The application is written as a unit by the connect flow, which registers the id and the
  * secret together and proves the pair by spending it — see `setOAuthApp` below.
  */
-export const SECRET_NAMES = ['linear'] as const
+/**
+ * `github` joins `linear` on the test this set was written around: a value used verbatim
+ * as a credential, by something that polls. The control plane reads pull requests Ogun
+ * opened to find the ones somebody has asked it to revise, and that read authenticates.
+ *
+ * Not the same thing as the gateway's `OGUN_GATEWAY_GITHUB_TOKEN`, and the two must not
+ * be conflated. That one is env-only, deliberately never discovered, and exists so a
+ * *sandbox* can read a public repository without a push ever being carried (ADR-0005).
+ * This one lives on the machine that polls (ADR-0012), is per project, and never enters
+ * a container.
+ */
+export const SECRET_NAMES = ['linear', 'github'] as const
 export type SecretName = (typeof SECRET_NAMES)[number]
 
 export const isSecretName = (name: string): name is SecretName =>

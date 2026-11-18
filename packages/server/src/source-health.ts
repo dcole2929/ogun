@@ -286,7 +286,12 @@ export async function sourceHealth(
       pollMinutes,
       maxPerPoll,
       maxPages,
-      team: parsed.success ? parsed.data.conditions.team : [],
+      /**
+       * Linear's teams, and empty for any other kind. The field predates the second
+       * source kind and is kept because the Coverage page reads it; a `github` source
+       * has repositories instead, which travel in `conditions` below.
+       */
+      team: parsed.success && parsed.data.kind === 'linear' ? parsed.data.conditions.team : [],
       conditions: parsed.success ? parsed.data.conditions : null,
       health: healthOf({
         slug: project.slug,

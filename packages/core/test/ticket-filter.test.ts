@@ -1,3 +1,4 @@
+import type { LinearSourceConfig } from '../src/config/source.ts'
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import {
@@ -254,7 +255,8 @@ describe('the sources: block', () => {
         notBlocked: false,
       },
     })
-    assert.deepEqual(ticketFilterOf(source), {
+    assert.equal(source.kind, 'linear')
+    assert.deepEqual(ticketFilterOf(source as LinearSourceConfig), {
       team: ['ENG'],
       status: ['Todo'],
       label: { all_of: ['ogun'], any_of: [], none_of: ['needs-design'] },
@@ -373,7 +375,8 @@ describe('the conditions grammar', () => {
         label: { any_of: ['admin', 'agent-ready'], none_of: ['needs-design'] },
       },
     })
-    assert.deepEqual(ticketFilterOf(source), {
+    assert.equal(source.kind, 'linear')
+    assert.deepEqual(ticketFilterOf(source as LinearSourceConfig), {
       team: ['EXC', 'HEI'],
       status: ['Todo'],
       label: { all_of: [], any_of: ['admin', 'agent-ready'], none_of: ['needs-design'] },
@@ -413,7 +416,8 @@ describe('a source written in the old shape', () => {
 
   it('is translated rather than refused', () => {
     const source = sourceSchema.parse(legacy)
-    assert.deepEqual(ticketFilterOf(source), {
+    assert.equal(source.kind, 'linear')
+    assert.deepEqual(ticketFilterOf(source as LinearSourceConfig), {
       team: ['ENG'],
       status: ['Todo'],
       label: { all_of: ['ogun'], any_of: [], none_of: ['wip'] },
