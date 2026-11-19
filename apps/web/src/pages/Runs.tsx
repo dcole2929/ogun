@@ -198,9 +198,15 @@ export function RunsPage() {
 
       {/* A queued job has no run row. Without this, triggering a worker while nothing was
           online showed an empty page — the work existed and was invisible. */}
+      <h2>Waiting</h2>
+      {pending.length === 0 && (
+        <p className="muted" style={{ fontSize: 13, marginTop: 0 }}>
+          Nothing is queued or blocked. Jobs appear here between being created and being
+          claimed by a runner.
+        </p>
+      )}
       {pending.length > 0 && (
         <>
-          <h2>Waiting</h2>
           <table>
             <thead>
               <tr>
@@ -252,9 +258,20 @@ export function RunsPage() {
             </p>
           ) : null}
           <Stranded pending={pending} />
-          <h2>Finished</h2>
         </>
       )}
+
+      {/**
+       * Outside the `pending.length > 0` block, which is where it used to live.
+       *
+       * It was there because it reads as a contrast to "Waiting", and that is true right
+       * up until nothing is waiting — at which point the only table on the page loses its
+       * heading and the page looks like it lost a section. The two buckets are a fact
+       * about this page rather than about how much happens to be queued, so both are
+       * always named: "Waiting" says so when it is empty rather than disappearing, and
+       * "Finished" no longer depends on it.
+       */}
+      <h2>Finished</h2>
 
       {!isLoading && allRuns.length > 0 && runs.length === 0 && (
         <Empty>
