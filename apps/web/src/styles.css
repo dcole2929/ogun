@@ -557,6 +557,10 @@ button.danger:hover:not(:disabled) { border-color: var(--red); }
    list — it reads as a hole rather than as a selection. */
 .picker-option.active { background: var(--panel-2); border: none; }
 .picker-note { margin: 0; padding: 7px; font-size: 11px; color: var(--muted); line-height: 1.45; }
+/* An identifier column must not wrap. `HEI-167 ↗` broken over two lines reads as two
+   values, and the whole point of the column is that one glance answers "about what". */
+td.mono > .extlink, td.mono { white-space: nowrap; }
+
 /* A button that is really a link: an action inside a sentence, where a bordered control
    would break the line it is explaining. */
 .linklike {

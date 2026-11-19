@@ -296,7 +296,7 @@ export function RunsPage() {
               <th>Produced</th>
               <th>Took</th>
               <th>Tokens</th>
-              <th>Commit</th>
+              <th>Ticket</th>
               <th />
             </tr>
           </thead>
@@ -353,7 +353,30 @@ function RunRow({ run: r }: { run: RunSummary }) {
           ? `${fmt(r.run.inputTokens)} / ${fmt(r.run.outputTokens)}`
           : '—'}
       </td>
-      <td className="muted mono">{r.run.repoSha?.slice(0, 7) ?? '—'}</td>
+      {/**
+       * The ticket, where `repoSha` used to be.
+       *
+       * That column showed the commit the workspace was *checked out at* — not anything
+       * the run produced — so every run of a given day carried the same value and the
+       * column said nothing. Twenty-nine consecutive rows reading `bd04888` is what
+       * prompted this. The base sha is still on the run's own page, where it answers a
+       * question somebody is actually asking.
+       *
+       * What belongs in a list is what the run was *about*. `.mono` so the identifier
+       * lines up, and excluded from the row click for the reason every `.mono` cell is:
+       * these are values people copy.
+       */}
+      <td className="mono">
+        {!r.ticket ? (
+          <span className="muted">—</span>
+        ) : r.ticket.url === null ? (
+          r.ticket.key
+        ) : (
+          <a className="extlink" href={r.ticket.url} target="_blank" rel="noreferrer">
+            {r.ticket.key}
+          </a>
+        )}
+      </td>
       <td className="chev-cell">
         <Chevron />
       </td>

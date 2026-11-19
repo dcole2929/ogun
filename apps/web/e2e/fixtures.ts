@@ -198,6 +198,8 @@ const run = (
   over: Record<string, unknown> = {},
   produced: Record<string, unknown> = {},
   job: Record<string, unknown> = {},
+  /** `null` for a run no source started — the dash case the Ticket column has to show. */
+  ticket: Record<string, unknown> | null = { key: 'HEI-167', url: 'https://linear.app/heirchive/issue/HEI-167' },
 ) => ({
   run: {
     id,
@@ -218,6 +220,13 @@ const run = (
   job: { id: `job-${id}`, nodeKey: 'review', state: 'succeeded', cycleRunId: 'cr-1', ...job },
   worker: { id: 'w-1', name: 'adversarial-review' },
   project: { slug: 'ogun' },
+  /**
+   * A ticket on every fixture row, because the column that replaced `Commit` is only
+   * worth photographing with something in it — and because the previous fixture set's
+   * blind spot (no row ever exercised an empty state) is what let a vanished heading
+   * ship. `run-notickets` below is the other half: a run no source started.
+   */
+  ticket,
   produced: { findings: 2, changed: false, branch: null, prUrl: null, ...produced },
 })
 
@@ -252,7 +261,7 @@ export const RUNS = {
     }),
     run('run-rejected', { outcome: 'changes-requested' }),
     run('run-error', { outcome: 'error', detail: 'the container exited 137' }),
-    run('run-approved'),
+    run('run-approved', {}, {}, {}, null),
   ],
   pending: [
     {

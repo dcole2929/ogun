@@ -16,6 +16,7 @@ import type { Env } from '../context.ts'
 import { RUNNER_STALE_MS } from '../foreman/admission.ts'
 import { finalizeRun } from '../foreman/finalize.ts'
 import { fleet } from '../foreman/reach.ts'
+import { readGrant } from '@ogun/core'
 
 const {
   artifacts,
@@ -26,6 +27,7 @@ const {
   projects,
   runEvents,
   runs,
+  sourceEmissions,
   stagedFindings,
   workers,
 } = schema
@@ -184,6 +186,65 @@ runsRoutes.get('/', async (c) => {
     .limit(Number(c.req.query('limit') ?? 50))
 
   /**
+   * Which ticket each run is about, for the runs on this page.
+   *
+   * A run started by a source knows its ticket only through its cycle run: the emission
+   * ledger is the join, and `externalKey` is the handle a person searches for. Without
+   * this the list says which *worker* ran and never what it ran *about*, which is the one
+   * thing somebody scanning it wants.
+   *
+   * **The title is deliberately absent and the url is built rather than stored.**
+   * `source_emissions` keeps a digest and not the text, and the schema says why: a column
+   * holding a ticket's body is a copy of Linear's content sitting where a later caller can
+   * read it and believe it current (ADR-0004). A stored URL has the same problem, because
+   * Linear's canonical form carries a title-derived slug. Constructing it from the
+   * identifier mirrors nothing and cannot go stale — and the slug-less form resolves,
+   * which was checked against the live API rather than assumed.
+   *
+   * One query for the page, not one per row.
+   */
+  const cycleRunIds = rows.map((r) => r.job.cycleRunId).filter((id): id is string => id !== null)
+  const emissionRows = cycleRunIds.length
+    ? await db
+        .select({
+          cycleRunId: sourceEmissions.cycleRunId,
+          externalKey: sourceEmissions.externalKey,
+          slug: projects.slug,
+        })
+        .from(sourceEmissions)
+        .innerJoin(projects, eq(projects.id, sourceEmissions.projectId))
+        .where(inArray(sourceEmissions.cycleRunId, cycleRunIds))
+    : []
+
+  /**
+   * The workspace those tickets live in, which is the other half of the address.
+   *
+   * Read from the project's grant rather than kept beside the emission, for the same
+   * reason: it is a fact about a credential, read where it is used. A project with no live
+   * grant yields no workspace and therefore no link, and the identifier still shows —
+   * which is the honest degradation rather than a broken anchor.
+   */
+  const workspaces = new Map<string, string>()
+  for (const slug of [...new Set(emissionRows.map((e) => e.slug))]) {
+    const grant = await readGrant(slug, 'linear')
+    const urlKey = grant.state === 'present' ? grant.grant.account?.urlKey : undefined
+    if (urlKey !== undefined) workspaces.set(slug, urlKey)
+  }
+
+  const ticketFor = new Map(
+    emissionRows.map((e) => {
+      const urlKey = workspaces.get(e.slug)
+      return [
+        e.cycleRunId,
+        {
+          key: e.externalKey,
+          url: urlKey === undefined ? null : `https://linear.app/${urlKey}/issue/${e.externalKey}`,
+        },
+      ] as const
+    }),
+  )
+
+  /**
    * Jobs waiting to be claimed, which have no run row yet. Without these, triggering a
    * worker while no runner is online showed *nothing at all* — the queue is where the
    * work is, and it was invisible.
@@ -305,6 +366,7 @@ runsRoutes.get('/', async (c) => {
       const change = changeByRun.get(r.run.id)
       return {
         ...r,
+        ticket: (r.job.cycleRunId && ticketFor.get(r.job.cycleRunId)) || null,
         produced: {
           findings: byRun.get(r.run.id) ?? 0,
           /** Non-null exactly when this run left a patch, published or not. */
@@ -385,6 +447,31 @@ runsRoutes.get('/:id', async (c) => {
     .where(eq(runs.id, id))
   if (!row) return c.json({ error: 'no such run' }, 404)
 
+  /**
+   * The ticket, by the same join and on the same terms as the list — see the long note
+   * there. The detail page needs it more than the list does: its subtitle was the whole
+   * job prompt, fences and all, which renders a ticket's body as a wall of text nobody
+   * reads and which is a mirrored copy of Linear's content to boot.
+   */
+  let ticket: { key: string; url: string | null } | null = null
+  if (row.job.cycleRunId !== null) {
+    const [emission] = await db
+      .select({ externalKey: sourceEmissions.externalKey })
+      .from(sourceEmissions)
+      .where(eq(sourceEmissions.cycleRunId, row.job.cycleRunId))
+    if (emission) {
+      const grant = await readGrant(row.project.slug, 'linear')
+      const urlKey = grant.state === 'present' ? grant.grant.account?.urlKey : undefined
+      ticket = {
+        key: emission.externalKey,
+        url:
+          urlKey === undefined
+            ? null
+            : `https://linear.app/${urlKey}/issue/${emission.externalKey}`,
+      }
+    }
+  }
+
   const events = await db
     .select()
     .from(runEvents)
@@ -416,6 +503,7 @@ runsRoutes.get('/:id', async (c) => {
 
   return c.json({
     ...row,
+    ticket,
     events,
     artifacts: files,
     produced: {
