@@ -95,6 +95,19 @@ export type PendingJob = {
   missing: string[]
 }
 
+/**
+ * Which ticket a run is about, when a source started it.
+ *
+ * No title, and the url is built rather than stored — see the runs route. The ledger
+ * keeps a digest and not the ticket's text, because a mirrored copy of Linear's content
+ * is one a later reader believes is current (ADR-0004), and Linear's canonical url
+ * carries a title-derived slug for the same reason.
+ *
+ * `url` is null for a project with no live Linear grant: the identifier still renders,
+ * unlinked, rather than becoming an anchor that goes nowhere.
+ */
+export type RunTicket = { key: string; url: string | null }
+
 export type RunSummary = {
   /**
    * Only on the list; the detail route returns the full `produced` breakdown.
@@ -110,6 +123,13 @@ export type RunSummary = {
     branch: string | null
     prUrl: string | null
   }
+  /**
+   * The ticket this run is about, when a source started it.
+   *
+   * Optional as well as nullable: a control plane that predates this field sends no key,
+   * and the page renders a dash rather than throwing.
+   */
+  ticket?: RunTicket | null
   run: {
     id: string
     outcome: string | null

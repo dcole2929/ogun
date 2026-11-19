@@ -1100,3 +1100,26 @@ test('a duration past an hour reads in hours', () => {
   assert.equal(duration(3 * 3_600_000), '3h 0m')
   assert.equal(duration(3 * 3_600_000 + 25 * 60_000), '3h 25m')
 })
+
+/**
+ * Both buckets are named even when one is empty.
+ *
+ * "Finished" used to render inside the `pending.length > 0` block, on the reasoning that
+ * it reads as a contrast to "Waiting". That holds until nothing is waiting — and then the
+ * only table on the page has no heading and the page looks like it lost a section, which
+ * is exactly how it was reported. The buckets are a fact about the page, not about how
+ * much happens to be queued.
+ */
+test('the runs page names both buckets with nothing waiting', () => {
+  const html = renderScoped(<RunsPage />, 'all', (qc) => {
+    qc.setQueryData(['runs'], {
+      runs: [],
+      pending: [],
+      onlineRunners: 1,
+      liveRunners: 1,
+    })
+  })
+  assert.match(html, />Waiting</)
+  assert.match(html, />Finished</)
+  assert.match(html, /Nothing is queued or blocked/)
+})

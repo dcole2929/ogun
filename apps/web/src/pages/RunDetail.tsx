@@ -24,11 +24,39 @@ export function RunDetailPage() {
   return (
     <Page
       title={`${data.worker.name} · ${data.project.slug}`}
-      subtitle={data.job.prompt ?? undefined}
+      /**
+       * Not the job prompt, which is what this was.
+       *
+       * The prompt is the worker's instruction with the ticket appended as fenced data —
+       * `-----BEGIN TICKET-----` and a paragraph of somebody's bug report. Rendered as a
+       * subtitle that is a wall of text above the page it belongs to, and a mirrored copy
+       * of Linear's content, which ADR-0004 says is the thing a later reader believes is
+       * current. The ticket is a link now, below; the prompt is still on the job and is
+       * not what a page about a run should open with.
+       */
+      subtitle={`${data.job.nodeKey} · ${when(data.run.startedAt)}`}
       actions={<Link to="/runs">← all runs</Link>}
     >
       <div className="card" style={{ marginBottom: 20 }}>
         <dl className="kv">
+          {/**
+           * First, because on a ticket pipeline it is the question — which ticket is this
+           * about — and it used to be answerable only by reading the fenced prompt.
+           */}
+          {data.ticket && (
+            <>
+              <dt>Ticket</dt>
+              <dd>
+                {data.ticket.url === null ? (
+                  <span className="mono">{data.ticket.key}</span>
+                ) : (
+                  <a className="extlink" href={data.ticket.url} target="_blank" rel="noreferrer">
+                    {data.ticket.key}
+                  </a>
+                )}
+              </dd>
+            </>
+          )}
           <dt>Outcome</dt>
           <dd>
             {running ? (

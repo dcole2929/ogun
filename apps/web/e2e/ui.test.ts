@@ -328,14 +328,30 @@ describe('the runs list', () => {
     await onList(page)
     // Positioned near the top of the cell for the same reason the drag above is: cells
     // are top-aligned, so the element's centre can be below its own text.
+    /**
+     * The ticket identifier, which is what this column holds now.
+     *
+     * It was the base sha until that column was removed — it showed the commit the
+     * workspace was *checked out at*, so every run of a day carried the same value and
+     * the column said nothing. The guard under test is unchanged: a `.mono` cell exists
+     * to be copied, so a double-click on one must select rather than navigate. Picking
+     * the row that *has* a ticket, because the one without renders a dash and selecting
+     * a dash would pass this test while proving nothing.
+     */
     await page
-      .locator('tr:has(a[href^="/runs/"]) td.mono')
-      .last()
+      .locator('tr:has(a[href^="/runs/"]) td.mono:has(a.extlink)')
+      .first()
       .dblclick({ position: { x: 12, y: 8 } })
 
     assert.ok(page.url().endsWith('/runs'), `navigated away to ${page.url()}`)
     const selected = await page.evaluate(() => window.getSelection()?.toString() ?? '')
-    assert.match(selected, /^[0-9a-f]{7}$/, `expected a sha, selected "${selected}"`)
+    /**
+     * `HEI` rather than `HEI-167`: a double-click selects a *word*, and a hyphen is a word
+     * boundary in every browser. What is under test is that something was selected and
+     * the page did not navigate — asserting the whole identifier would be asserting a
+     * text-segmentation rule this code does not own.
+     */
+    assert.match(selected, /^HEI/, `expected part of a ticket identifier, selected "${selected}"`)
   })
 
   /**
