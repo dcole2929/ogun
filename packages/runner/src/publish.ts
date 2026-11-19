@@ -74,12 +74,12 @@ export type Publication = {
  * Everything else in this file — the gates, the worktree, `git am`, the branch name — is
  * ordinary local work that needs no secret and can be tested without one. This type is
  * where that stops, and it is deliberately the smallest surface that can still do the
- * job: count what Ogun already has open, and get one branch to the remote with a draft
- * pull request on it.
+ * job: count what Ogun already has open, get one branch to the remote with a draft pull
+ * request on it, and say something on a pull request that is already there.
  *
  * There is exactly one implementation today, `githubCli`, which shells out to the host's
  * `git` and `gh`. Two more are expected, and the seam exists so that they arrive as new
- * implementations of these two methods rather than as a rewrite of the publisher:
+ * implementations of these methods rather than as a rewrite of the publisher:
  *
  *   - **A short-lived, repo-scoped GitHub App installation token.** The condition is a
  *     runner that is not the machine you are sitting at. `gh`'s credential is a person's,
@@ -91,8 +91,8 @@ export type Publication = {
  *     all — the same argument ADR-0005 makes about the container, applied one level out.
  *
  * Neither is built, and neither should be built before its condition is met. What matters
- * now is that adding one means writing `push` and `count` against a token instead of
- * against a CLI, and touching nothing that decides *whether* to publish.
+ * now is that adding one means writing these methods against a token instead of against
+ * a CLI, and touching nothing that decides *whether* to publish.
  */
 export type PublishRemote = {
   /**
@@ -113,6 +113,36 @@ export type PublishRemote = {
     title: string
     body: string
   }): Promise<{ url: string }>
+  /**
+   * Say something on a pull request that already exists.
+   *
+   * On this seam rather than at a call site because commenting is a write to GitHub, and
+   * a write to GitHub needs the credential this type is the only holder of. A caller that
+   * reached for `gh pr comment` where it stood would be the "ambient `gh` at every call
+   * site" ADR-0009 rejected — undiscoverable, and one more thing to unpick the day the
+   * installation token arrives. Three methods, still one credential path.
+   *
+   * **Nothing calls this yet, and that is deliberate rather than unfinished.** Posting on
+   * somebody's pull request is a side effect a person has to decide to want, and the
+   * obvious call sites cannot have it for free: a decline and a gate-refused patch are
+   * both rounds in which no pull request of ours exists to comment on, and the one job
+   * kind that does arrive with one — a `change-request`, a pull request somebody asked
+   * Ogun to revise — does not carry its number as far as the runner. Wiring it is a
+   * change to the job wire and a decision about the artefact, not a change to this file.
+   */
+  comment(input: {
+    /** The project's checkout on this host. How the remote and its credential are found. */
+    repo: string
+    /** The pull request's number on that repository. */
+    number: number
+    /**
+     * Markdown, posted as written. Nothing here fences it, and a comment is interpreted
+     * exactly as a pull request body is — so a caller passing agent prose owns the
+     * `Closes #12` and `@mention` problem `bodyFor` solves for the body. There is no
+     * agent prose on this path today because there is no path today.
+     */
+    body: string
+  }): Promise<void>
 }
 
 /**
@@ -704,6 +734,49 @@ export function githubCli(): PublishRemote {
           throw new Error(`gh pr create printed no pull request url: ${stdout.slice(-400)}`)
         }
         return { url }
+      } finally {
+        await rm(staging, { recursive: true, force: true }).catch(() => undefined)
+      }
+    },
+
+    async comment({ repo, number, body }) {
+      /**
+       * The number is proved to be a number before it is argv, for the reason `branchFor`
+       * gives at length about branch names: nothing here goes near a shell, so quoting is
+       * already a dead attack, and argument injection is not. `gh pr comment -5` is an
+       * option and not a pull request, and `--` is not something `gh` promises to honour
+       * in front of a positional — so the guard is on the value rather than on the
+       * punctuation. A number that arrives from a job payload or from a database row has
+       * been round-tripped through things this file did not establish.
+       */
+      if (!Number.isSafeInteger(number) || number <= 0) {
+        throw new Error(`refusing to comment on "${number}", which is not a pull request number`)
+      }
+
+      /**
+       * Through a file for the same two reasons `publish` writes the pull request body to
+       * one: a comment is unbounded prose, and an argv over ARG_MAX fails with an errno
+       * rather than with anything a person can read. Outside any worktree, mode 0600, and
+       * removed whatever happens.
+       */
+      const staging = await mkdtemp(join(tmpdir(), 'ogun-comment-'))
+      try {
+        const bodyFile = join(staging, 'body.md')
+        await writeFile(bodyFile, body, { mode: 0o600 })
+
+        /**
+         * Nothing is read back out of this. `publish` parses `gh`'s stdout because the
+         * pull request's url exists nowhere else; a comment's url is of no use to anybody
+         * here, so the only thing worth knowing is whether `gh` succeeded — which a
+         * non-zero exit already says. The rejection is left to propagate for the same
+         * reason the push's is: the caller is the thing that knows whether a comment that
+         * did not arrive is worth failing a run over, and a swallowed failure here would
+         * read as a comment that was posted.
+         */
+        await run('gh', ['pr', 'comment', String(number), '--body-file', bodyFile], {
+          cwd: repo,
+          env: GH_ENV,
+        })
       } finally {
         await rm(staging, { recursive: true, force: true }).catch(() => undefined)
       }

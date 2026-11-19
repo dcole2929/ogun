@@ -82,6 +82,8 @@ const modify = async (
 type Recorded = {
   counted: number
   published: Array<{ branch: string; base: string; title: string; body: string }>
+  /** Recorded so that "the publisher comments on nothing" is asserted and not assumed. */
+  commented: Array<{ number: number; body: string }>
 }
 
 /**
@@ -90,7 +92,7 @@ type Recorded = {
  * ref appeared on a remote and not that a spy was called.
  */
 const fakeRemote = (opts: { open?: number } = {}): { remote: PublishRemote; calls: Recorded } => {
-  const calls: Recorded = { counted: 0, published: [] }
+  const calls: Recorded = { counted: 0, published: [], commented: [] }
   return {
     calls,
     remote: {
@@ -102,6 +104,9 @@ const fakeRemote = (opts: { open?: number } = {}): { remote: PublishRemote; call
         calls.published.push({ branch, base, title, body })
         await git(from, ['push', '--quiet', 'origin', `HEAD:refs/heads/${branch}`])
         return { url: `https://github.test/ogun/pull/${calls.published.length}` }
+      },
+      async comment({ number, body }) {
+        calls.commented.push({ number, body })
       },
     },
   }
@@ -572,4 +577,26 @@ test('an ordinary pull request says nothing about building an image', async () =
   const body = calls.published[0]!.body
   assert.match(body, /suite passed on this tree/)
   assert.doesNotMatch(body, /ogun image build/)
+})
+
+/**
+ * `PublishRemote.comment` exists and `publishPatch` does not use it, which is a decision
+ * rather than an omission — so it is asserted here rather than left to be rediscovered.
+ *
+ * A comment is a notification on somebody's pull request, and the publisher is the wrong
+ * place to decide to send one: it runs unattended, after the report, on every modifier
+ * that produced a patch. Both halves are covered — a run that publishes and a run that is
+ * refused — because the tempting wiring is the refusal ("tell them why there is no pull
+ * request"), and the pull request a refused modifier run would be commenting on does not
+ * exist.
+ */
+test('the publisher comments on nothing, whether it publishes or refuses', async () => {
+  const { calls, go } = await publishing()
+  const published = await go()
+  assert.ok(published.pr, published.refused)
+  assert.deepEqual(calls.commented, [], 'publishing posted a comment nobody asked for')
+
+  const refused = await go({ tests: { run: true, passed: false } })
+  assert.equal(refused.pr, undefined)
+  assert.deepEqual(calls.commented, [], 'a refusal posted a comment nobody asked for')
 })
