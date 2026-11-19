@@ -256,7 +256,7 @@ button.primary { background: var(--accent); color: #16110a; border-color: var(--
 .timeline { display: flex; flex-direction: column; gap: 1px; }
 .event {
   display: grid;
-  grid-template-columns: 62px 130px 1fr;
+  grid-template-columns: 82px 130px 1fr;
   gap: 12px;
   padding: 6px 10px;
   border-radius: 5px;

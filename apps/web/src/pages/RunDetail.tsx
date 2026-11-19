@@ -3,7 +3,7 @@ import { useQuery } from '@tanstack/react-query'
 import { Link, useParams } from 'react-router'
 import { api, isInFlight, type RunDetail, type RunEventRow } from '../api.ts'
 import { Markdown } from '../Markdown.tsx'
-import { duration, Empty, Page, Pill, Severity, when } from '../ui.tsx'
+import { clock, duration, Empty, Page, Pill, Severity, when } from '../ui.tsx'
 
 export function RunDetailPage() {
   const { id = '' } = useParams()
@@ -312,8 +312,23 @@ function Produced({ detail }: { detail: RunDetail }) {
 
 function Event({ event, startedAt }: { event: RunEventRow; startedAt: string }) {
   const [expanded, setExpanded] = useState(false)
-  const offset = Math.max(0, (new Date(event.ts).getTime() - new Date(startedAt).getTime()) / 1000)
   const p = event.payload as Record<string, any>
+
+  /**
+   * The wall clock, not an offset from the run's start.
+   *
+   * `+265s` is arithmetic nobody asked for: it answers "how far into the run" when the
+   * question a timeline gets asked is "when did this happen" — which is the question you
+   * take to a log, a deploy, or somebody saying it broke around ten past. Converting back
+   * meant adding seconds to a start time two hundred rows up the page.
+   *
+   * The offset it replaces is still available and better placed: `Duration` in the header
+   * says how long the whole run took, and the gap between two rows is now read directly
+   * off their times.
+   */
+  const at = clock(event.ts)
+  /** Kept for the title, where "how far in" is a genuinely useful second reading. */
+  const offset = Math.max(0, (new Date(event.ts).getTime() - new Date(startedAt).getTime()) / 1000)
 
   const kind = event.type.replace(/^(run|agent|tool|runner)\./, '')
   const cls =
@@ -327,7 +342,9 @@ function Event({ event, startedAt }: { event: RunEventRow; startedAt: string }) 
 
   return (
     <div className={`event ${cls}`}>
-      <span className="when">+{offset.toFixed(0)}s</span>
+      <span className="when" title={`${offset.toFixed(0)}s into the run`}>
+        {at}
+      </span>
       <span className="kind">{event.type}</span>
       <div className="body">
         {renderBody(event.type, p, kind)}

@@ -1341,3 +1341,34 @@ test('a list with blank lines between its items is one list', () => {
   assert.equal(html.match(/<ul/g)?.length, 1, 'the bullets are not absorbed into the numbering')
   assert.match(html, /Written up as a single finding/, 'the paragraph still ends the list')
 })
+
+/**
+ * The timeline shows wall-clock time, not an offset from the run's start.
+ *
+ * `+265s` answers "how far into the run", which is not the question a timeline gets
+ * asked. "When did this happen" is, because that is what you take to a log, a deploy, or
+ * somebody saying it broke around ten past — and converting back meant adding seconds to
+ * a start time two hundred rows up the page.
+ */
+test('timeline rows are stamped with a clock time', () => {
+  const ts = '2026-10-16T12:04:25.000Z'
+  const html = renderScoped(
+    <Routes>
+      <Route path="/runs/:id" element={<RunDetailPage />} />
+    </Routes>,
+    'all',
+    (qc) =>
+      qc.setQueryData(['run', 'r1'], {
+        ...runRow(),
+        produced: { findings: [], suppressed: [], promoted: [], changes: [] },
+        events: [{ id: 'e1', seq: 1, ts, type: 'agent.message', payload: { text: 'hello' } }],
+        artifacts: [],
+      }),
+    '/runs/r1',
+  )
+  // The locale's own convention, so the assertion is against what `toLocaleTimeString`
+  // produces here rather than against a format this code does not choose.
+  const expected = new Date(ts).toLocaleTimeString(undefined, { timeStyle: 'medium' })
+  assert.ok(html.includes(expected), `expected "${expected}" in the timeline`)
+  assert.ok(!/\+\d+s<\/span>/.test(html), 'and no offset column')
+})
