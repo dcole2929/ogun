@@ -152,6 +152,42 @@ export const localConfigSchema = z.object({
    */
   oauth: z.record(z.string(), z.record(z.string(), z.unknown())).default({}),
 
+  /**
+   * The applications themselves, keyed by a name a person can type.
+   *
+   * Split out of `oauth` because that map conflated two things with different lifetimes
+   * and different owners. An **application** is a credential registered with a provider —
+   * a Linear OAuth app, a GitHub App — and one of them serves every project that reaches
+   * that provider. A **grant** is one project's live token from one of those. Keyed
+   * together, a second project meant a second copy of the same client secret or private
+   * key, and the day somebody rotated one the two would disagree with nothing to say so.
+   *
+   * The key is the name `--as` sets and `--link` takes: `github:heirchive`,
+   * `linear:heirchive`. Derived from the provider and the account the credential proved it
+   * authenticates against, so it names what the thing *is* rather than which project
+   * happened to register it first.
+   *
+   * Loose here and parsed in `secrets.ts`, for both reasons the block above gives — an
+   * older build must not choke on a newer build's application, and the value-bearing
+   * fields must stay out of the one error message every CLI command can print.
+   */
+  applications: z.record(z.string(), z.unknown()).default({}),
+
+  /**
+   * What each project currently holds from an application, by provider.
+   *
+   * `oauth` was the wrong name before this split and is the wrong name after it: half the
+   * things under it are not OAuth. A GitHub App authenticating as itself signs a JWT and
+   * exchanges it for an installation token, which is not an OAuth grant type at all, and
+   * `client_credentials` is only one of the five client authentication methods RFC 7591
+   * names. What every one of them does produce is a grant — a token with an expiry,
+   * obtained from an application — so that is what the map is called.
+   *
+   * Each record names the application it came from, so a grant can always be renewed
+   * without the project having to hold the credential that renews it.
+   */
+  grants: z.record(z.string(), z.record(z.string(), z.unknown())).default({}),
+
   /** Present once this machine has joined a control plane as a runner. */
   runner: z
     .object({

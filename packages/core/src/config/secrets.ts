@@ -980,6 +980,489 @@ export async function listOAuthApps(path = localConfigPath()): Promise<ProjectGr
  * must not make an older one report the project as disconnected, so unknown keys are
  * ignored and only the fields this build actually uses are required.
  */
+// ── applications and grants, which `oauth` used to conflate ───────────────
+
+/**
+ * An application registered with a provider, as it sits in the store.
+ *
+ * ### Why this is a union and `OAuthApp` was a struct
+ *
+ * `OAuthApp` was `{ clientId, clientSecret, redirectUri }`, and the flag that wrote it was
+ * called `--oauth` on the stated grounds that *"an application registered in the provider
+ * always means a client id and a client secret"*. That was true of the one provider that
+ * existed and is false in general. RFC 6749 §2.1 has public clients, which have a client
+ * id and no secret at all; RFC 7591 names five client authentication methods, of which a
+ * shared secret is one. And a GitHub App authenticating as itself is none of them: it
+ * signs a JWT with a private key and exchanges it for an installation token, which is not
+ * an OAuth grant type.
+ *
+ * So the shape is per provider, and `method` is recorded rather than inferred from which
+ * fields are present. Two providers could both carry a `clientId` and differ in what they
+ * do with it, and guessing from shape is how one of them half-works.
+ *
+ * ### Why the name is part of the record
+ *
+ * An application is shared — that is the whole reason it moved out of `oauth[project]` —
+ * so it needs a handle that projects can point at. The name is derived from the provider
+ * and the account the credential proved it authenticates against (`github:heirchive`),
+ * never from the project that happened to register it first: naming a shared thing after
+ * one of its users is a name that is wrong as soon as there are two.
+ */
+export type Application =
+  | {
+      name: string
+      provider: 'linear'
+      /** `client_credentials` acts as the app; `authorization_code` acts for a person. */
+      method: 'client_credentials' | 'authorization_code'
+      clientId: string
+      clientSecret: Secret
+      /**
+       * Stored rather than derived, and allowed to be empty — see the note that was on
+       * `parseOAuthApp`: the token exchange must send the *same* redirect uri the
+       * authorization used, and the grant that needs no browser has none to send.
+       */
+      redirectUri: string
+    }
+  | {
+      name: string
+      provider: 'github'
+      /** The only one GitHub offers for an app acting as itself. */
+      method: 'private_key_jwt'
+      /** Not secrets: both are on the App's settings page and in every JWT it signs. */
+      appId: string
+      installationId: string
+      privateKey: Secret
+    }
+
+/**
+ * A live token one project holds from one application.
+ *
+ * Flat rather than `{ app, grant: {…} }`, because a record called a grant that contains a
+ * field called a grant reads as two things when it is one. `app` names where it came
+ * from, which is what makes renewal possible without the project holding the credential
+ * that renews it.
+ *
+ * The fields below `app` are the ones `OAuthGrant` already had and the reasoning for each
+ * is unchanged: the token is sealed and everything beside it is not, so `doctor`, the
+ * Settings page and the poll can all read an expiry without a single `expose()`;
+ * `expiresAt` is absolute because a duration is only true at the instant it arrived.
+ */
+export type Grant = {
+  /** The key into `applications`. */
+  app: string
+  access: Secret
+  /** Absent for any grant that renews by asking again rather than by rotating. */
+  refresh?: Secret
+  /** RFC 6749's names where the provider uses them; the provider's own where it does not. */
+  grantType: LinearGrantType | 'installation'
+  /** Absolute, ms since epoch. */
+  expiresAt: number
+  obtainedAt: number
+  /** As granted, not as requested. Empty where the provider reports none. */
+  scopes: string[]
+  /** Who the provider attributes a write to. */
+  actor: string
+  /** The account this grant reaches, for `connect list` and for deriving an app name. */
+  account?: { id?: string; name: string; urlKey: string }
+  /** Linear's `viewer.id` under `actor=app`, stored because it is only obtainable live. */
+  appUserId?: string
+}
+
+export type StoredApplication =
+  | { state: 'present'; app: Application }
+  | { state: 'absent' }
+  | { state: 'malformed'; reason: string }
+  | { state: 'unreadable'; reason: string }
+
+/**
+ * The name an application gets when nobody supplies one.
+ *
+ * `<provider>:<account>`, lowercased because it is a handle somebody types into `--link`.
+ * The account comes from what the provider reported when the credential was proved, not
+ * from anything the operator typed, so an application cannot be named after a workspace it
+ * does not actually reach.
+ */
+export const deriveApplicationName = (provider: SecretName, account: string): string =>
+  `${provider}:${account.trim().toLowerCase()}`
+
+function parseApplication(name: string, raw: unknown): ParsedApplication {
+  if (!isRecord(raw)) return { ok: false, reason: 'the entry is not an object' }
+  const provider = raw.provider
+  if (provider !== 'linear' && provider !== 'github') {
+    return { ok: false, reason: `provider "${String(provider)}" is not one this build knows` }
+  }
+
+  if (provider === 'github') {
+    const { appId, installationId, privateKey } = raw
+    for (const [field, value] of Object.entries({ appId, installationId, privateKey })) {
+      if (typeof value !== 'string' || value.trim() === '') {
+        return { ok: false, reason: `${field} is missing or not a string` }
+      }
+    }
+    return {
+      ok: true,
+      app: {
+        name,
+        provider: 'github',
+        method: 'private_key_jwt',
+        appId: appId as string,
+        installationId: installationId as string,
+        privateKey: sealSecret(privateKey as string),
+      },
+    }
+  }
+
+  const { clientId, clientSecret, redirectUri } = raw
+  if (typeof clientId !== 'string' || clientId.trim() === '') {
+    return { ok: false, reason: 'clientId is missing or not a string' }
+  }
+  if (typeof clientSecret !== 'string') {
+    return { ok: false, reason: 'clientSecret is missing or not a string' }
+  }
+  if (typeof redirectUri !== 'string') {
+    return { ok: false, reason: 'redirectUri is missing or not a string' }
+  }
+  /**
+   * An application written before `method` existed is `client_credentials`, which is the
+   * only thing `ogun connect linear` wrote by default — the same reasoning the old
+   * `grantType` default carried, moved up a level. An unrecognised value is malformed
+   * rather than defaulted: a future build's method has renewal rules this one does not
+   * know, and guessing would mean spending the wrong credential at 3am.
+   */
+  const method = raw.method === undefined ? 'client_credentials' : raw.method
+  if (method !== 'client_credentials' && method !== 'authorization_code') {
+    return { ok: false, reason: `method "${String(method)}" is not one this build knows` }
+  }
+
+  return {
+    ok: true,
+    app: {
+      name,
+      provider: 'linear',
+      method,
+      clientId,
+      clientSecret: sealSecret(clientSecret),
+      redirectUri,
+    },
+  }
+}
+
+type ParsedApplication = { ok: true; app: Application } | { ok: false; reason: string }
+
+/**
+ * Move anything still under `oauth` into `applications` and `grants`.
+ *
+ * A pure function applied inside every write, rather than a migration command somebody
+ * has to remember. `updateLocalConfig` is already a read-modify-write under a lock, so
+ * folding this into it means the file is converted by the first `ogun connect`, `ogun
+ * project add` or token refresh that runs after the upgrade — and converted exactly once,
+ * because the second pass finds an empty `oauth` and does nothing.
+ *
+ * **It never overwrites.** An application or grant already in the new shape wins, so a
+ * half-migrated file — one project converted by a refresh, another not yet — converges
+ * rather than flapping. And `oauth` is cleared only for the entries actually moved, so an
+ * entry this build cannot parse stays where it is instead of being deleted by the upgrade
+ * that could not read it.
+ *
+ * The derived name uses the workspace the old grant recorded, falling back to the project
+ * slug when there is none. That fallback produces a worse name — `linear:ogun` for a
+ * registered-but-unauthorized application — and it is still better than refusing to
+ * migrate, because the alternative leaves a credential in a map nothing reads any more.
+ */
+export function migrateLegacyOAuth(config: LocalConfig): LocalConfig {
+  const applications = { ...config.applications }
+  const grants: LocalConfig['grants'] = Object.fromEntries(
+    Object.entries(config.grants).map(([slug, byProvider]) => [slug, { ...byProvider }]),
+  )
+  const oauth: LocalConfig['oauth'] = {}
+  let moved = false
+
+  for (const [slug, byProvider] of Object.entries(config.oauth)) {
+    for (const [provider, raw] of Object.entries(byProvider)) {
+      if (!isSecretName(provider) || !isRecord(raw)) {
+        oauth[slug] = { ...(oauth[slug] ?? {}), [provider]: raw }
+        continue
+      }
+      const grant = isRecord(raw.grant) ? raw.grant : undefined
+      const workspace = isRecord(grant?.workspace) ? grant.workspace : undefined
+      const account =
+        typeof workspace?.urlKey === 'string' && workspace.urlKey.trim() !== ''
+          ? workspace.urlKey
+          : slug
+      const name = deriveApplicationName(provider, account)
+
+      const { grant: _grant, ...application } = raw
+      if (applications[name] === undefined) {
+        applications[name] = { ...application, provider, method: raw.method ?? 'client_credentials' }
+      }
+      if (grant !== undefined && grants[slug]?.[provider] === undefined) {
+        const { workspace: _ws, ...rest } = grant
+        grants[slug] = {
+          ...(grants[slug] ?? {}),
+          [provider]: { ...rest, app: name, ...(workspace ? { account: workspace } : {}) },
+        }
+      }
+      moved = true
+    }
+  }
+
+  return moved ? { ...config, applications, grants, oauth } : config
+}
+
+/**
+ * Write an application, keeping any grants that already point at it.
+ *
+ * Returns whether it replaced one, because overwriting a credential silently is how an
+ * operator ends up with a working connection they cannot explain — the same reason
+ * `setProjectSecret` reports what it displaced.
+ */
+export async function setApplication(
+  app: Omit<Extract<Application, { provider: 'linear' }>, 'name' | 'clientSecret'> & {
+    name: string
+    clientSecret: string
+  } | Omit<Extract<Application, { provider: 'github' }>, 'name' | 'privateKey'> & {
+    name: string
+    privateKey: string
+  },
+  path = localConfigPath(),
+): Promise<{ replaced: boolean }> {
+  let replaced = false
+  await updateLocalConfig((config) => {
+    const migrated = migrateLegacyOAuth(config)
+    replaced = migrated.applications[app.name] !== undefined
+    const { name, ...rest } = app
+    return { ...migrated, applications: { ...migrated.applications, [name]: rest } }
+  }, path)
+  return { replaced }
+}
+
+export type StoredGrant =
+  | { state: 'present'; grant: Grant }
+  | { state: 'absent' }
+  | { state: 'malformed'; reason: string }
+  | { state: 'unreadable'; reason: string }
+
+function parseGrant(raw: unknown): { ok: true; grant: Grant } | { ok: false; reason: string } {
+  if (!isRecord(raw)) return { ok: false, reason: 'the entry is not an object' }
+  const { app, accessToken, refreshToken, expiresAt, obtainedAt } = raw
+  if (typeof app !== 'string' || app.trim() === '') {
+    return { ok: false, reason: 'app is missing — the grant does not say which application it came from' }
+  }
+  if (typeof accessToken !== 'string' || accessToken.trim() === '') {
+    return { ok: false, reason: 'accessToken is missing or not a string' }
+  }
+  if (typeof expiresAt !== 'number' || !Number.isFinite(expiresAt)) {
+    return { ok: false, reason: 'expiresAt is missing or not a number' }
+  }
+  const grantType = raw.grantType === undefined ? 'client_credentials' : raw.grantType
+  if (
+    grantType !== 'authorization_code' &&
+    grantType !== 'client_credentials' &&
+    grantType !== 'installation'
+  ) {
+    return { ok: false, reason: `grantType "${String(grantType)}" is not one this build knows` }
+  }
+  /**
+   * A refresh token is required for the grant that rotates and must be absent for the two
+   * that do not — the rule ADR-0014 settled, now with a third member. An `installation`
+   * token is renewed by signing a fresh JWT with the private key in the application, which
+   * needs no person and spends nothing, exactly as `client_credentials` is renewed by
+   * asking again.
+   */
+  if (grantType === 'authorization_code' && typeof refreshToken !== 'string') {
+    return { ok: false, reason: 'grant.refreshToken is missing on a grant that rotates' }
+  }
+
+  return {
+    ok: true,
+    grant: {
+      app,
+      access: sealSecret(accessToken),
+      ...(typeof refreshToken === 'string' ? { refresh: sealSecret(refreshToken) } : {}),
+      grantType,
+      expiresAt,
+      obtainedAt: typeof obtainedAt === 'number' ? obtainedAt : expiresAt,
+      scopes: Array.isArray(raw.scopes) ? raw.scopes.filter((s) => typeof s === 'string') : [],
+      actor: typeof raw.actor === 'string' ? raw.actor : 'app',
+      ...(isRecord(raw.account) && typeof raw.account.name === 'string' &&
+      typeof raw.account.urlKey === 'string'
+        ? {
+            account: {
+              ...(typeof raw.account.id === 'string' ? { id: raw.account.id } : {}),
+              name: raw.account.name,
+              urlKey: raw.account.urlKey,
+            },
+          }
+        : {}),
+      ...(typeof raw.appUserId === 'string' ? { appUserId: raw.appUserId } : {}),
+    },
+  }
+}
+
+export async function readGrant(
+  projectSlug: string,
+  provider: SecretName,
+  path = localConfigPath(),
+): Promise<StoredGrant> {
+  const store = await readStore(path)
+  if (store.state === 'missing') return { state: 'absent' }
+  if (store.state === 'unreadable') return { state: 'unreadable', reason: store.reason }
+  /**
+   * Read through the migration rather than from the raw file, so a config that has not
+   * been written since the upgrade answers correctly. The migration is pure and this copy
+   * is thrown away; the file converts on the next write.
+   */
+  const config = migrateLegacyOAuth(store.config)
+  const raw = config.grants[projectSlug]?.[provider]
+  if (raw === undefined) return { state: 'absent' }
+  const parsed = parseGrant(raw)
+  return parsed.ok
+    ? { state: 'present', grant: parsed.grant }
+    : { state: 'malformed', reason: parsed.reason }
+}
+
+/** Point a project at an application and record what it got back. */
+export async function storeGrant(
+  projectSlug: string,
+  provider: SecretName,
+  grant: {
+    app: string
+    accessToken: string
+    refreshToken?: string
+    grantType: Grant['grantType']
+    expiresAt: number
+    obtainedAt: number
+    scopes: string[]
+    actor: string
+    account?: { id?: string; name: string; urlKey: string }
+    appUserId?: string
+  },
+  path = localConfigPath(),
+): Promise<void> {
+  await updateLocalConfig((config) => {
+    const migrated = migrateLegacyOAuth(config)
+    return {
+      ...migrated,
+      grants: {
+        ...migrated.grants,
+        [projectSlug]: { ...(migrated.grants[projectSlug] ?? {}), [provider]: grant },
+      },
+    }
+  }, path)
+}
+
+/**
+ * Remove a project's grant, leaving the application alone.
+ *
+ * The asymmetry is the point of the split: disconnecting one project must not take a
+ * credential out from under five others. Removing the application itself is
+ * `clearApplication`, which refuses while anything still points at it.
+ */
+export async function clearGrant(
+  projectSlug: string,
+  provider: SecretName,
+  path = localConfigPath(),
+): Promise<boolean> {
+  let had = false
+  await updateLocalConfig((config) => {
+    const migrated = migrateLegacyOAuth(config)
+    const byProvider = { ...(migrated.grants[projectSlug] ?? {}) }
+    had = byProvider[provider] !== undefined
+    delete byProvider[provider]
+    const grants = { ...migrated.grants }
+    if (Object.keys(byProvider).length === 0) delete grants[projectSlug]
+    else grants[projectSlug] = byProvider
+    return { ...migrated, grants }
+  }, path)
+  return had
+}
+
+export class ApplicationInUse extends Error {
+  readonly usedBy: string[]
+  constructor(name: string, usedBy: string[]) {
+    super(`"${name}" is still used by ${usedBy.join(', ')}`)
+    this.name = 'ApplicationInUse'
+    this.usedBy = usedBy
+  }
+}
+
+/**
+ * Remove an application. Refuses while a project still holds a grant from it.
+ *
+ * Refusing rather than cascading, because the cascade is unrecoverable: the private key
+ * is the only copy and deleting it takes five projects offline to satisfy one `disconnect`
+ * somebody typed in the wrong directory. The error names who is still using it, which is
+ * the list they need in order to decide.
+ */
+export async function clearApplication(
+  name: string,
+  path = localConfigPath(),
+): Promise<boolean> {
+  let had = false
+  await updateLocalConfig((config) => {
+    const migrated = migrateLegacyOAuth(config)
+    const usedBy = Object.entries(migrated.grants)
+      .filter(([, byProvider]) => Object.values(byProvider).some((g) => isRecord(g) && g.app === name))
+      .map(([slug]) => slug)
+      .sort()
+    if (usedBy.length > 0) throw new ApplicationInUse(name, usedBy)
+    had = migrated.applications[name] !== undefined
+    const applications = { ...migrated.applications }
+    delete applications[name]
+    return { ...migrated, applications }
+  }, path)
+  return had
+}
+
+
+export async function readApplication(
+  name: string,
+  path = localConfigPath(),
+): Promise<StoredApplication> {
+  const store = await readStore(path)
+  if (store.state === 'missing') return { state: 'absent' }
+  if (store.state === 'unreadable') return { state: 'unreadable', reason: store.reason }
+  const raw = store.config.applications[name]
+  if (raw === undefined) return { state: 'absent' }
+  const parsed = parseApplication(name, raw)
+  return parsed.ok
+    ? { state: 'present', app: parsed.app }
+    : { state: 'malformed', reason: parsed.reason }
+}
+
+/**
+ * Every application on this machine, for `connect list` and for `--link`'s error when it
+ * cannot guess.
+ *
+ * Malformed entries are *listed*, not dropped. An application this build cannot parse is
+ * exactly the one somebody needs to see, and silently omitting it would answer "what can I
+ * link to" with a list that is missing the thing that is broken.
+ */
+export type ApplicationListing =
+  | { name: string; state: 'present'; app: Application; usedBy: string[] }
+  | { name: string; state: 'malformed'; reason: string; usedBy: string[] }
+
+export async function listApplications(path = localConfigPath()): Promise<ApplicationListing[]> {
+  const store = await readStore(path)
+  if (store.state !== 'read') return []
+  const uses = (name: string): string[] =>
+    Object.entries(store.config.grants)
+      .filter(([, byProvider]) =>
+        Object.values(byProvider).some((g) => isRecord(g) && g.app === name),
+      )
+      .map(([slug]) => slug)
+      .sort()
+
+  return Object.entries(store.config.applications)
+    .map(([name, raw]): ApplicationListing => {
+      const parsed = parseApplication(name, raw)
+      return parsed.ok
+        ? { name, state: 'present', app: parsed.app, usedBy: uses(name) }
+        : { name, state: 'malformed', reason: parsed.reason, usedBy: uses(name) }
+    })
+    .sort((a, b) => a.name.localeCompare(b.name))
+}
+
 type ParsedApp = { ok: true; app: OAuthApp } | { ok: false; reason: string }
 
 function parseOAuthApp(raw: unknown): ParsedApp {
