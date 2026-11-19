@@ -136,6 +136,53 @@ const stubStagingDir = (containerName: string): string =>
   join(tmpdir(), 'ogun-credentials', containerName)
 
 /**
+ * Where a runtime keeps its own state, per job, so it survives between rounds.
+ *
+ * ### The bug this exists for
+ *
+ * `exec` is a `docker run` per invocation, deliberately — "the job is one agent
+ * invocation, and a fresh container makes cleanup automatic". A retry round (§5.2) is a
+ * second invocation, so it is a second container, and the agent session the first round
+ * created died with the first one. The retry asks for `claude --resume <sessionId>`
+ * against a container that has never heard of it.
+ *
+ * It failed earlier than that, and more confusingly: the image ships `~/.claude` with no
+ * `.claude.json` in it, so `--resume` refused on the missing config before it ever got as
+ * far as the missing session. Every retry Ogun had ever attempted — three of three —
+ * ended `claude exited 1: Claude configuration file not found`, and the modifier run that
+ * had just been told what to fix was thrown away with a `changes-requested` outcome and
+ * no second attempt.
+ *
+ * ### Why a per-job directory rather than the host's own
+ *
+ * `credentialMounts` refuses to mount `~/.claude` wholesale and says why: it is 36MB on a
+ * working machine, 22MB of which is `projects/` — transcripts of every session in every
+ * repository, which routinely contain secrets from other projects. All of that is still
+ * true. This directory is empty when the job starts, holds only what this job's rounds
+ * write, and is removed in `dispose()` beside the credential staging.
+ *
+ * Under `tmpdir()` rather than the job's scratch for the reason `stubStagingDir` gives:
+ * scratch is user-configurable, and this is a directory only the sandbox writes and only
+ * the sandbox deletes.
+ */
+const sessionStateDir = (containerName: string): string =>
+  join(tmpdir(), 'ogun-sessions', containerName)
+
+/**
+ * Where each runtime keeps that state inside the container.
+ *
+ * The same two paths the base image sets `CLAUDE_CONFIG_DIR` and `CODEX_HOME` to. Written
+ * out rather than read from the image's environment because the mount has to be decided
+ * before the container exists, and a wrong guess here is silent: the runtime would write
+ * its session to a path nothing persists and the retry would fail exactly as it does
+ * today.
+ */
+const RUNTIME_STATE_HOME: Record<string, string> = {
+  claude: '/home/dev/.claude',
+  codex: '/home/dev/.codex',
+}
+
+/**
  * The default sandbox: real capability isolation, per-project image.
  *
  * What is deliberately absent is the point. No /var/run/docker.sock — anything holding
@@ -154,6 +201,7 @@ export function createContainerSandbox(opts: ContainerOptions): Sandbox {
   let session: GatewaySession | undefined
   let egressSession: SandboxEgress | undefined
   let stubDir: string | undefined
+  let sessionDir: string | undefined
 
   /**
    * Resolved per exec rather than captured once, because `provision()` is what fills
@@ -298,6 +346,17 @@ export function createContainerSandbox(opts: ContainerOptions): Sandbox {
        */
       stubDir = stubStagingDir(opts.name)
       await mkdir(stubDir, { recursive: true, mode: 0o700 })
+
+      /**
+       * Created here, in `provision`, for the ordering reason above: a bind mount whose
+       * source does not exist makes docker create an empty directory owned by root, and
+       * the entrypoint's `seed` would then fail to copy the credentials into it.
+       */
+      const stateHome = RUNTIME_STATE_HOME[opts.runtime]
+      if (stateHome !== undefined) {
+        sessionDir = sessionStateDir(opts.name)
+        await mkdir(sessionDir, { recursive: true, mode: 0o700 })
+      }
       const stubs: Array<{ hostPath: string; containerPath: string }> = []
       /**
        * The connection stubs ride the same list as the credential stubs, which is what
@@ -440,6 +499,15 @@ export function createContainerSandbox(opts: ContainerOptions): Sandbox {
       // way to confuse docker for no gain. The runner is long-lived, so a directory left
       // here is a real leak — one per job.
       if (stubDir) await rm(stubDir, { recursive: true, force: true }).catch(() => undefined)
+      /**
+       * With the credential staging, and for the same reason: this held one job's agent
+       * transcripts, and a job that has ended has no further use for them. Leaving them
+       * would turn a per-job directory into the accumulating `projects/` tree that
+       * `credentialMounts` refuses to mount in the first place.
+       */
+      if (sessionDir) {
+        await rm(sessionDir, { recursive: true, force: true }).catch(() => undefined)
+      }
     },
   }
 }
@@ -668,6 +736,19 @@ export function buildRunArgs(opts: ContainerOptions, image: string): string[] {
    *    off in its own config would remove the backstop for *itself*, not for others.
    */
   args.push('--volume', `ogun-cache-${opts.runtime}:/home/dev/.cache`)
+
+  /**
+   * The runtime's own state, so a retry round can resume the session the first round
+   * opened. See `sessionStateDir`: without it `--resume` reaches a container that has
+   * never heard of the session, which is every retry this build has ever attempted.
+   *
+   * Read-write and bind-mounted rather than a named volume, because `dispose()` has to be
+   * able to delete it and a volume would outlive the container that named it.
+   */
+  const stateHome = RUNTIME_STATE_HOME[opts.runtime]
+  if (stateHome !== undefined) {
+    args.push('--volume', `${sessionStateDir(opts.name)}:${stateHome}`)
+  }
 
   args.push('--env', `OGUN_PERMISSIONS=${opts.permissions}`)
 
