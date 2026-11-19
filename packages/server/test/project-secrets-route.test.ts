@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { schema } from '@ogun/core/db'
 import { listProjectSecrets, readProjectSecret } from '@ogun/core'
+import { SECRET_NAMES } from '@ogun/core'
 import { startHarness } from './harness.ts'
 import { secretWriteTransport, TLS_PROXY_ENV } from '../src/auth.ts'
 
@@ -309,7 +310,7 @@ describe('a project secret can be set over HTTP, and only when the wire can carr
     }
     assert.equal(system.projectSecretWrites.allowed, false)
     assert.match(system.projectSecretWrites.reason ?? '', /ogun connect <integration>/)
-    assert.deepEqual(system.projectSecretWrites.names, ['linear'])
+    assert.deepEqual(system.projectSecretWrites.names, [...SECRET_NAMES])
 
     // Declared TLS in front, and the same request is fine.
     setEnv(TLS_PROXY_ENV, '1')

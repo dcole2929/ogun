@@ -260,7 +260,10 @@ describe('what a poll ledger says about a source', () => {
     assert.equal(silent.health.state, 'silent')
     assert.match(silent.health.remedy!, /not a failure/)
     // The diagnosis needs both halves, so the conditions have to arrive with it.
-    assert.deepEqual(silent.conditions?.status, ['Todo'])
+    assert.deepEqual(
+      silent.conditions && 'status' in silent.conditions ? silent.conditions.status : null,
+      ['Todo'],
+    )
     assert.match(silent.health.detail!, /In Progress/)
 
     const { row: busy } = await source('quiet-hour')

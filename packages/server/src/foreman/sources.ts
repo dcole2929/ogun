@@ -2,14 +2,23 @@ import { and, eq, inArray, isNull, lt, or } from 'drizzle-orm'
 import { schema } from '@ogun/core/db'
 import type { Db } from '@ogun/core/db'
 import {
+  admitsRequest,
   admitsTicket,
   cycleDefinitionSchema,
+  loopGuard,
   remoteNarrowing,
+  requestBrief,
+  requestFilterOf,
+  requestKey,
+  requestLabel,
   sourceSchema,
   ticketBrief,
   ticketDigest,
   ticketFilterOf,
+  type AdmittedRequest,
   type AdmittedTicket,
+  type ChangeRequest,
+  type GithubSourceConfig,
   type ProjectSecret,
   type SecretName,
   type SourceConfig,
@@ -23,6 +32,13 @@ import {
 } from '../integrations/linear.ts'
 import { usableGrant } from './linear-grant.ts'
 import { projectLinearCredential } from '../integrations/linear-credential.ts'
+import {
+  githubHttp,
+  GithubUnavailable,
+  type GithubApi,
+  type GithubCredential,
+} from '../integrations/github.ts'
+import { projectGithubCredential } from '../integrations/github-credential.ts'
 import { fleetCredentials } from './admission.ts'
 import { startCycleRun } from './cycles.ts'
 
@@ -103,6 +119,13 @@ export type SourceDeps = {
    * tested without a token endpoint, which is the half that has no fixture.
    */
   grant?: typeof usableGrant
+  /**
+   * The GitHub seam, on the same terms as `linear` above: every rule this file enforces
+   * about change requests has to be testable on a machine with no GitHub token.
+   */
+  github?: (credential: GithubCredential) => GithubApi
+  /** How a project's GitHub credential is found, injected for the same reason. */
+  githubCredential?: typeof projectGithubCredential
   now?: () => Date
 }
 
@@ -355,6 +378,29 @@ export async function pollSource(
    */
   const project = await db.query.projects.findFirst({ where: eq(projects.id, row.projectId) })
   if (!project) return refuse('this source belongs to no project')
+
+  /**
+   * The split, and it is here rather than at the top of the function because everything
+   * above is common: the cadence claim, the cycle, the single entry node, the project.
+   * Those are facts about *a source*, not about what it watches, and duplicating them
+   * per kind is how two arms drift about which cycles are legal.
+   *
+   * Below this line nothing is shared, because nothing can be: Linear is one GraphQL
+   * document against a workspace, GitHub is three REST collections per repository, and
+   * the pure rules they feed take different filters and mint different brands.
+   */
+  if (config.kind === 'github') {
+    return pollChangeRequests(db, {
+      row,
+      config,
+      slug: project.slug,
+      cycleId: cycle.id,
+      nodeKeys: definition.nodes.map((n) => n.key),
+      refuse,
+      record,
+      deps,
+    })
+  }
 
   /**
    * Which credential, and whether it is usable right now — `projectLinearCredential`,
@@ -739,4 +785,232 @@ function entryNode(definition: {
 }): string | undefined {
   const entries = entryNodes(definition)
   return entries.length === 1 ? entries[0] : undefined
+}
+
+/**
+ * One poll of a `github` source: read the open pull requests, admit the ones somebody has
+ * asked Ogun to revise, and start a cycle for each.
+ *
+ * Deliberately not folded into `pollSource`'s body. The two kinds share a preamble — the
+ * cadence claim, the cycle, the single entry node, the project — and share nothing after
+ * it: different credential, different client, different pure rule, different brand. The
+ * `refuse` and `record` closures are passed in because they close over the poll's start
+ * time and the row being written, and reconstructing them here is how two arms come to
+ * record a poll two slightly different ways.
+ */
+async function pollChangeRequests(
+  db: Db,
+  input: {
+    row: typeof sources.$inferSelect
+    config: GithubSourceConfig
+    slug: string
+    cycleId: string
+    nodeKeys: string[]
+    refuse: (detail: string) => Promise<PollResult>
+    record: (result: PollResult) => Promise<PollResult>
+    deps: SourceDeps
+  },
+): Promise<PollResult> {
+  const { row, config, refuse, record, deps } = input
+
+  const resolved = await (deps.githubCredential ?? projectGithubCredential)(input.slug, {
+    ...(deps.secrets ? { secrets: deps.secrets } : {}),
+  })
+  if (resolved.state === 'refused') return refuse(resolved.detail)
+  if (resolved.state === 'failed') {
+    return record({
+      source: row.name,
+      outcome: 'failed',
+      kind: resolved.kind,
+      seen: 0,
+      admitted: 0,
+      emitted: [],
+      trimmed: 0,
+      truncated: false,
+      detail: resolved.detail,
+    })
+  }
+  const credential = resolved.credential
+
+  const api = (deps.github ?? ((c: GithubCredential) => githubHttp({ credential: c })))(credential)
+
+  const filter = requestFilterOf(config)
+  const seen: ChangeRequest[] = []
+  for (const repo of config.conditions.repos) {
+    try {
+      seen.push(
+        ...(await api.changeRequests({
+          repo,
+          perPage: PAGE_SIZE,
+          maxPages: config.maxPages,
+        })),
+      )
+    } catch (err) {
+      /**
+       * Recorded, not thrown, and the whole poll stops at the first repository that
+       * fails rather than carrying on to the next.
+       *
+       * Carrying on looks kinder and is worse: a token that has lost access to one
+       * repository of three would produce a poll reporting `ok` with two thirds of the
+       * answer, forever, and "Ogun stopped noticing reviews on that repo" is exactly the
+       * silence `source_polls` exists to prevent.
+       */
+      if (err instanceof GithubUnavailable) {
+        return record({
+          source: row.name,
+          outcome: 'failed',
+          kind: err.kind,
+          seen: seen.length,
+          admitted: 0,
+          emitted: [],
+          trimmed: 0,
+          truncated: false,
+          detail: `${repo}: ${err.message}`,
+        })
+      }
+      throw err
+    }
+  }
+
+  /**
+   * The loop guard runs before the filter, not after, because `admitsRequest` refuses a
+   * request whose comments are all Ogun's own — and it can only see that if they have
+   * already been removed. Stripping them afterwards would admit a pull request on the
+   * strength of Ogun's own report and then hand an agent an empty review.
+   */
+  const guarded = seen.map((r) => ({ ...r, comments: loopGuard(r.comments, credential.login) }))
+
+  const verdicts = guarded.map((request) => ({ request, verdict: admitsRequest(filter, request) }))
+  const admitted = verdicts.flatMap((v) => (v.verdict.admitted ? [v.verdict.request] : []))
+
+  /**
+   * Already emitted, by the composite key rather than by pull request number — see
+   * `requestKey`. A round that has been acted on is one row; the same pull request with a
+   * new commit or a new comment is a different row and emits again, which is the entire
+   * difference between this source and the ticket one.
+   */
+  const keys = admitted.map(requestKey)
+  const previously = keys.length
+    ? await db
+        .select()
+        .from(sourceEmissions)
+        .where(
+          and(
+            eq(sourceEmissions.projectId, row.projectId),
+            inArray(sourceEmissions.externalId, keys),
+          ),
+        )
+    : []
+  const done = new Set(previously.map((e) => e.externalId))
+  const fresh = admitted.filter((r) => !done.has(requestKey(r)))
+
+  const taking = fresh.slice(0, config.maxPerPoll)
+  const trimmed = fresh.length - taking.length
+
+  const emitted: string[] = []
+  const failures: string[] = []
+  for (const request of taking) {
+    const outcome = await emitRequest(db, {
+      row,
+      cycleId: input.cycleId,
+      nodeKeys: input.nodeKeys,
+      request,
+      credentials: await fleetCredentials(db),
+    })
+    if (outcome.emitted) emitted.push(requestLabel(request))
+    else if (outcome.detail) failures.push(`${requestLabel(request)}: ${outcome.detail}`)
+  }
+
+  /**
+   * What a person needs to read off a poll that emitted nothing, in the same spirit as
+   * `detailFor` — and for the same reason: "seen 9, admitted 0" does not say whether the
+   * label is missing everywhere or spelled differently from the one configured.
+   */
+  const detail =
+    emitted.length === 0 && seen.length > 0
+      ? [
+          `${seen.length} open pull request(s) read across ${config.conditions.repos.join(', ')};`,
+          `none is waiting on a revision. Looking for the label "${config.conditions.label}"`,
+          `on a branch under "${config.conditions.branchPrefix}".`,
+          ...failures,
+        ].join(' ')
+      : failures.join('; ')
+
+  return record({
+    source: row.name,
+    outcome: 'ok',
+    seen: seen.length,
+    admitted: admitted.length,
+    emitted,
+    trimmed,
+    truncated: false,
+    ...(detail ? { detail } : {}),
+  })
+}
+
+/**
+ * `emit`'s sibling for a change request.
+ *
+ * Separate rather than generic over the two, because the only thing they share is the
+ * claim-then-start shape and the interesting halves differ: the external id here is a
+ * composite that is *meant* to repeat per pull request, and the brief is a review rather
+ * than a ticket. A generic version would take four callbacks and be read by nobody.
+ */
+async function emitRequest(
+  db: Db,
+  input: {
+    row: typeof sources.$inferSelect
+    cycleId: string
+    nodeKeys: string[]
+    request: AdmittedRequest
+    credentials: Awaited<ReturnType<typeof fleetCredentials>>
+  },
+): Promise<{ emitted: boolean; detail?: string }> {
+  const key = requestKey(input.request)
+  const [claim] = await db
+    .insert(sourceEmissions)
+    .values({
+      projectId: input.row.projectId,
+      sourceId: input.row.id,
+      sourceName: input.row.name,
+      externalId: key,
+      externalKey: requestLabel(input.request),
+      /**
+       * The digest and the id are the same value here, and that is not an oversight.
+       * For a ticket they differ because the id is stable and the digest is content, so
+       * "this was edited since we acted" is a fact worth carrying. A round of review has
+       * no such distinction: anything that would change the digest has already changed
+       * the key and produced a new row.
+       */
+      digest: key,
+    })
+    .onConflictDoNothing({
+      target: [sourceEmissions.projectId, sourceEmissions.externalId],
+    })
+    .returning()
+
+  if (!claim) return { emitted: false }
+
+  try {
+    const { cycleRunId } = await startCycleRun(db, {
+      cycleId: input.cycleId,
+      trigger: `source:${input.row.name}`,
+      promptContext: Object.fromEntries(
+        input.nodeKeys.map((k) => [k, requestBrief(input.request)]),
+      ),
+      credentials: input.credentials,
+    })
+    await db
+      .update(sourceEmissions)
+      .set({ cycleRunId })
+      .where(eq(sourceEmissions.id, claim.id))
+    return { emitted: true }
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err)
+    await db
+      .update(sourceEmissions)
+      .set({ outcome: 'failed', detail })
+      .where(eq(sourceEmissions.id, claim.id))
+    return { emitted: false, detail }
+  }
 }

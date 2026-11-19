@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import type { TicketFilter } from '../sources/ticket.ts'
+import type { RequestFilter } from '../sources/change-request.ts'
 
 /**
  * A **source**: the thing that turns the outside world into jobs (§4.2's `integration`
@@ -139,18 +140,16 @@ const liftLegacy = (raw: unknown): unknown => {
   }
 }
 
-const sourceShape = z.object({
-  /**
-   * Which outside system. One value today, and it is spelled out rather than assumed so
-   * that a GitHub source is a new literal here — and so that a config saying `kind: jira`
-   * fails at the file rather than by polling nothing.
-   *
-   * Not a discriminated union yet, because a union of one produces worse messages than a
-   * literal does. It becomes one the day there are two, and the shape below is already
-   * the shape that survives that: `team` and `filter` are Linear's, and move under the
-   * linear arm.
-   */
-  kind: z.literal('linear'),
+/**
+ * What every source has, whatever it watches.
+ *
+ * The note that used to sit on `kind` said this becomes a discriminated union "the day
+ * there are two, and the shape below is already the shape that survives that". This is
+ * that day. What survived unchanged is everything here; what moved under the `linear`
+ * arm is `conditions`, which was always Linear's vocabulary — teams, workflow states,
+ * issue labels — wearing a general name.
+ */
+const commonShape = {
   /**
    * The cycle an admitted ticket starts. A worker's own name works too — every worker is
    * a one-node cycle (§5.1, ADR-0007), so a source pointed at a single scope evaluator is
@@ -196,16 +195,74 @@ const sourceShape = z.object({
    * Stopping early is recorded on the poll, so a team that has outgrown this says so.
    */
   maxPages: z.number().int().positive().default(4),
-  conditions: conditionsSchema,
   enabled: z.boolean().default(true),
+}
+
+const linearShape = z.object({
+  ...commonShape,
+  kind: z.literal('linear'),
+  conditions: conditionsSchema,
+})
+
+/**
+ * `kind: github` — pull requests Ogun opened that somebody has asked it to revise.
+ *
+ * The condition block is much smaller than Linear's and that is not an omission. A ticket
+ * arrives from an open tracker where anybody may have written anything, so the filter
+ * carries the whole burden of deciding what is work. A pull request here is one Ogun
+ * itself opened: the narrowing is mostly structural, and what is left is one question —
+ * has a person asked for this to be revised.
+ */
+export const requestConditionsSchema = z.object({
+  /**
+   * `owner/repo`, at least one. A list rather than one for the same reason
+   * `conditions.team` became one: a project with three repositories should not need
+   * three sources polling, rate-limiting and reporting separately.
+   */
+  repos: z.array(z.string().regex(/^[^/\s]+\/[^/\s]+$/, 'expected owner/repo')).min(1),
+  /**
+   * The label that means "act on this". Required, with no default.
+   *
+   * A default would be the whole argument lost: the point of a label is that somebody
+   * chose it, and a source that gates on `ogun-revise` because nobody said otherwise is
+   * a source gating on a word nobody has read. The same reasoning as `conditions.status`
+   * having no default.
+   */
+  label: z.string().min(1),
+  /**
+   * Only branches Ogun opened. The publisher's own prefix, which is `ogun/`.
+   *
+   * Configurable because the prefix is a constant in the runner and a project could in
+   * principle change it; not optional, because a source that polls every pull request in
+   * a repository and asks an agent about each one is a different and much worse feature.
+   */
+  branchPrefix: z.string().min(1).default('ogun/'),
+  /** Ogun's own pull requests are opened as drafts, so this defaults on. */
+  includeDrafts: z.boolean().default(true),
+})
+
+const githubShape = z.object({
+  ...commonShape,
+  kind: z.literal('github'),
+  conditions: requestConditionsSchema,
 })
 
 /**
  * Parsed through the legacy lift, so a `filter:` block written before the rename still
  * produces a source rather than a silently skipped row.
+ *
+ * `discriminatedUnion` rather than `union`, because the error for a mistyped key under
+ * `conditions:` should name the arm it failed in. A plain union reports every arm's
+ * complaint at once, which for a github source misspelling `repos` would be four lines
+ * about teams and statuses it has never heard of.
  */
-export const sourceSchema = z.preprocess(liftLegacy, sourceShape)
+export const sourceSchema = z.preprocess(
+  liftLegacy,
+  z.discriminatedUnion('kind', [linearShape, githubShape]),
+)
 export type SourceConfig = z.infer<typeof sourceSchema>
+export type LinearSourceConfig = Extract<SourceConfig, { kind: 'linear' }>
+export type GithubSourceConfig = Extract<SourceConfig, { kind: 'github' }>
 
 /**
  * The filter as the pure rule wants it, out of the config as the file wants it.
@@ -215,7 +272,14 @@ export type SourceConfig = z.infer<typeof sourceSchema>
  * key the rule does not read (or the reverse) this is where the mismatch shows up as a
  * type error instead of as a filter quietly ignoring a line somebody wrote.
  */
-export const ticketFilterOf = (source: SourceConfig): TicketFilter => ({
+export const requestFilterOf = (source: GithubSourceConfig): RequestFilter => ({
+  repos: source.conditions.repos,
+  label: source.conditions.label,
+  branchPrefix: source.conditions.branchPrefix,
+  includeDrafts: source.conditions.includeDrafts,
+})
+
+export const ticketFilterOf = (source: LinearSourceConfig): TicketFilter => ({
   team: source.conditions.team,
   status: source.conditions.status,
   label: source.conditions.label,
