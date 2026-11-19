@@ -68,12 +68,15 @@ const oldSpelling = (was: string): string =>
   `\`${was}\` is now \`ogun connect\`.\n` +
   '  The integration is an argument, not a command, and one command covers every way of\n' +
   '  giving a project access to it:\n' +
-  '    ogun connect linear --client-id <id> --client-secret <secret>\n' +
-  '                                             an application, in Ogun\'s own name\n' +
+  '    ogun connect linear --app                an application, in Ogun\'s own name\n' +
+  '    ogun connect github --app                a GitHub App, acting as itself\n' +
   '    ogun connect linear --consent …          somebody approves it in a browser\n' +
   '    ogun connect linear --api-key            a personal API key\n' +
   '    ogun connect list                        what is connected, and how healthy\n' +
   '    ogun disconnect linear                   remove every credential for it\n' +
+  '  An application\'s fields are `key=value` positionals — `clientId=…` for linear,\n' +
+  '  `appId=… installationId=… privateKey=./key.pem` for github — and anything you leave\n' +
+  '  out is prompted for. `ogun connect --help` lists them per integration.\n' +
   '  The project comes from the directory you are in, or from --project <slug>.\n' +
   '  For a per-project value that is not an integration: `ogun secret set <name> <key>`.'
 

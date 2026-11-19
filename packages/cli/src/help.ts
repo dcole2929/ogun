@@ -505,7 +505,7 @@ const topics: Record<string, Topic> = {
   },
 
   connect: {
-    summary: 'give a project access to an integration — Linear today, others as they land',
+    summary: 'give a project access to an integration — Linear and GitHub today',
     /**
      * **The usage lines name every input, including the ones that are not arguments.**
      *
@@ -515,51 +515,67 @@ const topics: Record<string, Topic> = {
      * collect appeared nowhere in it, so the only way to discover that it prompts was to
      * run it.
      *
-     * The credentials were positionals for one commit, which put them in the signature
-     * and still got it wrong: a client id and a client secret are two opaque strings from
-     * the same page of Linear's settings, and a fixed order between them is a coin flip.
-     * They are named flags now, and the flag names are the part a reader has to see.
+     * The credentials have had three shapes. Positionals put them in the signature and
+     * still got it wrong — two opaque strings from one page in a fixed order is a coin
+     * flip. Named flags (`--client-id`, `--client-secret`) fixed that and broke on the
+     * second provider, because a GitHub App has an app id, an installation id and a
+     * private key and none of them is a client anything. `field=value` is the shape that
+     * survives a third provider: the labels are a fact about the integration, not about
+     * the command, and `connect.ts` carries the full argument.
      */
     usage: [
-      'ogun connect <integration> --client-id <id> --client-secret <secret> [--project <slug>]',
-      'ogun connect <integration> --consent --client-id <id> --client-secret <secret>',
+      'ogun connect <integration> --app [--as <name>] [--project <slug>] [field=value …]',
+      'ogun connect <integration> --app --link <name> [--project <slug>]',
+      'ogun connect <integration> --consent [field=value …]',
       'ogun connect <integration> --api-key [<key>] [--replace] [--project <slug>]',
       'ogun connect list [--project <slug>]',
     ],
     notes: [
-      '<integration> — which product. One of: linear. It is an argument rather than a word ' +
-        'in the command path, so github and jira become values here rather than whole new ' +
-        'command trees.',
+      '<integration> — which product. One of: linear, github. It is an argument rather ' +
+        'than a word in the command path, so jira becomes a value here rather than a whole ' +
+        'new command tree.',
       'The FLAG NAMES WHAT YOU ARE CONNECTING, and that decides what else is required. ' +
-        '--oauth is an application you registered, which always means a client id and a ' +
-        'client secret; --api-key is one key and has neither. --oauth is the default, so ' +
-        'the first line above is what most people type:\n' +
-        '    ogun connect linear                                    prompts for both\n' +
-        '    ogun connect linear --client-id abc123                 prompts for the secret\n' +
+        '--app is an application you registered in the provider; --api-key is one key and ' +
+        'has no application at all. --app is the default, so the first line above is what ' +
+        'most people type:\n' +
+        '    ogun connect linear                                    prompts for every field\n' +
+        '    ogun connect linear clientId=abc123                    prompts for the secret\n' +
         '    ogun connect linear --api-key                          prompts for the key',
-      '--client-id <id> — the Client ID of the OAuth application you registered at ' +
-        'https://linear.app/settings/api/applications/new. Not a secret: it is in every ' +
-        "authorization URL a browser visits and on Linear's own settings page. Omit the " +
-        'flag to be prompted, VISIBLY, so you can check what you pasted — or to keep the ' +
-        'one already registered here.',
-      '--client-secret <secret> — the Client Secret from that same page. Omit the flag and ' +
-        'you are prompted with the echo off; pipe it and it is read from stdin:\n' +
-        '    op read op://vault/linear/secret | ogun connect linear --client-id abc123\n' +
-        '  Passing it inline works and prints a warning, because argv is readable by every ' +
-        'user on the box through /proc/<pid>/cmdline while the command runs, and your shell ' +
-        'writes the whole line into ~/.zsh_history or ~/.bash_history where nothing cleans ' +
-        'it up. Prefer the prompt or the pipe.',
-      '--api-key [<key>] — the personal API key, on exactly the same terms: leave the ' +
-        'value off to be prompted with the echo off, pipe it, or pass it inline and be ' +
-        'warned.\n' +
-        "    printf 'lin_api_…' | ogun connect linear --api-key\n" +
-        '    ogun connect linear --api-key=lin_api_…                 works, and warns',
-      'With no --client-id and no --client-secret, an application already registered on ' +
-        'this machine is reused and nothing is asked for. That is the reconnect after a ' +
-        'token lapses and the retry after one that failed on the network. Giving only ' +
-        '--client-secret rotates the secret and keeps the registered client id; giving a ' +
-        'NEW --client-id always asks for its own secret, because a secret belongs to the ' +
-        'application it was issued for.',
+      "THE FIELDS ARE key=value, AND THERE ARE NO PER-PROVIDER FLAGS. The valid keys are a " +
+        'fact about the integration:\n' +
+        '    linear    clientId, clientSecret\n' +
+        '    github    appId, installationId, privateKey\n' +
+        '  An unknown key is an error that lists the valid ones and stores nothing. Any ' +
+        'field you leave out is prompted for, ONE AT A TIME — the public ones visibly so ' +
+        'you can check what you pasted, the secrets with the echo off.',
+      'A PIPE FEEDS THOSE PROMPTS IN ORDER, one line per field, in the order listed above. ' +
+        'There is no --from flag and no second mechanism:\n' +
+        "    printf '%s\\n%s\\n' \"$ID\" \"$SECRET\" | ogun connect linear --app\n" +
+        '    op read op://vault/linear/secret | ogun connect linear clientId=abc123',
+      'FOR A PEM FIELD — github privateKey — a value containing a NEWLINE is the key ' +
+        'itself and anything else is a PATH to read. That is not a heuristic: a PEM always ' +
+        'has newlines and a path never does.\n' +
+        '    ogun connect github appId=1234567 installationId=98765432 privateKey=./key.pem\n' +
+        '    ogun connect github privateKey="$(cat key.pem)" …          also works, and warns',
+      'Passing a secret inline works and prints a warning, because argv is readable by ' +
+        'every user on the box through /proc/<pid>/cmdline while the command runs, and your ' +
+        'shell writes the whole line into ~/.zsh_history or ~/.bash_history where nothing ' +
+        'cleans it up. A privateKey given as a PATH draws no warning — a filename is not a ' +
+        'credential. Prefer the prompt or the pipe.',
+      'NOTHING IS STORED UNTIL A TOKEN COMES BACK. The order is exchange, identify, name ' +
+        'the application, write it, write the grant — so an application on this machine is ' +
+        'one that has been spent at least once, and its name describes an account the ' +
+        'credential actually reached. The cost: a FIRST connect whose token request fails ' +
+        'stores nothing and asks for the fields again. A reconnect is unaffected.',
+      'With no fields at all and a grant already on file, the application that grant came ' +
+        'from is reused and nothing is asked for. That is the reconnect after a token ' +
+        'lapses. Giving a field rotates it: a NEW clientId always asks for its own secret, ' +
+        'because a secret belongs to the application it was issued for.',
+      'AN APPLICATION IS SHARED AND A GRANT IS NOT. One Linear app or one GitHub App serves ' +
+        'every project that reaches that provider, and its private key exists ONCE on this ' +
+        'machine. --link points a second project at it without the credentials being typed ' +
+        'again — and it still mints a token, because "connected" has to mean "proved", not ' +
+        '"a pointer was written".',
       'A per-project value that is NOT an integration — a webhook signing key, a token a ' +
         'skill is handed — is `ogun secret set <name> <key>`. That command and ' +
         '`connect --api-key` write the same row for the same name, through the same lock, ' +
@@ -577,38 +593,65 @@ const topics: Record<string, Topic> = {
         heading: 'what you are connecting',
         rows: [
           [
-            '--oauth',
-            'an OAuth application you registered in the provider. THE DEFAULT, so no flag ' +
-              'is needed; the explicit spelling is for a script that must keep meaning ' +
-              'this even if the default changes. Requires --client-id and --client-secret. ' +
-              "Ogun asks Linear for a token in its OWN name — no browser, no consent " +
-              'screen, nobody to approve it. The token lasts 30 days and is renewed by ' +
-              "asking again, and it reaches the workspace's PUBLIC teams and no others",
+            '--app',
+            'an application you registered in the provider. THE DEFAULT, so no flag is ' +
+              'needed; the explicit spelling is for a script that must keep meaning this ' +
+              'even if the default changes. It was called --oauth, which was wrong: a ' +
+              'GitHub App signs a JWT with a private key and exchanges it for an ' +
+              'installation token, which is not an OAuth grant type at all. For LINEAR ' +
+              "Ogun asks for a token in its OWN name — no browser, nobody to approve it; " +
+              "it lasts 30 days, renews by asking again, and reaches the workspace's " +
+              'PUBLIC teams and no others. For GITHUB the installation token lasts about ' +
+              'an hour and is renewed by signing a fresh JWT',
           ],
           [
             '--api-key <key>',
-            'one personal API key, and no application. Everything Ogun does, it does AS ' +
-              'YOU — and once write-back lands, every comment it posts appears under your ' +
-              'name on a board other people read. The fallback for a workspace where you ' +
+            'one personal key, and no application. Everything Ogun does, it does AS YOU ' +
+              '— and once write-back lands, every comment it posts appears under your ' +
+              'name on a board other people read. The fallback for an account where you ' +
               'cannot register an application at all',
           ],
         ],
       },
       {
-        heading: 'which OAuth grant (only with --oauth, which it implies)',
+        heading: 'naming and sharing the application (with --app)',
+        rows: [
+          [
+            '--as <name>',
+            'the name to store the application under. The default is DERIVED from the ' +
+              'account the credential proved it reaches — github:heirchive, linear:acme — ' +
+              'and never from the project slug, because naming a shared thing after one of ' +
+              'its users is wrong as soon as there are two. Override it when one account ' +
+              'has two applications, which would otherwise derive the same name and ' +
+              'replace each other',
+          ],
+          [
+            '--link <name>',
+            'point this project at an application already registered here, by that name. ' +
+              'No credentials typed again and no second copy of a private key. IT STILL ' +
+              'MINTS A TOKEN: a link that only wrote a pointer would report a project as ' +
+              'connected on credentials somebody may have rotated a month ago. A bare ' +
+              '--link with no value is an error that LISTS the applications for that ' +
+              'provider, because that is the one thing you do not know when you type it',
+          ],
+        ],
+      },
+      {
+        heading: 'which grant (only with --app, which it implies)',
         rows: [
           [
             '--consent',
-            'the authorization-code grant instead of client-credentials: Ogun prints a URL, ' +
-              'somebody opens it and approves the installation, and the token that comes ' +
-              'back sees what THEY can see. YOU NEED THIS IF YOUR TEAMS ARE PRIVATE — a ' +
-              'client-credentials token reaches public teams only, so a private workspace ' +
-              'polls successfully and finds nothing, forever. Also what to use when Ogun ' +
-              'should see one person\'s view rather than the workspace\'s. The cost: it ' +
-              'installs at the workspace level, so Linear needs a workspace ADMIN to ' +
-              'approve it, and it is the one shape that needs the control plane running. ' +
-              'You do not also pass --oauth; --consent already means it. It is refused ' +
-              'beside --api-key, which has nobody to approve anything',
+            'LINEAR ONLY: the authorization-code grant instead of client-credentials. Ogun ' +
+              'prints a URL, somebody opens it and approves the installation, and the ' +
+              'token that comes back sees what THEY can see. YOU NEED THIS IF YOUR TEAMS ' +
+              'ARE PRIVATE — a client-credentials token reaches public teams only, so a ' +
+              'private workspace polls successfully and finds nothing, forever. Also what ' +
+              "to use when Ogun should see one person's view rather than the workspace's. " +
+              'The cost: it installs at the workspace level, so Linear needs a workspace ' +
+              'ADMIN to approve it, and it is the one shape that needs the control plane ' +
+              'running. You do not also pass --app; --consent already means it. It is ' +
+              'refused beside --api-key, which has nobody to approve anything, and beside ' +
+              'github, where an App authenticating as itself has nobody to ask',
           ],
         ],
       },
@@ -631,7 +674,7 @@ const topics: Record<string, Topic> = {
           'destroying it is what you mean. Without it, a terminal is asked and a script ' +
           'is REFUSED, because there is no history and the value being overwritten cannot ' +
           'be recovered from this machine. The same flag `ogun secret set` takes, for the ' +
-          'same row. It is refused beside --oauth, which destroys nothing that cannot be ' +
+          'same row. It is refused beside --app, which destroys nothing that cannot be ' +
           'got again: the application stays registered and the token it replaces was going ' +
           'to expire anyway',
       ],
@@ -641,11 +684,16 @@ const topics: Record<string, Topic> = {
         'OGUN_PUBLIC_URL',
         'with --consent only: the address a browser reaches this control plane at, when it ' +
           'is not the one this process sees — a reverse proxy terminating TLS. The redirect ' +
-          'URI is built from it and Linear matches that string exactly. The default grant ' +
-          'has no redirect URI at all, because it has no browser',
+          'URI is built from it and Linear matches that string exactly. The other grants ' +
+          'have no redirect URI at all, because they have no browser',
       ],
     ],
-    touches: [[LOCAL_CONFIG, 'the oauth block (or secrets, with --api-key), mode 0600']],
+    touches: [
+      [
+        LOCAL_CONFIG,
+        'the applications and grants blocks (or secrets, with --api-key), mode 0600',
+      ],
+    ],
     see: ['ogun connect list', 'ogun disconnect', 'ogun secret', 'ogun runner doctor'],
   },
 
@@ -660,14 +708,24 @@ const topics: Record<string, Topic> = {
       'It was `ogun connections`, a top-level noun beside three verbs. A listing is now a ' +
         'subcommand — `connect list`, mirroring `secret list` — and the old spelling is ' +
         'refused with a line naming this one.',
-      'One table where there used to be two. `ogun linear status` showed grants and `ogun ' +
-        'secret list` showed keys, and neither could see the other, so a project with both ' +
-        'appeared twice with no indication that only one of them was being read.',
-      'The VIA column is the mechanism: `app token` (client credentials, public teams ' +
-        'only), `consent` (authorization code, whatever the approver could see), or `api ' +
-        'key`. It is there because the two grants differ in what they can SEE, and ' +
-        '"connected" alone cannot explain a source that finds no tickets.',
-      'A key stored behind a working grant is reported in red as NOT used. An OAuth grant ' +
+      'TWO TABLES, because there are two kinds of thing. An APPLICATION is shared — one ' +
+        'Linear app or one GitHub App serves every project that reaches that provider, and ' +
+        'its private key exists once — and a GRANT is one project\'s live token from one ' +
+        'of those. The applications table says who shares each one; the rows below say ' +
+        'which application each project goes THROUGH.',
+      'It also collapsed two commands into one view: `ogun linear status` showed grants ' +
+        'and `ogun secret list` showed keys, and neither could see the other, so a project ' +
+        'with both appeared twice with no indication that only one of them was being read. ' +
+        'A GitHub credential would not have appeared at all.',
+      'AN APPLICATION USED BY NO PROJECT IS CALLED OUT, because that is a credential on ' +
+        'the disk that nothing reads — the one state the write path can still leave ' +
+        'behind, via `disconnect --keep-application` for the last project using it.',
+      'The VIA column is the mechanism: `app token` (Linear client credentials, public ' +
+        'teams only), `consent` (authorization code, whatever the approver could see), ' +
+        '`app install` (a GitHub App installation token), or `api key`. It is there ' +
+        'because the grants differ in what they can SEE, and "connected" alone cannot ' +
+        'explain a source that finds no tickets.',
+      'A key stored behind a working grant is reported in red as NOT used. A grant ' +
         'wins over a personal key, so rotating that key would be changing something nothing ' +
         'reads — an evening gone. `ogun secret list` says the same thing about the same ' +
         'row, in the same words.',
@@ -696,21 +754,33 @@ const topics: Record<string, Topic> = {
       'than anywhere: the moment you most want a credential gone is during an incident, ' +
       'and an incident is when the control plane is least likely to be answering.',
     notes: [
-      'It removes the access token, the client id and secret, and any personal API key ' +
-        'stored for that project — everything `connect` could have written.',
+      "It removes this project's access token, any personal API key stored for it, and — " +
+        'if no OTHER project is still using it — the application the token came from. ' +
+        'Everything `connect` could have written.',
       'A top-level verb rather than `connect rm`, and that is not an oversight: it revokes ' +
         'a token at Linear, which is an act on the outside world rather than the removal of ' +
         'a row from a listing.',
-      'The client id and secret go by default because under the default grant they ARE the ' +
-        'credential: anyone holding them can mint a live token, and the next poll would. A ' +
-        'disconnect that left them behind is one the machine undoes by itself.',
-      '--keep-application keeps them, so reconnecting with --consent is one command instead ' +
-        'of a trip back to Linear. It is REFUSED on a client-credentials connection, for ' +
+      'AN APPLICATION SHARED WITH ANOTHER PROJECT IS KEPT, and you are told which projects ' +
+        'are still using it. A cascade would take four working projects offline to satisfy ' +
+        'one disconnect typed in the wrong directory, and "disconnected" said while a ' +
+        'private key is still on the disk is the half-truth somebody removing a credential ' +
+        'least needs.',
+      'When nothing else uses it, the application goes, because credentials nobody reads ' +
+        'are credentials nobody is watching and they would be in every backup of the ' +
+        "machine. For LINEAR that is the client id and secret — under the default grant " +
+        'they ARE the credential, so leaving them would be a disconnect the machine undoes ' +
+        "by itself. FOR GITHUB IT IS THE PRIVATE KEY, AND GITHUB SHOWS ONE ONLY ONCE: " +
+        'reconnecting means generating a new key in the App\'s settings.',
+      '--keep-application keeps it. REFUSED on a Linear client-credentials connection, for ' +
         'the reason above — a warning about a state that reverts itself within one poll ' +
-        'interval is a warning nobody can act on.',
-      'The token is revoked at Linear too, best-effort. A disconnect that depended on ' +
-        'Linear being reachable would leave you unable to remove a credential from your own ' +
-        'machine during an outage. Whether it worked is reported as its own line.',
+        'interval is a warning nobody can act on. Allowed for github, where a private key ' +
+        'with no installation token beside it mints nothing until somebody signs a JWT ' +
+        'with it.',
+      'The token is revoked at Linear too, best-effort, and whether it worked is reported ' +
+        'as its own line. A disconnect that depended on Linear being reachable would leave ' +
+        'you unable to remove a credential from your own machine during an outage. GITHUB ' +
+        'HAS NO SUCH ENDPOINT for an installation token — a one-hour life is the whole of ' +
+        'its revocation story — so that is said rather than a revoke being reported.',
       'Neither the integration nor the project is checked against anything, where `connect` ' +
         'checks both. config.json gets hand-edited and `connect list` prints whatever it ' +
         'finds, so a row you can see has to be a row you can remove. Validation guards ' +
@@ -722,10 +792,11 @@ const topics: Record<string, Topic> = {
       ['--project <slug>', 'which project, instead of the one this directory belongs to'],
       [
         '--keep-application',
-        'leave the client id and secret behind. Only for a --consent connection',
+        'leave the application and its credentials behind. Refused on a Linear ' +
+          'client-credentials connection',
       ],
     ],
-    touches: [[LOCAL_CONFIG, 'the oauth and secrets blocks for that project']],
+    touches: [[LOCAL_CONFIG, 'the grants, applications and secrets blocks for that project']],
     see: ['ogun connect', 'ogun connect list'],
   },
 

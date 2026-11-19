@@ -1,6 +1,6 @@
 import { strict as assert } from 'node:assert'
 import { test } from 'node:test'
-import { sealSecret, type OAuthGrant, type ProjectSecret } from '@ogun/core'
+import { sealSecret, type Grant, type ProjectSecret } from '@ogun/core'
 import { connectionReader, linearConnection } from '../src/sandbox/connections.ts'
 
 /**
@@ -16,8 +16,10 @@ import { connectionReader, linearConnection } from '../src/sandbox/connections.t
  *  - it captures the token once, so a renewal never reaches a job that is already running.
  */
 
-const grant = (over: Partial<OAuthGrant> = {}): OAuthGrant => ({
-  clientId: 'client-abc',
+const grant = (over: Partial<Grant> = {}): Grant => ({
+  // The application the grant came from, by name — `clientId` before the store was split
+  // into shared applications and per-project grants.
+  app: 'linear:acme',
   // `grantType` became required while this file was being written: a grant renews by
   // branching on it rather than on whether a refresh token happens to be present, so a
   // fixture without one describes a grant nothing could renew. `authorization_code` here

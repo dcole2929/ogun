@@ -15,6 +15,14 @@ export * from './config/index.ts'
  */
 export * from './integrations/linear-oauth.ts'
 export * from './integrations/linear-connect.ts'
+/**
+ * The GitHub App credential, and the connect built on it. Here rather than in the server
+ * for the reason the Linear pair is here: `ogun connect github --app` signs the JWT and
+ * mints the token with nothing running, so the code that does it has to sit where both the
+ * CLI and the server can call it, once.
+ */
+export * from './integrations/github-app.ts'
+export * from './integrations/github-connect.ts'
 export * from './sources/index.ts'
 export * from './api.ts'
 export * from './image.ts'

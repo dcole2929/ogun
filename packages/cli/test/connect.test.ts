@@ -217,7 +217,7 @@ test('a key on the command line is stored, and warns loudly about it', async (t)
 test('the usage lines name every input, including the ones that are not arguments', async (t) => {
   /**
    * The property: **no usage line for `connect` reads as complete without its credentials
-   * in it**, and the line says where each one comes from when it is left out.
+   * in it**, and the page says where each one comes from when it is left out.
    *
    * This has been raised four times about this CLI and it is the acceptance bar. `ogun
    * linear app [--project <slug>]` was a whole sentence and a lie: the two values it
@@ -225,12 +225,14 @@ test('the usage lines name every input, including the ones that are not argument
    * run it — and a *script* that ran it got a process blocking on an empty stdin with
    * nothing on screen explaining why.
    *
-   * The credentials are **named flags** here, where the previous build had them as
-   * positionals. That version did put them in the usage line and still got it wrong: a
-   * client id and a client secret are two opaque strings from the same page of Linear's
-   * settings, and a fixed order between two values of the same shape is a coin flip at the
-   * keyboard. So the assertion is on the flag names, not merely on the presence of two
-   * angle-bracketed words.
+   * The credentials have had three shapes and this is the third. Positionals put them in
+   * the line and still got it wrong, because two opaque strings from one page in a fixed
+   * order is a coin flip. Named flags fixed that and broke on the second provider: a
+   * GitHub App has an app id, an installation id and a private key, and declaring
+   * `--app-id` on a command where it is valid for one value of `<integration>` is a flag
+   * table that grows a column per provider. So the line carries `field=value`, and **the
+   * valid keys are asserted on the page** — because that is where the discoverability a
+   * declared flag would have given now has to come from.
    *
    * Checked against `--help` and against the usage printed on a bad invocation, because
    * those are two different strings and only one of them is ever read deliberately.
@@ -239,66 +241,112 @@ test('the usage lines name every input, including the ones that are not argument
 
   const help = await ogun(['connect', '--help'], { config })
   assert.equal(help.code, 0, help.stderr)
-  assert.match(help.stdout, /ogun connect <integration> --client-id <id> --client-secret <secret>/)
-  assert.match(help.stdout, /ogun connect <integration> --consent --client-id <id>/)
+  assert.match(help.stdout, /ogun connect <integration> --app \[--as <name>\]/)
+  assert.match(help.stdout, /ogun connect <integration> --app --link <name>/)
+  assert.match(help.stdout, /ogun connect <integration> --consent \[field=value …\]/)
   assert.match(help.stdout, /ogun connect <integration> --api-key \[<key>\]/)
   assert.match(help.stdout, /ogun connect list/)
+  // The fields themselves, per provider, because no flag names them any more.
+  assert.match(help.stdout, /linear\s+clientId, clientSecret/)
+  assert.match(help.stdout, /github\s+appId, installationId, privateKey/)
   // And where each value comes from when it is omitted, which is the recommended path.
   assert.match(help.stdout, /prompt/)
-  assert.match(help.stdout, /stdin/)
+  assert.match(help.stdout, /pipe/)
   // And why passing one inline is worse, where somebody reading `--help` will see it.
   assert.match(help.stdout, /proc/)
   assert.match(help.stdout, /history/)
   // The kind flag, and the fact that consent is not a third kind but a grant inside one.
-  assert.match(help.stdout, /--oauth/)
-  assert.match(help.stdout, /which OAuth grant/)
+  assert.match(help.stdout, /--app\b/)
+  assert.match(help.stdout, /which grant/)
+  // The PEM rule, stated rather than left to be discovered.
+  assert.match(help.stdout, /a PEM always has/)
 
   const bare = await ogun(['connect'], { config })
   assert.equal(bare.code, 1)
-  assert.match(bare.stderr, /--client-id <id> --client-secret <secret>/)
+  assert.match(bare.stderr, /--app \[--as <name>\]/)
   assert.match(bare.stderr, /--api-key \[<key>\]/)
+  assert.match(bare.stderr, /field=value/)
 })
 
-test('the credentials are flags, and a leftover positional is refused unspoken', async (t) => {
+test('a field is key=value, and an unknown or bare one is refused unspoken', async (t) => {
   /**
-   * The property: `ogun connect linear <secret>` fails, names the flags, and **does not
-   * echo what it was given**.
+   * The property: `ogun connect linear <secret>` fails, says what the shape is, lists the
+   * keys that would have worked, and **does not echo what it was given**.
    *
-   * The positional shape existed for one commit, so the plausible second positional here
-   * is a client secret. Quoting it back would write a live credential to stderr on top of
-   * the shell history and the `ps` window it is already in — the same rule that stops the
-   * integration name being echoed one function over, arriving through the other argument.
+   * Both halves are the point. The listing is where the discoverability of a declared flag
+   * went: somebody who typed `client-id=abc` is told the spelling that works at the moment
+   * they are looking, which is better than a help page. And the silence is the rule that
+   * stops the integration name being echoed one function over, arriving through the other
+   * argument — the plausible thing in this position is a client secret, and quoting it
+   * would write a live credential to stderr on top of the shell history and the `ps` window
+   * it is already in.
    */
   const config = await scratch(t)
   await machineKnowing(config, { ogun: '/does/not/matter' })
 
-  const set = await ogun(['connect', 'linear', SECRET, '--project', 'ogun'], { config })
+  const bare = await ogun(['connect', 'linear', SECRET, '--project', 'ogun'], { config })
+  assert.equal(bare.code, 1)
+  assert.ok(!`${bare.stdout}${bare.stderr}`.includes(SECRET), bare.stderr)
+  assert.match(bare.stderr, /`key=value`/)
+  assert.match(bare.stderr, /clientId, clientSecret/)
+  assert.match(bare.stderr, /compromised/)
 
-  assert.equal(set.code, 1)
-  assert.ok(!`${set.stdout}${set.stderr}`.includes(SECRET), set.stderr)
-  assert.match(set.stderr, /--client-secret <secret>/)
-  assert.match(set.stderr, /compromised/)
+  // A key the provider does not have, with the value still unquoted.
+  const wrong = await ogun(
+    ['connect', 'linear', `client-id=${SECRET}`, '--project', 'ogun'],
+    { config },
+  )
+  assert.equal(wrong.code, 1)
+  assert.ok(!`${wrong.stdout}${wrong.stderr}`.includes(SECRET), wrong.stderr)
+  assert.match(wrong.stderr, /"client-id" is not a field a linear application has/)
+  assert.match(wrong.stderr, /Valid: clientId, clientSecret/)
+
+  // And a github key offered to linear is just as wrong, which is the whole reason the
+  // schema is per provider rather than a union of every provider's fields.
+  const foreign = await ogun(['connect', 'linear', 'appId=123', '--project', 'ogun'], { config })
+  assert.equal(foreign.code, 1)
+  assert.match(foreign.stderr, /"appId" is not a field a linear application has/)
+
   assert.deepEqual(await secretsIn(config), {})
 })
 
-test('--app-token is dropped, and says which flag replaced it', async (t) => {
+test('the removed flags are removed, not deprecated, and the usage carries the answer', async (t) => {
   /**
-   * The property: a flag that existed for one commit answers with its replacement rather
-   * than with "Unknown option".
+   * The property: `--oauth`, `--client-id`, `--client-secret` and `--app-token` are gone
+   * from the flag table entirely, and the parser's refusal carries a usage line with
+   * `field=value` in it.
    *
-   * `--app-token` named the token that came back; `--oauth` names what is being connected,
-   * which is the distinction the whole reshape turns on. Muscle memory outlives a commit
-   * even when nothing outside this repository ever ran it, and a parser error naming an
-   * option is a dead end where one sentence is not.
+   * This reverses a decision rather than extending one. `--app-token` had a **deprecation
+   * stub** — a declared flag whose only job was to fail with a sentence naming its
+   * replacement — on the reasoning that *"muscle memory outlives a commit even when
+   * nothing outside this repository ever ran it, and a parser error naming an option is a
+   * dead end where one sentence is not"*. The product owner chose plain removal, and the
+   * argument holds against the stub rather than against that reasoning: a stub is a
+   * permanent row in the flag table, it appears in the parser's own errors, and it has to
+   * be maintained past the point where anybody remembers what it was for. `--client-id`
+   * could not have had a useful one anyway — the value it carried now arrives as
+   * `clientId=…` *and* is validated against a provider schema, so there is nothing a stub
+   * could do with the string it was handed.
+   *
+   * What makes the removal cheap is asserted here: `args.ts` refuses an unknown flag rather
+   * than ignoring it, and prints this command's usage beside the refusal — so the reader of
+   * a failed `--client-id abc123` is one line away from `clientId=abc123`.
    */
   const config = await scratch(t)
   await machineKnowing(config, { ogun: '/does/not/matter' })
 
-  const set = await ogun(['connect', 'linear', '--app-token', '--project', 'ogun'], { config })
-
-  assert.equal(set.code, 1)
-  assert.match(set.stderr, /--oauth/)
-  assert.ok(!/Unknown option/.test(set.stderr), set.stderr)
+  for (const flag of [
+    ['--oauth'],
+    ['--app-token'],
+    ['--client-id', 'abc123'],
+    ['--client-secret', SECRET],
+  ]) {
+    const set = await ogun(['connect', 'linear', ...flag, '--project', 'ogun'], { config })
+    assert.equal(set.code, 1, flag.join(' '))
+    assert.match(set.stderr, /Unknown option/, flag.join(' '))
+    assert.match(set.stderr, /field=value/, flag.join(' '))
+    assert.ok(!set.stderr.includes(SECRET), 'the parser error quoted the secret')
+  }
   assert.deepEqual(await secretsIn(config), {})
 })
 
@@ -356,30 +404,29 @@ test('a rejected integration is not quoted back, because it may be the credentia
 
 test('two kinds at once are refused, and consent is not a third kind', async (t) => {
   /**
-   * The property: `--oauth --api-key` fails naming both kinds, and `--api-key --consent`
+   * The property: `--app --api-key` fails naming both kinds, and `--api-key --consent`
    * fails with a *different* sentence, because it is a different mistake.
    *
    * Not a preference to be resolved by precedence. Somebody who typed both believes one of
    * those words means something other than what it does, and silently honouring the winner
    * would store a credential of a kind they did not ask for — with a different attribution
-   * in Linear — and tell them it worked.
+   * in the provider — and tell them it worked.
    *
    * The second half is the one this shape exists for. `--consent` is a **modifier inside
-   * the OAuth kind**: it selects the authorization-code grant, implies `--oauth`, and has
-   * no meaning beside an api key, which has nobody to approve it. The previous build made
-   * all three peers, which put a fork in the road where there is none — and then had to
-   * reject `--oauth` on the grounds that two of its three flags were OAuth.
+   * the application kind**: it selects the authorization-code grant, implies `--app`, and
+   * has no meaning beside an api key, which has nobody to approve it. The previous build
+   * made all three peers, which put a fork in the road where there is none.
    */
   const config = await scratch(t)
   await machineKnowing(config, { ogun: '/does/not/matter' })
 
   const kinds = await ogun(
-    ['connect', 'linear', '--api-key', '--oauth', '--project', 'ogun'],
+    ['connect', 'linear', '--api-key', '--app', '--project', 'ogun'],
     { config },
     `${KEY}\n`,
   )
   assert.equal(kinds.code, 1)
-  assert.match(kinds.stderr, /--oauth and --api-key are different kinds/)
+  assert.match(kinds.stderr, /--app and --api-key are different kinds/)
 
   const grant = await ogun(
     ['connect', 'linear', '--api-key', '--consent', '--project', 'ogun'],
@@ -387,28 +434,34 @@ test('two kinds at once are refused, and consent is not a third kind', async (t)
     `${KEY}\n`,
   )
   assert.equal(grant.code, 1)
-  assert.match(grant.stderr, /--consent is an OAuth grant, not a kind/)
+  assert.match(grant.stderr, /--consent is a grant an application obtains, not a kind/)
 
-  // And an application's credentials handed to the kind that has no application.
-  const mixed = await ogun(
-    ['connect', 'linear', '--api-key', '--client-id', 'abc123', '--project', 'ogun'],
+  /**
+   * And an application's *name* handed to the kind that has no application. `--as` and
+   * `--link` are both about the shared `applications` map; an api key is filed under one
+   * project, has no name and cannot be shared, so neither flag has anything to refer to.
+   * This replaces the old `--api-key --client-id` case, which stopped existing when the
+   * credentials became `field=value` — and the fields are refused by `parseFields`, which
+   * says more because it knows the schema.
+   */
+  const named = await ogun(
+    ['connect', 'linear', '--api-key', '--as', 'linear:acme', '--project', 'ogun'],
     { config },
     `${KEY}\n`,
   )
-  assert.equal(mixed.code, 1)
-  assert.match(mixed.stderr, /--api-key takes one key and no application/)
+  assert.equal(named.code, 1)
+  assert.match(named.stderr, /--as and --link are about a stored application/)
 
   assert.deepEqual(await secretsIn(config), {})
 })
 
-test('--consent needs no --oauth beside it, and both together is not an error', async (t) => {
+test('--consent needs no --app beside it, and both together is not an error', async (t) => {
   /**
-   * The property: `--consent` alone reaches the consent flow, and `--oauth --consent` does
+   * The property: `--consent` alone reaches the consent flow, and `--app --consent` does
    * the same thing rather than being refused as two kinds.
    *
-   * That is what makes `--consent` a modifier rather than a peer. `--oauth --consent` was
-   * the clunky spelling the brief asked to be improved on; the improvement is that the
-   * implication runs one way, so the redundant form is accepted and nobody has to type it.
+   * That is what makes `--consent` a modifier rather than a peer: the implication runs one
+   * way, so the redundant form is accepted and nobody has to type it.
    *
    * Both invocations are checked by where they *stop* — the control plane is asked which
    * projects it knows, which only the consent path does.
@@ -420,12 +473,33 @@ test('--consent needs no --oauth beside it, and both together is not an error', 
 
   for (const argv of [
     ['connect', 'linear', '--consent', '--project', 'heirchive-api'],
-    ['connect', 'linear', '--oauth', '--consent', '--project', 'heirchive-api'],
+    ['connect', 'linear', '--app', '--consent', '--project', 'heirchive-api'],
   ]) {
     const set = await ogun(argv, { config, server: server.url }, '')
     assert.equal(set.code, 1, argv.join(' '))
     assert.match(set.stderr, /not a project this control plane knows/, argv.join(' '))
   }
+})
+
+test('--consent is refused for github, where nobody approves anything', async (t) => {
+  /**
+   * The property: a grant a provider does not offer is refused by name, before anything is
+   * collected or any server is asked.
+   *
+   * `--consent` is a browser round trip in which a person approves an application. A
+   * GitHub App authenticating as itself signs a JWT with its private key and exchanges it
+   * for an installation token — there is nobody to ask, and the approval that *did* happen
+   * was whoever installed the App, in GitHub's UI, before Ogun was involved. Accepting the
+   * flag and quietly doing the ordinary thing would be the worse answer: an operator who
+   * typed it believes they are getting something they are not.
+   */
+  const config = await scratch(t)
+  await machineKnowing(config, { ogun: '/does/not/matter' })
+
+  const set = await ogun(['connect', 'github', '--consent', '--project', 'ogun'], { config })
+  assert.equal(set.code, 1)
+  assert.match(set.stderr, /signs a JWT/)
+  assert.match(set.stderr, /Nothing was stored/)
 })
 
 test('a project this machine has never heard of is refused, and nothing is stored', async (t) => {
@@ -653,6 +727,14 @@ test('the default grant refuses to silently replace a consent connection', async
     config,
     JSON.stringify({
       projects: { ogun: '/does/not/matter' },
+      /**
+       * Written in the **old** `oauth[project][provider]` shape on purpose, so this covers
+       * the migration as well as the refusal. A legacy entry has no `method` field — it did
+       * not exist — and defaulting it to `client_credentials` would have let a consent
+       * connection be silently reconnected as an ordinary one: the refusal below defeated
+       * by the migration underneath it. `migrateLegacyOAuth` reads the method off the
+       * grant for exactly this.
+       */
       oauth: {
         ogun: {
           linear: {
@@ -713,38 +795,60 @@ test('--consent refuses an unknown slug before it asks for anything', async (t) 
   assert.deepEqual(server.seen, ['GET /api/projects'])
 })
 
-test('a rotated client secret keeps the registered client id, and a new one does not', async (t) => {
+test('a rotated secret keeps the registered client id, and a new id does not inherit it', async (t) => {
   /**
-   * The property: `--client-secret <new>` on an application already registered here sends
-   * the **stored** client id back with it, and `--client-id <other>` never inherits the
-   * stored secret.
+   * The property: `clientSecret=<new>` on an application this project already has a grant
+   * from sends the **stored** client id back with it, and `clientId=<other>` never inherits
+   * the stored secret.
    *
    * Two positionals could not express a rotation at all — you had to re-paste both, and a
    * value re-pasted is a value re-typed, which is how a trailing space gets into a
-   * credential. Named flags make "the secret changed and nothing else did" sayable, so
+   * credential. Named fields make "the secret changed and nothing else did" sayable, so
    * each half falls back to the store on its own.
    *
-   * The asymmetry is the load-bearing part. A stored client secret belongs to a stored
-   * client id: pairing it with an id the operator just typed would authenticate an
-   * application it was never issued for, and Linear's answer to that names the *client*
-   * rather than the mismatch. So a new id asks for its own secret — which, with stdin a
-   * pipe, is the value on stdin.
+   * The asymmetry is the load-bearing part, and it is now a per-provider fact rather than a
+   * Linear one: a stored secret is reusable only while the identity it is **bound to** is
+   * unchanged (`SECRET_BOUND_TO`). Pairing it with an id the operator just typed would
+   * authenticate an application it was never issued for, and the provider's answer to that
+   * names the *client* rather than the mismatch. So a new id asks for its own secret —
+   * which, with stdin a pipe, is the value on stdin.
    *
-   * Driven through `--consent`, because that is the one shape where the registration
-   * crosses a wire this test can watch. The default grant posts straight to Linear.
+   * Driven through `--consent`, because that is the one shape where the credentials cross a
+   * wire this test can watch. The default grant posts straight to Linear.
    */
   const dir = await box(t)
   const config = join(dir, 'config.json')
+  const callback = 'http://127.0.0.1:1/api/oauth/linear/callback'
   await writeFile(
     config,
     JSON.stringify({
       projects: { ogun: '/does/not/matter' },
-      oauth: {
+      applications: {
+        'linear:acme': {
+          provider: 'linear',
+          method: 'authorization_code',
+          clientId: 'client-1',
+          clientSecret: 'lin_secret_ORIGINALORIGINALORIG',
+          redirectUri: callback,
+        },
+      },
+      /**
+       * The grant is what points this project at the application now — an application is
+       * shared, so there is nothing filed under the project itself. `linkedApplication`
+       * reads the grant to find the credentials, which is why one has to be here for a
+       * rotation to have anything to fall back to.
+       */
+      grants: {
         ogun: {
           linear: {
-            clientId: 'client-1',
-            clientSecret: 'lin_secret_ORIGINALORIGINALORIG',
-            redirectUri: 'http://127.0.0.1:1/api/oauth/linear/callback',
+            app: 'linear:acme',
+            accessToken: 'access-abcdefghijkl',
+            refreshToken: 'refresh-abcdefghijkl',
+            grantType: 'authorization_code',
+            expiresAt: Date.now() + 86_399_000,
+            obtainedAt: Date.now(),
+            scopes: ['read'],
+            actor: 'app',
           },
         },
       },
@@ -754,48 +858,293 @@ test('a rotated client secret keeps the registered client id, and a new one does
 
   const routes = {
     'GET /api/projects': projectsAre('ogun'),
-    'GET /api/oauth/linear': (): [number, unknown] => [
-      200,
-      { redirectUri: 'http://127.0.0.1:1/api/oauth/linear/callback' },
-    ],
-    'PUT /api/oauth/linear/app/ogun': (): [number, unknown] => [200, { ok: true }],
+    'GET /api/oauth/linear': (): [number, unknown] => [200, { redirectUri: callback }],
     'POST /api/oauth/linear/start/ogun': (): [number, unknown] => [
       200,
       {
         authorizeUrl: 'https://linear.app/oauth/authorize?x=1',
-        redirectUri: 'http://127.0.0.1:1/api/oauth/linear/callback',
+        redirectUri: callback,
         scopes: ['read'],
         actor: 'app',
       },
     ],
   }
 
+  /**
+   * The credentials go to `start` now rather than to `PUT …/app/:project`, and that is the
+   * reordering rather than a renamed endpoint: they ride in the server's
+   * `PendingAuthorization` across the browser round trip, so nothing is written until the
+   * authorization comes back. The route that used to register them is still there for the
+   * web UI and no longer writes.
+   */
   const rotated = await stub(t, routes)
   const one = await ogun(
-    ['connect', 'linear', '--consent', '--client-secret', SECRET, '--project', 'ogun'],
+    ['connect', 'linear', '--consent', `clientSecret=${SECRET}`, '--project', 'ogun'],
     { config, server: rotated.url },
     '',
   )
   assert.equal(one.code, 0, one.stderr)
-  assert.deepEqual(rotated.sent['PUT /api/oauth/linear/app/ogun'], {
+  assert.deepEqual(rotated.sent['POST /api/oauth/linear/start/ogun'], {
     clientId: 'client-1',
     clientSecret: SECRET,
   })
 
   const replaced = await stub(t, routes)
   const two = await ogun(
-    ['connect', 'linear', '--consent', '--client-id', 'client-2', '--project', 'ogun'],
+    ['connect', 'linear', '--consent', 'clientId=client-2', '--project', 'ogun'],
     { config, server: replaced.url },
     // stdin is a pipe, so the secret this application needs is read from it rather than
     // taken from the one belonging to client-1.
     `${KEY}\n`,
   )
   assert.equal(two.code, 0, two.stderr)
-  assert.deepEqual(replaced.sent['PUT /api/oauth/linear/app/ogun'], {
+  assert.deepEqual(replaced.sent['POST /api/oauth/linear/start/ogun'], {
     clientId: 'client-2',
     clientSecret: KEY,
   })
   assert.ok(!`${two.stdout}${two.stderr}`.includes('ORIGINAL'), two.stdout)
+})
+
+// ── an application is shared, and a grant is not ──────────────────────────
+
+/**
+ * A machine holding one GitHub App that two projects use, written directly.
+ *
+ * Written rather than connected, because connecting a GitHub App signs a JWT and talks to
+ * `api.github.com` — there is no App and no key here, and `github-app-fixtures.ts` records
+ * that at length. What these tests are about is the store and the surfaces over it, which
+ * need no network.
+ */
+const machineWithASharedApp = (configPath: string): Promise<void> =>
+  writeFile(
+    configPath,
+    JSON.stringify({
+      projects: { 'heirchive-api': '/srv/api', 'heirchive-web': '/srv/web' },
+      applications: {
+        'github:heirchive': {
+          provider: 'github',
+          method: 'private_key_jwt',
+          appId: '1234567',
+          installationId: '98765432',
+          privateKey: '-----BEGIN PRIVATE KEY-----\nSECRETKEYBYTES\n-----END PRIVATE KEY-----',
+        },
+        'github:other-org': {
+          provider: 'github',
+          method: 'private_key_jwt',
+          appId: '7654321',
+          installationId: '11111111',
+          privateKey: '-----BEGIN PRIVATE KEY-----\nIDLEKEYBYTES\n-----END PRIVATE KEY-----',
+        },
+      },
+      grants: {
+        'heirchive-api': {
+          github: {
+            app: 'github:heirchive',
+            accessToken: 'ghs_AAAAAAAAAAAAAAAAAAAA',
+            grantType: 'installation',
+            expiresAt: Date.now() + 36e5,
+            obtainedAt: Date.now(),
+            scopes: ['pull_requests:read'],
+            actor: 'ogun[bot]',
+            account: { id: '42', name: 'Heirchive', urlKey: 'Heirchive' },
+          },
+        },
+        'heirchive-web': {
+          github: {
+            app: 'github:heirchive',
+            accessToken: 'ghs_BBBBBBBBBBBBBBBBBBBB',
+            grantType: 'installation',
+            expiresAt: Date.now() + 36e5,
+            obtainedAt: Date.now(),
+            scopes: ['pull_requests:read'],
+            actor: 'ogun[bot]',
+            account: { id: '42', name: 'Heirchive', urlKey: 'Heirchive' },
+          },
+        },
+      },
+    }),
+    { mode: 0o600 },
+  )
+
+test('a bare --link lists the applications, because that is what you do not know', async (t) => {
+  /**
+   * The property: `--link` with no value is **this command's** error and it **lists the
+   * applications for that provider**, with who is using each.
+   *
+   * Declared as `optional-string` purely so that this is reachable: as a plain `string`
+   * flag the parser answers *"option '--link' argument missing"*, which is correct and
+   * useless. The one thing somebody who typed a bare `--link` does not know is what the
+   * valid values are, and a usage line answers that question with "give me one of them".
+   *
+   * The names are the whole point of a derived name: nobody has to invent or remember one,
+   * so the command has to be able to show them.
+   */
+  const dir = await box(t)
+  const config = join(dir, 'config.json')
+  await machineWithASharedApp(config)
+
+  const bare = await ogun(
+    ['connect', 'github', '--app', '--link', '--project', 'heirchive-api'],
+    { config },
+  )
+  assert.equal(bare.code, 1)
+  assert.match(bare.stderr, /github:heirchive/)
+  assert.match(bare.stderr, /used by heirchive-api, heirchive-web/)
+  assert.match(bare.stderr, /github:other-org/)
+  assert.match(bare.stderr, /used by nothing yet/)
+  // And never the key, from the one error that prints an application's details.
+  assert.ok(!bare.stderr.includes('SECRETKEYBYTES'), bare.stderr)
+
+  // A provider with no applications says so and names the command that registers one,
+  // rather than listing another provider's.
+  const none = await ogun(
+    ['connect', 'linear', '--app', '--link', '--project', 'heirchive-api'],
+    { config },
+  )
+  assert.equal(none.code, 1)
+  assert.match(none.stderr, /there are none/)
+  assert.match(none.stderr, /ogun connect <integration> --app/)
+})
+
+test('--consent and --link together are refused rather than arbitrated', async (t) => {
+  /**
+   * The property: the two ways of getting a token cannot both happen, and the refusal says
+   * what each one would have produced.
+   *
+   * Both resolutions are wrong and in opposite directions. Honouring `--link` mints a
+   * client-credentials token from an application the operator asked to connect *with
+   * consent* — a silent reduction in reach, from what an approver could see to public teams
+   * only, which is the one failure shape with no error anywhere. Honouring `--consent`
+   * ignores the name they typed and starts a browser flow for credentials they did not mean
+   * to re-enter.
+   */
+  const dir = await box(t)
+  const config = join(dir, 'config.json')
+  await machineKnowing(config, { ogun: '/does/not/matter' })
+
+  const both = await ogun(
+    ['connect', 'linear', '--consent', '--link', 'linear:acme', '--project', 'ogun'],
+    { config },
+  )
+  assert.equal(both.code, 1)
+  assert.match(both.stderr, /two different ways to get a token/)
+  assert.match(both.stderr, /public teams only/)
+})
+
+test('--link and typed fields together are refused rather than arbitrated', async (t) => {
+  /**
+   * The property: `--link <name> clientId=…` fails naming both ways forward.
+   *
+   * Not a preference to resolve. `--link` means "use the credentials already here" and a
+   * field means "here are credentials"; honouring either silently would store something
+   * other than what was asked for, under a name the operator chose for the other thing.
+   */
+  const dir = await box(t)
+  const config = join(dir, 'config.json')
+  await machineWithASharedApp(config)
+
+  const both = await ogun(
+    ['connect', 'github', '--link', 'github:heirchive', 'appId=9', '--project', 'heirchive-api'],
+    { config },
+  )
+  assert.equal(both.code, 1)
+  assert.match(both.stderr, /there is nothing to type/)
+  assert.match(both.stderr, /--link <name>/)
+})
+
+test('a private key path that cannot be read fails naming the path and nothing of the file', async (t) => {
+  /**
+   * The property: a PEM field with **no newline** is read as a path, and an unreadable one
+   * fails with the path named, the rule stated, and nothing stored.
+   *
+   * The rule has to not read as magic, so the message carries its own justification: a PEM
+   * always has newlines and a path never does, which makes the two distinguishable with
+   * certainty rather than by heuristic. Somebody who mistyped a filename gets told what
+   * the field accepts in the same breath.
+   *
+   * It fails **before** any network call, which is also why this is testable at all: there
+   * is no GitHub App here, so every path that reaches `api.github.com` is out of reach of
+   * this suite.
+   */
+  const dir = await box(t)
+  const config = join(dir, 'config.json')
+  await machineKnowing(config, { 'heirchive-api': '/srv/api' })
+
+  const missing = await ogun(
+    [
+      'connect',
+      'github',
+      'appId=1234567',
+      'installationId=98765432',
+      `privateKey=${join(dir, 'not-here.pem')}`,
+      '--project',
+      'heirchive-api',
+    ],
+    { config },
+  )
+  assert.equal(missing.code, 1)
+  assert.match(missing.stderr, /not-here\.pem/)
+  assert.match(missing.stderr, /ENOENT/)
+  assert.match(missing.stderr, /a PEM always has newlines\n\s+and a path never does/)
+  assert.match(missing.stderr, /Nothing was stored/)
+
+  // An empty file is a path that reads and holds no key, which is its own sentence: "it
+  // read fine and there is nothing in it" is not the same problem as "I could not read it".
+  const empty = join(dir, 'empty.pem')
+  await writeFile(empty, '')
+  const blank = await ogun(
+    [
+      'connect',
+      'github',
+      'appId=1234567',
+      'installationId=98765432',
+      `privateKey=${empty}`,
+      '--project',
+      'heirchive-api',
+    ],
+    { config },
+  )
+  assert.equal(blank.code, 1)
+  assert.match(blank.stderr, /is empty, so there is no key in it/)
+})
+
+test('disconnecting a shared app keeps it and names who is still using it', async (t) => {
+  /**
+   * The property: `ogun disconnect github` removes this project's token, **leaves the App**
+   * because another project holds a grant from it, and says which project that is.
+   *
+   * The cascade is the thing being refused: one App serves every project in the
+   * organisation, so taking its private key would take them all offline to satisfy one
+   * `disconnect` typed in the wrong directory. And GitHub shows a private key once, so a
+   * cascade here is unrecoverable rather than inconvenient.
+   *
+   * The revoke line is the other half and it is a fact about the provider rather than
+   * about the credential: **GitHub has no endpoint that ends an installation token early.**
+   * Reporting "the provider could not be told" — which is what the Linear path says when a
+   * revoke fails — would be a warning about a request that was never going to be made.
+   */
+  const dir = await box(t)
+  const config = join(dir, 'config.json')
+  await machineWithASharedApp(config)
+
+  const first = await ogun(['disconnect', 'github', '--project', 'heirchive-api'], { config })
+  assert.equal(first.code, 0, first.stderr)
+  assert.match(first.stdout, /heirchive-api disconnected from github/)
+  assert.match(first.stdout, /still registered — heirchive-web is still using it/)
+  assert.match(first.stdout, /no endpoint for/)
+
+  // And the last one takes it, with the sentence that matters about a GitHub key.
+  const last = await ogun(['disconnect', 'github', '--project', 'heirchive-web'], { config })
+  assert.equal(last.code, 0, last.stderr)
+  assert.match(last.stdout, /the application went with it/)
+  assert.match(last.stdout, /GitHub shows one only once/)
+
+  const file = JSON.parse(await readFile(config, 'utf8')) as {
+    applications?: Record<string, unknown>
+    grants?: Record<string, unknown>
+  }
+  assert.deepEqual(Object.keys(file.grants ?? {}), [])
+  assert.deepEqual(Object.keys(file.applications ?? {}), ['github:other-org'])
 })
 
 // ── the listing ───────────────────────────────────────────────────────────
@@ -832,6 +1181,51 @@ test('connect list is the machine inventory and does not narrow to the directory
   // integration name.
   const filtered = await ogun(['connect', 'list', '--project', 'nobody'], { config }, '', elsewhere)
   assert.match(filtered.stdout, /nobody is not connected/)
+})
+
+test('connect list has an applications table, says who shares each, and flags idle ones', async (t) => {
+  /**
+   * The property: the listing has **two tables**, because there are two kinds of thing —
+   * and a GitHub credential appears in it at all, which it could not before.
+   *
+   * One table keyed by project could only show a shared application by repeating it per
+   * project, so the day somebody rotated one it would have shown rows that disagreed with
+   * nothing to say which one a poll used. The applications table says the name (which is
+   * the handle `--link` takes), the method (recorded rather than inferred), the identifiers
+   * that are **not** secrets, and who is using it.
+   *
+   * The idle line is the one that earns the section. An application no project holds a
+   * grant from is a private key on this disk that nothing reads — reachable through
+   * `disconnect --keep-application` for the last project using it — and it is the exact
+   * shape this repository has one sentence about. Nothing else would ever mention it again.
+   */
+  const dir = await box(t)
+  const config = join(dir, 'config.json')
+  await machineWithASharedApp(config)
+
+  const listed = await ogun(['connect', 'list'], { config })
+  assert.equal(listed.code, 0, listed.stderr)
+
+  // The applications table: name, provider, method, non-secret identifiers, and users.
+  assert.match(listed.stdout, /APPLICATION/)
+  assert.match(listed.stdout, /github:heirchive/)
+  assert.match(listed.stdout, /private_key_jwt/)
+  assert.match(listed.stdout, /app 1234567, installation 98765432/)
+  assert.match(listed.stdout, /heirchive-api, heirchive-web/)
+
+  // The per-project rows, with the application each one goes THROUGH.
+  assert.match(listed.stdout, /THROUGH/)
+  assert.match(listed.stdout, /app install/)
+
+  // The idle application, called out by name.
+  assert.match(listed.stdout, /github:other-org is used by no project/)
+  assert.match(listed.stdout, /--app --link <name>/)
+
+  // And neither key, from either table. There is no field on the types this reads that one
+  // would fit in, which is structural rather than remembered.
+  for (const secret of ['SECRETKEYBYTES', 'IDLEKEYBYTES', 'ghs_AAAA', 'ghs_BBBB']) {
+    assert.ok(!listed.stdout.includes(secret), `the listing carried ${secret}`)
+  }
 })
 
 test('connect list omits secrets that are not integrations, and says how many', async (t) => {

@@ -1,6 +1,11 @@
 import { strict as assert } from 'node:assert'
 import { test } from 'node:test'
-import { LinearOAuthError, sealSecret, type OAuthGrant, type ProjectOAuth } from '@ogun/core'
+import {
+  LinearOAuthError,
+  sealSecret,
+  type Grant,
+  type StoredApplication,
+} from '@ogun/core'
 import { usableGrant } from '../src/foreman/linear-grant.ts'
 
 /**
@@ -14,8 +19,14 @@ import { usableGrant } from '../src/foreman/linear-grant.ts'
 
 const HOUR = 60 * 60 * 1000
 
-const grantExpiring = (inMs: number): OAuthGrant => ({
-  clientId: 'client-1',
+const grantExpiring = (inMs: number): Grant => ({
+  /**
+   * The grant names the application it came from, and the renewal reads it by that name.
+   * That is what the `applications`/`grants` split bought here: one Linear application can
+   * serve five projects, so a renewal for one of them has to read the credential from the
+   * single place it is stored rather than from a per-project copy that could have drifted.
+   */
+  app: 'linear:acme',
   access: sealSecret('access-old'),
   refresh: sealSecret('refresh-old'),
   grantType: 'authorization_code',
@@ -23,22 +34,24 @@ const grantExpiring = (inMs: number): OAuthGrant => ({
   obtainedAt: Date.now() - 23 * HOUR,
   scopes: ['read'],
   actor: 'app',
-  workspace: { id: 'org-1', name: 'Acme', urlKey: 'acme' },
+  account: { id: 'org-1', name: 'Acme', urlKey: 'acme' },
 })
 
 /** The default grant: no refresh token, because renewal is asking again. */
-const appGrantExpiring = (inMs: number): OAuthGrant => {
+const appGrantExpiring = (inMs: number): Grant => {
   const { refresh: _none, ...rest } = grantExpiring(inMs)
   return { ...rest, grantType: 'client_credentials' }
 }
 
-const registered: ProjectOAuth = {
+const registered: StoredApplication = {
   state: 'present',
   app: {
+    name: 'linear:acme',
+    provider: 'linear',
+    method: 'client_credentials',
     clientId: 'client-1',
     clientSecret: sealSecret('lin_secret_abcdefgh'),
     redirectUri: 'http://localhost:7777/api/oauth/linear/callback',
-    grant: undefined,
   },
 }
 
@@ -260,23 +273,78 @@ test('two polls arriving together produce one refresh, not two', async () => {
 })
 
 /**
- * The property: a grant with no application behind it says so, rather than reporting an
- * expired token.
+ * The property: a grant whose application is not usable says **which** application and
+ * **why**, rather than reporting an expired token.
  *
- * Only reachable by hand-editing config.json, which §4.5 says happens — the write paths
- * refuse to create it. The fix is to register the application, and reporting it as an
- * expiry problem sends somebody to reconnect an application that is not there.
+ * Only reachable by hand-editing config.json, which §4.5 says happens — `storeGrant`
+ * refuses to write a grant naming an application that is not there, and `clearApplication`
+ * refuses to remove one a grant still points at. The fix is to register the application,
+ * and reporting it as an expiry problem sends somebody to reconnect an application that is
+ * not there.
+ *
+ * The name is in the message because an application is shared now: "the application is
+ * gone" is not an answer when the machine holds four, and the one that is missing is the
+ * only thing the operator can act on.
+ *
+ * The wrong-provider case is the one the split added. A `grants.ogun.linear` entry naming a
+ * GitHub application is a hand-edit, and falling through to `app.app.clientId` on it would
+ * be a `undefined` client id in a token request — a 400 from Linear naming the client,
+ * which names neither the real fault nor the fix.
  */
-test('a grant whose application has been hand-removed names that, not the expiry', async () => {
-  const result = await usableGrant(
+test('a grant whose application is not usable names which one, and why', async () => {
+  const absent = await usableGrant(
     'ogun',
     'linear',
     grantExpiring(-1 * HOUR),
     deps({ readApp: async () => ({ state: 'absent' }) }),
   )
+  assert.equal(absent.state, 'refused')
+  assert.match(absent.state === 'refused' ? absent.detail : '', /"linear:acme": absent/)
+
+  const wrongProvider = await usableGrant(
+    'ogun',
+    'linear',
+    grantExpiring(-1 * HOUR),
+    deps({
+      readApp: async () => ({
+        state: 'present',
+        app: {
+          name: 'linear:acme',
+          provider: 'github',
+          method: 'private_key_jwt',
+          appId: '1',
+          installationId: '2',
+          privateKey: sealSecret('k'),
+        },
+      }),
+    }),
+  )
+  assert.equal(wrongProvider.state, 'refused')
+  assert.match(
+    wrongProvider.state === 'refused' ? wrongProvider.detail : '',
+    /it is a github application/,
+  )
+})
+
+/**
+ * The property: a grant type Linear does not issue is **refused**, not sent down whichever
+ * branch happens to be the `else`.
+ *
+ * `Grant['grantType']` stopped being a Linear-only set when GitHub Apps landed, and the
+ * branch below it is a two-way choice between Linear's two grants. An `installation` entry
+ * filed under `grants.<project>.linear` is a hand-edit, and falling through to the refresh
+ * arm would spend an empty refresh token and report whatever Linear said about it — a
+ * message naming neither the real problem nor the fix.
+ */
+test('a grant type linear does not issue is refused rather than guessed at', async () => {
+  const result = await usableGrant(
+    'ogun',
+    'linear',
+    { ...appGrantExpiring(-1 * HOUR), grantType: 'installation' },
+    deps(),
+  )
   assert.equal(result.state, 'refused')
-  if (result.state !== 'refused') return
-  assert.match(result.detail, /no application behind it/)
+  assert.match(result.state === 'refused' ? result.detail : '', /installation/)
 })
 
 /**
@@ -336,8 +404,8 @@ test('the grant type decides the renewal, rather than the presence of a refresh 
  * The property: what gets **written** after a client-credentials renewal has no refresh
  * token in it, and still says which grant it came from.
  *
- * `storeOAuthGrant` is where a renewal turns into the thing the next process reads, and the
- * shape it writes is the shape `parseOAuthApp` will judge. Writing a `grantType` of
+ * `storeGrant` is where a renewal turns into the thing the next process reads, and the
+ * shape it writes is the shape `parseGrant` will judge. Writing a `grantType` of
  * `authorization_code` here — by carrying the old value forward instead of taking the new
  * one — would produce an entry that is `malformed` on the next read, because it would claim
  * to be a rotating grant with nothing to rotate. A connection that works until the process
@@ -362,7 +430,9 @@ test('a renewed app token is written with no refresh token and its own grant typ
   assert.equal(written?.accessToken, 'access-reissued')
   // Carried forward rather than re-fetched: a renewal cannot change which workspace the
   // grant is in, and re-running `identify` would be a GraphQL request a poll does not need.
-  assert.deepEqual(written?.workspace, { id: 'org-1', name: 'Acme', urlKey: 'acme' })
+  assert.deepEqual(written?.account, { id: 'org-1', name: 'Acme', urlKey: 'acme' })
+  // And it still names the application, so the *next* renewal can find the credential.
+  assert.equal(written?.app, 'linear:acme')
 })
 
 /**

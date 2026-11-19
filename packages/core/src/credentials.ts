@@ -162,20 +162,41 @@ export function describeGrant(
     { kind: 'at', expiresAt },
     { now, horizonMs: GRANT_REFRESH_HORIZON_MS },
   )
+  /**
+   * The word is `grant`, and it was `oauth`.
+   *
+   * It stopped being true of every caller. A GitHub App's installation token is not an
+   * OAuth grant of any kind — it is a JWT signed with a private key, exchanged for a token
+   * — which is the same correction that renamed `ogun connect --oauth` to `--app` and made
+   * `Application` a per-provider union. A status line that says `oauth` about it is wrong
+   * in the one place an operator looks to find out what they are connected *as*.
+   *
+   * `grant` is true of all three — a token with an expiry, obtained from an application —
+   * and it still distinguishes this from a personal key, which is the only thing the word
+   * was ever carrying. Which *kind* of grant is the `VIA` column in `ogun connect list`
+   * and `doctor`'s own sentence, both of which say it per provider.
+   */
   switch (health.state) {
     case 'valid':
-      return { ok: true, detail: `oauth, ${humanDuration(health.msRemaining)} left` }
+      return { ok: true, detail: `grant, ${humanDuration(health.msRemaining)} left` }
     case 'expiring':
       return {
         ok: true,
-        detail: `oauth, ${humanDuration(health.msRemaining)} left — the next poll renews it`,
+        detail: `grant, ${humanDuration(health.msRemaining)} left — the next poll renews it`,
       }
     default:
       return {
         ok: true,
+        /**
+         * "the next poll renews it" and **not** "from the refresh token", which this said
+         * and which was only ever true of one of the three grants. A `client_credentials`
+         * token is renewed by asking again with the client id and secret, and an
+         * `installation` token by signing a fresh JWT; neither has a refresh token, so
+         * naming one sends an operator looking for a field that is not there.
+         */
         detail:
-          `oauth, expired ${humanDuration(health.state === 'expired' ? health.msElapsed : 0)} ` +
-          'ago — the next poll renews it from the refresh token',
+          `grant, expired ${humanDuration(health.state === 'expired' ? health.msElapsed : 0)} ` +
+          'ago — the next poll renews it',
       }
   }
 }

@@ -421,15 +421,15 @@ test('the gate is about a value, so a first set and a blank entry pass it', asyn
   assert.match(eager.stdout, /brand-new stored for ogun/)
 })
 
-test('both doors onto the row are gated identically, and --oauth is exempt on purpose', async (t) => {
+test('both doors onto the row are gated identically, and --app is exempt on purpose', async (t) => {
   /**
    * The property: `ogun connect linear --api-key` gets the same refusal `ogun secret set
-   * linear` gets, from the same function — and `--replace` is refused beside `--oauth`,
+   * linear` gets, from the same function — and `--replace` is refused beside `--app`,
    * where there is no stored key to destroy.
    *
    * A rule enforced at one of two doors is not a rule, and this is the one place two
-   * commands the same operator runs could disagree about destroying a credential. The OAuth
-   * exemption is the line the rule is drawn on: a reconnect spends a client id and secret
+   * commands the same operator runs could disagree about destroying a credential. The
+   * application exemption is the line the rule is drawn on: a reconnect spends credentials
    * that stay registered in the provider and replaces a token that was going to expire
    * anyway, so gating it would put a confirmation in front of the repair for a connection
    * that has just lapsed.
