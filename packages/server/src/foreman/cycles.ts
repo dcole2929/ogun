@@ -114,7 +114,7 @@ export async function startCycleRun(
    */
   const { policies } = await projectPolicies(db, cycle.projectId)
 
-  return db.transaction(async (tx) => {
+  const created = await db.transaction(async (tx) => {
     const [cycleRun] = await tx
       .insert(cycleRuns)
       .values({
@@ -233,6 +233,30 @@ export async function startCycleRun(
 
     return { cycleRunId: cycleRun.id, jobIds }
   })
+
+  /**
+   * The sweep that `finalize` does after a job ends, done once here for the jobs that
+   * ended before they began.
+   *
+   * Admission runs above, and a node it refuses is written straight to `skipped` — a
+   * terminal state, reached without any job ever finishing. `releaseDependents` is called
+   * from exactly one place, `finalizeRun`, and that place is only reached by a job that
+   * *ran*. So a cycle whose entry node was refused left every node behind it on `blocked`
+   * with nothing in the system that would ever look at them again, and the cycle run
+   * itself on `running` with no end. That is what the three oldest stuck runs on this
+   * machine are: September, a credential that had lapsed, `scope` refused at admission,
+   * and `plan` waiting on it ever since.
+   *
+   * Outside the transaction deliberately. These two read and write the same rows the
+   * transaction just created, and they are idempotent — re-running them on an already
+   * swept cycle moves nothing — so the cost of doing them after the commit is a window in
+   * which a refused cycle looks briefly unresolved, against holding a write transaction
+   * open across a second graph walk. A crash inside that window leaves exactly the state
+   * this function exists to repair, which the boot-time reconciliation then picks up.
+   */
+  await releaseDependents(db, created.cycleRunId)
+  await finalizeCycleIfDone(db, created.cycleRunId)
+  return created
 }
 
 /**
@@ -271,11 +295,54 @@ async function declinedNodes(db: Db, cycleRunId: string): Promise<Set<string>> {
  * draft pull request with the decline sitting in the ledger saying it should not exist.
  * Nobody writing that config would see the bug in it.
  */
+/**
+ * **To a fixed point, because one pass only ever resolves one layer.**
+ *
+ * `releasePass` reads the jobs table once and then walks that snapshot, so a node whose
+ * dependency the same pass has just marked terminal still looks blocked to it. With two
+ * nodes nothing notices. With three it strands the tail every time, and the shape it
+ * strands in is the worst one available: `implement` sitting on `blocked` forever, which
+ * the Runs page renders as "waiting on a dependency" — the same sentence it shows for a
+ * job that is about to run.
+ *
+ * Found in production on a ticket pipeline. `scope` declined a ticket, the pass released
+ * from `scope` and correctly skipped `plan`, and `implement` — one edge further out —
+ * was never looked at again, because the only thing that calls this is a *job finishing*
+ * and no job was ever going to finish. Eleven jobs and twenty-seven cycle runs had
+ * accumulated like that, the oldest from two months earlier, every one of them reported
+ * as still running.
+ *
+ * The bound is the job count rather than `while (changed)`: each pass moves at least one
+ * job out of `blocked` or stops, and a graph has finitely many nodes, so anything beyond
+ * that many passes means a pass is reporting work it did not do. Looping forever on that
+ * would hang the request that finalized a job; stopping leaves the cycle in exactly the
+ * state this function was called to fix, which is at least the state it was already in.
+ */
 export async function releaseDependents(db: Db, cycleRunId: string): Promise<string[]> {
+  const released: string[] = []
+  const bound = await db.$count(jobs, eq(jobs.cycleRunId, cycleRunId))
+  for (let pass = 0; pass < bound; pass++) {
+    const moved = await releasePass(db, cycleRunId)
+    released.push(...moved.queued)
+    if (!moved.queued.length && !moved.skipped.length) break
+  }
+  return released
+}
+
+/**
+ * One walk of the graph: every blocked job whose dependencies have all gone terminal is
+ * either queued or skipped. Returns both, because the caller needs "did anything move" to
+ * decide whether to walk again and "what was queued" to hand back to its own caller.
+ */
+async function releasePass(
+  db: Db,
+  cycleRunId: string,
+): Promise<{ queued: string[]; skipped: string[] }> {
+  const skipped: string[] = []
   const all = await db.select().from(jobs).where(eq(jobs.cycleRunId, cycleRunId))
   const byNode = new Map(all.map((j) => [j.nodeKey, j]))
   const cycleRun = await db.query.cycleRuns.findFirst({ where: eq(cycleRuns.id, cycleRunId) })
-  if (!cycleRun) return []
+  if (!cycleRun) return { queued: [], skipped: [] }
   /**
    * The run's own frozen graph, not the `cycles` row.
    *
@@ -304,6 +371,7 @@ export async function releaseDependents(db: Db, cycleRunId: string): Promise<str
         .update(jobs)
         .set({ state: 'skipped' })
         .where(eq(jobs.id, job.id))
+      skipped.push(job.id)
       await markCoverage(db, cycleRunId, job, {
         // `blocked` in its narrow sense: a dependency in this cycle did not succeed.
         outcome: 'blocked',
@@ -324,7 +392,7 @@ export async function releaseDependents(db: Db, cycleRunId: string): Promise<str
     await db.update(jobs).set({ state: 'queued' }).where(eq(jobs.id, job.id))
     released.push(job.id)
   }
-  return released
+  return { queued: released, skipped }
 }
 
 /**
