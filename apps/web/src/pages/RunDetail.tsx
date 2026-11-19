@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Link, useParams } from 'react-router'
-import { api, type RunDetail, type RunEventRow } from '../api.ts'
+import { api, isInFlight, type RunDetail, type RunEventRow } from '../api.ts'
 import { duration, Empty, Page, Pill, Severity, when } from '../ui.tsx'
 
 export function RunDetailPage() {
@@ -10,16 +10,16 @@ export function RunDetailPage() {
     queryKey: ['run', id],
     queryFn: () => api.run(id),
     // The SSE stream owns updates once it attaches; polling on top would double-render.
-    refetchInterval: (q) => (q.state.data?.run.endedAt ? false : 4000),
+    refetchInterval: (q) => (isInFlight(q.state.data) ? 4000 : false),
   })
 
-  const live = useLiveEvents(id, data?.run.endedAt === null || data?.run.endedAt === undefined)
+  const live = useLiveEvents(id, isInFlight(data))
   const events = useMergedEvents(data?.events ?? [], live)
 
   if (error) return <p className="error">{String(error)}</p>
   if (!data) return <Empty>loading…</Empty>
 
-  const running = !data.run.endedAt
+  const running = isInFlight(data)
 
   return (
     <Page
@@ -109,15 +109,39 @@ export function RunDetailPage() {
  */
 function Produced({ detail }: { detail: RunDetail }) {
   const { promoted, changes, findings, suppressed } = detail.produced
-  const running = !detail.run.endedAt
+  const running = isInFlight(detail)
   const outcome = detail.run.outcome
-
-  if (running) return null
 
   return (
     <>
       <h2>Result</h2>
       <div className="card" style={{ marginBottom: 20 }}>
+        {/*
+          A run in flight. This was `if (running) return null` — no Result heading and no
+          card, so the page you land on after pressing run is metadata and a timeline with
+          a gap where the answer goes, and the section appears from nowhere at the end.
+          There is no partial result to show and that is the point worth saying: findings,
+          the patch, the coverage row and the outcome are one transaction written when the
+          run reports (§5.1), precisely so that a crash cannot leave half of them. So this
+          says *why* it is empty, which is a fact about the system, rather than leaving an
+          emptiness that reads as "this run produced nothing".
+
+          Anything already on the page is still rendered below — artifacts upload as the
+          run goes, and a run whose report landed while `endedAt` was still being written
+          should show what it reported rather than this sentence and nothing else.
+        */}
+        {running && (
+          <p style={{ marginTop: 0, fontSize: 13 }}>
+            <span className="live">still running</span>
+            <span className="muted" style={{ marginLeft: 8 }}>
+              — started {when(detail.run.startedAt)}. Nothing is recorded as produced yet:
+              the findings, the patch and the outcome are written in one transaction when
+              this run reports, so this stays empty until it finishes. The timeline below
+              is live.
+            </span>
+          </p>
+        )}
+
         {/* The failure reasons first, since that is what you opened this page for when
             something went wrong. */}
         {outcome === 'error' && (

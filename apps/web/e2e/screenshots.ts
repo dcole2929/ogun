@@ -1,6 +1,6 @@
 import { mkdir, writeFile } from 'node:fs/promises'
 import { open, settle } from './harness.ts'
-import { ALL_CLEAR, LINEAR_OPTIONS_UNREACHABLE } from './fixtures.ts'
+import { ALL_CLEAR, LINEAR_OPTIONS_UNREACHABLE, RUNS } from './fixtures.ts'
 
 /**
  * The UI, photographed — one file per state.
@@ -42,7 +42,27 @@ type Shot = {
   path: string
   status?: unknown
   /** `unreachable` shows the editor with its Linear suggestions missing. */
-  linearOptions?: 'unreachable' 
+  linearOptions?: 'unreachable'
+  /**
+   * An ISO instant to pin the browser's clock to before the page loads.
+   *
+   * The note above says no captured fixture may render a relative time, and for every
+   * shot until now that was free — none of those pages shows one. The Runs page is built
+   * out of them: "3h ago", "ran for 7m", a clock counting up on an in-flight row. Without
+   * a fixed now, this file's own stability rule would forbid photographing the page this
+   * whole change is about.
+   *
+   * Pinning the clock rather than rewriting the fixtures in absolute time, because the
+   * relative rendering IS the thing under review — a shot of absolute timestamps would be
+   * a picture of a page nobody uses.
+   */
+  now?: string
+  /**
+   * Extra route bodies for this shot. `ROUTES['/api/runs']` is deliberately empty so that
+   * every other page's shot is unaffected by a list full of relative times; the three
+   * shots that are *about* that list opt into the fixture here.
+   */
+  routes?: Record<string, unknown> 
   /** Anything to do before the shutter: open the panel, drag the handle. */
   act?: (page: Awaited<ReturnType<typeof open>>['page']) => Promise<void>
   clip?: { x: number; y: number; width: number; height: number }
@@ -127,6 +147,42 @@ const SHOTS: Shot[] = [
     },
   },
   {
+    /**
+     * The list this change is about: a chevron per row saying the rows go somewhere, the
+     * pull request a run produced readable without opening it, and a run still in flight
+     * reading as in flight rather than as a blank outcome.
+     */
+    name: 'runs',
+    path: '/runs',
+    now: '2026-10-16T15:00:00.000Z',
+    routes: { '/api/runs': RUNS },
+  },
+  {
+    /** The status key open, which is the answer to "what does declined mean". */
+    name: 'runs-status-key',
+    path: '/runs',
+    now: '2026-10-16T15:00:00.000Z',
+    routes: { '/api/runs': RUNS },
+    act: async (page) => {
+      await page.click('.key button')
+      await page.waitForSelector('.key-list')
+    },
+  },
+  {
+    /**
+     * A waiting job, expanded. The old table said "waiting on a dependency" for every
+     * row in it; this says which node, what state it is in, and what the job needs.
+     */
+    name: 'runs-waiting',
+    path: '/runs',
+    now: '2026-10-16T15:00:00.000Z',
+    routes: { '/api/runs': RUNS },
+    act: async (page) => {
+      await page.click('.chev-button')
+      await page.waitForSelector('.panel-row')
+    },
+  },
+  {
     name: 'skills-scoped',
     path: '/skills',
     act: async (page) => {
@@ -159,7 +215,8 @@ export async function capture(): Promise<string[]> {
       ...(shot.linearOptions === 'unreachable'
         ? { '/api/linear-options': LINEAR_OPTIONS_UNREACHABLE }
         : {}),
-    })
+      ...(shot.routes ?? {}),
+    }, shot.now)
     try {
       // No animation, no blinking caret: both are pixels that differ by when the shutter
       // happened to fall rather than by anything anyone changed.

@@ -2,7 +2,7 @@ import { createServer, type Server } from 'node:http'
 import { readFile } from 'node:fs/promises'
 import { extname, join, normalize } from 'node:path'
 import { chromium, type Browser, type Page } from 'playwright'
-import { CYCLES, LINEAR_OPTIONS, ROUTES, SKILLS, SOURCES, WORKERS } from './fixtures.ts'
+import { CYCLES, LINEAR_OPTIONS, ROUTES, RUN_DETAIL, SKILLS, SOURCES, WORKERS } from './fixtures.ts'
 
 const DIST = new URL('../dist/', import.meta.url).pathname
 
@@ -82,11 +82,32 @@ export type Harness = {
 export async function open(
   path = '/',
   overrides: Record<string, unknown> = {},
+  /**
+   * An ISO instant to pin the page's clock to, for a shot of a surface built out of
+   * relative times. Applied with `addInitScript` so it is installed before any of the
+   * bundle runs — a page that has already read the real `Date.now()` once will keep
+   * rendering from it.
+   */
+  now?: string,
 ): Promise<Harness> {
   const site = await serveDist()
   const browser: Browser = await chromium.launch()
   const context = await browser.newContext({ viewport: { width: 1280, height: 800 } })
   const page = await context.newPage()
+
+  if (now !== undefined) {
+    await page.addInitScript(`{
+      const fixed = ${JSON.stringify(new Date(now).getTime())}
+      const Real = Date
+      // Only the no-argument constructor and Date.now() are pinned; every other call is
+      // still the real one, so a fixture's own ISO strings parse as themselves.
+      class Frozen extends Real {
+        constructor(...args) { super(...(args.length ? args : [fixed])) }
+        static now() { return fixed }
+      }
+      globalThis.Date = Frozen
+    }`)
+  }
 
   await page.route('**/api/**', async (route) => {
     const url = new URL(route.request().url())
@@ -101,6 +122,16 @@ export async function open(
     if (project && url.pathname === '/api/workers') {
       body = { ...WORKERS, workers: WORKERS.workers.filter((w) => w.project.slug === project) }
     }
+
+    /**
+     * One run, by id — so a test that clicks a row lands on a page that renders.
+     *
+     * `notes` is excluded by name because `/api/runs/notes` is a *list* route that this
+     * pattern would otherwise swallow, handing the coverage page one run where it expects
+     * `{ notes: [] }`. The real server has the same collision and solves it the same way:
+     * `GET /notes` is registered above `GET /:id` in `routes/runs.ts`.
+     */
+    if (/\/api\/runs\/(?!notes$)[^/]+$/.test(url.pathname)) body = overrides[url.pathname] ?? RUN_DETAIL
 
     // Per-project paths, which carry the slug in the path rather than the query.
     if (/\/api\/projects\/[^/]+\/sources$/.test(url.pathname)) body = SOURCES

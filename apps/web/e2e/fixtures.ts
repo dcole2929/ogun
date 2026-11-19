@@ -179,6 +179,126 @@ export const CYCLES = {
   ],
 }
 
+/**
+ * The Runs list, with rows in it.
+ *
+ * **Deliberately not in `ROUTES`.** Every fixture reachable by default is one the
+ * screenshot pass can photograph, and `screenshots.ts` is explicit that nothing it
+ * captures may render a relative time — "3 days ago" is a pixel difference every morning,
+ * and a screenshot that changes on its own is a diff nobody reads. These rows carry
+ * timestamps, so they are handed to the tests that ask for them and `/api/runs` stays
+ * empty for everybody else.
+ *
+ * One finished run, one in flight, one `dispatched` with a pull request, and one job
+ * blocked behind a dependency that has already finished — the four shapes the list has to
+ * tell apart.
+ */
+const run = (
+  id: string,
+  over: Record<string, unknown> = {},
+  produced: Record<string, unknown> = {},
+  job: Record<string, unknown> = {},
+) => ({
+  run: {
+    id,
+    outcome: 'approved',
+    detail: null,
+    notes: null,
+    startedAt: '2026-10-16T12:00:00.000Z',
+    endedAt: '2026-10-16T12:07:00.000Z',
+    durationMs: 420_000,
+    rounds: 1,
+    repoSha: 'ab12cd34ef56ab78',
+    runtime: 'claude',
+    model: 'sonnet',
+    inputTokens: 4100,
+    outputTokens: 900,
+    ...over,
+  },
+  job: { id: `job-${id}`, nodeKey: 'review', state: 'succeeded', cycleRunId: 'cr-1', ...job },
+  worker: { id: 'w-1', name: 'adversarial-review' },
+  project: { slug: 'ogun' },
+  produced: { findings: 2, changed: false, branch: null, prUrl: null, ...produced },
+})
+
+export const RUNS = {
+  runs: [
+    // `job.state` matters here: a run with no `endedAt` whose job has been swept to
+    // `failed` is abandoned, not in flight, and the list has to tell them apart.
+    run(
+      'run-inflight',
+      { outcome: null, endedAt: null, durationMs: null, repoSha: null },
+      {},
+      { state: 'running' },
+    ),
+    run(
+      'run-dispatched',
+      { outcome: 'dispatched' },
+      {
+        changed: true,
+        branch: 'ogun/implement/3f2a9c',
+        prUrl: 'https://github.com/Heirchive/heirchive-api/pull/412',
+      },
+    ),
+    /**
+     * The three the taxonomy exists to keep apart, all on one page: a worker that read the
+     * work and said no, a gate that refused the output, and a crash. They are four words
+     * for "it didn't work" to anybody who has not read `outcomes.ts`, which is what the
+     * status key is for — so the fixture has to contain them for the key to be testable.
+     */
+    run('run-declined', {
+      outcome: 'declined',
+      detail: 'the ticket names no acceptance criteria, so there is nothing to build against',
+    }),
+    run('run-rejected', { outcome: 'changes-requested' }),
+    run('run-error', { outcome: 'error', detail: 'the container exited 137' }),
+    run('run-approved'),
+  ],
+  pending: [
+    {
+      job: {
+        id: 'job-blocked',
+        nodeKey: 'implement',
+        state: 'blocked',
+        createdAt: '2026-10-16T11:00:00.000Z',
+        cycleRunId: 'cr-9',
+        dependsOn: ['plan'],
+      },
+      requires: ['claude', 'docker'],
+      cycle: { name: 'ticket' },
+      dependencies: [{ nodeKey: 'plan', state: 'skipped', terminal: true }],
+      worker: { id: 'w-2', name: 'implement' },
+      project: { slug: 'ogun' },
+      reach: 'claimable',
+      missing: [],
+    },
+  ],
+  onlineRunners: 1,
+  liveRunners: 1,
+}
+
+/**
+ * One run as `/api/runs/:id` returns it — so a row click lands on a page that renders
+ * rather than on an error, which is the half of "the row is clickable" that matters.
+ *
+ * Finished, not in flight: `RunDetailPage` attaches an `EventSource` for a run with no
+ * `endedAt`, and the route stub answers with JSON rather than an event stream, so the
+ * browser would reconnect in a loop and `networkidle` would never arrive.
+ */
+export const RUN_DETAIL = {
+  ...run('run-approved'),
+  job: {
+    id: 'job-run-approved',
+    nodeKey: 'review',
+    state: 'succeeded',
+    cycleRunId: 'cr-1',
+    prompt: 'look for isolation bugs',
+  },
+  produced: { findings: [], suppressed: [], promoted: [], changes: [] },
+  events: [],
+  artifacts: [],
+}
+
 export const ROUTES: Record<string, unknown> = {
   '/api/projects': PROJECTS,
   '/api/system/status': STATUS,

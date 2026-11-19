@@ -4,9 +4,11 @@ import { and, asc, count, desc, eq, gt, inArray, isNotNull, isNull, or, sql } fr
 import { schema } from '@ogun/core/db'
 import {
   eventBatchSchema,
+  isTerminal,
   runPublishedSchema,
   runReportSchema,
   runStartedSchema,
+  type JobState,
   type RunEvent,
   type RunReport,
 } from '@ogun/core'
@@ -18,6 +20,7 @@ import { fleet } from '../foreman/reach.ts'
 const {
   artifacts,
   changes,
+  cycleRuns,
   findings,
   jobs,
   projects,
@@ -187,17 +190,70 @@ runsRoutes.get('/', async (c) => {
    */
   const pending = await db
     .select({
-      job: { id: jobs.id, nodeKey: jobs.nodeKey, state: jobs.state, createdAt: jobs.createdAt },
+      job: {
+        id: jobs.id,
+        nodeKey: jobs.nodeKey,
+        state: jobs.state,
+        createdAt: jobs.createdAt,
+        /**
+         * The cycle run this job belongs to, and the node keys it was created waiting on.
+         *
+         * Both are here for one reason: a `blocked` row used to render as the bare pill
+         * "waiting on a dependency", which is the shape principle 6 forbids — the fact a
+         * reader needs is *which* node and what became of it, and the queue view is where
+         * they are looking when they need it. `dependsOn` is the snapshot taken at
+         * creation, not the live graph, which is deliberate: `releasePass` releases
+         * against the frozen definition, so naming the live edges here would sometimes
+         * name nodes that are not what this job is actually held by.
+         */
+        cycleRunId: jobs.cycleRunId,
+        dependsOn: jobs.dependsOn,
+      },
       requires: jobs.requires,
+      /** The snapshot on the cycle run, so a renamed or deleted cycle still reads. */
+      cycle: { name: cycleRuns.cycleName },
       worker: { id: workers.id, name: jobs.workerName },
       project: { slug: projects.slug },
     })
     .from(jobs)
     .leftJoin(workers, eq(workers.id, jobs.workerId))
     .innerJoin(projects, eq(projects.id, jobs.projectId))
+    .innerJoin(cycleRuns, eq(cycleRuns.id, jobs.cycleRunId))
     .where(inArray(jobs.state, ['queued', 'blocked']))
     .orderBy(desc(jobs.createdAt))
     .limit(50)
+
+  /**
+   * What each waiting job is held by: its dependencies, by node key, with the state each
+   * one is in now.
+   *
+   * One query for every cycle run on the page rather than one per job — the same reason
+   * `fleet` is read once (see `reach.ts`): fifty round trips to answer one question about
+   * one set of rows is slower and also inconsistent, since a sweep landing halfway down
+   * the list would produce a page whose rows disagree about the same node.
+   *
+   * `terminal` is computed here, from core's `isTerminal`, rather than left to the
+   * browser. The release rule in `releasePass` is "every dependency has gone terminal",
+   * and a page that re-derived that from a string comparison would be a second
+   * implementation of the job-state vocabulary living in a bundle — which is how the two
+   * start disagreeing about a state added to `JOB_STATES` later. The UI needs the
+   * distinction because the two cases are different situations: a dependency still
+   * running is a job that will move on its own, and a dependency already terminal on a
+   * job still sitting at `blocked` is one nothing is going to move.
+   */
+  const waitingOn = [
+    ...new Set(pending.filter((p) => p.job.dependsOn.length > 0).map((p) => p.job.cycleRunId)),
+  ]
+  const siblings =
+    waitingOn.length === 0
+      ? []
+      : await db
+          .select({ cycleRunId: jobs.cycleRunId, nodeKey: jobs.nodeKey, state: jobs.state })
+          .from(jobs)
+          .where(inArray(jobs.cycleRunId, waitingOn))
+  // Keyed on both, because node keys are unique only within a cycle run
+  // (`jobs_cyclerun_node_idx`) and this map holds several runs at once.
+  const siblingState = new Map(siblings.map((s) => [`${s.cycleRunId}\u0000${s.nodeKey}`, s.state]))
 
   // What could pick them up, so "queued" can say whether it is waiting on a machine, on
   // a machine that is asleep, or on a machine that does not exist. See `foreman/reach.ts`
@@ -208,16 +264,69 @@ runsRoutes.get('/', async (c) => {
    * What each run produced, for the list. A run's result is what you are scanning for —
    * "3 findings" or "nothing found" or "failed" — and having to open each one to learn
    * that makes the list a table of timestamps.
+   *
+   * Both of these are scoped to the runs on the page. The findings count was a `group by`
+   * over the whole table, which costs more every night the factory runs for a number only
+   * fifty rows can display; `changes` would have been worse, since it is read per row
+   * rather than aggregated.
    */
-  const counts = await db
-    .select({ runId: stagedFindings.runId, n: count() })
-    .from(stagedFindings)
-    .groupBy(stagedFindings.runId)
+  const ids = rows.map((r) => r.run.id)
+  const counts =
+    ids.length === 0
+      ? []
+      : await db
+          .select({ runId: stagedFindings.runId, n: count() })
+          .from(stagedFindings)
+          .where(inArray(stagedFindings.runId, ids))
+          .groupBy(stagedFindings.runId)
   const byRun = new Map(counts.map((c) => [c.runId, c.n]))
 
+  /**
+   * The pull request a modifier's patch was published as, for the list.
+   *
+   * It was already on the detail route and only there, so "what did last night produce
+   * that I have to go and review" meant opening every `dispatched` run to find out which
+   * ones had a link. A `changes` row with no branch is work that was done and *not*
+   * published (§4.4) — the publisher refused, or has not run yet — so the two are carried
+   * separately here rather than collapsed into one nullable url, because a row that
+   * produced a patch nobody can see is the one worth noticing.
+   */
+  const published =
+    ids.length === 0
+      ? []
+      : await db
+          .select({ runId: changes.runId, branch: changes.branch, prUrl: changes.prUrl })
+          .from(changes)
+          .where(inArray(changes.runId, ids))
+  const changeByRun = new Map(published.map((ch) => [ch.runId, ch]))
+
   return c.json({
-    runs: rows.map((r) => ({ ...r, produced: { findings: byRun.get(r.run.id) ?? 0 } })),
-    pending: pending.map((p) => ({ ...p, ...machines.verdict(p.requires) })),
+    runs: rows.map((r) => {
+      const change = changeByRun.get(r.run.id)
+      return {
+        ...r,
+        produced: {
+          findings: byRun.get(r.run.id) ?? 0,
+          /** Non-null exactly when this run left a patch, published or not. */
+          branch: change?.branch ?? null,
+          prUrl: change?.prUrl ?? null,
+          changed: change !== undefined,
+        },
+      }
+    }),
+    pending: pending.map((p) => ({
+      ...p,
+      ...machines.verdict(p.requires),
+      dependencies: p.job.dependsOn.map((nodeKey) => {
+        const state = siblingState.get(`${p.job.cycleRunId}\u0000${nodeKey}`) ?? null
+        // A dependency with no job row at all. Not reachable through `startCycleRun`,
+        // which creates every node of the graph in one transaction — but a null here is
+        // reported as "no job" rather than silently counted as satisfied, because the one
+        // way it could happen is a graph edited to point at a node that was removed, and
+        // that is precisely a case where guessing is worse than saying so.
+        return { nodeKey, state, terminal: state !== null && isTerminal(state as JobState) }
+      }),
+    })),
     onlineRunners: machines.online,
     /** Live machines, up or not. Zero is a different problem from "none match". */
     liveRunners: machines.live,
