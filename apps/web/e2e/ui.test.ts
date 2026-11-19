@@ -2,7 +2,7 @@ import { strict as assert } from 'node:assert'
 import { after, before, describe, test } from 'node:test'
 import type { Page } from 'playwright'
 import { open, settle, type Harness } from './harness.ts'
-import { ALL_CLEAR, RUNS } from './fixtures.ts'
+import { ALL_CLEAR, RUN_WITH_EVENTS, RUNS } from './fixtures.ts'
 
 /**
  * The tray is a toggle, and these tests share one browser for speed — so a test that
@@ -451,5 +451,59 @@ describe('the runs list', () => {
       (el) => getComputedStyle(el, '::before').animationName,
     )
     assert.equal(name, 'pulse')
+  })
+})
+
+/**
+ * The timeline on the run page, which is two facts a rendered string cannot hold: a
+ * command's output is collapsed until somebody asks for it, and a ninety-line heredoc
+ * is kept whole without owning the page.
+ */
+describe('the run timeline', () => {
+  let h: Harness
+  before(
+    async () =>
+      (h = await open('/runs/run-events', { '/api/runs/run-events': RUN_WITH_EVENTS })),
+  )
+  after(async () => h.stop())
+
+  /** The flow this change was not allowed to disturb: command, then its output, hidden. */
+  test('a command is followed by its output, collapsed until it is asked for', async () => {
+    const { page } = h
+    await page.waitForSelector('.timeline .cmd')
+    assert.equal(await page.locator('.tool-output').count(), 0, 'nothing is expanded on arrival')
+
+    await page.locator('.output-toggle').first().click()
+    await page.waitForSelector('.tool-output')
+    assert.match((await page.textContent('.tool-output')) ?? '', /name: make-a-change/)
+
+    await page.locator('.output-toggle').first().click()
+    await page.waitForSelector('.tool-output', { state: 'detached' })
+  })
+
+  /**
+   * The row used to slice the command at 160 characters, so a heredoc ended mid-token —
+   * `open(p, 'w').write(s)` then a bare `E` where `EOF` had been cut in half. The whole
+   * command is in the DOM now; the block is what is bounded, not the text.
+   */
+  test('a multi-line command is kept whole and bounded by its block', async () => {
+    const { page } = h
+    const block = page.locator('.cmd').nth(1)
+    const text = (await block.textContent()) ?? ''
+    assert.match(text, /python3 - <<'EOF'/, 'the first line')
+    assert.match(text, /grep -n 'Sign out'/, 'and the last one, past where the slice fell')
+
+    const { height, scrollHeight } = await block.evaluate((el) => ({
+      height: el.getBoundingClientRect().height,
+      scrollHeight: el.scrollHeight,
+    }))
+    assert.ok(height <= 180, `a command block may not exceed its cap, got ${height}`)
+    assert.ok(scrollHeight >= height, 'and it scrolls rather than clipping to nothing')
+  })
+
+  /** The prompt is decoration: the command beside it is what a reader is being told. */
+  test('the prompt is hidden from a screen reader', async () => {
+    const { page } = h
+    assert.equal(await page.locator('.cmd-sigil').first().getAttribute('aria-hidden'), 'true')
   })
 })

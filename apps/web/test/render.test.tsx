@@ -1123,3 +1123,221 @@ test('the runs page names both buckets with nothing waiting', () => {
   assert.match(html, />Finished</)
   assert.match(html, /Nothing is queued or blocked/)
 })
+
+/**
+ * The timeline, which is most of the run page and is built entirely out of payloads
+ * nobody designed for it. Every shape below was copied off a live control plane.
+ */
+const timeline = (events: Array<Record<string, unknown>>): string =>
+  renderScoped(
+    <Routes>
+      <Route path="/runs/:id" element={<RunDetailPage />} />
+    </Routes>,
+    'all',
+    (qc) =>
+      qc.setQueryData(['run', 'r1'], {
+        ...runRow(),
+        produced: { findings: [], suppressed: [], promoted: [], changes: [] },
+        artifacts: [],
+        events: events.map((e, i) => ({
+          id: `e${i}`,
+          seq: i,
+          ts: '2026-10-16T12:00:10.000Z',
+          ...e,
+        })),
+      }),
+    '/runs/r1',
+  )
+
+/**
+ * `Bash cd /workspace && pnpm test` — the tool's name in front of every shell command on
+ * the page, where the command is the content and the name is a fact about the harness.
+ */
+test('a shell command is set as a command rather than labelled with its tool', () => {
+  const html = timeline([
+    {
+      type: 'tool.started',
+      payload: {
+        name: 'Bash',
+        callId: 'c1',
+        input: {
+          command: 'pnpm --filter heirchive-web test',
+          description: 'Run the web suite',
+        },
+      },
+    },
+    {
+      type: 'tool.completed',
+      payload: { name: 'Bash', callId: 'c1', isError: false, output: 'Tests: 53 passed' },
+    },
+  ])
+
+  assert.match(html, /class="cmd"/, 'the command needs a block of its own')
+  assert.match(html, /cmd-sigil/, 'and a prompt saying what it is')
+  assert.match(html, /pnpm --filter heirchive-web test/)
+  assert.doesNotMatch(html, /tool-name/, 'a command carries no label — the prompt is the label')
+  // The intent claude sends with most Bash calls, kept without a second line per row.
+  assert.match(html, /title="Run the web suite"/)
+  // The collapsed output is the flow this change is not allowed to disturb.
+  assert.match(html, /output \(16 chars\)/)
+  assert.match(html, /output-toggle/, 'the gap between the outcome and the link is a class')
+})
+
+/**
+ * Keyed off the payload, not the name. Codex calls the shell `command_execution` and
+ * claude calls it `Bash`; a name list would be one row per runtime, forever.
+ */
+test('a shell command from another runtime is still a command', () => {
+  const html = timeline([
+    {
+      type: 'tool.started',
+      payload: {
+        name: 'command_execution',
+        callId: 'c1',
+        input: { command: 'pnpm --filter heirchive-web test' },
+      },
+    },
+  ])
+  assert.match(html, /cmd-sigil/)
+  assert.doesNotMatch(html, /command_execution/, 'the runtime\'s word for "shell" is not content')
+})
+
+/** Everything that is not a command keeps the verb, because the argument does not say it. */
+test('a file tool keeps its name and drops the sandbox mount', () => {
+  const html = timeline([
+    {
+      type: 'tool.started',
+      payload: {
+        name: 'Read',
+        callId: 'c1',
+        input: { file_path: '/workspace/apps/web/src/pages/RunDetail.tsx', offset: 120, limit: 60 },
+      },
+    },
+  ])
+  assert.match(html, /tool-name">Read/, 'reading a file and rewriting it have to look different')
+  assert.match(html, /apps\/web\/src\/pages\/RunDetail\.tsx/)
+  assert.doesNotMatch(html, /\/workspace\//, 'the mount is the same on every row')
+  assert.match(html, /from line 120/, 'which is why the same file appears four times')
+})
+
+/**
+ * An agent's message is markdown and always was. Rendered as preformatted text the
+ * timeline showed the source — `## What I built`, stray backticks, `**` around words —
+ * and the longest message on the page is the one that says what the run did.
+ */
+test("an agent's message renders as the markdown it was written as", () => {
+  const html = timeline([
+    {
+      type: 'agent.message',
+      payload: {
+        text: [
+          'Done — one commit, clean tree.',
+          '',
+          '## What I built',
+          '',
+          '- Label `Exit` → **Sign out**, which the app already settles.',
+          '',
+          '```',
+          'pnpm --filter heirchive-web test   53 passed',
+          '```',
+        ].join('\n'),
+      },
+    },
+  ])
+
+  assert.match(html, /class="md"/, 'the skill page\'s renderer, not a second one')
+  assert.match(html, /md-h2/)
+  assert.match(html, /md-list/)
+  assert.match(html, /md-code/)
+  assert.match(html, /<strong>Sign out<\/strong>/)
+  assert.match(html, /md-inline-code/)
+  assert.doesNotMatch(html, /## What I built/, 'the source is not the rendering')
+  assert.doesNotMatch(html, /\*\*Sign out\*\*/)
+})
+
+/**
+ * A runner note is a sentence the runner wrote and a copy of the same thing in fields.
+ * The default branch rendered the whole payload, so the note appeared twice on one row —
+ * once as prose and once inside a JSON dump of itself.
+ */
+test('a runner note reads as its sentence rather than as its payload', () => {
+  const html = timeline([
+    {
+      type: 'runner.note',
+      payload: {
+        note: 'patch extracted: 2 file(s) over 1 commit(s), 9352 bytes',
+        bytes: 9352,
+        round: 1,
+        commits: 1,
+        filesChanged: 2,
+      },
+    },
+  ])
+  assert.match(html, /patch extracted: 2 file\(s\) over 1 commit\(s\), 9352 bytes/)
+  assert.doesNotMatch(html, /&quot;filesChanged&quot;/, 'the fields are the same thing again')
+})
+
+/**
+ * Claude's `tool.completed` carries no exit code at all — only codex does. The row read
+ * `failed (exit ?)` on every failed claude call: a question mark where a reader looks for
+ * the number, standing for a field that was never going to be there.
+ */
+test('a failed tool call does not invent an exit code it was never sent', () => {
+  const html = timeline([
+    { type: 'tool.completed', payload: { name: 'Bash', callId: 'c1', isError: true, output: 'no' } },
+  ])
+  assert.match(html, />failed</)
+  assert.doesNotMatch(html, /exit \?/)
+})
+
+/**
+ * A rate-limit row is the provider's object as it arrived, and as JSON it was the widest
+ * line on the page — `overageDisabledReason`, an epoch integer, two lines of wrap — for a
+ * row whose entire content is "the five-hour window let this through".
+ */
+test('a rate-limit row says which window and whether it allowed the call', () => {
+  const html = timeline([
+    {
+      type: 'rate_limit',
+      payload: {
+        info: {
+          status: 'allowed',
+          resetsAt: 1794939600,
+          overageStatus: 'rejected',
+          rateLimitType: 'five_hour',
+          isUsingOverage: false,
+          overageDisabledReason: 'org_level_disabled',
+        },
+      },
+    },
+  ])
+  assert.match(html, /five_hour · allowed/)
+  assert.doesNotMatch(html, /org_level_disabled/)
+})
+
+/**
+ * How an agent writes a numbered list: a blank line between the items. Each item used to
+ * end its own `<ol>`, so a run page carried a list of two points numbered `1.` and `1.`
+ * — markup that was correct in every assertion and wrong in the only place it is read.
+ */
+test('a list with blank lines between its items is one list', () => {
+  const html = renderToString(
+    <Markdown
+      source={[
+        '1. **The gateway** — well defended.',
+        '',
+        '2. **The patch path** — where the finding is.',
+        '',
+        'Written up as a single finding.',
+        '',
+        '- a bulleted list under it',
+        '',
+        '- is still its own list',
+      ].join('\n')}
+    />,
+  )
+  assert.equal(html.match(/<ol/g)?.length, 1, 'one ordered list, not one per item')
+  assert.equal(html.match(/<li>/g)?.length, 4, 'two items in each list')
+  assert.equal(html.match(/<ul/g)?.length, 1, 'the bullets are not absorbed into the numbering')
+  assert.match(html, /Written up as a single finding/, 'the paragraph still ends the list')
+})
