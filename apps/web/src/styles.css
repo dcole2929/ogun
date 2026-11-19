@@ -11,6 +11,10 @@
   --yellow: #d9b23a;
   --blue: #6a9fd8;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  /* Named because the timeline needs to step *out* of the mono it sets on tool rows:
+     a tool's name is a label, the argument beside it is code, and the two are in the
+     same line. `inherit` cannot say that — inside a mono block it is mono. */
+  --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
 }
 
 @media (prefers-color-scheme: light) {
@@ -30,7 +34,7 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--text);
-  font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  font: 14px/1.5 var(--sans);
 }
 
 a { color: inherit; text-decoration: none; }
@@ -252,7 +256,7 @@ button.primary { background: var(--accent); color: #16110a; border-color: var(--
 .timeline { display: flex; flex-direction: column; gap: 1px; }
 .event {
   display: grid;
-  grid-template-columns: 62px 130px 1fr;
+  grid-template-columns: 82px 130px 1fr;
   gap: 12px;
   padding: 6px 10px;
   border-radius: 5px;
@@ -278,6 +282,44 @@ button.primary { background: var(--accent); color: #16110a; border-color: var(--
   overflow: auto;
   white-space: pre-wrap;
 }
+
+/* A shell command, set as a command.
+
+   The row used to read `Bash cd /workspace && pnpm test`: the tool's name, which is a
+   fact about the harness, in front of the only part anybody reads. The prompt says
+   "command" in the one character everyone already knows, and the block says where the
+   command ends — which a multi-line heredoc wrapped into prose did not. */
+.cmd {
+  display: flex;
+  gap: 8px;
+  padding: 5px 9px;
+  border-radius: 5px;
+  background: var(--panel-2);
+  /* A heredoc that rewrites a file runs to ninety lines, and no single call is allowed
+     to be the whole screen. The same cap and scroll as `.tool-output` above, so a
+     command and its output behave alike. */
+  max-height: 180px;
+  overflow: auto;
+}
+.cmd-sigil { color: var(--accent); flex: none; user-select: none; }
+.cmd code { white-space: pre-wrap; overflow-wrap: anywhere; }
+
+/* Every other tool keeps its name: `Read`, `Edit`, `Grep` in front of a path is the
+   difference between looking at a file and rewriting it. The name is a label, so it
+   steps out of the mono the row is set in; the argument is code, so it stays. */
+.tool-call { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.tool-name { font-family: var(--sans); font-size: 11px; color: var(--muted); letter-spacing: 0.03em; }
+.tool-arg { overflow-wrap: anywhere; }
+
+/* Markdown inside a timeline row. The renderer is the skill page's, which is set for a
+   page of prose; here it is one entry among a hundred, so it loses the page's font size
+   and the trailing margin that would open a gap under every message. */
+.event .body .md { white-space: normal; font-size: 13px; }
+.event .body .md > *:last-child { margin-bottom: 0; }
+.event .body .md-h1, .event .body .md-h2, .event .body .md-h3 { margin-top: 14px; }
+
+/* Without it the outcome and the link render as one word: `okoutput (172 chars)`. */
+.output-toggle { margin-left: 8px; }
 
 .live { display: inline-flex; align-items: center; gap: 6px; color: var(--green); font-size: 12px; }
 .live::before {

@@ -1,6 +1,6 @@
 import { mkdir, writeFile } from 'node:fs/promises'
 import { open, settle } from './harness.ts'
-import { ALL_CLEAR, LINEAR_OPTIONS_UNREACHABLE, RUNS } from './fixtures.ts'
+import { ALL_CLEAR, LINEAR_OPTIONS_UNREACHABLE, RUN_WITH_EVENTS, RUNS } from './fixtures.ts'
 
 /**
  * The UI, photographed — one file per state.
@@ -63,6 +63,15 @@ type Shot = {
    * shots that are *about* that list opt into the fixture here.
    */
   routes?: Record<string, unknown> 
+  /**
+   * Photograph the whole scrollable page rather than the viewport.
+   *
+   * Every other shot here is of something above the fold at 1280x800. The run page's
+   * timeline is not: it sits under the metadata card and the Result section, so a
+   * viewport screenshot of that page is a picture of everything except the part under
+   * review.
+   */
+  fullPage?: boolean
   /** Anything to do before the shutter: open the panel, drag the handle. */
   act?: (page: Awaited<ReturnType<typeof open>>['page']) => Promise<void>
   clip?: { x: number; y: number; width: number; height: number }
@@ -183,6 +192,21 @@ const SHOTS: Shot[] = [
     },
   },
   {
+    /**
+     * The timeline, which is the page: a shell command set as a command rather than
+     * labelled `Bash`, each one followed by its collapsed output, and an agent's closing
+     * message rendered as the markdown it was written as.
+     *
+     * `now` because the header renders `when(startedAt)` — "3h ago" is a pixel difference
+     * every hour, and this file's stability rule forbids it.
+     */
+    name: 'run-detail',
+    path: '/runs/run-events',
+    now: '2026-10-16T15:00:00.000Z',
+    routes: { '/api/runs/run-events': RUN_WITH_EVENTS },
+    fullPage: true,
+  },
+  {
     name: 'skills-scoped',
     path: '/skills',
     act: async (page) => {
@@ -231,6 +255,7 @@ export async function capture(): Promise<string[]> {
       const file = `${DIR}${shot.name}.png`
       await h.page.screenshot({
         path: file,
+        ...(shot.fullPage ? { fullPage: true } : {}),
         ...(shot.clip ? { clip: shot.clip } : {}),
         caret: 'hide',
         animations: 'disabled',

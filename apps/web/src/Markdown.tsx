@@ -122,6 +122,11 @@ function renderBlocks(src: string): ReactNode[] {
     const bullet = /^\s*([-*+]|\d+\.)\s+/.exec(line)
     if (bullet) {
       const ordered = /\d/.test(bullet[1] ?? '')
+      /** Whether a line opens another item of the list being read, rather than a new one. */
+      const continues = (l: string | undefined): boolean => {
+        const next = /^\s*([-*+]|\d+\.)\s+/.exec(l ?? '')
+        return next !== null && /\d/.test(next[1] ?? '') === ordered
+      }
       const items: string[] = []
       while (i < lines.length) {
         const l = lines[i] ?? ''
@@ -131,6 +136,18 @@ function renderBlocks(src: string): ReactNode[] {
         } else if (/^\s{2,}\S/.test(l) && items.length > 0) {
           // continuation of the previous item
           items[items.length - 1] += `\n${l.trim()}`
+          i++
+        } else if (l.trim() === '' && continues(lines[i + 1])) {
+          /**
+           * A blank line between items is a *loose* list, not the end of one — which is
+           * how agents write them, and a run page showed the result: an agent's numbered
+           * list of two points rendered as two lists, both of them numbered `1.`, because
+           * each item ended its own `<ol>`.
+           *
+           * The next line has to open an item of the same kind, so a list followed by a
+           * paragraph still ends, and a bulleted list under a numbered one stays its own
+           * list rather than being absorbed into the numbering.
+           */
           i++
         } else break
       }

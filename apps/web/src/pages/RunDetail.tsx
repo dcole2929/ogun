@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Link, useParams } from 'react-router'
 import { api, isInFlight, type RunDetail, type RunEventRow } from '../api.ts'
-import { duration, Empty, Page, Pill, Severity, when } from '../ui.tsx'
+import { Markdown } from '../Markdown.tsx'
+import { clock, duration, Empty, Page, Pill, Severity, when } from '../ui.tsx'
 
 export function RunDetailPage() {
   const { id = '' } = useParams()
@@ -311,8 +312,23 @@ function Produced({ detail }: { detail: RunDetail }) {
 
 function Event({ event, startedAt }: { event: RunEventRow; startedAt: string }) {
   const [expanded, setExpanded] = useState(false)
-  const offset = Math.max(0, (new Date(event.ts).getTime() - new Date(startedAt).getTime()) / 1000)
   const p = event.payload as Record<string, any>
+
+  /**
+   * The wall clock, not an offset from the run's start.
+   *
+   * `+265s` is arithmetic nobody asked for: it answers "how far into the run" when the
+   * question a timeline gets asked is "when did this happen" — which is the question you
+   * take to a log, a deploy, or somebody saying it broke around ten past. Converting back
+   * meant adding seconds to a start time two hundred rows up the page.
+   *
+   * The offset it replaces is still available and better placed: `Duration` in the header
+   * says how long the whole run took, and the gap between two rows is now read directly
+   * off their times.
+   */
+  const at = clock(event.ts)
+  /** Kept for the title, where "how far in" is a genuinely useful second reading. */
+  const offset = Math.max(0, (new Date(event.ts).getTime() - new Date(startedAt).getTime()) / 1000)
 
   const kind = event.type.replace(/^(run|agent|tool|runner)\./, '')
   const cls =
@@ -326,14 +342,19 @@ function Event({ event, startedAt }: { event: RunEventRow; startedAt: string }) 
 
   return (
     <div className={`event ${cls}`}>
-      <span className="when">+{offset.toFixed(0)}s</span>
+      <span className="when" title={`${offset.toFixed(0)}s into the run`}>
+        {at}
+      </span>
       <span className="kind">{event.type}</span>
       <div className="body">
         {renderBody(event.type, p, kind)}
         {event.type === 'tool.completed' && p.output ? (
           <>
+            {/* `output-toggle` carries the gap. Inline with no margin, the outcome and
+                the link rendered as one word — a picture of this timeline read
+                "okoutput (172 chars)" on every successful call. */}
             <a
-              className="muted"
+              className="muted output-toggle"
               style={{ cursor: 'pointer', fontSize: 11 }}
               onClick={() => setExpanded(!expanded)}
             >
@@ -347,34 +368,143 @@ function Event({ event, startedAt }: { event: RunEventRow; startedAt: string }) 
   )
 }
 
-function renderBody(type: string, p: Record<string, any>, kind: string): string {
+function renderBody(type: string, p: Record<string, any>, kind: string): ReactNode {
   switch (type) {
     case 'run.started':
       return `${p.runtime}${p.model ? ` · ${p.model}` : ''}`
+    /**
+     * An agent's message is markdown and always was — headings, bullets, `code`, bold.
+     * Rendered as preformatted text it was the source: `## What I built` and stray
+     * backticks down a timeline, with the longest message on the page — the closing
+     * account of what the run did — the worst affected.
+     *
+     * This is the renderer the skill page uses, not a second one and not a markdown
+     * dependency: it builds React elements and never sets inner HTML, which matters more
+     * here than there. A skill is a file from a repository; this is whatever a model
+     * wrote, which is the less trustworthy of the two.
+     */
     case 'agent.message':
+      return <Markdown source={String(p.text ?? '')} />
+    // Reasoning is not markdown — it is a thinking trace, and `.event.reasoning` already
+    // sets it apart in muted italics.
     case 'agent.reasoning':
       return String(p.text ?? '')
     case 'tool.started':
-      return `${p.name}${p.input ? ` ${summarizeInput(p.input)}` : ''}`
+      return <ToolCall name={String(p.name ?? 'tool')} input={p.input} />
     case 'tool.completed':
-      return p.isError ? `failed (exit ${p.exitCode ?? '?'})` : `ok${p.exitCode !== undefined ? ` (exit ${p.exitCode})` : ''}`
+      return p.isError
+        ? `failed${p.exitCode === undefined ? '' : ` (exit ${p.exitCode})`}`
+        : `ok${p.exitCode !== undefined ? ` (exit ${p.exitCode})` : ''}`
     case 'run.completed':
       return p.outcome ? String(p.outcome) : 'done'
     case 'run.failed':
       return String(p.error ?? 'failed')
-    case 'rate_limit':
-      return JSON.stringify(p.info ?? {})
+    /**
+     * The runner talking: which skill was injected, what the patch extractor got, why a
+     * gate refused. `note` is the sentence it wrote, and the rest of the payload is the
+     * same thing in fields — so the default branch below rendered the note twice, once as
+     * prose and once inside a JSON dump of the row it came from.
+     */
+    case 'runner.note':
+      return typeof p.note === 'string' ? p.note : JSON.stringify(p)
+    /**
+     * The provider's own object, verbatim, which is how it reached the database — and as
+     * a line of JSON it was the widest row on the page, two full lines of
+     * `overageDisabledReason` and an epoch integer. Two fields answer what a reader is
+     * asking when they notice this row at all: which window, and whether it let the call
+     * through. The rest is still in the payload for anyone reading the API.
+     */
+    case 'rate_limit': {
+      const info = (p.info ?? {}) as Record<string, unknown>
+      const said = [info.rateLimitType, info.status].filter((v) => typeof v === 'string')
+      return said.length > 0 ? said.join(' · ') : JSON.stringify(info)
+    }
     default:
       return `${kind} ${JSON.stringify(p).slice(0, 200)}`
   }
 }
 
-const summarizeInput = (input: unknown): string => {
-  if (typeof input !== 'object' || input === null) return String(input)
-  const o = input as Record<string, unknown>
-  const first = o.command ?? o.file_path ?? o.pattern ?? o.path ?? o.prompt
-  return first ? String(first).slice(0, 160) : JSON.stringify(o).slice(0, 160)
+/**
+ * A tool call, as the thing it is rather than as a labelled row.
+ *
+ * It said `Bash cd /workspace && pnpm test` — the word `Bash` in front of every shell
+ * command on the page, where the command is the content and the tool's name is a fact
+ * about the harness. A command is now set as a command, behind a `>` prompt.
+ *
+ * Keyed off the payload's *shape* rather than the tool's name, deliberately: codex calls
+ * the same thing `command_execution` and claude calls it `Bash`, both carrying `command`,
+ * and a name list would have to grow a row for every runtime added later (§4.7). Anything
+ * carrying a command is a command.
+ *
+ * Every other tool keeps its name, because there it carries the verb: `Read`, `Edit` and
+ * `Grep` in front of a path are the difference between looking at a file and rewriting
+ * it, and the argument alone does not say which happened.
+ */
+function ToolCall({ name, input }: { name: string; input: unknown }) {
+  const o = typeof input === 'object' && input !== null ? (input as Record<string, unknown>) : null
+  const command = typeof o?.command === 'string' ? o.command : null
+
+  if (command !== null) {
+    return (
+      /**
+       * `description` as the tooltip rather than a second line. Claude sends a short
+       * statement of intent with most Bash calls ("Run the web suite"), which is worth
+       * having and is not worth doubling the height of a timeline of a hundred calls to
+       * show. Codex sends none, and then there is nothing to hover.
+       */
+      <div className="cmd" title={typeof o?.description === 'string' ? o.description : undefined}>
+        {/* Decoration, so it is hidden from a screen reader — "greater than" read aloud
+            before every command is noise, and the element after it is the command. */}
+        <span className="cmd-sigil" aria-hidden="true">
+          &gt;
+        </span>
+        <code>{command}</code>
+      </div>
+    )
+  }
+
+  const arg = argumentOf(o)
+  return (
+    <div className="tool-call">
+      <span className="tool-name">{name}</span>
+      {arg && <code className="tool-arg">{arg}</code>}
+      {/* The window of a partial read, which is why the same file appears four times.
+          One string rather than three children: React splits adjacent text nodes with a
+          comment when it renders to markup, and `from line <!-- -->120` is a thing
+          nothing can search for — not a test, and not ctrl-F on the page. */}
+      {typeof o?.offset === 'number' && (
+        <span className="muted" style={{ fontSize: 11 }}>
+          {`from line ${o.offset}${typeof o.limit === 'number' ? ` (${o.limit})` : ''}`}
+        </span>
+      )}
+    </div>
+  )
 }
+
+/**
+ * The one value worth showing for a tool that is not a command — the file, the pattern,
+ * the skill. The order is the order the shapes actually occur in: `file_path` for
+ * Read/Write/Edit, `pattern` for Grep and Glob, `path` for a listing, `skill` for a Skill
+ * call, `prompt` for a subagent.
+ *
+ * Nothing that stands for the input falls back to the input, truncated — a row that says
+ * only `TodoWrite` is a row that has told you nothing.
+ */
+function argumentOf(o: Record<string, unknown> | null): string {
+  if (o === null) return ''
+  const first = o.file_path ?? o.pattern ?? o.path ?? o.skill ?? o.prompt
+  if (first === undefined || first === null) return JSON.stringify(o).slice(0, 160)
+  return shortenPath(String(first).slice(0, 200))
+}
+
+/**
+ * Sandbox paths are absolute and all start at the same mount, so `/workspace/` is eleven
+ * characters of nothing on every row — and it pushes the part that differs off the right
+ * of a narrow column. Only that prefix: a path somewhere else is somewhere else, and
+ * saying so is the point of showing it.
+ */
+const shortenPath = (value: string): string =>
+  value.startsWith('/workspace/') ? value.slice('/workspace/'.length) : value
 
 /**
  * SSE, not websockets — the timeline only flows one way. The server backfills anything

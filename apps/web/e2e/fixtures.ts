@@ -317,3 +317,206 @@ export const ROUTES: Record<string, unknown> = {
   '/api/runs': { runs: [], pending: [], onlineRunners: 1, liveRunners: 1 },
   '/api/runners': { runners: [], addresses: [], tokenRequired: false, reachabilityWarning: null },
 }
+
+/**
+ * One timeline row. `offset` is seconds after the run started, because that is the column
+ * the page renders — an absolute `ts` here would be a number nobody can check against the
+ * `+12s` in the picture.
+ */
+const event = (seq: number, offset: number, type: string, payload: Record<string, unknown>) => ({
+  id: `e${seq}`,
+  seq,
+  ts: new Date(Date.parse('2026-10-16T12:00:00.000Z') + offset * 1000).toISOString(),
+  type,
+  payload,
+})
+
+/**
+ * A run with a timeline in it, event by event.
+ *
+ * `RUN_DETAIL` above carries `events: []`, which is all the click-through test needs and
+ * exactly nothing of what the timeline renders. Every payload shape here was copied off a
+ * real run out of a live control plane (`/api/runs/:id`), because the timeline's whole job
+ * is formatting payloads nobody designed for it: `Bash` carries `command` plus a prose
+ * `description`, `Read` carries `file_path` and sometimes a line window, `Grep` carries a
+ * `pattern`, and codex calls the same shell tool `command_execution` instead of `Bash`.
+ * A fixture written from the UI's assumptions would photograph those assumptions.
+ *
+ * Finished, for the same reason `RUN_DETAIL` is: an in-flight run attaches an
+ * `EventSource` the route stub cannot answer.
+ */
+export const RUN_WITH_EVENTS = {
+  ...run('run-events', { model: 'claude-opus-5' }, {}, { nodeKey: 'implement' }),
+  worker: { id: 'w-3', name: 'implement' },
+  job: {
+    id: 'job-run-events',
+    nodeKey: 'implement',
+    state: 'succeeded',
+    cycleRunId: 'cr-2',
+    prompt: 'build the plan at .ogun-in/upstream.json',
+  },
+  produced: {
+    findings: [],
+    suppressed: [],
+    promoted: [],
+    changes: [
+      {
+        id: 'ch-1',
+        branch: 'ogun/implement/15ad22c',
+        filesChanged: 2,
+        testsPassed: true,
+        prUrl: 'https://github.com/Heirchive/heirchive-api/pull/412',
+      },
+    ],
+  },
+  artifacts: [],
+  events: [
+    event(0, 0, 'runner.note', {
+      note: 'skill make-a-change (builtin) at .claude/skills/make-a-change',
+      path: '.claude/skills/make-a-change',
+      skill: 'make-a-change',
+      origin: 'builtin',
+      injected: true,
+    }),
+    event(1, 1, 'run.started', {
+      runtime: 'claude',
+      model: 'claude-opus-5',
+      tools: 26,
+      sessionId: '38a31b06-1686-4e61-a91b-0ee8b3358300',
+    }),
+    event(2, 3, 'agent.message', {
+      text: "I'll start by reading the skill and my inputs.",
+    }),
+    event(3, 4, 'tool.started', {
+      name: 'Bash',
+      callId: 'c1',
+      input: {
+        command: 'cat /workspace/.claude/skills/make-a-change/SKILL.md',
+        description: 'Read the make-a-change skill',
+      },
+    }),
+    event(4, 6, 'tool.completed', {
+      name: 'Bash',
+      callId: 'c1',
+      isError: false,
+      output:
+        '---\nname: make-a-change\ndescription: Take one item of work and build it.\n---\n\n# Make a change\n\nYou are the step that turns one item of work into a commit somebody can read.',
+    }),
+    event(5, 8, 'tool.started', {
+      name: 'Read',
+      callId: 'c2',
+      input: { file_path: '/workspace/apps/web/src/components/layout/Sidebar.tsx', offset: 120, limit: 60 },
+    }),
+    event(6, 9, 'tool.completed', {
+      name: 'Read',
+      callId: 'c2',
+      isError: false,
+      output: '   120\tconst handleSignOut = async () => {\n   121\t  try {\n   122\t    await signOut()',
+    }),
+    event(7, 11, 'tool.started', {
+      name: 'Grep',
+      callId: 'c3',
+      input: { pattern: 'text-destructive', path: 'apps/web/src', output_mode: 'files_with_matches' },
+    }),
+    event(8, 12, 'tool.completed', {
+      name: 'Grep',
+      callId: 'c3',
+      isError: false,
+      output: 'apps/web/src/components/ui/alert.tsx\napps/web/src/components/ui/form.tsx',
+    }),
+    /** The multi-line case: a heredoc is the shape a one-line row cannot show. */
+    event(9, 20, 'tool.started', {
+      name: 'Bash',
+      callId: 'c4',
+      input: {
+        command:
+          "cd /workspace && python3 - <<'EOF'\np = 'apps/web/src/components/layout/Sidebar.tsx'\ns = open(p).read()\ns = s.replace('Exit', 'Sign out')\nopen(p, 'w').write(s)\nEOF\ngrep -n 'Sign out' apps/web/src/components/layout/Sidebar.tsx",
+        description: 'Rename the label',
+        timeout: 120000,
+      },
+    }),
+    event(10, 22, 'tool.completed', {
+      name: 'Bash',
+      callId: 'c4',
+      isError: false,
+      output: "87:            <span className=\"sr-only\">Sign out</span>",
+    }),
+    event(11, 24, 'tool.started', {
+      name: 'Edit',
+      callId: 'c5',
+      input: {
+        file_path: '/workspace/apps/web/src/components/layout/Sidebar.tsx',
+        old_string: 'catch { href = "/auth/signin" }',
+        new_string: 'catch (e) { setError(message(e)) }',
+        replace_all: false,
+      },
+    }),
+    event(12, 25, 'tool.completed', { name: 'Edit', callId: 'c5', isError: false, output: 'ok' }),
+    event(13, 27, 'tool.started', {
+      name: 'Write',
+      callId: 'c6',
+      input: {
+        file_path: '/workspace/apps/web/src/components/layout/Sidebar.test.tsx',
+        content: 'import { render, screen } from "@testing-library/react"\n'.repeat(4),
+      },
+    }),
+    event(14, 28, 'tool.completed', { name: 'Write', callId: 'c6', isError: false, output: 'ok' }),
+    /** The failing command, which the row has to say out loud rather than collapse. */
+    event(15, 40, 'tool.started', {
+      name: 'Bash',
+      callId: 'c7',
+      input: { command: 'pnpm --filter heirchive-web test', description: 'Run the web suite' },
+    }),
+    event(16, 95, 'tool.completed', {
+      name: 'Bash',
+      callId: 'c7',
+      isError: true,
+      exitCode: 1,
+      output:
+        'FAIL  src/components/layout/Sidebar.test.tsx\n  ● renders the error instead of navigating\n\n    expect(window.location.href).toBe("/dashboard")\n\n    Received: "/auth/signin"\n\nTests: 1 failed, 52 passed',
+    }),
+    /** Codex names the same tool `command_execution`, and carries no description. */
+    event(17, 120, 'tool.started', {
+      name: 'command_execution',
+      callId: 'c8',
+      input: { command: 'pnpm --filter heirchive-web test' },
+    }),
+    event(18, 150, 'tool.completed', {
+      name: 'command_execution',
+      callId: 'c8',
+      exitCode: 0,
+      isError: false,
+      output: 'Tests: 53 passed, 9 files',
+    }),
+    /** What an agent's closing message actually looks like: markdown, and a page of it. */
+    event(19, 160, 'agent.message', {
+      text: [
+        'Done — one commit, clean tree.',
+        '',
+        '## What I built',
+        '',
+        'The plan at `.ogun-in/upstream.json` was my specification; every claim it made',
+        'held at this commit.',
+        '',
+        '- Label `Exit` → **Sign out**. The app settles the tiebreak: every auth control',
+        '  says "Sign in" and the button\'s own `title` already said "Sign out".',
+        '- The error handling was the bigger half. `handleSignOut` caught the rejection,',
+        '  bound it to nothing, and navigated from *both* branches.',
+        '',
+        '## Verification',
+        '',
+        '```',
+        'pnpm --filter heirchive-web test   53 passed, 9 files',
+        'tsc --noEmit                       clean',
+        '```',
+        '',
+        'One thing to be straight about: the gate\'s command is api-only, so it cannot see',
+        'this change at all.',
+      ].join('\n'),
+    }),
+    event(20, 162, 'run.completed', {
+      result: 'approved',
+      usage: { inputTokens: 4100, outputTokens: 900 },
+    }),
+  ],
+}

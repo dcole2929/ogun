@@ -322,6 +322,20 @@ export const Severity = ({ value }: { value: string }) => (
 export const exact = (iso: string | null | undefined): string =>
   iso ? new Date(iso).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'medium' }) : ''
 
+/**
+ * Clock time to the second, for a column of them.
+ *
+ * `exact` is the tooltip form and carries a date; this is the one that goes *in* a
+ * timeline, where every row shares a day and repeating it would be ninety characters of
+ * noise per screen. Seconds are kept because tool calls land within the same minute.
+ *
+ * The locale's own 12- or 24-hour convention, via `timeStyle`, rather than a hand-rolled
+ * `HH:MM:SS` — the browser already knows what this reader expects and a fixed format
+ * would be wrong for half of them.
+ */
+export const clock = (iso: string | null | undefined): string =>
+  iso ? new Date(iso).toLocaleTimeString(undefined, { timeStyle: 'medium' }) : ''
+
 export function when(iso: string | null | undefined): string {
   if (!iso) return '—'
   const d = new Date(iso)
