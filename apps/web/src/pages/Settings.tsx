@@ -850,7 +850,20 @@ function GithubAppForm({
   writes: SystemInfo['projectSecretWrites'] | undefined
   onConnected: () => void
 }) {
-  const [project, setProject] = useState(projects[0] ?? '')
+  /**
+   * Derived, not initialised — `useState(projects[0] ?? '')` runs once, and `projects`
+   * arrives from a query that had not resolved yet.
+   *
+   * The failure is invisible, which is why it shipped: a `<select value="">` whose options
+   * have no empty value *displays the first one*, so the control showed a project while
+   * the state behind it was still `''`. Everything looked filled, Connect stayed disabled,
+   * and nothing on screen said which field was unsatisfied.
+   *
+   * `picked` is null until somebody chooses, so the default follows the data instead of
+   * freezing whatever happened to be there on the first render.
+   */
+  const [picked, setPicked] = useState<string | null>(null)
+  const project = picked ?? projects[0] ?? ''
   const [appId, setAppId] = useState('')
   const [installationId, setInstallationId] = useState('')
   const [privateKey, setPrivateKey] = useState('')
@@ -892,7 +905,7 @@ function GithubAppForm({
     <div className="form" style={{ marginTop: 14 }}>
       <label>
         <span>Project</span>
-        <select value={project} onChange={(e) => setProject(e.target.value)}>
+        <select value={project} onChange={(e) => setPicked(e.target.value)}>
           {projects.map((slug) => (
             <option key={slug} value={slug}>
               {slug}

@@ -1517,3 +1517,35 @@ test('the github app form takes a .pem as a file, not only as a paste', () => {
   // The promise the form makes before the click, so a refusal does not read as a bug.
   assert.match(html, /nothing is stored if that fails/)
 })
+
+/**
+ * The project selection follows the data rather than the first render.
+ *
+ * `useState(projects[0] ?? '')` runs once, and `projects` comes from a query that may not
+ * have resolved — so the state froze at `''`. A `<select value="">` whose options have no
+ * empty value *displays the first one*, so the control showed a project while the state
+ * behind it was empty: every field looked filled and Connect stayed disabled, with
+ * nothing on screen naming the unsatisfied one. Reported as "the connect button is never
+ * enabled", and reproduced by delaying `/api/projects` by 1.5s.
+ */
+test('the github app form defaults to a project that arrives after it renders', () => {
+  const seed = (withProjects: boolean) => (qc: QueryClient) => {
+    qc.setQueryData(['system'], systemWith({ allowed: true, reason: null, names: ['linear'] }))
+    qc.setQueryData(['linearOauth'], linearOauth())
+    qc.setQueryData(['githubConnections'], { connections: [], registerUrl: 'https://x' })
+    if (withProjects) qc.setQueryData(['projects'], { projects: [{ slug: 'heirchive-api' }] })
+  }
+
+  // The render that used to freeze the state: the form exists, the list does not yet.
+  const early = render(<SettingsPage />, seed(false))
+  assert.match(early, /type="file"/, 'the form renders before the projects query resolves')
+
+  // And once the list is there, the select's value is the project rather than empty —
+  // which is what `ready` reads.
+  const later = render(<SettingsPage />, seed(true))
+  assert.match(later, /<option[^>]*value="heirchive-api"/)
+  assert.ok(
+    !/<select[^>]*value=""/.test(later),
+    'no select is left holding a value none of its options has',
+  )
+})
