@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link, useSearchParams } from 'react-router'
 import { api, type LinearApp, type LinearOauth, type SystemInfo } from '../api.ts'
-import { Empty, Page } from '../ui.tsx'
+import { Empty, Page, when } from '../ui.tsx'
 
 /**
  * What this control plane is, and what the machine running it can actually do.
@@ -177,6 +177,9 @@ export function SettingsPage() {
 
       <h2>Linear</h2>
       <LinearConnection />
+
+      <h2>GitHub</h2>
+      <GithubConnection />
 
       <h2>Project secrets</h2>
       <ProjectSecrets secrets={projectSecrets} writes={data.projectSecretWrites} />
@@ -686,6 +689,125 @@ function Applications() {
           ))}
         </tbody>
       </table>
+    </div>
+  )
+}
+
+/**
+ * GitHub, which is an App rather than a consent flow.
+ *
+ * Deliberately not a mirror of the Linear card. That one is about a browser round trip —
+ * a callback URL to paste, a redirect to approve — and GitHub's App has none of that: it
+ * is registered on github.com, installed on an account, and authenticates by signing a
+ * JWT with a private key it holds. The card's job is to say who Ogun is acting as and to
+ * get somebody to the two places that do the work.
+ *
+ * No form, and that is the same decision the applications table makes. The credential is
+ * a private key with push access to an organisation; `ogun connect github --app` takes it
+ * with the echo off, proves it by minting a token before anything is stored, and names
+ * every project it displaces. A textarea in a browser would be a second path to the same
+ * store with none of that, and the weaker of the two.
+ */
+function GithubConnection() {
+  const { data, isLoading } = useQuery({
+    queryKey: ['githubConnections'],
+    queryFn: api.githubConnections,
+  })
+
+  if (isLoading || !data) return <div className="card">loading…</div>
+  const { connections } = data
+
+  return (
+    <div className="card">
+      <p className="muted" style={{ marginTop: 0, fontSize: 12 }}>
+        An App gives Ogun an identity of its own. A personal access token authenticates{' '}
+        <em>as you</em>, so its pull requests are yours, it cannot request changes on them —
+        GitHub refuses a review of your own pull request — and the loop guard that stops
+        Ogun acting on its own comments cannot tell your words from its own.
+      </p>
+
+      {connections.length === 0 ? (
+        <>
+          <p className="muted" style={{ fontSize: 12 }}>
+            Nothing on this machine is connected to GitHub. Three steps, and only the last
+            one is Ogun&rsquo;s:
+          </p>
+          <ol className="muted" style={{ fontSize: 12, lineHeight: 1.7 }}>
+            <li>
+              Register an App at{' '}
+              <a className="extlink" href={data.registerUrl} target="_blank" rel="noreferrer">
+                github.com/settings/apps/new
+              </a>
+              {' '}— or under an organisation, which is where it belongs if the repositories
+              are. Turn the webhook <strong>off</strong>: Ogun polls, because a control
+              plane behind NAT has no address an inbound hook could reach.
+            </li>
+            <li>
+              Give it <strong>Pull requests: read &amp; write</strong> and{' '}
+              <strong>Contents: read &amp; write</strong>, and nothing else. Install it on
+              the account, choosing <strong>All repositories</strong> if you would rather
+              not repeat this per repo.
+            </li>
+            <li>
+              Hand Ogun the three values. The private key is a file, so it is a path here
+              rather than a paste:
+              <pre className="cmd-block">
+                ogun connect github --app appId=… installationId=… privateKey=./key.pem
+              </pre>
+            </li>
+          </ol>
+        </>
+      ) : (
+        <table>
+          <thead>
+            <tr>
+              <th>Project</th>
+              <th>Acts as</th>
+              <th>Application</th>
+              <th>Token</th>
+            </tr>
+          </thead>
+          <tbody>
+            {connections.map((g) => (
+              <tr key={`${g.project}:${g.application}`}>
+                <td>{g.project}</td>
+                <td className="mono">
+                  {/**
+                   * The question this card exists to answer. `ogun[bot]` means the App is
+                   * doing the work; anything else means a credential is standing in for it
+                   * and the attribution, the review state and the loop guard are all a
+                   * person's rather than Ogun's.
+                   */}
+                  {g.actor.endsWith('[bot]') ? (
+                    g.actor
+                  ) : (
+                    <span className="pill yellow" title="not an App identity">
+                      {g.actor}
+                    </span>
+                  )}
+                </td>
+                <td className="mono muted">
+                  {g.application}
+                  {g.account ? <span className="muted"> · {g.account}</span> : null}
+                </td>
+                <td className="muted">
+                  {g.malformed !== undefined ? (
+                    <span className="pill red" title={g.malformed}>
+                      unreadable
+                    </span>
+                  ) : g.expiresAt === undefined ? (
+                    '—'
+                  ) : (
+                    /* An installation token lasts an hour and renews before use, so a
+                       past expiry here is ordinary rather than a fault. */
+                    when(new Date(g.expiresAt).toISOString())
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
     </div>
   )
 }

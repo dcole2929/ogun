@@ -1086,3 +1086,56 @@ oauthRoutes.get('/applications', async (c) => {
     ),
   })
 })
+
+/**
+ * The GitHub half of the Settings page.
+ *
+ * Its own route rather than fields bolted onto `/linear`, for the reason the applications
+ * route gives: the two providers answer different questions. Linear's card is about a
+ * consent flow with a callback URL and a redirect to paste; GitHub's is about an App that
+ * was registered on github.com, installed on an account, and whose identity — the thing
+ * that makes "opened by Ogun" a fact rather than a branch-prefix guess — is the point.
+ *
+ * Read-only, like the applications listing and for the same reason: the credential is a
+ * private key, and `ogun connect github --app` already takes it with the echo off, proves
+ * it by minting a token before storing anything, and names what it displaced.
+ */
+oauthRoutes.get('/github', async (c) => {
+  const [grants, applications] = await Promise.all([
+    listGrants().catch(() => []),
+    listApplications().catch(() => []),
+  ])
+  const byName = new Map(applications.map((a) => [a.name, a]))
+
+  return c.json({
+    connections: grants
+      .filter((g) => g.provider === 'github')
+      .map((g) => {
+        const listed = byName.get(g.app)
+        const app =
+          listed?.state === 'present' && listed.app.provider === 'github' ? listed.app : undefined
+        return {
+          project: g.project,
+          application: g.app,
+          /**
+           * The login Ogun acts as — `ogun[bot]`. The single most useful fact on this card,
+           * because it is what tells you whether pull requests are being opened by the App
+           * or by whoever's token is standing in for it.
+           */
+          actor: g.actor,
+          appId: app?.appId ?? null,
+          installationId: app?.installationId ?? null,
+          account: g.account?.name ?? null,
+          ...(g.expiresAt !== undefined ? { expiresAt: g.expiresAt } : {}),
+          ...(g.malformed !== undefined ? { malformed: g.malformed } : {}),
+        }
+      }),
+    /**
+     * Where an App is registered, which is a page on github.com rather than anything Ogun
+     * can do — so the card links it rather than pretending to a flow it does not have.
+     * Not derived from a configured org: this machine may serve several, and guessing one
+     * would send somebody to register an App under the wrong account.
+     */
+    registerUrl: 'https://github.com/settings/apps/new',
+  })
+})

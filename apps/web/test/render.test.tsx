@@ -1434,3 +1434,55 @@ test('an unreadable application is shown rather than hidden', () => {
   assert.match(html, /github:broken/)
   assert.match(html, /unreadable/)
 })
+
+/**
+ * The GitHub card's whole job is the identity question.
+ *
+ * A personal token authenticates *as a person*, so Ogun's pull requests are theirs, it
+ * cannot request changes on them — GitHub refuses a review of your own pull request — and
+ * the loop guard cannot tell that person's comments from Ogun's. `ogun[bot]` is the
+ * difference, so the card marks anything that is not one.
+ */
+test('the github card says who Ogun is acting as, and flags a non-App identity', () => {
+  const seed = (actor: string) => (qc: QueryClient) => {
+    qc.setQueryData(['system'], systemWith({ allowed: true, reason: null, names: ['linear'] }))
+    qc.setQueryData(['linearOauth'], linearOauth())
+    qc.setQueryData(['githubConnections'], {
+      connections: [
+        {
+          project: 'heirchive-api',
+          application: 'github:heirchive',
+          actor,
+          appId: '1234567',
+          installationId: '98765432',
+          account: 'Heirchive',
+          expiresAt: Date.now() + 3_600_000,
+        },
+      ],
+      registerUrl: 'https://github.com/settings/apps/new',
+    })
+  }
+
+  const asApp = render(<SettingsPage />, seed('ogun[bot]'))
+  assert.match(asApp, /ogun\[bot\]/)
+  assert.ok(!/pill yellow/.test(asApp.split('github:heirchive')[0]!.slice(-400)), 'an App is not flagged')
+
+  const asPerson = render(<SettingsPage />, seed('dcole2929'))
+  assert.match(asPerson, /not an App identity/)
+})
+
+/** With nothing connected the card has to teach the three steps, only one of which is Ogun's. */
+test('the github card explains the setup when nothing is connected', () => {
+  const html = render(<SettingsPage />, (qc) => {
+    qc.setQueryData(['system'], systemWith({ allowed: true, reason: null, names: ['linear'] }))
+    qc.setQueryData(['linearOauth'], linearOauth())
+    qc.setQueryData(['githubConnections'], {
+      connections: [],
+      registerUrl: 'https://github.com/settings/apps/new',
+    })
+  })
+  assert.match(html, /github\.com\/settings\/apps\/new/)
+  assert.match(html, /ogun connect github --app/)
+  // The webhook line, because a control plane behind NAT has no address a hook can reach.
+  assert.match(html, /webhook/i)
+})
