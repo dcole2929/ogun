@@ -390,9 +390,10 @@ export async function projectAdd(args: string[], serverUrl: string): Promise<voi
    * `.ogun/config.yaml`, a file nothing in the tool has ever created and which the person
    * had not been shown.
    *
-   * So the entry point that was missing is this one. Two lines is the whole of a valid
-   * config — everything else in that file has a default or is a thing to add later — and
-   * writing them is what turns "I have a repo" into "Ogun has a project".
+   * So the entry point that was missing is this one, and it is the whole of what was
+   * missing: two lines are a valid config — everything else in that file has a default or
+   * is a thing to add later — and with them on disk `ogun project sync` is a step that
+   * works rather than one that fails on a file nobody wrote.
    *
    * Never over an existing file. That one is the definition, reviewed in a pull request,
    * and a command called `add` overwriting it would be the worst kind of surprise.
@@ -424,15 +425,37 @@ export async function projectAdd(args: string[], serverUrl: string): Promise<voi
   console.log(dim(`  in ${localConfigPath()}`))
 
   /**
-   * And then register it, rather than printing the command that would.
+   * `sync` is still a separate command, and this still points at it.
    *
-   * The old ending told you to run `ogun project sync` and left. That is one more step
-   * for the thing you already asked for, and on a repository with no config it was a step
-   * that could not succeed — which is how `add` came to be a command that reported
-   * success and produced no project.
+   * The two do different jobs on different sides of the wire: a path is a fact about
+   * *this machine* and never leaves it (§4.5), while syncing posts a resolved config to
+   * the control plane. Registering a checkout is a thing to do without re-registering a
+   * project, and syncing is a thing to do from a machine that never runs a runner — so
+   * folding one into the other would take a command away rather than add one.
+   *
+   * What was broken was never the split. It was that this line recommended `sync` to a
+   * repository `sync` could not read, and the same function had printed "has no
+   * .ogun/config.yaml" twenty lines earlier. With the config written, the recommendation
+   * is true: it is one step, and the step works.
    */
-  console.log('')
-  await projectSync([root], serverUrl)
+  if (configured === null) {
+    console.log(dim(`\n  Next: \`ogun project sync\` registers "${slug}" with the control plane.`))
+    return
+  }
+  /**
+   * An existing config means the project may already be registered, which is worth a
+   * request to find out: nagging somebody to sync a project they have synced is how a
+   * command's last line becomes something people stop reading.
+   */
+  const known = await fetch(`${serverUrl}/api/projects`, { headers: await authHeaders() })
+    .then((r) => r.json() as Promise<{ projects: Array<{ slug: string }> }>)
+    .then((d) => d.projects.some((p) => p.slug === slug))
+    .catch(() => null)
+  if (known === false) {
+    console.log(
+      dim(`\n  The control plane has no project called "${slug}" yet — \`ogun project sync\`.`),
+    )
+  }
 }
 
 

@@ -48,7 +48,7 @@ const bareRepo = async (): Promise<{ dir: string; repo: string; config: string }
   return { dir, repo, config: join(dir, 'config.json') }
 }
 
-test('adding a repository Ogun has never seen produces a project', async () => {
+test('adding a repository Ogun has never seen writes the config sync needs', async () => {
   const { dir, repo, config } = await bareRepo()
   try {
     const added = await ogun(['project', 'add', repo], config)
@@ -62,12 +62,17 @@ test('adding a repository Ogun has never seen produces a project', async () => {
     const machine = JSON.parse(await readFile(config, 'utf8')) as { projects: Record<string, string> }
     assert.equal(machine.projects.clawz, repo)
 
-    // And the half that was missing: `add` now ends with a project rather than with
-    // instructions for making one. No server here, so the sync attempt fails — what is
-    // asserted is that it was attempted, not that it succeeded.
+    // `add` does not sync. The two commands sit on opposite sides of the wire — a path
+    // is a fact about this machine and never leaves it, syncing posts a config to the
+    // control plane — and what was broken was never the split. It was that `add`
+    // recommended `sync` to a repository `sync` could not read.
+    //
+    // So the recommendation stays and is now true, which is the property worth pinning:
+    // the file named in it exists by the time it is printed.
+    assert.match(added.stdout, /Next: `ogun project sync`/)
     assert.ok(
-      /synced clawz/.test(added.stdout) || /ECONNREFUSED|fetch failed|could not reach/i.test(added.stderr),
-      `add did not go on to register the project: ${added.stdout}${added.stderr}`,
+      !/^synced /m.test(added.stdout),
+      'add registers a path; it does not reach the control plane',
     )
 
     // The thing that bites later, said at the moment the file appears.
