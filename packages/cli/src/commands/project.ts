@@ -1,8 +1,9 @@
 import { execFile } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
-import { join, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { promisify } from 'node:util'
 import { existsSync } from 'node:fs'
+import { mkdir, writeFile } from 'node:fs/promises'
 import { basename } from 'node:path'
 import {
   discoverSkills,
@@ -371,8 +372,49 @@ export async function projectAdd(args: string[], serverUrl: string): Promise<voi
   if (!configured && !flags.name) {
     console.log(
       dim(
-        `${root} has no .ogun/config.yaml, so this is registered as "${slug}" from its\n` +
-          'directory name. If the project is known by another name, pass --name.',
+        `${root} has no .ogun/config.yaml, so "${slug}" is taken from the directory name.\n` +
+          'If the project is known by another name, pass --name.',
+      ),
+    )
+  }
+  /**
+   * A repository with no config gets one, because otherwise this command cannot do what
+   * it is named for.
+   *
+   * `project add` was written as a performance hint for a project that already exists —
+   * "tell this machine where a repo is checked out, without the full sync" — and that is
+   * a real thing to want. But it is also the first command under `projects` in the help
+   * and the one called `add`, so it is what somebody reaches for with a repository Ogun
+   * has never seen. There it wrote a path into this machine's map and stopped: the
+   * control plane had no project, `project list` showed nothing, and the only way on was
+   * `.ogun/config.yaml`, a file nothing in the tool has ever created and which the person
+   * had not been shown.
+   *
+   * So the entry point that was missing is this one. Two lines is the whole of a valid
+   * config — everything else in that file has a default or is a thing to add later — and
+   * writing them is what turns "I have a repo" into "Ogun has a project".
+   *
+   * Never over an existing file. That one is the definition, reviewed in a pull request,
+   * and a command called `add` overwriting it would be the worst kind of surprise.
+   */
+  const configPath = join(root, '.ogun', 'config.yaml')
+  if (configured === null) {
+    await mkdir(dirname(configPath), { recursive: true })
+    await writeFile(
+      configPath,
+      `# What Ogun does in this repository. Committed, because the runner reads it from\n` +
+        `# git at the commit a job is pinned to and never from the working tree — a change\n` +
+        `# that is not committed is invisible to every run.\n` +
+        `#\n` +
+        `# Nothing is configured yet. \`ogun skills\` lists what is available to add here.\n` +
+        `project:\n  name: ${slug}\n`,
+      'utf8',
+    )
+    console.log(green(`wrote ${configPath}`))
+    console.log(
+      dim(
+        '  Commit it — the runner reads this file from git, so an uncommitted one is\n' +
+          '  invisible to a run.',
       ),
     )
   }
@@ -381,54 +423,18 @@ export async function projectAdd(args: string[], serverUrl: string): Promise<voi
   console.log(green(`${slug} → ${root}`))
   console.log(dim(`  in ${localConfigPath()}`))
 
-  const known = await fetch(`${serverUrl}/api/projects`, { headers: await authHeaders() })
-    .then((r) => r.json() as Promise<{ projects: Array<{ slug: string }> }>)
-    .then((d) => d.projects.some((p) => p.slug === slug))
-    .catch(() => null)
   /**
-   * Two different sentences, because `sync` reads `.ogun/config.yaml` and a repository
-   * without one cannot be synced.
+   * And then register it, rather than printing the command that would.
    *
-   * Saying "run `ogun project sync`" to somebody who has just been told the file is
-   * missing is a dead end the command walks them into: add succeeds, sync fails with
-   * ENOENT on a path nobody chose, and `project list` does not show the project. The
-   * information to tell them apart was already here — `configured` is null exactly when
-   * there is no file — and was simply not used.
-   *
-   * Outside the `known` check, unlike the sentence below it. Whether the control plane
-   * has heard of this project is a question only the control plane can answer, and the
-   * `catch` above turns an unreachable one into `null`. Whether this repository has a
-   * config is a fact about the disk, true at the same moment either way — so the advice
-   * that depends on it does not wait for a server that may be stopped.
+   * The old ending told you to run `ogun project sync` and left. That is one more step
+   * for the thing you already asked for, and on a repository with no config it was a step
+   * that could not succeed — which is how `add` came to be a command that reported
+   * success and produced no project.
    */
-  if (configured === null) {
-    {
-      console.log(
-        dim(
-          `\n  "${slug}" is not registered with the control plane yet, and cannot be until\n` +
-            '  this repository says what Ogun should do in it. The smallest file that works:\n',
-        ),
-      )
-      console.log(dim(`    ${root}/.ogun/config.yaml`))
-      console.log(`      project:`)
-      console.log(`        name: ${slug}`)
-      console.log(
-        dim(
-          '\n  That registers the project and nothing else — no workers, no cycles, no\n' +
-            '  sources — which is enough for `ogun project sync` to accept it. Commit it:\n' +
-            '  the runner reads this file from git at the pinned commit, never from the\n' +
-            '  working tree, so an uncommitted one is invisible to every run.',
-        ),
-      )
-      return
-    }
-  }
-  if (known === false) {
-    console.log(
-      dim(`\n  The control plane has no project called "${slug}" yet — \`ogun project sync\`.`),
-    )
-  }
+  console.log('')
+  await projectSync([root], serverUrl)
 }
+
 
 /**
  * Ogun's `skills/` directory is the built-in library — universal disciplines available in

@@ -1,6 +1,6 @@
 import { strict as assert } from 'node:assert'
 import { execFile } from 'node:child_process'
-import { mkdir, mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { test } from 'node:test'
@@ -48,24 +48,57 @@ const bareRepo = async (): Promise<{ dir: string; repo: string; config: string }
   return { dir, repo, config: join(dir, 'config.json') }
 }
 
-test('adding a project with no config says what to write, not what to run', async () => {
+test('adding a repository Ogun has never seen produces a project', async () => {
   const { dir, repo, config } = await bareRepo()
   try {
     const added = await ogun(['project', 'add', repo], config)
 
-    assert.equal(added.code, 0, 'registering the path still succeeds')
-    assert.match(added.stdout, /cannot be until/)
-    // The file by name and its contents, so it can be written without guessing.
-    assert.match(added.stdout, /\.ogun\/config\.yaml/)
-    assert.match(added.stdout, /name: clawz/)
-    // `sync` is still named, as the step after writing the file. What must not appear is
-    // the sentence that offered it as the immediate remedy to a repository that has
-    // nothing for it to read.
+    // The file it could not have had, with the name it will be known by.
+    const written = await readFile(join(repo, '.ogun', 'config.yaml'), 'utf8')
+    assert.match(written, /^project:\n {2}name: clawz$/m)
+    assert.match(added.stdout, /wrote .*\.ogun\/config\.yaml/)
+
+    // The path, on this machine, which is what `add` always did.
+    const machine = JSON.parse(await readFile(config, 'utf8')) as { projects: Record<string, string> }
+    assert.equal(machine.projects.clawz, repo)
+
+    // And the half that was missing: `add` now ends with a project rather than with
+    // instructions for making one. No server here, so the sync attempt fails — what is
+    // asserted is that it was attempted, not that it succeeded.
     assert.ok(
-      !/has no project called .* yet/.test(added.stdout),
-      'a repository with no config is not sent straight to the command that reads one',
+      /synced clawz/.test(added.stdout) || /ECONNREFUSED|fetch failed|could not reach/i.test(added.stderr),
+      `add did not go on to register the project: ${added.stdout}${added.stderr}`,
     )
-    assert.match(added.stdout, /enough for `ogun project sync` to accept it/)
+
+    // The thing that bites later, said at the moment the file appears.
+    assert.match(added.stdout, /Commit it/)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+/**
+ * The config is the definition — reviewed in a pull request, read by the runner from git.
+ * A command called `add` overwriting one would be the worst kind of surprise, so an
+ * existing file decides the name rather than being replaced by a guess from the directory.
+ */
+test('an existing config is never overwritten, and names the project', async () => {
+  const { dir, repo, config } = await bareRepo()
+  try {
+    await mkdir(join(repo, '.ogun'), { recursive: true })
+    const original = 'project:\n  name: already-here\n  defaultBranch: develop\n'
+    await writeFile(join(repo, '.ogun', 'config.yaml'), original)
+
+    const added = await ogun(['project', 'add', repo], config)
+
+    assert.equal(await readFile(join(repo, '.ogun', 'config.yaml'), 'utf8'), original)
+    assert.ok(!/wrote /.test(added.stdout), 'nothing was written over it')
+    const machine = JSON.parse(await readFile(config, 'utf8')) as { projects: Record<string, string> }
+    assert.equal(
+      machine.projects['already-here'],
+      repo,
+      'the configured name wins over the directory name',
+    )
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
