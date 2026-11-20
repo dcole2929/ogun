@@ -13,6 +13,8 @@ import {
   LINEAR_SCOPES,
   linkedApplication,
   applicationIdentifier,
+  connectGithubApp,
+  GithubAppError,
   listApplications,
   listGrants,
   normalizeSecretInput,
@@ -858,7 +860,6 @@ oauthRoutes.get('/linear', async (c) => {
         // stored, and a future editor cannot widen a boolean into a disclosure.
         clientSecretSet: app !== undefined,
         redirectUri: app?.redirectUri ?? '',
-        connected: g.malformed === undefined,
         scopes: g.scopes,
         actor: g.actor,
         ...(g.grantType ? { grantType: g.grantType } : {}),
@@ -1138,4 +1139,96 @@ oauthRoutes.get('/github', async (c) => {
      */
     registerUrl: 'https://github.com/settings/apps/new',
   })
+})
+
+/**
+ * Register a GitHub App for a project, from the Settings page.
+ *
+ * ### Why this one writes where `PUT /linear/app/:project` no longer does
+ *
+ * That route stopped writing because its flow has a second half: a browser round trip
+ * that ends in a token, and holding the credentials in memory until then means nothing
+ * unproven reaches the store. An App has no second half. The three values *are* the
+ * credential, and they prove themselves in one request — `connectGithubApp` mints an
+ * installation token before it writes a thing. So the same principle produces a write
+ * here and an offer there.
+ *
+ * ### The transport gate
+ *
+ * `secretWriteTransport` for the reason the project-secret route has it: a private key
+ * with push access to an organisation must not cross a connection that is not carrying
+ * it privately, and the control plane binds beyond localhost on purpose. The CLI is
+ * unaffected — it writes the file directly and never touches a socket.
+ *
+ * Nothing of the key is echoed. The response is the connection, which is public facts:
+ * the account, the login, the application name, the expiry.
+ */
+oauthRoutes.post('/github/app/:project', async (c) => {
+  const transport = secretWriteTransport()
+  if (!transport.allowed) return c.json({ error: transport.reason }, 403)
+
+  const project = c.req.param('project')
+  const known = await c.var.ctx.db.query.projects.findFirst({
+    where: eq(projects.slug, project),
+    columns: { id: true },
+  })
+  if (!known) return c.json({ error: UNKNOWN_PROJECT }, 404)
+
+  let body: unknown
+  try {
+    body = JSON.parse(await c.req.text())
+  } catch {
+    // The parser quotes its source and the source is a private key.
+    return c.json({ error: 'the request body was not valid JSON. Nothing was stored.' }, 400)
+  }
+
+  const fields = body as Record<string, unknown> | null
+  for (const name of ['appId', 'installationId', 'privateKey'] as const) {
+    if (typeof fields?.[name] !== 'string' || (fields[name] as string).trim() === '') {
+      return c.json(
+        { error: `expected {"appId": "…", "installationId": "…", "privateKey": "…"} — ${name} is missing.` },
+        400,
+      )
+    }
+  }
+
+  /**
+   * A paste that lost its line breaks is the failure this catches, and it is worth
+   * catching here rather than at `createSign`: a one-line PEM fails deep inside node's
+   * crypto with a message about a header, hours of confusion away from "you pasted this
+   * into a browser".
+   */
+  const privateKey = (fields!.privateKey as string).trim()
+  if (!privateKey.includes('\n')) {
+    return c.json(
+      {
+        error:
+          'that private key is a single line, so it is not a PEM — a pasted key keeps its ' +
+          'line breaks. Nothing was stored.',
+      },
+      400,
+    )
+  }
+
+  try {
+    const connection = await connectGithubApp(project, {
+      appId: normalizeSecretInput(fields!.appId as string),
+      installationId: normalizeSecretInput(fields!.installationId as string),
+      privateKey,
+    })
+    return c.json({ connected: connection })
+  } catch (err) {
+    if (err instanceof InvalidSecret) return c.json({ error: err.message }, 400)
+    /**
+     * GitHub refusing the credential is a 400, not a 500: the operator's input is what is
+     * wrong and they are the one who can fix it. `GithubAppError` already separates that
+     * from a transport fault, and forwarding its message is safe — it is built never to
+     * carry the key or the JWT, which `github-app.test.ts` asserts against a stub that
+     * reflects them back.
+     */
+    if (err instanceof GithubAppError) {
+      return c.json({ error: err.message }, err.kind === 'config' ? 400 : 502)
+    }
+    throw err
+  }
 })

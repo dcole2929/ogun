@@ -1486,3 +1486,34 @@ test('the github card explains the setup when nothing is connected', () => {
   // The webhook line, because a control plane behind NAT has no address a hook can reach.
   assert.match(html, /webhook/i)
 })
+
+/** The form refuses on a control plane that cannot carry a secret, and offers the CLI. */
+test('the github app form is replaced by the CLI when the wire cannot carry a key', () => {
+  const html = render(<SettingsPage />, (qc) => {
+    qc.setQueryData(
+      ['system'],
+      systemWith({ allowed: false, reason: 'the control plane is bound beyond localhost.', names: ['linear'] }),
+    )
+    qc.setQueryData(['linearOauth'], linearOauth())
+    qc.setQueryData(['githubConnections'], { connections: [], registerUrl: 'https://x' })
+  })
+  assert.match(html, /bound beyond localhost/)
+  assert.match(html, /ogun connect github --app/)
+  // And no field that would have taken one.
+  assert.ok(!/placeholder="-----BEGIN RSA PRIVATE KEY-----"/.test(html))
+})
+
+/** With a usable wire it offers the three fields, and the key is a file as well as a paste. */
+test('the github app form takes a .pem as a file, not only as a paste', () => {
+  const html = render(<SettingsPage />, (qc) => {
+    qc.setQueryData(['system'], systemWith({ allowed: true, reason: null, names: ['linear'] }))
+    qc.setQueryData(['linearOauth'], linearOauth())
+    qc.setQueryData(['githubConnections'], { connections: [], registerUrl: 'https://x' })
+    qc.setQueryData(['projects'], { projects: [{ slug: 'heirchive-api' }] })
+  })
+  assert.match(html, /type="file"/)
+  assert.match(html, /accept=".pem/)
+  assert.match(html, /-----BEGIN RSA PRIVATE KEY-----/)
+  // The promise the form makes before the click, so a refusal does not read as a bug.
+  assert.match(html, /nothing is stored if that fails/)
+})

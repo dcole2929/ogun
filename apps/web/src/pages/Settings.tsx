@@ -709,13 +709,17 @@ function Applications() {
  * store with none of that, and the weaker of the two.
  */
 function GithubConnection() {
+  const qc = useQueryClient()
   const { data, isLoading } = useQuery({
     queryKey: ['githubConnections'],
     queryFn: api.githubConnections,
   })
+  const system = useQuery({ queryKey: ['system'], queryFn: api.system })
+  const projects = useQuery({ queryKey: ['projects'], queryFn: api.projects })
 
   if (isLoading || !data) return <div className="card">loading…</div>
   const { connections } = data
+  const writes = system.data?.projectSecretWrites
 
   return (
     <div className="card">
@@ -757,7 +761,15 @@ function GithubConnection() {
             </li>
           </ol>
         </>
-      ) : (
+      ) : null}
+
+      <GithubAppForm
+        projects={(projects.data?.projects ?? []).map((p) => p.slug)}
+        writes={writes}
+        onConnected={() => void qc.invalidateQueries({ queryKey: ['githubConnections'] })}
+      />
+
+      {connections.length > 0 ? (
         <table>
           <thead>
             <tr>
@@ -807,6 +819,157 @@ function GithubConnection() {
             ))}
           </tbody>
         </table>
+      ) : null}
+    </div>
+  )
+}
+
+/**
+ * The three values that make an App, from a browser.
+ *
+ * A **file picker as well as a textarea**, and the picker is the one that matters: the
+ * private key arrives as a `.pem` you downloaded, so the honest gesture is to hand over
+ * that file rather than to select 1,700 characters of it in a text editor. Paste stays
+ * for the case where the key lives in a password manager and never touched the disk.
+ *
+ * The file is read in the browser and sent as text; nothing is uploaded, because there is
+ * no upload endpoint and a multipart body would be a second shape for the one route to
+ * parse.
+ *
+ * `appId` and `installationId` are plain inputs rather than password fields. Neither is a
+ * secret — both are on the App's settings page and in every JWT Ogun signs — and masking
+ * them would mean an operator could not check what they pasted, which is the mistake the
+ * CLI's `--client-id` note already records.
+ */
+function GithubAppForm({
+  projects,
+  writes,
+  onConnected,
+}: {
+  projects: string[]
+  writes: SystemInfo['projectSecretWrites'] | undefined
+  onConnected: () => void
+}) {
+  const [project, setProject] = useState(projects[0] ?? '')
+  const [appId, setAppId] = useState('')
+  const [installationId, setInstallationId] = useState('')
+  const [privateKey, setPrivateKey] = useState('')
+  const [fileName, setFileName] = useState<string | null>(null)
+
+  const connect = useMutation({
+    mutationFn: () => api.connectGithubApp(project, { appId, installationId, privateKey }),
+    onSuccess: () => {
+      // Cleared on success and not before: a failed attempt keeps what was typed, because
+      // retyping an app id to fix a key is how somebody gives up on a form.
+      setAppId('')
+      setInstallationId('')
+      setPrivateKey('')
+      setFileName(null)
+      onConnected()
+    },
+  })
+
+  /**
+   * The same refusal the project-secret form shows, for the same reason: a private key
+   * with push access to an organisation must not cross a connection that is not carrying
+   * it privately. The CLI is unaffected — it writes the file and never opens a socket.
+   */
+  if (writes && !writes.allowed) {
+    return (
+      <p className="muted" style={{ fontSize: 12 }}>
+        {writes.reason} Connect from the control-plane machine instead:
+        <pre className="cmd-block">
+          ogun connect github --app appId=… installationId=… privateKey=./key.pem
+        </pre>
+      </p>
+    )
+  }
+
+  const ready = project !== '' && appId.trim() !== '' && installationId.trim() !== '' &&
+    privateKey.trim() !== ''
+
+  return (
+    <div className="form" style={{ marginTop: 14 }}>
+      <label>
+        <span>Project</span>
+        <select value={project} onChange={(e) => setProject(e.target.value)}>
+          {projects.map((slug) => (
+            <option key={slug} value={slug}>
+              {slug}
+            </option>
+          ))}
+        </select>
+        <small>One App can serve several — connect each, or link them with the CLI.</small>
+      </label>
+      <label>
+        <span>App ID</span>
+        <input type="text" value={appId} onChange={(e) => setAppId(e.target.value)} />
+        <small>On the App&rsquo;s settings page. Not a secret.</small>
+      </label>
+      <label>
+        <span>Installation ID</span>
+        <input
+          type="text"
+          value={installationId}
+          onChange={(e) => setInstallationId(e.target.value)}
+        />
+        <small>
+          The number at the end of the URL after you install it:{' '}
+          <span className="mono">/settings/installations/<strong>12345678</strong></span>
+        </small>
+      </label>
+      <label className="wide">
+        <span>Private key</span>
+        <input
+          type="file"
+          accept=".pem,application/x-pem-file"
+          onChange={(e) => {
+            const file = e.target.files?.[0]
+            if (!file) return
+            setFileName(file.name)
+            void file.text().then(setPrivateKey)
+          }}
+        />
+        <textarea
+          rows={4}
+          value={privateKey}
+          placeholder="-----BEGIN RSA PRIVATE KEY-----"
+          onChange={(e) => {
+            setPrivateKey(e.target.value)
+            setFileName(null)
+          }}
+        />
+        <small>
+          {fileName === null
+            ? 'Choose the .pem you downloaded, or paste it. It is sent once and never shown again.'
+            : `${fileName} — read in this browser, not uploaded.`}
+        </small>
+      </label>
+
+      <div className="row wide" style={{ marginTop: 4 }}>
+        <button
+          className="primary"
+          disabled={!ready || connect.isPending}
+          onClick={() => connect.mutate()}
+        >
+          {connect.isPending ? 'minting a token…' : 'Connect'}
+        </button>
+        <span className="muted" style={{ fontSize: 12 }}>
+          {/* Said before the click, because "it stored nothing" after a failure reads as a
+              bug unless somebody already knew that was the rule. */}
+          proved by minting an installation token — nothing is stored if that fails
+        </span>
+      </div>
+      {connect.error && (
+        <p className="error wide" style={{ fontSize: 13 }}>
+          {String(connect.error)}
+        </p>
+      )}
+      {connect.data && (
+        <p className="wide" style={{ fontSize: 13 }}>
+          Connected as <span className="mono">{connect.data.connected.login}</span> on{' '}
+          <span className="mono">{connect.data.connected.account}</span>.
+        </p>
       )}
     </div>
   )
@@ -1033,20 +1196,9 @@ function LinearConnection() {
                       </button>
                       <button onClick={() => setConfirming(null)}>Cancel</button>
                     </span>
-                  ) : app.connected ? (
+                  ) : (
                     <button className="danger" onClick={() => setConfirming(app.project)}>
                       Disconnect
-                    </button>
-                  ) : (
-                    // No credentials sent: the application is already on the control-plane
-                    // machine, and asking for a client secret we are holding is how a
-                    // trailing space gets into one.
-                    <button
-                      className="primary"
-                      disabled={connectApp.isPending}
-                      onClick={() => connectApp.mutate({ project: app.project })}
-                    >
-                      Connect
                     </button>
                   )}
                 </td>
@@ -1184,7 +1336,15 @@ function tokenState(app: LinearApp) {
       </span>
     )
   }
-  if (!app.connected) return <span className="pill yellow">not connected</span>
+  /**
+   * There is no "registered but not connected" state any more, so there is no pill for it.
+   *
+   * It was reachable while an application could be written before anything proved it: you
+   * registered, and a row sat unconnected until somebody finished the authorization.
+   * Nothing unproven reaches the store now — the credentials wait in memory and the
+   * application is written together with the grant — so a project either has a grant and
+   * appears here, or has neither and does not appear at all.
+   */
   const left = app.expiresAt === undefined ? null : app.expiresAt - Date.now()
   return (
     <span className="pill green" title="renewed by the poll that needs it">

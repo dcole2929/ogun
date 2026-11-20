@@ -448,7 +448,6 @@ export type LinearApp = {
   clientId: string
   clientSecretSet: boolean
   redirectUri: string
-  connected: boolean
   scopes: string[]
   actor: string
   /**
@@ -719,6 +718,18 @@ export const api = {
    */
   applications: () => json<{ applications: ApplicationRow[] }>('/api/oauth/applications'),
   githubConnections: () => json<GithubSettings>('/api/oauth/github'),
+  /**
+   * Register a GitHub App for a project. The key is sent once and never comes back — the
+   * response is the connection, which is public facts about it.
+   */
+  connectGithubApp: (
+    project: string,
+    app: { appId: string; installationId: string; privateKey: string },
+  ) =>
+    json<{ connected: GithubSettings['connections'][number] & { login: string; account: string } }>(
+      `/api/oauth/github/app/${project}`,
+      { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(app) },
+    ),
   linearOauth: () => json<LinearOauth>('/api/oauth/linear'),
   /**
    * The client secret from Linear's registration form. The other request that carries one,
