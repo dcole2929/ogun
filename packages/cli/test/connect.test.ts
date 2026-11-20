@@ -1479,17 +1479,15 @@ test('doctor names the credentials this machine holds and none of their values',
 })
 
 /**
- * A pasted PEM is named for what it is, rather than read as a filename.
+ * A key that arrives as one line is named for what it is, rather than read as a filename.
  *
- * Reported from a real terminal: pasting the key at the prompt filled the screen with
- * shell commands made of the key's own lines. A prompt reads one line and a PEM has about
- * thirty, so the header answers the prompt and the remaining lines go to the shell.
- *
- * Without this the header becomes a *path*, and the operator is told
- * `could not read -----BEGIN RSA PRIVATE KEY----- (ENOENT)` — which explains nothing about
- * what just happened to their terminal, and sends them to look for a missing file.
+ * The prompt reads a paste whole now, so this is the `key=value` case: an unquoted
+ * `$(cat key.pem)` collapses in some shells, and a value copied from a password manager's
+ * preview does the same. Without this the header becomes a *path* and the operator is
+ * told `could not read -----BEGIN RSA PRIVATE KEY----- (ENOENT)`, which sends them
+ * looking for a missing file.
  */
-test('a private key pasted instead of a path says so, and names the gesture that works', async () => {
+test('a one-line private key says so, and names both forms that work', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'ogun-pem-paste-'))
   const config = join(dir, 'config.json')
   await machineKnowing(config, { 'heirchive-api': '/srv/api' })
@@ -1509,12 +1507,10 @@ test('a private key pasted instead of a path says so, and names the gesture that
   )
 
   assert.equal(pasted.code, 1)
-  assert.match(pasted.stderr, /the key itself rather than a path/)
-  // The two facts that explain the mess on screen.
-  assert.match(pasted.stderr, /a prompt reads one line/)
-  assert.match(pasted.stderr, /the rest went to your shell/)
-  // And the gesture that does work, spelled out rather than described.
+  assert.match(pasted.stderr, /first line of a key rather than a whole one/)
+  // Both forms that work, spelled out rather than described.
   assert.match(pasted.stderr, /privateKey=\.\/key\.pem/)
+  assert.match(pasted.stderr, /cat key\.pem/)
   assert.match(pasted.stderr, /Nothing was stored/)
   // Never the value: it is a credential even when it is only the first line of one.
   assert.ok(!pasted.stderr.includes('MII'), 'no part of a key is quoted back')
@@ -1522,3 +1518,55 @@ test('a private key pasted instead of a path says so, and names the gesture that
   await rm(dir, { recursive: true, force: true })
 })
 
+
+/**
+ * The prompt reads a pasted key whole.
+ *
+ * `prompt` took `chunk.split('\n')[0]` and paused stdin, so a thirty-line paste answered
+ * with its header and left the rest in the terminal's buffer — which the shell then read
+ * as commands, putting most of a private key into `~/.zsh_history`. The data was never
+ * unavailable; it was discarded.
+ *
+ * Both gestures go through one prompt and the first line tells them apart, so neither has
+ * to be declared in advance: a path ends at its newline, a key at its own `-----END`.
+ */
+test('the prompt reads a pasted key whole, and a path on one line', async () => {
+  const { promptKeyOrPath } = await import('../src/prompt.ts')
+
+  const feed = async (text: string): Promise<string> => {
+    const stdin = process.stdin as unknown as {
+      setEncoding: () => void
+      resume: () => void
+      pause: () => void
+      on: (e: string, fn: (c: string) => void) => void
+      removeListener: (e: string, fn: (c: string) => void) => void
+    }
+    let handler: ((c: string) => void) | undefined
+    const real = { on: stdin.on, removeListener: stdin.removeListener, setEncoding: stdin.setEncoding, resume: stdin.resume, pause: stdin.pause }
+    stdin.setEncoding = () => {}
+    stdin.resume = () => {}
+    stdin.pause = () => {}
+    stdin.on = (_e, fn) => { handler = fn }
+    stdin.removeListener = () => {}
+    try {
+      const pending = promptKeyOrPath('')
+      handler?.(text)
+      return await pending
+    } finally {
+      Object.assign(stdin, real)
+    }
+  }
+
+  /** Everything after `-----END` belongs to whoever reads stdin next, not to the key. */
+  const key = await feed(
+    '-----BEGIN RSA PRIVATE KEY-----\nAAAA\nBBBB\n-----END RSA PRIVATE KEY-----\nNOT-PART-OF-IT\n',
+  )
+  assert.equal(key.split('\n').length, 4)
+  assert.ok(key.startsWith('-----BEGIN'))
+  assert.ok(key.trimEnd().endsWith('-----END RSA PRIVATE KEY-----'))
+  assert.ok(!key.includes('NOT-PART-OF-IT'), 'the paste ends where the key does')
+
+  // A path is one line and never opens with a PEM header, so it resolves immediately
+  // rather than waiting for an end marker that is never coming.
+  assert.equal(await feed('./key.pem\nLEFTOVER\n'), './key.pem')
+})

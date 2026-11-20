@@ -110,6 +110,73 @@ export function prompt(label: string): Promise<string> {
 }
 
 /**
+ * A value that may be one line or many, for a field whose natural form is a file.
+ *
+ * ### Why `prompt` could not do this
+ *
+ * It takes `chunk.split('\n')[0]` and pauses stdin. A pasted PEM arrives as one chunk of
+ * thirty lines, so the header was answered with and the remaining twenty-nine were left
+ * in the terminal's buffer — which the shell then read as commands the moment the process
+ * exited. That is how a private key ends up in `~/.zsh_history` as a sequence of things
+ * nobody ran on purpose.
+ *
+ * The data was never unavailable. It was discarded, and the fix is to keep reading.
+ *
+ * ### The two gestures, told apart by their first line
+ *
+ * A path is one line and never begins `-----BEGIN`. A key always does. So the first line
+ * decides which is being offered, and nothing has to be declared in advance or terminated
+ * by hand: a path resolves immediately, and a key resolves when its `-----END` arrives.
+ *
+ * No `Ctrl-D` and no blank-line sentinel, because both are conventions somebody has to
+ * already know, and the one gesture this exists for — select the file's contents, paste —
+ * carries its own terminator.
+ *
+ * Echoed, like `prompt` and unlike `promptHidden`. A path is not a secret and a mistyped
+ * one has to be visible; a pasted key is already on screen by the time this sees it,
+ * because the terminal echoed it as it arrived. Hiding the prompt would not have hidden
+ * the paste.
+ */
+export function promptKeyOrPath(label: string): Promise<string> {
+  return new Promise<string>((resolve) => {
+    process.stderr.write(label)
+    process.stdin.setEncoding('utf8')
+    process.stdin.resume()
+
+    let buffer = ''
+    const finish = (value: string): void => {
+      process.stdin.removeListener('data', onData)
+      process.stdin.pause()
+      resolve(value)
+    }
+    const onData = (chunk: string): void => {
+      buffer += chunk
+      const firstLine = buffer.split('\n')[0] ?? ''
+      /**
+       * Not a key, so it is a path, and a path is finished at its first newline. Waiting
+       * for more would hang on the ordinary case.
+       */
+      if (!firstLine.trimStart().startsWith('-----BEGIN')) {
+        if (buffer.includes('\n')) finish(firstLine)
+        return
+      }
+      /**
+       * A key, so read to its end. `-----END` rather than a line count, because the line
+       * count differs by key type and a PEM that is short by a line is a PEM that will
+       * not parse — better to wait for the marker and let the paste be the thing that
+       * decides it is complete.
+       */
+      const end = buffer.indexOf('-----END')
+      if (end === -1) return
+      const after = buffer.indexOf('\n', end)
+      if (after === -1) return
+      finish(buffer.slice(0, after))
+    }
+    process.stdin.on('data', onData)
+  })
+}
+
+/**
  * Everything on stdin, for the piped case.
  *
  * Read as a string rather than as a buffer that is later stringified, and nothing else
