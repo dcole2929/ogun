@@ -22,12 +22,31 @@ const cli = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'src', 'main.
 
 type Result = { code: number; stdout: string; stderr: string }
 
+/**
+ * An address nothing is listening on, so no test here can reach a real control plane.
+ *
+ * `OGUN_CONFIG` redirects the machine-local file and nothing else. The server URL
+ * defaults to `localhost:7777`, which on a developer's machine is their own running
+ * control plane — so a test that invokes `project sync` registers its fixtures in the
+ * database somebody is actually using. This suite's fixtures are named `clawz` and
+ * `already-here` and point at temp directories that are deleted when the test ends, and
+ * one of them turned up in a real `ogun project list`.
+ *
+ * Port 0 cannot be connected to, so `sync` fails at the request rather than at anything
+ * these tests are about — which is the right place for it to stop. What they assert is
+ * that the directory resolved and the config was found, both of which happen first.
+ */
+const NO_SERVER = 'http://127.0.0.1:0'
+
 const ogun = (args: string[], config: string, cwd?: string): Promise<Result> =>
   new Promise((done) => {
     const child = execFile(
       process.execPath,
       [cli, ...args],
-      { env: { ...process.env, OGUN_CONFIG: config }, ...(cwd ? { cwd } : {}) },
+      {
+        env: { ...process.env, OGUN_CONFIG: config, OGUN_SERVER_URL: NO_SERVER },
+        ...(cwd ? { cwd } : {}),
+      },
       (err, stdout, stderr) =>
         done({
           code: (err as { code?: number } | null)?.code ?? 0,
