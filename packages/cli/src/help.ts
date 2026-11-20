@@ -1424,6 +1424,8 @@ ${bold('projects')}
   ogun project add [dir] [--name]  tell this machine where a repo is checked out
   ogun project sync [dir]          read .ogun/config.yaml and register it
   ogun project list
+
+${bold('credentials')}
   ogun connect <integration>       give this project access to Linear (or the next one)
   ogun connect list                what is connected, how, and how healthy
   ogun disconnect <integration>    remove every credential for it

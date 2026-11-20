@@ -1,6 +1,6 @@
 import { strict as assert } from 'node:assert'
 import { test } from 'node:test'
-import { helpFor } from '../src/help.ts'
+import { helpFor, usage } from '../src/help.ts'
 
 /**
  * A help topic is the one thing a person reads *before* they know what they are doing,
@@ -108,4 +108,42 @@ test('connect renders what you are connecting apart from which grant', () => {
   assert.ok(kinds > 0, 'the kinds have their own heading')
   assert.ok(grants > kinds, 'the grant modifier comes after the kind it modifies')
   assert.match(rendered, /which OAuth grant \(only with --oauth, which it implies\)/)
+})
+
+/**
+ * Credentials are their own heading, not a tail on `projects`.
+ *
+ * `connect`, `disconnect` and `secret` sat under `projects` from when a project was a
+ * positional argument to them. It stopped being one — they take the directory you are
+ * standing in, as `project add` and `project sync` always have — and the per-command page
+ * has said so ever since ("Both moved out of this namespace"). Only the front page still
+ * grouped them with the two commands that register a repository, which is where somebody
+ * looking for `ogun project connect` got the idea that it exists.
+ *
+ * Not "config": `.ogun/config.yaml` is the project's definition and `~/.ogun/config.json`
+ * is this machine's map, so the word is taken twice over in this CLI and neither is what
+ * these commands manage.
+ */
+test('credentials are their own heading, after projects', () => {
+  // `usage` is the front page; `helpFor` serves the per-command pages.
+  const top = usage('http://localhost:4000')
+
+  const projects = top.indexOf('projects')
+  const credentials = top.indexOf('credentials')
+  assert.ok(credentials > projects, 'credentials follows projects')
+
+  // The project heading covers registering a repository, and stops there.
+  const projectBlock = top.slice(projects, credentials)
+  for (const command of ['project add', 'project sync', 'project list']) {
+    assert.ok(projectBlock.includes(command), `${command} is under projects`)
+  }
+  for (const command of ['connect', 'secret']) {
+    assert.ok(!projectBlock.includes(command), `${command} is not under projects`)
+  }
+
+  // And every credential command is under the new one.
+  const credentialBlock = top.slice(credentials)
+  for (const command of ['ogun connect', 'ogun disconnect', 'ogun secret']) {
+    assert.ok(credentialBlock.includes(command), `${command} is under credentials`)
+  }
 })
