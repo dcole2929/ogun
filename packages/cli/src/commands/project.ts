@@ -28,6 +28,24 @@ export async function projectSync(args: string[], serverUrl: string): Promise<vo
   const { first } = parse(args, {}, 'ogun project sync [dir]')
   const root = resolve(first ?? process.cwd())
   const loaded = await loadProjectConfig(root).catch((err) => {
+    /**
+     * A file that is missing and a file that will not parse are different problems with
+     * different fixes, and `ENOENT: no such file or directory` is the one that reads as a
+     * fault in Ogun rather than as something to go and do.
+     *
+     * It is also the one somebody is most likely to hit, because `ogun project add` sends
+     * them here: add registers the path, sync is the next step, and a repository that has
+     * never had a config has nothing for this to read.
+     */
+    if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') {
+      fail(
+        `${root} has no .ogun/config.yaml, so there is nothing to sync.\n\n` +
+          `  Write one — the smallest that works is two lines:\n\n` +
+          `    project:\n      name: ${basename(root)}\n\n` +
+          '  Commit it. The runner reads this file from git at the commit a job is pinned\n' +
+          '  to, never from the working tree, so an uncommitted one is invisible to a run.',
+      )
+    }
     fail(`could not load ${root}/.ogun/config.yaml:\n  ${problemsIn(err)}`)
     throw err
   })
@@ -367,6 +385,44 @@ export async function projectAdd(args: string[], serverUrl: string): Promise<voi
     .then((r) => r.json() as Promise<{ projects: Array<{ slug: string }> }>)
     .then((d) => d.projects.some((p) => p.slug === slug))
     .catch(() => null)
+  /**
+   * Two different sentences, because `sync` reads `.ogun/config.yaml` and a repository
+   * without one cannot be synced.
+   *
+   * Saying "run `ogun project sync`" to somebody who has just been told the file is
+   * missing is a dead end the command walks them into: add succeeds, sync fails with
+   * ENOENT on a path nobody chose, and `project list` does not show the project. The
+   * information to tell them apart was already here — `configured` is null exactly when
+   * there is no file — and was simply not used.
+   *
+   * Outside the `known` check, unlike the sentence below it. Whether the control plane
+   * has heard of this project is a question only the control plane can answer, and the
+   * `catch` above turns an unreachable one into `null`. Whether this repository has a
+   * config is a fact about the disk, true at the same moment either way — so the advice
+   * that depends on it does not wait for a server that may be stopped.
+   */
+  if (configured === null) {
+    {
+      console.log(
+        dim(
+          `\n  "${slug}" is not registered with the control plane yet, and cannot be until\n` +
+            '  this repository says what Ogun should do in it. The smallest file that works:\n',
+        ),
+      )
+      console.log(dim(`    ${root}/.ogun/config.yaml`))
+      console.log(`      project:`)
+      console.log(`        name: ${slug}`)
+      console.log(
+        dim(
+          '\n  That registers the project and nothing else — no workers, no cycles, no\n' +
+            '  sources — which is enough for `ogun project sync` to accept it. Commit it:\n' +
+            '  the runner reads this file from git at the pinned commit, never from the\n' +
+            '  working tree, so an uncommitted one is invisible to every run.',
+        ),
+      )
+      return
+    }
+  }
   if (known === false) {
     console.log(
       dim(`\n  The control plane has no project called "${slug}" yet — \`ogun project sync\`.`),
