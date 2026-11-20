@@ -22,12 +22,12 @@ const cli = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'src', 'main.
 
 type Result = { code: number; stdout: string; stderr: string }
 
-const ogun = (args: string[], config: string): Promise<Result> =>
+const ogun = (args: string[], config: string, cwd?: string): Promise<Result> =>
   new Promise((done) => {
     const child = execFile(
       process.execPath,
       [cli, ...args],
-      { env: { ...process.env, OGUN_CONFIG: config } },
+      { env: { ...process.env, OGUN_CONFIG: config }, ...(cwd ? { cwd } : {}) },
       (err, stdout, stderr) =>
         done({
           code: (err as { code?: number } | null)?.code ?? 0,
@@ -122,6 +122,40 @@ test('syncing a repository with no config names the file rather than an errno', 
     // The half that is easy to leave out and expensive to learn later: the runner reads
     // this file from git, so writing it is not the same as committing it.
     assert.match(synced.stderr, /Commit it/)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+/**
+ * Both commands default to the directory you are standing in.
+ *
+ * They always have — `resolve(first ?? process.cwd())` in each — and the behaviour was
+ * asked about anyway, which is a fair thing to wonder: `[dir]` in a usage line says the
+ * argument is optional and nothing about what omitting it gets you. So the default is
+ * written down now, and pinned here so it cannot quietly become a required argument.
+ */
+test('add and sync default to the current directory', async () => {
+  const { dir, repo, config } = await bareRepo()
+  try {
+    // No path argument, run from inside the repo.
+    const added = await ogun(['project', 'add'], config, repo)
+    assert.equal(added.code, 0, added.stderr)
+    assert.match(added.stdout, new RegExp(`clawz → ${repo}`))
+
+    const machine = JSON.parse(await readFile(config, 'utf8')) as {
+      projects: Record<string, string>
+    }
+    assert.equal(machine.projects.clawz, repo, 'the path it registered is where it ran')
+
+    // And sync reaches the same file without being told where it is. No server here, so
+    // it cannot finish — what matters is that it got past resolving the directory, which
+    // the ENOENT message would prove it had not.
+    const synced = await ogun(['project', 'sync'], config, repo)
+    assert.ok(
+      !/has no \.ogun\/config\.yaml/.test(synced.stderr),
+      `sync did not find the config add had just written: ${synced.stderr}`,
+    )
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
