@@ -12,6 +12,7 @@ import {
   LINEAR_ACTOR,
   LINEAR_SCOPES,
   linkedApplication,
+  applicationIdentifier,
   listApplications,
   listGrants,
   normalizeSecretInput,
@@ -1040,3 +1041,48 @@ const settingsUrl = (result: string, project?: string): string => {
   if (project) params.set('project', project)
   return `/settings?${params.toString()}`
 }
+
+/**
+ * Every application on this machine, and which projects go through each.
+ *
+ * Its own route rather than a field on `GET /linear`, because an application is not a
+ * Linear concept: one GitHub App serves an organisation, and the sharing it makes
+ * possible is the thing the Settings page was blind to. A `/linear` route that answered
+ * "here are your GitHub applications too" would be a name that lies.
+ *
+ * **No secret, ever.** `identifiesAs` is the non-secret half of whatever identifies the
+ * application to its provider — a client id for Linear, an app and installation id for
+ * GitHub — on the same terms `connect list` prints them: those values are in every
+ * authorization URL and on the provider's own settings page, and withholding them would
+ * mean the page could not say *which* application a project is connected through, which
+ * is the first question the moment two exist.
+ */
+oauthRoutes.get('/applications', async (c) => {
+  const listed = await listApplications().catch(() => [])
+  return c.json({
+    applications: listed.map((entry) =>
+      entry.state === 'present'
+        ? {
+            name: entry.name,
+            provider: entry.app.provider,
+            method: entry.app.method,
+            identifiesAs: applicationIdentifier(entry.app),
+            usedBy: entry.usedBy,
+            malformed: null,
+          }
+        : {
+            name: entry.name,
+            provider: null,
+            method: null,
+            identifiesAs: null,
+            usedBy: entry.usedBy,
+            /**
+             * Listed rather than dropped. An application this build cannot parse is
+             * exactly the one somebody needs to see, and omitting it would answer "what
+             * is connected here" with a list missing the broken thing.
+             */
+            malformed: entry.reason,
+          },
+    ),
+  })
+})

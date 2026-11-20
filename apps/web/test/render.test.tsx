@@ -1372,3 +1372,65 @@ test('timeline rows are stamped with a clock time', () => {
   assert.ok(html.includes(expected), `expected "${expected}" in the timeline`)
   assert.ok(!/\+\d+s<\/span>/.test(html), 'and no offset column')
 })
+
+/**
+ * The Settings page had no notion of an application.
+ *
+ * A credential shared by three projects rendered as three credentials — which is what the
+ * store itself used to do, holding a separate copy of the same client secret per project
+ * with nothing keeping them in agreement. `usedBy` is the field that makes "rotate this
+ * and three projects change" something the page can say.
+ */
+test('settings lists applications and who connects through each', () => {
+  const html = render(<SettingsPage />, (qc) => {
+    qc.setQueryData(['system'], systemWith({ allowed: true, reason: null, names: ['linear'] }))
+    qc.setQueryData(['linearOauth'], linearOauth())
+    qc.setQueryData(['applications'], {
+      applications: [
+        {
+          name: 'linear:heirchive',
+          provider: 'linear',
+          method: 'client_credentials',
+          identifiesAs: '07a66d3979aa',
+          usedBy: ['heirchive-api', 'ogun'],
+          malformed: null,
+        },
+        {
+          name: 'github:spare',
+          provider: 'github',
+          method: 'private_key_jwt',
+          identifiesAs: 'app 123 · installation 456',
+          usedBy: [],
+          malformed: null,
+        },
+      ],
+    })
+  })
+  assert.match(html, /linear:heirchive/)
+  assert.match(html, /heirchive-api, ogun/)
+  // An application nothing uses is a credential on disk for no reason, and saying so is
+  // the only way anybody finds out.
+  assert.match(html, /no project connects through it/)
+})
+
+/** A broken entry is listed, not dropped — it is the one somebody needs to see. */
+test('an unreadable application is shown rather than hidden', () => {
+  const html = render(<SettingsPage />, (qc) => {
+    qc.setQueryData(['system'], systemWith({ allowed: true, reason: null, names: ['linear'] }))
+    qc.setQueryData(['linearOauth'], linearOauth())
+    qc.setQueryData(['applications'], {
+      applications: [
+        {
+          name: 'github:broken',
+          provider: null,
+          method: null,
+          identifiesAs: null,
+          usedBy: ['heirchive-api'],
+          malformed: 'appId is missing or not a string',
+        },
+      ],
+    })
+  })
+  assert.match(html, /github:broken/)
+  assert.match(html, /unreadable/)
+})

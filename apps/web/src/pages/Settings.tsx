@@ -172,6 +172,9 @@ export function SettingsPage() {
         )}
       </div>
 
+      <h2>Applications</h2>
+      <Applications />
+
       <h2>Linear</h2>
       <LinearConnection />
 
@@ -608,6 +611,85 @@ function AdminToken() {
  * the field is cleared. The mutation closes over the field, and the field is cleared first
  * on success.
  */
+/**
+ * Every registered application, and who goes through each.
+ *
+ * The page had no notion of one. A credential shared by three projects rendered as three
+ * credentials — which is what the store itself used to do, holding a separate copy of the
+ * same client secret per project, with nothing keeping them in agreement. One GitHub App
+ * serves a whole organisation, so sharing is the normal case rather than the exception,
+ * and "rotate this and three projects change" is a fact the page has to be able to state.
+ *
+ * Read-only, deliberately. Registering an application means pasting a client secret or a
+ * private key, and `ogun connect` already asks for those with the echo off, proves them by
+ * spending them before storing anything, and names what it displaced. A second write path
+ * through a browser would be a second place for that reasoning to live, and the weaker of
+ * the two.
+ */
+function Applications() {
+  const { data, isLoading } = useQuery({
+    queryKey: ['applications'],
+    queryFn: api.applications,
+  })
+
+  if (isLoading) return <div className="card">loading…</div>
+  const rows = data?.applications ?? []
+
+  if (rows.length === 0) {
+    return (
+      <div className="card">
+        <p className="muted" style={{ margin: 0, fontSize: 13 }}>
+          No application is registered on this machine. One is what lets Ogun act as
+          itself rather than as you — <span className="mono">ogun connect &lt;integration&gt; --app</span>.
+        </p>
+      </div>
+    )
+  }
+
+  return (
+    <div className="card">
+      <table>
+        <thead>
+          <tr>
+            <th>Application</th>
+            <th>Provider</th>
+            <th>Identifies as</th>
+            <th>Used by</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((a) => (
+            <tr key={a.name}>
+              <td className="mono">{a.name}</td>
+              <td className="muted">
+                {a.provider ?? '—'}
+                {a.method ? <span className="muted"> · {a.method}</span> : null}
+              </td>
+              <td className="mono muted">{a.identifiesAs ?? '—'}</td>
+              <td>
+                {/**
+                 * The point of the table. An application nothing uses is a credential
+                 * sitting on disk for no reason, and one used by four projects is four
+                 * things that change when it is rotated — neither was visible before.
+                 */}
+                {a.malformed !== null ? (
+                  <span className="pill red" title={a.malformed}>
+                    unreadable
+                  </span>
+                ) : a.usedBy.length === 0 ? (
+                  <span className="muted">nothing — no project connects through it</span>
+                ) : (
+                  a.usedBy.join(', ')
+                )}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
 function LinearConnection() {
   const qc = useQueryClient()
   const [search, setSearch] = useSearchParams()

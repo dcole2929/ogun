@@ -108,6 +108,24 @@ export type PendingJob = {
  */
 export type RunTicket = { key: string; url: string | null }
 
+/**
+ * One registered application, and the projects that authenticate through it.
+ *
+ * `usedBy` is the field the page existed without: a credential shared by three projects
+ * looked like three credentials, and rotating it looked like three jobs. Nothing here is
+ * a secret — `identifiesAs` is the half that is already in every authorization URL and on
+ * the provider's own settings page.
+ */
+export type ApplicationRow = {
+  name: string
+  provider: string | null
+  method: string | null
+  identifiesAs: string | null
+  usedBy: string[]
+  /** Set when this build cannot read the entry. Listed anyway — see the route. */
+  malformed: string | null
+}
+
 export type RunSummary = {
   /**
    * Only on the list; the detail route returns the full `produced` breakdown.
@@ -678,6 +696,7 @@ export const api = {
    * because a `docker --version` was hanging would be hiding the answer behind an
    * unrelated question.
    */
+  applications: () => json<{ applications: ApplicationRow[] }>('/api/oauth/applications'),
   linearOauth: () => json<LinearOauth>('/api/oauth/linear'),
   /**
    * The client secret from Linear's registration form. The other request that carries one,
