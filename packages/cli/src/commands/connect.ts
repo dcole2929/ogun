@@ -318,7 +318,7 @@ const FIELDS: Record<SecretName, Field[]> = {
   github: [
     { key: 'appId', kind: 'public', label: 'App ID' },
     { key: 'installationId', kind: 'public', label: 'Installation ID' },
-    { key: 'privateKey', kind: 'pem', label: 'Private key (PEM, or a path to one)' },
+    { key: 'privateKey', kind: 'pem', label: 'Private key — path to the .pem file' },
   ],
 }
 
@@ -366,6 +366,23 @@ const SECRET_BOUND_TO: Record<SecretName, string[]> = {
  */
 async function resolvePem(value: string, field: Field): Promise<string> {
   if (value.includes('\n')) return value
+  /**
+   * A single line that opens a PEM is a paste that lost the rest of itself.
+   *
+   * A terminal prompt reads one line, and a PEM is about thirty — so pasting one answers
+   * the prompt with its header and hands the remaining lines to the shell as commands.
+   * That is what this message exists for: without it the header becomes a *filename*, and
+   * the operator is told `could not read -----BEGIN RSA PRIVATE KEY----- (ENOENT)`, which
+   * explains nothing about what just happened to their terminal.
+   */
+  if (value.trimStart().startsWith('-----BEGIN')) {
+    fail(
+      `that is the key itself rather than a path to it, and a prompt reads one line while\n` +
+        `  a PEM has about thirty — the rest went to your shell. Give the file instead:\n` +
+        `    ogun connect github --app ${field.key}=./key.pem\n` +
+        '  Nothing was stored.',
+    )
+  }
   const contents = await readFile(value, 'utf8').catch((err: NodeJS.ErrnoException) => {
     fail(
       `could not read ${value} (${err.code ?? 'unknown'}). A value for ${field.key} with no\n` +
@@ -676,9 +693,16 @@ async function collectFields(
     const value =
       piped !== undefined
         ? (piped[next++] ?? '')
-        : field.kind === 'public'
-          ? await prompt(`  ${field.label}: `)
-          : await promptHidden(`  ${field.label} (not echoed): `)
+        : field.kind === 'secret'
+          ? await promptHidden(`  ${field.label} (not echoed): `)
+          : /**
+             * `public` and `pem` both echo, for the same reason and a different one. A
+             * client id is not a secret. A pem field takes a *path*, which is not one
+             * either — and hiding it would mean a mistyped filename could not be seen,
+             * on the one input where the alternative is a thirty-line paste that cannot
+             * work at a prompt at all.
+             */
+            await prompt(`  ${field.label}: `)
     if (value.trim() === '') {
       fail(
         `nothing was stored — ${field.key} is required and ` +

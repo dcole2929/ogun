@@ -1477,3 +1477,48 @@ test('doctor names the credentials this machine holds and none of their values',
   assert.match(check.detail, /ogun\/linear/)
   assert.ok(!check.detail.includes(KEY), check.detail)
 })
+
+/**
+ * A pasted PEM is named for what it is, rather than read as a filename.
+ *
+ * Reported from a real terminal: pasting the key at the prompt filled the screen with
+ * shell commands made of the key's own lines. A prompt reads one line and a PEM has about
+ * thirty, so the header answers the prompt and the remaining lines go to the shell.
+ *
+ * Without this the header becomes a *path*, and the operator is told
+ * `could not read -----BEGIN RSA PRIVATE KEY----- (ENOENT)` — which explains nothing about
+ * what just happened to their terminal, and sends them to look for a missing file.
+ */
+test('a private key pasted instead of a path says so, and names the gesture that works', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'ogun-pem-paste-'))
+  const config = join(dir, 'config.json')
+  await machineKnowing(config, { 'heirchive-api': '/srv/api' })
+
+  const pasted = await ogun(
+    [
+      'connect',
+      'github',
+      '--app',
+      'appId=1234567',
+      'installationId=98765432',
+      'privateKey=-----BEGIN RSA PRIVATE KEY-----',
+      '--project',
+      'heirchive-api',
+    ],
+    { config },
+  )
+
+  assert.equal(pasted.code, 1)
+  assert.match(pasted.stderr, /the key itself rather than a path/)
+  // The two facts that explain the mess on screen.
+  assert.match(pasted.stderr, /a prompt reads one line/)
+  assert.match(pasted.stderr, /the rest went to your shell/)
+  // And the gesture that does work, spelled out rather than described.
+  assert.match(pasted.stderr, /privateKey=\.\/key\.pem/)
+  assert.match(pasted.stderr, /Nothing was stored/)
+  // Never the value: it is a credential even when it is only the first line of one.
+  assert.ok(!pasted.stderr.includes('MII'), 'no part of a key is quoted back')
+
+  await rm(dir, { recursive: true, force: true })
+})
+
