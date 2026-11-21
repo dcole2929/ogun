@@ -92,7 +92,17 @@ const ogun = (
         env: {
           ...process.env,
           OGUN_CONFIG: env.config,
-          ...(env.server ? { OGUN_SERVER_URL: env.server } : {}),
+          /**
+           * A test that names no server gets one that cannot be reached, rather than
+           * falling through to `localhost:7777` — which on a developer's machine is their
+           * own running control plane, with their own projects in it.
+           *
+           * `OGUN_CONFIG` redirects the machine-local file and nothing else, so that
+           * fallback is the whole of what stands between a fixture and real data. It did
+           * not hold: a fixture project from a sibling suite turned up in a real
+           * `ogun project list`.
+           */
+          OGUN_SERVER_URL: env.server ?? 'http://127.0.0.1:0',
         },
         ...(cwd ? { cwd } : {}),
       },

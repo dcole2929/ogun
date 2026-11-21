@@ -491,11 +491,16 @@ const topics: Record<string, Topic> = {
     summary: 'the repositories the factory works on',
     usage: ['ogun project add [dir] | sync [dir] | list'],
     subcommands: [
-      ['add [dir]', 'tell this machine where a repo is checked out'],
-      ['sync [dir]', "read the repo's .ogun/config.yaml and register it"],
+      ['add [dir]', 'tell this machine where a repo is checked out (default: here)'],
+      ['sync [dir]', "read the repo's .ogun/config.yaml and register it (default: here)"],
       ['list', 'every project the control plane knows about (the default)'],
     ],
     notes: [
+      '`add` and `sync` both default to the directory you are standing in, which is the ' +
+        'normal way to run them — `[dir]` is for the other case, pointing at a repo from ' +
+        'somewhere else. Neither reads a project name from an argument: `add` takes it ' +
+        "from the config, or `--name`, or the directory's own name, and `sync` always " +
+        'takes it from the config.',
       "A project's credentials are `ogun connect` (an integration) or `ogun secret` (any " +
         'other value it needs). Both moved out of this namespace when the project stopped ' +
         'being a positional and started coming from the directory you are standing in, as ' +
@@ -1424,6 +1429,8 @@ ${bold('projects')}
   ogun project add [dir] [--name]  tell this machine where a repo is checked out
   ogun project sync [dir]          read .ogun/config.yaml and register it
   ogun project list
+
+${bold('credentials')}
   ogun connect <integration>       give this project access to Linear (or the next one)
   ogun connect list                what is connected, how, and how healthy
   ogun disconnect <integration>    remove every credential for it
