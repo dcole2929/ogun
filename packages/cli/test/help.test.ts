@@ -17,8 +17,11 @@ test('a line break an author wrote survives to the reader', () => {
 
   // The examples are laid out by their author, one per line, aligned. Each has to arrive
   // as its own line — a wrapped command line is not merely ugly, it is wrong if copied.
-  assert.match(rendered, /^\s+ogun connect linear\s+prompts for both$/m)
-  assert.match(rendered, /^\s+printf 'lin_api_…' \| ogun connect linear --api-key$/m)
+  assert.match(rendered, /^\s+ogun connect linear\s+prompts for every field$/m)
+  assert.match(
+    rendered,
+    /^\s+ogun connect github appId=1234567 installationId=98765432 privateKey=\.\/key\.pem$/m,
+  )
 })
 
 /**
@@ -64,8 +67,16 @@ test('every credential a command collects is named in one of its usage lines', (
     [
       ['connect'],
       [
-        /ogun connect <integration> --client-id <id> --client-secret <secret>/,
-        /ogun connect <integration> --consent --client-id <id> --client-secret <secret>/,
+        /**
+         * `field=value` rather than a flag per credential, and the keys themselves are
+         * asserted below rather than in the usage line — because there are two providers
+         * and the valid keys are a fact about the integration, not about the command. A
+         * line carrying every provider's fields would be the per-provider flag table in a
+         * different costume.
+         */
+        /ogun connect <integration> --app \[--as <name>\] \[--project <slug>\] \[field=value …\]/,
+        /ogun connect <integration> --app --link <name>/,
+        /ogun connect <integration> --consent \[field=value …\]/,
         /ogun connect <integration> --api-key \[<key>\]/,
       ],
     ],
@@ -89,25 +100,46 @@ test('every credential a command collects is named in one of its usage lines', (
     assert.ok(rendered, page.join(' '))
     for (const pattern of expected) assert.match(rendered, pattern, page.join(' '))
   }
+
+  /**
+   * The other half of the bar for `connect`: the usage line can only say `field=value`, so
+   * the page has to say **which** fields, per provider. Without this the line is complete
+   * and useless, which is the fault this whole test exists for one level up.
+   */
+  const connect = helpFor(['connect']) as string
+  assert.match(connect, /linear\s+clientId, clientSecret/)
+  assert.match(connect, /github\s+appId, installationId, privateKey/)
 })
 
 /**
- * The two-level flag structure is *rendered* as two levels.
+ * The multi-level flag structure is *rendered* as multiple levels.
  *
  * `--api-key` and `--consent` in one alphabetical block read as alternatives, which is
  * exactly the flattening the command was reshaped to undo: one names a kind of integration
  * and the other selects a grant inside the other kind. The headings are how a reader who
  * skips the prose still sees it.
+ *
+ * There are three now, and the middle one is what the shared-application split added:
+ * `--as` and `--link` are neither a kind nor a grant, they are what a credential this
+ * machine already holds is *called* and who else may use it. Rendering them beside
+ * `--api-key` would say they apply to it, and they are refused there.
+ *
+ * "which OAuth grant" became "which grant" for the reason `--oauth` became `--app`: a
+ * GitHub App's installation token is not an OAuth grant, so the heading over the flag that
+ * selects one must not claim every provider's is.
  */
-test('connect renders what you are connecting apart from which grant', () => {
+test('connect renders what you are connecting apart from naming it and from the grant', () => {
   const rendered = helpFor(['connect'])
   assert.ok(rendered)
 
   const kinds = rendered.indexOf('what you are connecting')
-  const grants = rendered.indexOf('which OAuth grant')
+  const naming = rendered.indexOf('naming and sharing the application')
+  const grants = rendered.indexOf('which grant')
   assert.ok(kinds > 0, 'the kinds have their own heading')
-  assert.ok(grants > kinds, 'the grant modifier comes after the kind it modifies')
-  assert.match(rendered, /which OAuth grant \(only with --oauth, which it implies\)/)
+  assert.ok(naming > kinds, 'naming comes after the kind it applies to')
+  assert.ok(grants > naming, 'the grant modifier comes after the kind it modifies')
+  assert.match(rendered, /which grant \(only with --app, which it implies\)/)
+  assert.ok(!/which OAuth grant/.test(rendered), 'a GitHub installation token is not an OAuth grant')
 })
 
 /**

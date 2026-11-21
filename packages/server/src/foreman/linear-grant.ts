@@ -3,13 +3,13 @@ import {
   credentialHealth,
   GRANT_REFRESH_HORIZON_MS,
   LinearOAuthError,
-  NoOAuthApp,
-  readOAuthApp,
+  NoApplication,
+  readApplication,
   refreshGrant,
   sealSecret,
-  storeOAuthGrant,
+  storeGrant,
   type Fetch,
-  type OAuthGrant,
+  type Grant,
   type SecretName,
 } from '@ogun/core'
 import type { LinearCredential } from '../integrations/linear.ts'
@@ -102,8 +102,8 @@ import type { LinearCredential } from '../integrations/linear.ts'
  */
 
 export type GrantDeps = {
-  readApp?: typeof readOAuthApp
-  store?: typeof storeOAuthGrant
+  readApp?: typeof readApplication
+  store?: typeof storeGrant
   refresh?: typeof refreshGrant
   /** The `client_credentials` renewal, which is the same request the connect made. */
   reissue?: typeof appTokenGrant
@@ -160,7 +160,7 @@ const inFlight = new Map<string, Promise<UsableGrant>>()
 export async function usableGrant(
   projectSlug: string,
   provider: SecretName,
-  grant: OAuthGrant,
+  grant: Grant,
   deps: GrantDeps = {},
 ): Promise<UsableGrant> {
   const now = deps.now?.() ?? Date.now()
@@ -195,24 +195,38 @@ export async function usableGrant(
 async function refreshOnce(
   projectSlug: string,
   provider: SecretName,
-  grant: OAuthGrant,
+  grant: Grant,
   deps: GrantDeps,
   now: number,
 ): Promise<UsableGrant> {
-  const app = await (deps.readApp ?? readOAuthApp)(projectSlug, provider)
-  if (app.state !== 'present') {
+  /**
+   * The application is found through the **grant**, which names it, rather than by looking
+   * under the project. That is the whole of what the `applications`/`grants` split bought
+   * here: one Linear application can serve five projects, and a renewal for one of them
+   * reads the credential from the single place it is stored instead of from a per-project
+   * copy that could have drifted from the other four.
+   */
+  const app = await (deps.readApp ?? readApplication)(grant.app)
+  if (app.state !== 'present' || app.app.provider !== 'linear') {
     /**
-     * A grant with no application behind it. `storeOAuthGrant` refuses to create this and
-     * `setOAuthApp` drops a grant whose client id changed, so reaching it means a hand-edit
-     * of config.json — which §4.5 says happens. Said plainly rather than reported as an
-     * expired token, because the fix is to register the application, not to reconnect.
+     * A grant naming an application that is not there. `storeGrant` refuses to create this
+     * and `clearApplication` refuses to remove an application a grant still points at, so
+     * reaching it means a hand-edit of config.json — which §4.5 says happens. Said plainly
+     * rather than reported as an expired token, because the fix is to register the
+     * application, not to reconnect.
      */
+    const why =
+      app.state === 'present'
+        ? `it is a ${app.app.provider} application`
+        : app.state === 'malformed'
+          ? app.reason
+          : app.state
     return {
       state: 'refused',
       detail:
-        `"${projectSlug}" has a ${provider} grant with no application behind it ` +
-        `(${app.state}), so its access token cannot be refreshed. Register the ` +
-        'application again and reconnect',
+        `"${projectSlug}" has a ${provider} grant from an application this machine cannot ` +
+        `use ("${grant.app}": ${why}), so its access token cannot be refreshed. Register ` +
+        'the application again and reconnect',
     }
   }
 
@@ -230,6 +244,25 @@ async function refreshOnce(
    * function answers with `ready`, `refused` or `failed`, and *when* to try again is the
    * poll's schedule.
    */
+  /**
+   * A grant type this file cannot renew is refused rather than guessed at.
+   *
+   * `Grant['grantType']` is no longer a Linear-only set — `installation` joined it when
+   * GitHub Apps landed — and the branch below is a two-way choice between Linear's two
+   * grants. An `installation` entry filed under `grants.<project>.linear` is a hand-edit,
+   * and falling through to the `refreshGrant` arm would spend an empty refresh token and
+   * report whatever Linear says about it, which names neither the real problem nor the fix.
+   */
+  if (grant.grantType !== 'client_credentials' && grant.grantType !== 'authorization_code') {
+    return {
+      state: 'refused',
+      detail:
+        `"${projectSlug}" has a ${provider} grant recorded as \`${grant.grantType}\`, which ` +
+        'is not one of the two grants linear issues, so nothing here knows how to renew ' +
+        'it. Reconnect the project',
+    }
+  }
+
   let tokens
   try {
     tokens =
@@ -242,10 +275,10 @@ async function refreshOnce(
           })
         : await (deps.refresh ?? refreshGrant)({
             /**
-             * Non-null because `parseOAuthApp` refuses an authorization-code grant with no
+             * Non-null because `parseGrant` refuses an authorization-code grant with no
              * refresh token — the check that survived ADR-0014's blanket one, narrowed to
              * the grant it was always about. A grant that reaches here without one is a
-             * `malformed` entry that never became an `OAuthGrant`.
+             * `malformed` entry that never became a `Grant`.
              */
             refreshToken: grant.refresh?.expose() ?? '',
             clientId: app.app.clientId,
@@ -291,7 +324,8 @@ async function refreshOnce(
   }
 
   try {
-    await (deps.store ?? storeOAuthGrant)(projectSlug, provider, {
+    await (deps.store ?? storeGrant)(projectSlug, provider, {
+      app: grant.app,
       accessToken: tokens.accessToken,
       ...(tokens.refreshToken ? { refreshToken: tokens.refreshToken } : {}),
       grantType: tokens.grantType,
@@ -304,7 +338,7 @@ async function refreshOnce(
       // does not need.
       scopes: tokens.scopes.length > 0 ? tokens.scopes : grant.scopes,
       actor: grant.actor,
-      ...(grant.workspace ? { workspace: grant.workspace } : {}),
+      ...(grant.account ? { account: grant.account } : {}),
       ...(grant.appUserId ? { appUserId: grant.appUserId } : {}),
     })
   } catch (err) {
@@ -325,7 +359,7 @@ async function refreshOnce(
      * evidence an operator debugs from is the thing that is wrong. One rule, and the
      * failure it names is the one that applies.
      */
-    const detail = err instanceof NoOAuthApp ? err.message : asMessage(err)
+    const detail = err instanceof NoApplication ? err.message : asMessage(err)
     return {
       state: 'failed',
       /**
@@ -363,10 +397,10 @@ async function refreshOnce(
  * The one `expose()` on the poll's side of this module, at the point the token becomes a
  * header — ADR-0012's "once per consumer, at the wire".
  */
-const bearer = (grant: OAuthGrant): LinearCredential => ({
+const bearer = (grant: Grant): LinearCredential => ({
   kind: 'oauth',
   token: grant.access.expose(),
-  workspace: grant.workspace?.name,
+  workspace: grant.account?.name,
 })
 
 const asMessage = (err: unknown): string => (err instanceof Error ? err.message : String(err))

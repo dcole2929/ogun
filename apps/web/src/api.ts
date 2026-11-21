@@ -108,6 +108,45 @@ export type PendingJob = {
  */
 export type RunTicket = { key: string; url: string | null }
 
+/**
+ * One registered application, and the projects that authenticate through it.
+ *
+ * `usedBy` is the field the page existed without: a credential shared by three projects
+ * looked like three credentials, and rotating it looked like three jobs. Nothing here is
+ * a secret — `identifiesAs` is the half that is already in every authorization URL and on
+ * the provider's own settings page.
+ */
+/**
+ * What the Settings page knows about GitHub.
+ *
+ * `actor` is the field that matters: it is the login Ogun acts as, and the difference
+ * between `ogun[bot]` and a person's own account is the difference between "opened by
+ * Ogun" being a fact and being a guess from the branch name.
+ */
+export type GithubSettings = {
+  connections: Array<{
+    project: string
+    application: string
+    actor: string
+    appId: string | null
+    installationId: string | null
+    account: string | null
+    expiresAt?: number
+    malformed?: string
+  }>
+  registerUrl: string
+}
+
+export type ApplicationRow = {
+  name: string
+  provider: string | null
+  method: string | null
+  identifiesAs: string | null
+  usedBy: string[]
+  /** Set when this build cannot read the entry. Listed anyway — see the route. */
+  malformed: string | null
+}
+
 export type RunSummary = {
   /**
    * Only on the list; the detail route returns the full `produced` breakdown.
@@ -409,7 +448,6 @@ export type LinearApp = {
   clientId: string
   clientSecretSet: boolean
   redirectUri: string
-  connected: boolean
   scopes: string[]
   actor: string
   /**
@@ -678,6 +716,20 @@ export const api = {
    * because a `docker --version` was hanging would be hiding the answer behind an
    * unrelated question.
    */
+  applications: () => json<{ applications: ApplicationRow[] }>('/api/oauth/applications'),
+  githubConnections: () => json<GithubSettings>('/api/oauth/github'),
+  /**
+   * Register a GitHub App for a project. The key is sent once and never comes back — the
+   * response is the connection, which is public facts about it.
+   */
+  connectGithubApp: (
+    project: string,
+    app: { appId: string; installationId: string; privateKey: string },
+  ) =>
+    json<{ connected: GithubSettings['connections'][number] & { login: string; account: string } }>(
+      `/api/oauth/github/app/${project}`,
+      { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(app) },
+    ),
   linearOauth: () => json<LinearOauth>('/api/oauth/linear'),
   /**
    * The client secret from Linear's registration form. The other request that carries one,

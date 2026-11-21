@@ -6,13 +6,14 @@ import { join } from 'node:path'
 import { Hono } from 'hono'
 import { logger } from 'hono/logger'
 import { schema } from '@ogun/core/db'
-import { listOAuthApps, readOAuthApp } from '@ogun/core'
+import { listGrants, readApplication, setApplication, storeGrant } from '@ogun/core'
 import { startHarness } from './harness.ts'
 import { TLS_PROXY_ENV } from '../src/auth.ts'
 import { scopeForPath } from '../src/auth.ts'
 import {
   beginAuthorization,
   callbackUri,
+  clearOfferedApplications,
   clearPendingAuthorizations,
   consumeState,
   LINEAR_CALLBACK_PATH,
@@ -44,7 +45,7 @@ const CLIENT_SECRET = 'lin_secret_QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ'
  */
 test('a state can be consumed once', () => {
   clearPendingAuthorizations()
-  const state = beginAuthorization({ project: 'ogun', redirectUri: 'http://x/cb' })
+  const state = beginAuthorization({ project: 'ogun', redirectUri: 'http://x/cb', clientId: 'client-1', clientSecret: CLIENT_SECRET })
   assert.deepEqual(consumeState(state)?.project, 'ogun')
   assert.equal(consumeState(state), undefined, 'the same state was accepted twice')
 })
@@ -60,12 +61,12 @@ test('a state can be consumed once', () => {
 test('a state older than the window is refused, and abandoned ones are swept', () => {
   clearPendingAuthorizations()
   const now = Date.now()
-  const stale = beginAuthorization({ project: 'ogun', redirectUri: 'http://x/cb' }, now)
+  const stale = beginAuthorization({ project: 'ogun', redirectUri: 'http://x/cb', clientId: 'client-1', clientSecret: CLIENT_SECRET }, now)
   assert.equal(consumeState(stale, now + 11 * 60 * 1000), undefined)
 
-  const swept = beginAuthorization({ project: 'ogun', redirectUri: 'http://x/cb' }, now)
+  const swept = beginAuthorization({ project: 'ogun', redirectUri: 'http://x/cb', clientId: 'client-1', clientSecret: CLIENT_SECRET }, now)
   // A later, unrelated use sweeps it: the entry is gone before anybody presents it.
-  beginAuthorization({ project: 'other', redirectUri: 'http://x/cb' }, now + 11 * 60 * 1000)
+  beginAuthorization({ project: 'other', redirectUri: 'http://x/cb', clientId: 'client-1', clientSecret: CLIENT_SECRET }, now + 11 * 60 * 1000)
   assert.equal(consumeState(swept, now + 11 * 60 * 1000), undefined)
 })
 
@@ -81,10 +82,30 @@ test('a state older than the window is refused, and abandoned ones are swept', (
  */
 test('the project is a property of the stored authorization, not of the callback', () => {
   clearPendingAuthorizations()
-  const state = beginAuthorization({ project: 'ogun', redirectUri: 'http://x/cb' })
+  const state = beginAuthorization({
+    project: 'ogun',
+    redirectUri: 'http://x/cb',
+    clientId: 'client-1',
+    clientSecret: CLIENT_SECRET,
+  })
   const entry = consumeState(state)
   assert.equal(entry?.project, 'ogun')
   assert.equal(entry?.redirectUri, 'http://x/cb')
+  /**
+   * The client id and secret ride in the entry too, and that is what lets nothing be
+   * written to config.json before the authorization comes back. The flow used to register
+   * the application first, because the callback had to find one in the store — so an
+   * abandoned browser tab left behind a client secret no poll would ever spend.
+   *
+   * Every reason this map is in memory rather than in config.json is the reason it is the
+   * right place for them: the flow begins and ends in one process within seconds, the
+   * entry is single-use, and a restart mid-flow loses the credentials along with the nonce
+   * and asks the operator to start again. Which is exactly what the assertion below
+   * fixes — consumed once, and gone.
+   */
+  assert.equal(entry?.clientId, 'client-1')
+  assert.equal(entry?.clientSecret, CLIENT_SECRET)
+  assert.equal(consumeState(state), undefined, 'the credentials outlived their one use')
 })
 
 /**
@@ -210,15 +231,22 @@ describe('a project can be connected to linear, and only through a flow it start
     })
 
   /**
-   * The property: registering an application answers with the **exact** redirect URI to
-   * paste into Linear's form.
+   * The property: offering an application answers with the **exact** redirect URI to paste
+   * into Linear's form, and **writes nothing**.
    *
    * The single most common way this feature fails is a redirect URI that differs from the
    * registered one by a port or a trailing slash, and Linear's error for it names nothing.
    * Generating the string on the server that will receive the callback — rather than
    * documenting it and hoping — is what turns that from a mystery into a copy button.
+   *
+   * The second half is new and is the whole of the reordering. This route used to register
+   * the application immediately, which is how the callback found it later; the credentials
+   * now travel in the `PendingAuthorization` the next request mints, so an operator who
+   * closes the tab leaves nothing behind. The assertion is on the store rather than on the
+   * response, because the response is unchanged — that is deliberate, since the web UI
+   * calls this path and is being reworked separately.
    */
-  test('registering an application answers with the callback url to register', async () => {
+  test('offering an application answers with the callback url and stores nothing', async () => {
     const res = await registerApp(slug, { clientId: 'client-1', clientSecret: CLIENT_SECRET })
     assert.equal(res.status, 200)
     const body = (await res.json()) as { redirectUri: string; scopes: string[]; actor: string }
@@ -227,6 +255,9 @@ describe('a project can be connected to linear, and only through a flow it start
     // from a personal key, surfaced where the operator is deciding whether to approve it.
     assert.deepEqual(body.scopes, ['read'])
     assert.equal(body.actor, 'app')
+
+    assert.equal((await readApplication('linear:acme', store)).state, 'absent')
+    assert.deepEqual(await listGrants(store), [])
   })
 
   /**
@@ -267,13 +298,20 @@ describe('a project can be connected to linear, and only through a flow it start
     assert.equal(res.status, 403)
     assert.match(await res.text(), /cleartext/)
 
-    const app = await readOAuthApp(slug, 'linear', store)
-    assert.equal(
-      app.state === 'present' ? app.app.clientId : '',
-      'client-1',
-      'a refused registration reached the store anyway',
-    )
+    /**
+     * And the refused credentials did not displace the offer the previous test left, which
+     * is the only place they could have landed now that the route writes nothing. A gate
+     * that refused the response while accepting the value into memory would be a gate in
+     * name only — and the `start` below is what would then have spent it.
+     */
     setEnv('OGUN_BIND', '127.0.0.1')
+    const started = await h.fetch(`/api/oauth/linear/start/${slug}`, { method: 'POST' })
+    const authorizeUrl = ((await started.json()) as { authorizeUrl: string }).authorizeUrl
+    assert.equal(
+      new URL(authorizeUrl).searchParams.get('client_id'),
+      'client-1',
+      'a refused offer reached the pending credentials anyway',
+    )
   })
 
   /**
@@ -303,8 +341,12 @@ describe('a project can be connected to linear, and only through a flow it start
     // this callback was ever about.
     assert.ok(!location.includes('project='))
 
-    const apps = await listOAuthApps(store)
-    assert.equal(apps.find((a) => a.project === slug)?.connected, false)
+    assert.deepEqual(
+      (await listGrants(store)).filter((g) => g.project === slug),
+      [],
+      'a refused callback filed a grant anyway',
+    )
+    assert.equal((await readApplication('linear:acme', store)).state, 'absent')
   })
 
   /**
@@ -381,6 +423,8 @@ describe('a project can be connected to linear, and only through a flow it start
    * than an afternoon.
    */
   test('starting from an address the application was not registered with is refused', async () => {
+    // The offer records the callback URL as it was when the credentials were handed over.
+    await registerApp(slug, { clientId: 'client-1', clientSecret: CLIENT_SECRET })
     setEnv(PUBLIC_URL_ENV, 'http://somewhere-else:9999')
     const res = await h.fetch(`/api/oauth/linear/start/${slug}`, { method: 'POST' })
     assert.equal(res.status, 409)
@@ -399,6 +443,7 @@ describe('a project can be connected to linear, and only through a flow it start
    * knows which authorizations it started.
    */
   test('starting an authorization returns a url carrying a server-minted state', async () => {
+    await registerApp(slug, { clientId: 'client-1', clientSecret: CLIENT_SECRET })
     const res = await h.fetch(`/api/oauth/linear/start/${slug}`, { method: 'POST' })
     assert.equal(res.status, 200)
     const body = (await res.json()) as { authorizeUrl: string; redirectUri: string }
@@ -412,16 +457,21 @@ describe('a project can be connected to linear, and only through a flow it start
   })
 
   /**
-   * The property: a project with no application cannot start a flow, and is told where
-   * applications come from.
+   * The property: a project with nothing offered and no grant to reuse cannot start a flow,
+   * and is told where applications come from.
    *
    * Ogun ships no client id — it is self-hosted, so each workspace registers its own — and
-   * an operator who has never done that has no way to guess. The refusal carries the URL.
+   * an operator who has never done that has no way to guess. The refusal carries the URL,
+   * and it also says that nothing is stored until the authorization comes back, because
+   * that is the fact a reader of this message is most likely to have assumed otherwise.
    */
-  test('a project with no application is told to create one, with the url', async () => {
+  test('a project with nothing offered is told to create an application, with the url', async () => {
+    clearOfferedApplications()
     const res = await h.fetch('/api/oauth/linear/start/no-such-project', { method: 'POST' })
     assert.equal(res.status, 409)
-    assert.match(await res.text(), /linear\.app\/settings\/api\/applications\/new/)
+    const body = await res.text()
+    assert.match(body, /linear\.app\/settings\/api\/applications\/new/)
+    assert.match(body, /nothing is stored until the authorization comes back/)
   })
 
   /**
@@ -486,7 +536,16 @@ describe('a project can be connected to linear, and only through a flow it start
       body: '{}',
     })
     assert.equal(nothing.status, 409)
-    assert.match(await nothing.text(), /no linear application is registered/)
+    /**
+     * The sentence changed with the reordering and the change is the point: there is no
+     * "application registered for this project" any more — an application is shared, and a
+     * project reaches one through its grant. A reconnect with nothing to reconnect from is
+     * now pointed at `--link`, which is the answer when the credentials are on this machine
+     * under another project.
+     */
+    const detail = await nothing.text()
+    assert.match(detail, /holds no linear grant/)
+    assert.match(detail, /--link/)
     setEnv('OGUN_BIND', '127.0.0.1')
   })
 
@@ -504,23 +563,41 @@ describe('a project can be connected to linear, and only through a flow it start
    * silently reconnects, which is the same end state with a spent token in front of it.
    */
   test('keeping the application is refused when the client credentials are the credential', async () => {
-    await registerApp(slug, { clientId: 'client-cc', clientSecret: CLIENT_SECRET })
-    const config = JSON.parse(await readFile(store, 'utf8'))
-    config.oauth[slug].linear.grant = {
-      accessToken: 'access-abcdefghijkl',
-      grantType: 'client_credentials',
-      expiresAt: Date.now() + 2_591_999_000,
-      scopes: ['read'],
-      actor: 'app',
-    }
-    await writeFile(store, JSON.stringify(config))
+    // Written directly rather than through the routes, because there is no Linear
+    // application to authorize against — the fixtures file records that in full.
+    await setApplication(
+      {
+        name: 'linear:acme',
+        provider: 'linear',
+        method: 'client_credentials',
+        clientId: 'client-cc',
+        clientSecret: CLIENT_SECRET,
+        redirectUri: '',
+      },
+      store,
+    )
+    await storeGrant(
+      slug,
+      'linear',
+      {
+        app: 'linear:acme',
+        accessToken: 'access-abcdefghijkl',
+        grantType: 'client_credentials',
+        expiresAt: Date.now() + 2_591_999_000,
+        obtainedAt: Date.now(),
+        scopes: ['read'],
+        actor: 'app',
+      },
+      store,
+    )
 
     const res = await h.fetch(`/api/oauth/linear/${slug}?keep=application`, { method: 'DELETE' })
     assert.equal(res.status, 409)
     assert.match(await res.text(), /not a disconnection/)
 
-    const [row] = await listOAuthApps(store)
-    assert.equal(row?.connected, true, 'a refused disconnect removed the grant anyway')
+    const [row] = await listGrants(store)
+    assert.equal(row?.project, slug, 'a refused disconnect removed the grant anyway')
+    assert.equal((await readApplication('linear:acme', store)).state, 'present')
   })
 
   /**

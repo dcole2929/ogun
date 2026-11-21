@@ -519,123 +519,235 @@ default when `ogun project` is given no subcommand.
 ### `ogun connect | connect list | disconnect`
 
 ```
-ogun connect <integration> --client-id <id> --client-secret <secret> [--project <slug>]
-ogun connect <integration> --consent --client-id <id> --client-secret <secret>
+ogun connect <integration> --app [--as <name>] [--project <slug>] [field=value …]
+ogun connect <integration> --app --link <name> [--project <slug>]
+ogun connect <integration> --consent [field=value …]
 ogun connect <integration> --api-key [<key>] [--replace] [--project <slug>]
 ogun connect list [--project <slug>]
 ogun disconnect <integration> [--project <slug>] [--keep-application]
 ```
 
 One vocabulary for giving a project **access** to an integration. `<integration>` is a
-**value** — `linear` today — rather than a word in the command path, so a GitHub or Jira
+**value** — `linear` and `github` today — rather than a word in the command path, so a Jira
 integration becomes a new argument rather than a whole new command tree.
 
 #### the flag names what you are connecting
 
-- **`--oauth`** — an OAuth application you registered in the provider, which **always**
-  means a client id and a client secret. This is the default and needs no flag; the
-  explicit spelling is for a script that must keep meaning this if the default changes.
-  Ogun asks Linear for a token in its own name through the `client_credentials` grant: no
-  browser, no consent screen, nobody to approve it. The token lasts 30 days and is renewed
-  by asking again. **It reaches the workspace's public teams and no others**, so `connect`
-  prints the teams the new token can actually read — a workspace of private teams would
-  otherwise poll successfully and find nothing, forever, with every surface reporting a
-  healthy connection.
-- **`--api-key [<key>]`** — one personal API key, and no application. Everything Ogun does,
-  it does **as you**, and once write-back lands every comment it posts appears under your
-  name on a board other people make decisions from. The fallback for a workspace where you
-  cannot register an application at all.
+- **`--app`** — an application you registered in the provider. This is the default and needs
+  no flag; the explicit spelling is for a script that must keep meaning this if the default
+  changes. For **linear**, Ogun asks for a token in its own name through the
+  `client_credentials` grant: no browser, no consent screen, nobody to approve it. The token
+  lasts 30 days and is renewed by asking again, and **it reaches the workspace's public teams
+  and no others** — so `connect` prints the teams the new token can actually read, because a
+  workspace of private teams would otherwise poll successfully and find nothing, forever,
+  with every surface reporting a healthy connection. For **github**, a GitHub App signs a JWT
+  with its private key and exchanges it for an installation token: about an hour long, renewed
+  by signing a fresh one, and Ogun gets a login of its own (`<app>[bot]`) rather than being
+  indistinguishable from whoever issued a token.
+- **`--api-key [<key>]`** — one personal key, and no application. Everything Ogun does, it
+  does **as you**, and once write-back lands every comment it posts appears under your name on
+  a board other people make decisions from. The fallback for an account where you cannot
+  register an application at all.
 
-`--consent` is **not a third kind**; it selects which OAuth grant, and it implies
-`--oauth`. It runs the authorization-code flow: Ogun prints a URL, somebody approves the
-installation in a browser, and the token that comes back sees what *they* can see. **You
-need it if your teams are private**, and for user-scoped access. It installs at the
-workspace level, so Linear needs a workspace admin to approve it, and it is the one shape
-that needs the control plane running — its CSRF nonce lives in that process and its
-callback is delivered to it. `--api-key --consent` is refused: an api key has nobody to
-approve anything.
+It was called `--oauth`, and the rename matters rather than being tidier. That flag justified
+itself on the grounds that *"an application registered in the provider always means a client
+id and a client secret"*, and **that is false**: RFC 6749 §2.1 defines public clients, which
+have a client id and no secret at all, and RFC 7591 §2 names five client authentication
+methods of which a shared secret is one. The provider that forced the issue is in none of
+them — a GitHub App authenticating as itself signs a JWT and exchanges it for an installation
+token, which is not an OAuth grant type, so a flag called `--oauth` would have been a lie
+about what it connects. `--app` names the thing the operator *has*.
 
-The previous shape had three peer flags — `--app-token`, `--consent`, `--api-key` — and
-rejected `--oauth` on the grounds that two of the three *were* OAuth. That described the
-triple correctly and the triple was the mistake: two of those name a kind of integration
-and the third names a grant inside one of them. `--app-token` is dropped and refuses with a
-line naming `--oauth`.
+`--consent` is **not a third kind**; it selects which grant, and it implies `--app`. It runs
+Linear's authorization-code flow: Ogun prints a URL, somebody approves the installation in a
+browser, and the token that comes back sees what *they* can see. **You need it if your teams
+are private**, and for user-scoped access. It installs at the workspace level, so Linear needs
+a workspace admin to approve it, and it is the one shape that needs the control plane running
+— its CSRF nonce lives in that process and its callback is delivered to it. `--api-key
+--consent` is refused: an api key has nobody to approve anything. So is `github --consent`: an
+App authenticating as itself has nobody to ask.
 
-#### every input is in the usage line, and the credentials are named
+#### the fields are `key=value`, and there are no per-provider flags
 
-The client id and the client secret are **flags, not positionals**. They were positionals
-for one commit, which does put them in the signature and still gets it wrong: both are
-opaque strings from the same page of Linear's settings, nothing about either says which
-slot it belongs in, and getting them the wrong way round produces a token error that names
-the *client* rather than the order. The rule the whole CLI is held to: **a lone value can
-be positional; several credential values of the same shape must be named.** That is why
-`ogun secret set <name> <key>` keeps `<key>` positional and `--api-key [<key>]` carries its
-own.
+```
+ogun connect linear --app clientId=07a66d39
+ogun connect github --app appId=1234567 installationId=98765432 privateKey=./key.pem
+```
 
-Leave a flag off and the value is prompted for at a terminal or read from stdin when stdin
-is a pipe; that is the recommended path and the help says so underneath. Passing a
-credential inline **works and prints a warning** — argv is readable by every user on the
-box through `/proc/<pid>/cmdline` while the command runs, and your shell writes the whole
-line to its history — because a refusal cannot un-leak a value that is already in both, and
-a usage line that names an argument it then refuses teaches you the documentation lies. The
-Client ID is prompted for *visibly* and draws no warning: it is in every authorization URL
-a browser visits and on Linear's own settings page, and a warning that fires on a value
-that is not a secret is how people learn to scroll past warnings.
+The credentials have had three shapes. Positionals put them in the usage line and still got
+it wrong: a client id and a client secret are two opaque strings from the same page of
+Linear's settings, nothing about either says which slot it belongs in, and getting them the
+wrong way round produces a token error naming the *client* rather than the order. Named flags
+(`--client-id`, `--client-secret`) fixed that and broke on the second provider — a GitHub App
+has an app id, an installation id and a private key, none of them a client anything — so
+declaring one flag per credential would mean a flag table that grows a column per provider,
+each row valid for exactly one value of `<integration>` and an "unknown option" for every
+other. **There are no per-provider flags, ever.**
 
-With neither credential flag given, an application already registered on this machine is
-reused and nothing is asked for — the reconnect after a 30-day token lapses, and the retry
-after one that failed on the network. Giving only `--client-secret` rotates the secret and
-keeps the registered client id; a **new** `--client-id` always asks for its own secret,
-because a stored secret belongs to the application it was issued for.
+`field=value` keeps everything the named flags bought — each value labelled, order
+irrelevant, nothing a coin flip — and makes the set of labels a fact about the *provider*
+rather than about the command:
 
-Connecting one way retires the other: `--oauth` and `--consent` remove any personal key
-stored for that project, and `--api-key` is **refused** on a project that already has a
-working grant, because a grant wins over a key and storing one there would write a
-credential nothing reads. Switching a `--consent` connection to the default is refused too
-— it is a silent reduction in reach, from what an approver could see to public teams only.
+| integration | fields |
+| --- | --- |
+| `linear` | `clientId`, `clientSecret` |
+| `github` | `appId`, `installationId`, `privateKey` |
+
+An **unknown key is an error that lists the valid ones** and stores nothing, which is where
+the discoverability a declared flag would have given gets delivered: at the moment somebody
+is looking, rather than on a help page they did not open. `--oauth`, `--client-id`,
+`--client-secret` and `--app-token` are **removed, not deprecated** — a deprecation stub is a
+permanent row in the flag table that has to be maintained past the point anybody remembers
+what it was for, and the parser's refusal already prints a usage line carrying `field=value`.
+
+**Any field you leave out is prompted for, one at a time** — the public ones visibly so you
+can check what you pasted, the secrets with the echo off. A **pipe feeds those prompts in
+order**, one line per field, in the order above; there is no `--from` flag and no second
+mechanism, because a second path to the same place is two implementations that disagree about
+trimming the first time somebody fixes one of them.
+
+```
+printf '%s\n%s\n' "$ID" "$SECRET" | ogun connect linear --app
+```
+
+For a field the schema types as a **PEM** — `github privateKey` — **a value containing a
+newline is the key itself, and anything else is a path to read.** That is not a heuristic: a
+PEM always has newlines and a path never does, so the two are distinguishable with certainty.
+`privateKey=./key.pem` and `privateKey="$(cat key.pem)"` both work; a path draws no inline
+warning, because a filename is not a credential.
+
+Passing a secret inline **works and prints a warning** — argv is readable by every user on
+the box through `/proc/<pid>/cmdline` while the command runs, and your shell writes the whole
+line to its history — because a refusal cannot un-leak a value that is already in both, and a
+usage line that names an argument it then refuses teaches you the documentation lies. A public
+field draws no warning: a client id is in every authorization URL a browser visits and on the
+provider's own settings page, and a warning that fires on a value that is not a secret is how
+people learn to scroll past warnings.
+
+With **no fields at all** and a grant already on file, the application that grant came from is
+reused and nothing is asked for — the reconnect after a token lapses. Giving one field rotates
+it: `clientSecret=<new>` keeps the registered client id, and a **new** `clientId` always asks
+for its own secret, because a stored secret belongs to the application it was issued for. A
+GitHub private key belongs to the **App** rather than to the installation, so changing
+`installationId` keeps the key.
+
+#### nothing is stored until a token comes back
+
+The order is **exchange → identify → name the application → write it → write the grant.** An
+application in `~/.ogun/config.json` is one that has been spent at least once, and the name on
+it describes an account the credential actually reached.
+
+The previous order wrote the application first, which bought a cheap retry: a failed token
+request left the project "registered, not connected", and the operator re-ran the command
+without pasting anything. The cost was the thing this repository has one sentence about — *a
+credential nothing reads looks exactly like one that works* — a client secret on disk that no
+poll would ever spend, reported by `connect list` and `doctor` as a thing that exists. So the
+new cost is stated rather than hidden: **a first-ever connect whose token call fails stores
+nothing and asks for the fields again.** A reconnect is unaffected. `--consent` holds the
+credentials in the server's in-memory, single-use, ten-minute pending-authorization entry
+across the browser round trip rather than writing them, for the same reason.
+
+#### an application is shared; a grant is not
+
+An **application** is a credential registered with a provider — a Linear OAuth app, a GitHub
+App — and one of them serves every project that reaches that provider. A **grant** is one
+project's live token from one of those. They used to be one map keyed by project, so a second
+project meant a second copy of the same client secret or private key: two values that must
+agree, with nothing that makes them, and no way to tell which one a poll used. **A GitHub
+App's private key is displayed once at generation and can never be retrieved again**, which
+is what made the duplication untenable rather than merely untidy.
+
+So an application has a **name**, and the name is the handle:
+
+- **`--as <name>`** sets it. The default is **derived** from the account the credential proved
+  it reaches — `github:heirchive`, `linear:acme`, lowercased — and never from the project
+  slug, because naming a shared thing after one of its users is wrong as soon as there are
+  two. Override it when one account has two applications, which would otherwise derive the
+  same name and replace each other.
+- **`--link <name>`** points a project at an application already registered here: no
+  credentials typed again, no second copy of a private key. **It still mints a token**,
+  because "connected" has to mean "proved", not "a pointer was written" — a link that only
+  recorded a name would report a project as connected on credentials somebody may have
+  rotated a month ago, and the first evidence would be a poll at 3am. A bare `--link` with no
+  value is an error that **lists** the applications for that provider, because that is the one
+  thing you do not know when you type it.
+
+Replacing the application under a name with a *different* application (a different client id,
+or a different App or installation) **drops the grants it had minted** and names the projects
+that were disconnected: they were tokens from an application those projects no longer use, and
+keeping them would leave connections that report as healthy and 401 on the next poll. Rotating
+a secret or a private key keeps every grant, because every token the application already
+issued still works.
+
+#### what connecting one way does to the other
+
+`--app` and `--consent` remove any personal key stored for that project, and `--api-key` is
+**refused** on a project that already has a working grant, because a grant wins over a key and
+storing one there would write a credential nothing reads. Switching a `--consent` connection
+to the default is refused too — it is a silent reduction in reach, from what an approver could
+see to public teams only.
 
 **The project comes from the directory** you are standing in — the name in
-`.ogun/config.yaml`, else the registered project this directory sits inside — resolved
-exactly as `ogun project add` and `ogun project sync` resolve it, with `--project` to
-override. A slug this machine has no record of is refused **before anything is asked for**,
-because a credential filed under a project nothing polls reports as connected and is read by
-nothing; `--allow-unregistered` is the way through for a control plane whose repositories
-live elsewhere, and it warns. One rule for every kind: the same command, the same slug, the
-same refusal.
+`.ogun/config.yaml`, else the registered project this directory sits inside — resolved exactly
+as `ogun project add` and `ogun project sync` resolve it, with `--project` to override. A slug
+this machine has no record of is refused **before anything is asked for**, because a credential
+filed under a project nothing polls reports as connected and is read by nothing;
+`--allow-unregistered` is the way through for a control plane whose repositories live
+elsewhere, and it warns. One rule for every kind: the same command, the same slug, the same
+refusal.
 
 `ogun connect list` reads `~/.ogun/config.json` directly and answers with the control plane
-down, which is when the question is usually asked. It was `ogun connections`, a top-level
-noun beside three verbs; a listing is a subcommand now, mirroring `ogun secret list`, and
-the old spelling is refused with a line naming the new one. One table for keys and grants —
-two listings that could not see each other made the answer to "is this connected" depend on
-which command you ran. The **VIA** column names the mechanism, because the two grants differ
-in what they can *see* and "connected" alone cannot explain a source finding no tickets. A
-key sitting behind a working grant is shown in red as **NOT used**. It shows keys only where
-the name is an integration — `ogun secret` stores free-form names now, and a webhook signing
-key is not something a project reaches anything with — and it counts anything it left out on
-the last line, so a short table never quietly implies an empty store. It lists the whole
-machine and does not narrow to the current directory: `connect` and `disconnect` act on
-exactly one project, so naming the wrong one is their whole failure mode, while a listing
-that answered for wherever the shell was standing would say "nothing connected" on a machine
-holding four. Nothing anywhere prints a stored value back.
+down, which is when the question is usually asked. It was `ogun connections`, a top-level noun
+beside three verbs; a listing is a subcommand now, mirroring `ogun secret list`, and the old
+spelling is refused with a line naming the new one.
 
-`ogun disconnect` removes **every** credential that project has for the integration — the
-token, the client id and secret, and any personal key. It stays a top-level verb rather than
-becoming `connect rm`, because it revokes a token at Linear: an act on the outside world
-rather than the removal of a row from a listing. The client id and secret go by default
-because under the default grant they *are* the credential: anyone holding them can mint a
-live token and the next poll would, so a disconnect that left them behind is one the machine
-undoes by itself. `--keep-application` keeps them so a `--consent` reconnect is one command,
-and is **refused** on a client-credentials connection. The token is revoked at Linear too,
-best-effort, and whether that worked is its own line. Neither the integration nor the
-project is checked, where `connect` checks both: `connect list` prints whatever the file
-holds, that file gets hand-edited, and a row you can see has to be a row you can remove.
+**Two tables**, because there are two kinds of thing. The applications table gives each one's
+name, provider, method, the identifiers that are **not** secrets, and which projects use it —
+and calls out any application **no project holds a grant from**, because that is a credential
+on the disk nothing reads, reachable through `disconnect --keep-application` for the last
+project using it. The per-project rows follow, each naming the application it goes **through**.
+A GitHub credential would not have appeared in this listing at all before the split. The
+**VIA** column names the mechanism — `app token`, `consent`, `app install`, `api key` —
+because the grants differ in what they can *see* and "connected" alone cannot explain a source
+finding no tickets. A key sitting behind a working grant is shown in red as **NOT used**. It
+shows keys only where the name is an integration — `ogun secret` stores free-form names now,
+and a webhook signing key is not something a project reaches anything with — and it counts
+anything it left out on the last line, so a short table never quietly implies an empty store.
+It lists the whole machine and does not narrow to the current directory: `connect` and
+`disconnect` act on exactly one project, so naming the wrong one is their whole failure mode,
+while a listing that answered for wherever the shell was standing would say "nothing
+connected" on a machine holding four. Nothing anywhere prints a stored value back.
+
+`ogun disconnect` removes this project's token, any personal key, and — **only if no other
+project is still using it** — the application the token came from. It stays a top-level verb
+rather than becoming `connect rm`, because it revokes a token at Linear: an act on the outside
+world rather than the removal of a row from a listing.
+
+An application another project shares is **kept**, and the projects still using it are named:
+a cascade would take four working projects offline to satisfy one `disconnect` typed in the
+wrong directory, and "disconnected" said while a private key is still on the disk is a
+half-truth. When nothing else uses it, it goes, because a credential kept after the last thing
+that read it is a live credential nobody is watching and it would be in every backup of the
+machine. For Linear that is the client id and secret, which under the default grant *are* the
+credential — leaving them would be a disconnect the machine undoes by itself. **For GitHub it
+is the private key, and GitHub shows one only once**: reconnecting means generating a new one.
+`--keep-application` keeps it, and is **refused** on a Linear client-credentials connection
+for the reason above; it is allowed for github, where a key with no installation token beside
+it mints nothing until somebody signs a JWT with it.
+
+The Linear token is revoked at Linear too, best-effort, and whether that worked is its own
+line. **GitHub has no endpoint that ends an installation token early** — a one-hour life is
+the whole of its revocation story — so that is said rather than a revoke being reported.
+Neither the integration nor the project is checked, where `connect` checks both: `connect
+list` prints whatever the file holds, that file gets hand-edited, and a row you can see has to
+be a row you can remove.
 
 Run these on the **control-plane machine** — it is what polls, so it is where the credential
 has to be. Only `--consent` needs the server up; the rest write the file directly, so they
 work before `ogun init`, with the database down, and over SSH.
 
-Touches: `~/.ogun/config.json` (the `oauth` block, or `secrets` with `--api-key`), mode 0600.
+Touches: `~/.ogun/config.json` (the `applications` and `grants` blocks, or `secrets` with
+`--api-key`), mode 0600.
 
 ### `ogun secret set | list | rm`
 

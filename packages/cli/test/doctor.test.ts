@@ -202,19 +202,39 @@ test('an api key behind a live grant is reported as not being used', async () =>
 })
 
 /**
- * The property: an application registered and never connected is a warning with the
- * command that finishes it.
+ * The property: an application **no project holds a grant from** is a warning naming the
+ * command that would use it.
  *
  * It is the one genuinely actionable state here, and it is invisible from every other
  * surface — the poll refuses, quietly, into a `source_polls` row. `doctor` is where a
  * person looks when nothing is happening.
+ *
+ * What the state *means* changed with the split, and the warning is worth more than it
+ * was. It used to be "this project registered an application and nobody finished the
+ * authorization", which the write path can no longer create: nothing is stored until a
+ * token has come back. What it is now is **a credential on this disk that nothing on this
+ * machine reads** — reachable through `disconnect --keep-application` for the last project
+ * using it — which is the exact shape this repository has one sentence about. It is also
+ * no longer about one project, so the remedy names `--link` rather than a slug.
  */
-test('an application nobody connected warns, and names the command that finishes it', async () => {
-  const store = await storeWith({ oauth: { ogun: { linear: anApp() } } })
+test('an application no project uses warns, and names the command that would use it', async () => {
+  const store = await storeWith({
+    applications: {
+      'linear:acme': {
+        provider: 'linear',
+        method: 'client_credentials',
+        clientId: 'client-1',
+        clientSecret: 'lin_secret_abcdefghij',
+        redirectUri: '',
+      },
+    },
+  })
   const [check] = await linearGrants(store, now)
   assert.equal(check?.ok, false)
-  assert.match(check!.detail, /never connected/)
-  assert.match(check!.detail, /ogun connect linear --project ogun/)
+  assert.match(check!.detail, /nothing on this machine reads it/)
+  assert.match(check!.detail, /--link linear:acme/)
+  // And never the secret, from the one listing that carries an application's fields.
+  assert.ok(!check!.detail.includes('lin_secret_'))
 })
 
 /**
@@ -226,6 +246,6 @@ test('an application nobody connected warns, and names the command that finishes
  * connection — and the absence-of-evidence mistake is the one the credential preflight was
  * built to avoid.
  */
-test('a machine with no linear applications adds no line', async () => {
+test('a machine with no applications and no grants adds no line', async () => {
   assert.deepEqual(await linearGrants(await storeWith({ projects: {} }), now), [])
 })

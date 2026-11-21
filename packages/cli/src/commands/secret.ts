@@ -1,12 +1,12 @@
 import {
   clearProjectSecret,
   isSecretName,
-  listOAuthApps,
+  listGrants,
   listProjectSecrets,
   loadLocalConfig,
   localConfigPath,
   PROJECT_CONFIG_PATH,
-  readOAuthApp,
+  readGrant,
   SECRET_NAMES,
   setProjectSecret,
   type DisplacedSecret,
@@ -373,8 +373,18 @@ const readBy = (project: string, name: string, shadowed: Set<string>): string =>
  * from the same functions, without ever holding a value.
  */
 export async function shadowedKeys(): Promise<Set<string>> {
-  const apps = await listOAuthApps().catch(() => [])
-  return new Set(apps.filter((a) => a.connected).map((a) => `${a.project}/${a.provider}`))
+  const grants = await listGrants().catch(() => [])
+  /**
+   * Every grant shadows, and there is no `connected` to filter on any more — a grant *is*
+   * a connection now that applications live in their own map. A malformed entry is
+   * deliberately **excluded**: `readProjectSecret` reports it as `malformed` and does not
+   * fall through to the key, so the key is not being read either, and calling it shadowed
+   * would send somebody to disconnect a grant whose real problem is that nothing can read
+   * it.
+   */
+  return new Set(
+    grants.filter((g) => g.malformed === undefined).map((g) => `${g.project}/${g.provider}`),
+  )
 }
 
 // ── removing ───────────────────────────────────────────────────────────────
@@ -424,8 +434,8 @@ export async function secretRm(args: string[]): Promise<void> {
    * poll they meant to stop keeps working.
    */
   if (isSecretName(name)) {
-    const app = await readOAuthApp(project.slug, name)
-    if (app.state === 'present' && app.app.grant) {
+    const grant = await readGrant(project.slug, name)
+    if (grant.state === 'present') {
       console.log(
         yellow(`  ${project.slug} is still connected to ${name} as an application.`) +
           dim(
@@ -456,8 +466,8 @@ export async function refuseShadowedKey(
   name: string,
 ): Promise<void> {
   if (!isSecretName(name)) return
-  const existing = await readOAuthApp(project.slug, name)
-  if (existing.state !== 'present' || !existing.app.grant) return
+  const existing = await readGrant(project.slug, name)
+  if (existing.state !== 'present') return
   fail(
     `"${project.slug}" is already connected to ${name} as an application, and a\n` +
       '  personal key would sit behind that grant being read by nothing. Nothing was ' +

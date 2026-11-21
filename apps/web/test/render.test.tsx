@@ -1372,3 +1372,180 @@ test('timeline rows are stamped with a clock time', () => {
   assert.ok(html.includes(expected), `expected "${expected}" in the timeline`)
   assert.ok(!/\+\d+s<\/span>/.test(html), 'and no offset column')
 })
+
+/**
+ * The Settings page had no notion of an application.
+ *
+ * A credential shared by three projects rendered as three credentials — which is what the
+ * store itself used to do, holding a separate copy of the same client secret per project
+ * with nothing keeping them in agreement. `usedBy` is the field that makes "rotate this
+ * and three projects change" something the page can say.
+ */
+test('settings lists applications and who connects through each', () => {
+  const html = render(<SettingsPage />, (qc) => {
+    qc.setQueryData(['system'], systemWith({ allowed: true, reason: null, names: ['linear'] }))
+    qc.setQueryData(['linearOauth'], linearOauth())
+    qc.setQueryData(['applications'], {
+      applications: [
+        {
+          name: 'linear:heirchive',
+          provider: 'linear',
+          method: 'client_credentials',
+          identifiesAs: '07a66d3979aa',
+          usedBy: ['heirchive-api', 'ogun'],
+          malformed: null,
+        },
+        {
+          name: 'github:spare',
+          provider: 'github',
+          method: 'private_key_jwt',
+          identifiesAs: 'app 123 · installation 456',
+          usedBy: [],
+          malformed: null,
+        },
+      ],
+    })
+  })
+  assert.match(html, /linear:heirchive/)
+  assert.match(html, /heirchive-api, ogun/)
+  // An application nothing uses is a credential on disk for no reason, and saying so is
+  // the only way anybody finds out.
+  assert.match(html, /no project connects through it/)
+})
+
+/** A broken entry is listed, not dropped — it is the one somebody needs to see. */
+test('an unreadable application is shown rather than hidden', () => {
+  const html = render(<SettingsPage />, (qc) => {
+    qc.setQueryData(['system'], systemWith({ allowed: true, reason: null, names: ['linear'] }))
+    qc.setQueryData(['linearOauth'], linearOauth())
+    qc.setQueryData(['applications'], {
+      applications: [
+        {
+          name: 'github:broken',
+          provider: null,
+          method: null,
+          identifiesAs: null,
+          usedBy: ['heirchive-api'],
+          malformed: 'appId is missing or not a string',
+        },
+      ],
+    })
+  })
+  assert.match(html, /github:broken/)
+  assert.match(html, /unreadable/)
+})
+
+/**
+ * The GitHub card's whole job is the identity question.
+ *
+ * A personal token authenticates *as a person*, so Ogun's pull requests are theirs, it
+ * cannot request changes on them — GitHub refuses a review of your own pull request — and
+ * the loop guard cannot tell that person's comments from Ogun's. `ogun[bot]` is the
+ * difference, so the card marks anything that is not one.
+ */
+test('the github card says who Ogun is acting as, and flags a non-App identity', () => {
+  const seed = (actor: string) => (qc: QueryClient) => {
+    qc.setQueryData(['system'], systemWith({ allowed: true, reason: null, names: ['linear'] }))
+    qc.setQueryData(['linearOauth'], linearOauth())
+    qc.setQueryData(['githubConnections'], {
+      connections: [
+        {
+          project: 'heirchive-api',
+          application: 'github:heirchive',
+          actor,
+          appId: '1234567',
+          installationId: '98765432',
+          account: 'Heirchive',
+          expiresAt: Date.now() + 3_600_000,
+        },
+      ],
+      registerUrl: 'https://github.com/settings/apps/new',
+    })
+  }
+
+  const asApp = render(<SettingsPage />, seed('ogun[bot]'))
+  assert.match(asApp, /ogun\[bot\]/)
+  assert.ok(!/pill yellow/.test(asApp.split('github:heirchive')[0]!.slice(-400)), 'an App is not flagged')
+
+  const asPerson = render(<SettingsPage />, seed('dcole2929'))
+  assert.match(asPerson, /not an App identity/)
+})
+
+/** With nothing connected the card has to teach the three steps, only one of which is Ogun's. */
+test('the github card explains the setup when nothing is connected', () => {
+  const html = render(<SettingsPage />, (qc) => {
+    qc.setQueryData(['system'], systemWith({ allowed: true, reason: null, names: ['linear'] }))
+    qc.setQueryData(['linearOauth'], linearOauth())
+    qc.setQueryData(['githubConnections'], {
+      connections: [],
+      registerUrl: 'https://github.com/settings/apps/new',
+    })
+  })
+  assert.match(html, /github\.com\/settings\/apps\/new/)
+  assert.match(html, /ogun connect github --app/)
+  // The webhook line, because a control plane behind NAT has no address a hook can reach.
+  assert.match(html, /webhook/i)
+})
+
+/** The form refuses on a control plane that cannot carry a secret, and offers the CLI. */
+test('the github app form is replaced by the CLI when the wire cannot carry a key', () => {
+  const html = render(<SettingsPage />, (qc) => {
+    qc.setQueryData(
+      ['system'],
+      systemWith({ allowed: false, reason: 'the control plane is bound beyond localhost.', names: ['linear'] }),
+    )
+    qc.setQueryData(['linearOauth'], linearOauth())
+    qc.setQueryData(['githubConnections'], { connections: [], registerUrl: 'https://x' })
+  })
+  assert.match(html, /bound beyond localhost/)
+  assert.match(html, /ogun connect github --app/)
+  // And no field that would have taken one.
+  assert.ok(!/placeholder="-----BEGIN RSA PRIVATE KEY-----"/.test(html))
+})
+
+/** With a usable wire it offers the three fields, and the key is a file as well as a paste. */
+test('the github app form takes a .pem as a file, not only as a paste', () => {
+  const html = render(<SettingsPage />, (qc) => {
+    qc.setQueryData(['system'], systemWith({ allowed: true, reason: null, names: ['linear'] }))
+    qc.setQueryData(['linearOauth'], linearOauth())
+    qc.setQueryData(['githubConnections'], { connections: [], registerUrl: 'https://x' })
+    qc.setQueryData(['projects'], { projects: [{ slug: 'heirchive-api' }] })
+  })
+  assert.match(html, /type="file"/)
+  assert.match(html, /accept=".pem/)
+  assert.match(html, /-----BEGIN RSA PRIVATE KEY-----/)
+  // The promise the form makes before the click, so a refusal does not read as a bug.
+  assert.match(html, /nothing is stored if that fails/)
+})
+
+/**
+ * The project selection follows the data rather than the first render.
+ *
+ * `useState(projects[0] ?? '')` runs once, and `projects` comes from a query that may not
+ * have resolved — so the state froze at `''`. A `<select value="">` whose options have no
+ * empty value *displays the first one*, so the control showed a project while the state
+ * behind it was empty: every field looked filled and Connect stayed disabled, with
+ * nothing on screen naming the unsatisfied one. Reported as "the connect button is never
+ * enabled", and reproduced by delaying `/api/projects` by 1.5s.
+ */
+test('the github app form defaults to a project that arrives after it renders', () => {
+  const seed = (withProjects: boolean) => (qc: QueryClient) => {
+    qc.setQueryData(['system'], systemWith({ allowed: true, reason: null, names: ['linear'] }))
+    qc.setQueryData(['linearOauth'], linearOauth())
+    qc.setQueryData(['githubConnections'], { connections: [], registerUrl: 'https://x' })
+    if (withProjects) qc.setQueryData(['projects'], { projects: [{ slug: 'heirchive-api' }] })
+  }
+
+  // The render that used to freeze the state: the form exists, the list does not yet.
+  const early = render(<SettingsPage />, seed(false))
+  assert.match(early, /type="file"/, 'the form renders before the projects query resolves')
+
+  // And once the list is there, the select's value is the project rather than empty —
+  // which is what `ready` reads.
+  const later = render(<SettingsPage />, seed(true))
+  assert.match(later, /<option[^>]*value="heirchive-api"/)
+  assert.ok(
+    !/<select[^>]*value=""/.test(later),
+    'no select is left holding a value none of its options has',
+  )
+})

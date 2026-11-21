@@ -11,12 +11,14 @@ import {
   LinearOAuthError,
   LINEAR_ACTOR,
   LINEAR_SCOPES,
-  listOAuthApps,
+  linkedApplication,
+  applicationIdentifier,
+  connectGithubApp,
+  GithubAppError,
+  listApplications,
+  listGrants,
   normalizeSecretInput,
-  readOAuthApp,
-  registeredApplication,
   sealSecret,
-  setOAuthApp,
   type LinearConnection,
   type Secret,
 } from '@ogun/core'
@@ -139,10 +141,43 @@ const STATE_TTL_MS = 10 * 60 * 1000
  * nothing stored and the code never spent. That ordering is the whole value: an
  * unrecognised state means the code is not ours, and exchanging it first and asking
  * afterwards would already have created the grant the check exists to prevent.
+ *
+ * ### It now carries the client id and secret, and that is what lets nothing be written
+ *   before the authorization is proved
+ *
+ * This flow used to register the application **first**, because the browser round trip had
+ * to find one in the store when it came back. The connect path no longer works that way —
+ * see `connectWithAppToken` for why nothing unproven reaches the store — and the consent
+ * flow has to match it, or an abandoned browser tab would leave behind the one thing the
+ * reordering exists to prevent: a client secret on disk that no poll will ever spend,
+ * named after a workspace nobody confirmed.
+ *
+ * So the credentials travel in the entry. **Every reason the comment above gives for this
+ * map being in memory rather than in config.json is the reason it is the right place for
+ * them**, and none of it is weakened by what is now inside:
+ *
+ *  - *"The flow begins and ends in one process within seconds"* — so the credentials are
+ *    held for seconds, bounded by the same ten minutes, and a restart mid-flow loses them
+ *    along with the nonce. The operator is told to start again, which is correct and rare,
+ *    and nothing partial is left on the disk.
+ *  - *"Persisting it would put a short-lived nonce into a 0600 credential file and add a
+ *    second writer to it for no benefit"* — the client secret is not short-lived, but the
+ *    *registration* of it is: it belongs in that file only once there is a grant to put
+ *    beside it. Writing it earlier is exactly the second writer and exactly the no-benefit.
+ *  - Single-use still holds and matters more: `consumeState` deletes before it returns, so
+ *    the secret is in the map for one callback and gone, rather than readable by a second
+ *    attempt.
+ *
+ * What it does cost is stated plainly: a client secret is in this process's heap for up to
+ * ten minutes. It already was — it arrives in a request body and goes out in a token
+ * request — and the alternative is not "no copy" but "a copy on the disk, forever, whether
+ * or not the flow finished".
  */
 type PendingAuthorization = {
   project: string
   redirectUri: string
+  clientId: string
+  clientSecret: string
   createdAt: number
 }
 
@@ -245,13 +280,17 @@ const UNKNOWN_PROJECT =
  *
  * ### The client secret may be omitted, and that is the interesting case
  *
- * A body of `{}` reuses the client id and secret already in the store. That covers three
- * things at once: retrying after a token request that failed on the network, reconnecting
- * a project whose 30-day token lapsed with nothing to renew it from, and the Settings
- * card's connect button on an application somebody registered earlier. All three would
+ * A body of `{}` reuses the client id and secret of the application **this project's grant
+ * already came from**. That covers reconnecting a project whose 30-day token lapsed with
+ * nothing to renew it from, and the Settings card's reconnect button — both of which would
  * otherwise send a person back to Linear's settings page for a value this machine already
- * holds — and a value re-pasted is a value re-typed, which is how a trailing space gets
- * into a credential.
+ * holds, and a value re-pasted is a value re-typed, which is how a trailing space gets into
+ * a credential.
+ *
+ * It no longer covers *retrying after a failed first connect*, and that is the cost of the
+ * reordering `connectWithAppToken` documents: a connect that never got a token stored
+ * nothing, so there is nothing here to reuse. The 409 names `--link` instead, which is the
+ * answer when the credentials are on this machine under another project.
  *
  * ### The transport gate, and when it does not apply
  *
@@ -310,15 +349,15 @@ oauthRoutes.post('/linear/connect/:project', async (c) => {
       return c.json({ error: err.message }, 400)
     }
   } else {
-    const stored = await registeredApplication(project, 'linear')
+    const stored = await linkedApplication(project, 'linear')
     if (!stored) {
       return c.json(
         {
           error:
-            'no linear application is registered for this project on this machine, so ' +
-            'there is nothing to connect with. Create one at ' +
-            'https://linear.app/settings/api/applications/new and send its client id and ' +
-            'secret.',
+            'this project holds no linear grant on this machine, so there is no ' +
+            'application to reuse. An application is shared between projects now, so ' +
+            'either send a client id and secret, or point this project at one this ' +
+            'machine already holds — `ogun connect linear --app --link <name>`.',
         },
         409,
       )
@@ -345,16 +384,75 @@ oauthRoutes.post('/linear/connect/:project', async (c) => {
   return c.json({ connected: connection })
 })
 
-// ── registering the application, for the flow that has a browser in it ─────
+// ── offering the application, for the flow that has a browser in it ────────
+
+/**
+ * Credentials a surface has handed over for a consent flow it is about to start, by
+ * project.
+ *
+ * ### Why this exists at all, which is a question worth answering before reading it
+ *
+ * The consent flow is two authenticated requests and then a browser: `PUT …/app/:project`
+ * takes the client id and secret and answers with the exact callback URL to paste into
+ * Linear's form, and `POST …/start/:project` mints the `state` and hands back an
+ * authorization URL. The credentials arrive at the first and are needed at the second.
+ *
+ * They used to be *written to config.json* by the first, which is how the second found
+ * them — and that is precisely what the reordering removed: an abandoned flow left a
+ * client secret on the disk that no poll would ever spend. `PendingAuthorization` is where
+ * they belong once a flow has actually started, and it cannot hold them before `state`
+ * exists, because an entry keyed by a nonce that has not been minted is not an entry.
+ *
+ * So this is the gap between the two requests and nothing more. It is deliberately **not**
+ * `PendingAuthorization` with a looser key:
+ *
+ *  - Keyed by **project**, so a second attempt replaces the first rather than accumulating.
+ *    A nonce-keyed map must not do that — two tabs mid-flow are two valid authorizations —
+ *    and an offer is a draft, where the newest is the only one anybody means.
+ *  - **Not single-use.** `/start` may legitimately be called twice for one offer (a
+ *    refreshed Settings page), and failing the second with "start again" would send the
+ *    operator back to Linear for a secret they just typed.
+ *  - Swept on the same ten minutes, by the same clock, because the hazard is identical: a
+ *    client secret in a long-lived process's heap for an abandoned flow.
+ *
+ * The CLI does not use it. `ogun connect linear --consent` sends the credentials to
+ * `/start` directly, which is one request and no window at all; this exists for the web
+ * UI's two-step card.
+ */
+type OfferedApplication = {
+  clientId: string
+  clientSecret: string
+  redirectUri: string
+  createdAt: number
+}
+
+const offered = new Map<string, OfferedApplication>()
+
+const sweepOffers = (now: number): void => {
+  for (const [project, offer] of offered) {
+    if (now - offer.createdAt > STATE_TTL_MS) offered.delete(project)
+  }
+}
+
+/** Only for tests, which must not inherit a previous test's half-finished offer. */
+export const clearOfferedApplications = (): void => offered.clear()
 
 /**
  * `PUT /api/oauth/linear/app/:project` — the client id and secret from Linear's form.
+ *
+ * **It no longer writes anything.** It validates the pair, works out the callback URL the
+ * operator has to paste into Linear, and holds the credentials for the `start` that
+ * follows. The name is now a slight lie — nothing is registered until a token comes back —
+ * and it is kept rather than renamed because the web UI calls it by this path; the
+ * registration happens in `completeAuthorization`, through the same `finishConnection`
+ * every other connect goes through.
  *
  * Gated by `secretWriteTransport`, exactly like `PUT /api/system/secrets/:project/:name`
  * and through the same function, because it carries the same kind of value: a credential
  * belonging to a third party's workspace, typed by a person, crossing a network in
  * cleartext unless the operator has TLS in front. One rule, one implementation, one
- * refusal sentence that names the CLI.
+ * refusal sentence that names the CLI. That gate is unchanged by this route no longer
+ * writing — it is about what the request *carries*, not about what is done with it.
  *
  * The body is parsed by hand for the reason the secrets route documents at length: V8
  * builds `JSON.parse`'s message out of a window of the source it choked on, `app.onError`
@@ -402,26 +500,37 @@ oauthRoutes.put('/linear/app/:project', async (c) => {
     return c.json({ error: err.message }, 400)
   }
 
+  const now = Date.now()
+  sweepOffers(now)
   const redirectUri = callbackUri(c.req.url)
-  const { grantKept } = await setOAuthApp(project, 'linear', {
+  offered.set(project, {
     clientId,
+    // Held as a string rather than as the `Secret`, because the only thing that happens to
+    // it next is a token request's form body. A sealed value in a map would have to be
+    // `expose()`d at the consume site, which is a second place reaching for it.
     clientSecret: clientSecret.expose(),
     redirectUri,
+    createdAt: now,
   })
 
   /**
    * The redirect URI comes back in the response because it is the thing the operator has
    * to paste into Linear, and a value they retype from memory is a value that differs by a
-   * trailing slash. `grantKept` says whether an existing connection survived — it does when
-   * only the secret was rotated, and does not when the application changed — because
-   * "connected" quietly becoming "not connected" is the kind of state change that is only
-   * noticed by a poll failing at 3am.
+   * trailing slash.
+   *
+   * `grantKept` says whether an existing connection will survive this — it does when only
+   * the secret was rotated, and does not when the client id changed, because the tokens an
+   * application issued are dead the moment the project points at a different application.
+   * It is answered from the project's current grant rather than from a write that has not
+   * happened yet, and it is still worth answering here: "connected" quietly becoming "not
+   * connected" is the kind of state change only a poll failing at 3am notices.
    */
+  const current = await linkedApplication(project, 'linear')
   return c.json({
     project,
     clientId,
     redirectUri,
-    grantKept,
+    grantKept: current !== undefined && current.clientId === clientId,
     scopes: [...LINEAR_SCOPES],
     actor: LINEAR_ACTOR,
   })
@@ -429,75 +538,149 @@ oauthRoutes.put('/linear/app/:project', async (c) => {
 
 // ── starting the flow ──────────────────────────────────────────────────────
 
+/**
+ * `POST /api/oauth/linear/start/:project` — mint a `state` and hand back an authorization
+ * URL.
+ *
+ * ### Where the credentials come from, in order
+ *
+ *  1. **This request's body**, `{clientId, clientSecret}`. That is what the CLI sends, and
+ *     it collapses the flow to one request with no window in which a secret is held
+ *     anywhere but a `PendingAuthorization`. Gated by `secretWriteTransport` when it is
+ *     present, because the gate follows the value and not the endpoint — the same rule
+ *     `PUT …/app/:project` is held to.
+ *  2. **An offer** left by `PUT …/app/:project`, which is the web UI's two-step card.
+ *  3. **The application this project's grant already came from**, for a re-consent that
+ *     should not send anybody back to Linear's settings page for a value this machine is
+ *     holding.
+ *
+ * Nothing has been written to the store at this point by any of the three, and that is the
+ * change: this route used to require an application to exist first. See
+ * `PendingAuthorization` for why the credentials ride in the entry instead.
+ */
 oauthRoutes.post('/linear/start/:project', async (c) => {
   const project = c.req.param('project')
-  const app = await readOAuthApp(project, 'linear')
-  if (app.state !== 'present') {
-    return c.json(
-      {
-        error:
-          app.state === 'absent'
-            ? 'no linear application is registered for this project on this machine. ' +
-              'Create one at https://linear.app/settings/api/applications/new and store ' +
-              'its client id and secret first.'
-            : `this project's linear application could not be read (${app.state}).`,
-      },
-      409,
-    )
+  const current = callbackUri(c.req.url)
+
+  const raw = await c.req.text()
+  let body: unknown
+  try {
+    body = raw.trim() === '' ? {} : JSON.parse(raw)
+  } catch {
+    // The parser quotes a window of its source, and the source is a client secret.
+    return c.json({ error: 'the request body was not valid JSON. Nothing was stored.' }, 400)
+  }
+  const fields = (body ?? {}) as { clientId?: unknown; clientSecret?: unknown }
+  const supplied = fields.clientId !== undefined || fields.clientSecret !== undefined
+
+  let credentials: { clientId: string; clientSecret: string; redirectUri: string }
+  if (supplied) {
+    if (typeof fields.clientId !== 'string' || typeof fields.clientSecret !== 'string') {
+      return c.json(
+        {
+          error:
+            'expected a JSON body of {"clientId": "…", "clientSecret": "…"}, or {} to use ' +
+            'the credentials already offered for this project.',
+        },
+        400,
+      )
+    }
+    const transport = secretWriteTransport()
+    if (!transport.allowed) return c.json({ error: transport.reason }, 403)
+    try {
+      // The same validator every other door uses, so a trailing newline off a paste is
+      // caught here rather than as an `ERR_INVALID_CHAR` inside undici at exchange time.
+      credentials = {
+        clientId: normalizeSecretInput(fields.clientId),
+        clientSecret: normalizeSecretInput(fields.clientSecret),
+        redirectUri: current,
+      }
+    } catch (err) {
+      if (!(err instanceof InvalidSecret)) throw err
+      // Safe to forward: it names the rule that was broken, never the input that broke it.
+      return c.json({ error: err.message }, 400)
+    }
+  } else {
+    sweepOffers(Date.now())
+    const offer = offered.get(project)
+    if (offer) {
+      credentials = {
+        clientId: offer.clientId,
+        clientSecret: offer.clientSecret,
+        redirectUri: offer.redirectUri,
+      }
+    } else {
+      const linked = await linkedApplication(project, 'linear')
+      if (!linked) {
+        return c.json(
+          {
+            error:
+              'no linear credentials have been offered for this project and it holds no ' +
+              'grant to reuse one from. Create an application at ' +
+              'https://linear.app/settings/api/applications/new and send its client id ' +
+              'and secret — nothing is stored until the authorization comes back.',
+          },
+          409,
+        )
+      }
+      credentials = {
+        clientId: linked.clientId,
+        clientSecret: linked.clientSecret,
+        /**
+         * An application with no callback URL recorded was registered by the browserless
+         * path, which has no browser round trip to have one — so the current address is
+         * adopted here rather than refused.
+         *
+         * This used to refuse, on the grounds that *"adopting the current address would
+         * authorize against a URI Linear was never told about and get an error that names
+         * nothing"*. The hazard is real and the refusal was aimed at the wrong half of it:
+         * the URI Linear has to have been told about is the one in the **authorization
+         * request**, and that is this request's address either way. What the stored value
+         * protects is the *exchange* echoing the same string the authorization used, and
+         * that is now carried in the pending entry rather than read back out of the store.
+         * So the mismatch check below is what remains, and it only has something to
+         * compare when there is a recorded URI to compare against.
+         */
+        redirectUri: linked.redirectUri === '' ? current : linked.redirectUri,
+      }
+    }
   }
 
   /**
-   * The redirect URI is taken from the **stored application**, not rebuilt from this
-   * request. They are normally the same string, and the case where they differ is the case
-   * that matters: an operator who registered the application while reaching the control
-   * plane on `localhost` and is now on `192.168.1.10` would otherwise silently authorize
-   * against a URI Linear has never been told about, and Linear's refusal names nothing
-   * useful. Reported instead, with both strings, so the mismatch is a sentence rather than
-   * a mystery.
+   * The redirect URI the authorization will use must be one this control plane can
+   * actually receive a callback at, and a *recorded* one that differs from where the
+   * operator is standing is the failure worth naming: somebody who registered the
+   * application while reaching the control plane on `localhost` and is now on
+   * `192.168.1.10` would otherwise silently authorize against a URI Linear has never been
+   * told about, and Linear's refusal names nothing useful.
    */
-  const current = callbackUri(c.req.url)
-  /**
-   * An application with no callback URL recorded was registered by the browserless path,
-   * where there is no browser round trip to have one. Adopting the current address here
-   * would authorize against a URI Linear was never told about and get an error that names
-   * nothing — the exact failure the stored value exists to prevent — so the operator is
-   * sent to the command that registers one instead.
-   */
-  if (app.app.redirectUri === '') {
-    return c.json(
-      {
-        error:
-          "this project's linear application was registered without a callback URL, which " +
-          'is what connecting without a browser does. The consent flow needs one, and ' +
-          'Linear matches it exactly. Register it from this control plane — ' +
-          `\`ogun connect linear --consent --project ${project}\` — which stores ${current} ` +
-          'and prints it to paste into Linear.',
-      },
-      409,
-    )
-  }
-  if (current !== app.app.redirectUri) {
+  if (credentials.redirectUri !== current) {
     return c.json(
       {
         error:
           `this project's linear application was registered with the callback URL ` +
-          `${app.app.redirectUri}, and you are reaching this control plane at ${current}. ` +
-          'Linear matches the redirect URI exactly, so authorizing now would fail with an ' +
-          'error that does not say why. Either open the control plane at the registered ' +
-          'address, or register the application again from this one.',
+          `${credentials.redirectUri}, and you are reaching this control plane at ` +
+          `${current}. Linear matches the redirect URI exactly, so authorizing now would ` +
+          'fail with an error that does not say why. Either open the control plane at the ' +
+          'registered address, or register the application again from this one.',
       },
       409,
     )
   }
 
-  const state = beginAuthorization({ project, redirectUri: app.app.redirectUri })
+  const state = beginAuthorization({
+    project,
+    redirectUri: credentials.redirectUri,
+    clientId: credentials.clientId,
+    clientSecret: credentials.clientSecret,
+  })
   return c.json({
     authorizeUrl: authorizationUrl({
-      clientId: app.app.clientId,
-      redirectUri: app.app.redirectUri,
+      clientId: credentials.clientId,
+      redirectUri: credentials.redirectUri,
       state,
     }),
-    redirectUri: app.app.redirectUri,
+    redirectUri: credentials.redirectUri,
     scopes: [...LINEAR_SCOPES],
     actor: LINEAR_ACTOR,
     expiresInMs: STATE_TTL_MS,
@@ -558,7 +741,7 @@ oauthRoutes.get('/linear/callback', async (c) => {
     return c.redirect(settingsUrl('no-code', entry.project), 302)
   }
 
-  const outcome = await completeAuthorization({ project: entry.project, code, redirectUri: entry.redirectUri })
+  const outcome = await completeAuthorization({ ...entry, code })
   if (outcome.ok) return c.redirect(settingsUrl('connected', entry.project), 302)
   return c.redirect(settingsUrl(outcome.reason, entry.project), 302)
 })
@@ -626,11 +809,7 @@ oauthRoutes.post('/linear/exchange', async (c) => {
     )
   }
 
-  const outcome = await completeAuthorization({
-    project: entry.project,
-    code,
-    redirectUri: entry.redirectUri,
-  })
+  const outcome = await completeAuthorization({ ...entry, code })
   if (!outcome.ok) return c.json({ error: outcome.detail, reason: outcome.reason }, 400)
   return c.json({ connected: outcome.summary })
 })
@@ -638,13 +817,67 @@ oauthRoutes.post('/linear/exchange', async (c) => {
 // ── status and disconnect ──────────────────────────────────────────────────
 
 /**
- * What every surface reads: which projects have an application, and what state each
- * connection is in. Never a token — `ProjectGrantPresence` has no field one fits in.
+ * What every surface reads: which projects are connected to Linear and how healthy each
+ * connection is. Never a token — neither `GrantPresence` nor `ApplicationListing` has a
+ * field one fits in.
+ *
+ * ### The `apps` array keeps ADR-0014's field names, deliberately, for now
+ *
+ * The store underneath it is two maps rather than one, so this row is now **composed**: a
+ * project and an expiry come from the grant, a client id and a callback URL from the
+ * application it names. The shape going out is unchanged because the web UI declares its
+ * own copy of it (`apps/web/src/api.ts`), and that app is being reworked in a separate
+ * pass — a field renamed here would be a Settings page that renders blanks with nothing
+ * saying why.
+ *
+ * Two consequences are worth stating rather than discovering:
+ *
+ *  - `connected` is now **always true**. A row exists because a grant exists, and a grant
+ *    is a connection by construction; "registered but never connected" is a state the
+ *    write path can no longer create (see `connectWithAppToken`).
+ *  - A row says nothing about **who else shares** the application, which is the fact the
+ *    split exists to expose. That belongs on this response and is the one thing the next
+ *    pass over the UI should add; `ogun connect list` already prints it.
  */
 oauthRoutes.get('/linear', async (c) => {
-  const apps = await listOAuthApps().catch(() => [])
+  const [grants, applications] = await Promise.all([
+    listGrants().catch(() => []),
+    listApplications().catch(() => []),
+  ])
+  const byName = new Map(applications.map((a) => [a.name, a]))
+
+  const apps = grants
+    .filter((g) => g.provider === 'linear')
+    .map((g) => {
+      const listed = byName.get(g.app)
+      const app = listed?.state === 'present' && listed.app.provider === 'linear' ? listed.app : undefined
+      return {
+        project: g.project,
+        provider: g.provider,
+        clientId: app?.clientId ?? '',
+        // The one place a secret's *presence* is reported, and it is a boolean for the
+        // reason `ProjectGrantPresence` gave: the honest thing to report is whether one is
+        // stored, and a future editor cannot widen a boolean into a disclosure.
+        clientSecretSet: app !== undefined,
+        redirectUri: app?.redirectUri ?? '',
+        scopes: g.scopes,
+        actor: g.actor,
+        ...(g.grantType ? { grantType: g.grantType } : {}),
+        ...(g.expiresAt !== undefined ? { expiresAt: g.expiresAt } : {}),
+        ...(g.obtainedAt !== undefined ? { obtainedAt: g.obtainedAt } : {}),
+        // `workspace` on the wire, `account` in the store: the store's field is shared with
+        // GitHub, where "workspace" would be a word for something that is not one.
+        ...(g.account ? { workspace: { id: g.account.id ?? '', ...g.account } } : {}),
+        ...(g.malformed !== undefined
+          ? { malformed: g.malformed }
+          : listed?.state === 'malformed'
+            ? { malformed: `its application is unreadable (${listed.reason})` }
+            : {}),
+      }
+    })
+
   return c.json({
-    apps: apps.filter((a) => a.provider === 'linear'),
+    apps,
     /**
      * The callback URL as it would be right now, which is what the operator pastes into
      * Linear's registration form. Rendered even for a project with no application yet,
@@ -743,19 +976,20 @@ async function completeAuthorization(input: {
   project: string
   code: string
   redirectUri: string
+  clientId: string
+  clientSecret: string
 }): Promise<Completion> {
-  const app = await readOAuthApp(input.project, 'linear')
-  if (app.state !== 'present') {
-    return fail(input.project, 'no-app', "this project's linear application is no longer registered")
-  }
-
   let tokens
   try {
     tokens = await exchangeCode({
       code: input.code,
       redirectUri: input.redirectUri,
-      clientId: app.app.clientId,
-      clientSecret: app.app.clientSecret.expose(),
+      clientId: input.clientId,
+      // The one `expose()`-equivalent on this path, and it is at a wire: the value goes
+      // into the form body of a token request and is held nowhere else. It never was a
+      // `Secret` here — it came out of a request body and into the pending entry — which
+      // is why the entry's doc comment carries the containment argument instead.
+      clientSecret: input.clientSecret,
     })
   } catch (err) {
     if (!(err instanceof LinearOAuthError)) throw err
@@ -764,7 +998,25 @@ async function completeAuthorization(input: {
     return fail(input.project, err.kind, err.message)
   }
 
-  const summary = await finishConnection(input.project, 'linear', app.app.clientId, tokens)
+  /**
+   * The application is written **here**, after the exchange, by `finishConnection` — which
+   * is the same function the browserless connect uses, so a project connected through a
+   * browser and a project connected without one are the same two rows in the store. The
+   * credentials came out of the pending entry rather than out of config.json, which is
+   * what makes "nothing is written until a token comes back" true of this path as well.
+   */
+  const summary = await finishConnection(
+    input.project,
+    'linear',
+    {
+      clientId: input.clientId,
+      clientSecret: input.clientSecret,
+      redirectUri: input.redirectUri,
+      method: 'authorization_code',
+    },
+    tokens,
+  )
+  offered.delete(input.project)
   lastFailure.delete(input.project)
   return { ok: true, summary }
 }
@@ -790,3 +1042,193 @@ const settingsUrl = (result: string, project?: string): string => {
   if (project) params.set('project', project)
   return `/settings?${params.toString()}`
 }
+
+/**
+ * Every application on this machine, and which projects go through each.
+ *
+ * Its own route rather than a field on `GET /linear`, because an application is not a
+ * Linear concept: one GitHub App serves an organisation, and the sharing it makes
+ * possible is the thing the Settings page was blind to. A `/linear` route that answered
+ * "here are your GitHub applications too" would be a name that lies.
+ *
+ * **No secret, ever.** `identifiesAs` is the non-secret half of whatever identifies the
+ * application to its provider — a client id for Linear, an app and installation id for
+ * GitHub — on the same terms `connect list` prints them: those values are in every
+ * authorization URL and on the provider's own settings page, and withholding them would
+ * mean the page could not say *which* application a project is connected through, which
+ * is the first question the moment two exist.
+ */
+oauthRoutes.get('/applications', async (c) => {
+  const listed = await listApplications().catch(() => [])
+  return c.json({
+    applications: listed.map((entry) =>
+      entry.state === 'present'
+        ? {
+            name: entry.name,
+            provider: entry.app.provider,
+            method: entry.app.method,
+            identifiesAs: applicationIdentifier(entry.app),
+            usedBy: entry.usedBy,
+            malformed: null,
+          }
+        : {
+            name: entry.name,
+            provider: null,
+            method: null,
+            identifiesAs: null,
+            usedBy: entry.usedBy,
+            /**
+             * Listed rather than dropped. An application this build cannot parse is
+             * exactly the one somebody needs to see, and omitting it would answer "what
+             * is connected here" with a list missing the broken thing.
+             */
+            malformed: entry.reason,
+          },
+    ),
+  })
+})
+
+/**
+ * The GitHub half of the Settings page.
+ *
+ * Its own route rather than fields bolted onto `/linear`, for the reason the applications
+ * route gives: the two providers answer different questions. Linear's card is about a
+ * consent flow with a callback URL and a redirect to paste; GitHub's is about an App that
+ * was registered on github.com, installed on an account, and whose identity — the thing
+ * that makes "opened by Ogun" a fact rather than a branch-prefix guess — is the point.
+ *
+ * Read-only, like the applications listing and for the same reason: the credential is a
+ * private key, and `ogun connect github --app` already takes it with the echo off, proves
+ * it by minting a token before storing anything, and names what it displaced.
+ */
+oauthRoutes.get('/github', async (c) => {
+  const [grants, applications] = await Promise.all([
+    listGrants().catch(() => []),
+    listApplications().catch(() => []),
+  ])
+  const byName = new Map(applications.map((a) => [a.name, a]))
+
+  return c.json({
+    connections: grants
+      .filter((g) => g.provider === 'github')
+      .map((g) => {
+        const listed = byName.get(g.app)
+        const app =
+          listed?.state === 'present' && listed.app.provider === 'github' ? listed.app : undefined
+        return {
+          project: g.project,
+          application: g.app,
+          /**
+           * The login Ogun acts as — `ogun[bot]`. The single most useful fact on this card,
+           * because it is what tells you whether pull requests are being opened by the App
+           * or by whoever's token is standing in for it.
+           */
+          actor: g.actor,
+          appId: app?.appId ?? null,
+          installationId: app?.installationId ?? null,
+          account: g.account?.name ?? null,
+          ...(g.expiresAt !== undefined ? { expiresAt: g.expiresAt } : {}),
+          ...(g.malformed !== undefined ? { malformed: g.malformed } : {}),
+        }
+      }),
+    /**
+     * Where an App is registered, which is a page on github.com rather than anything Ogun
+     * can do — so the card links it rather than pretending to a flow it does not have.
+     * Not derived from a configured org: this machine may serve several, and guessing one
+     * would send somebody to register an App under the wrong account.
+     */
+    registerUrl: 'https://github.com/settings/apps/new',
+  })
+})
+
+/**
+ * Register a GitHub App for a project, from the Settings page.
+ *
+ * ### Why this one writes where `PUT /linear/app/:project` no longer does
+ *
+ * That route stopped writing because its flow has a second half: a browser round trip
+ * that ends in a token, and holding the credentials in memory until then means nothing
+ * unproven reaches the store. An App has no second half. The three values *are* the
+ * credential, and they prove themselves in one request — `connectGithubApp` mints an
+ * installation token before it writes a thing. So the same principle produces a write
+ * here and an offer there.
+ *
+ * ### The transport gate
+ *
+ * `secretWriteTransport` for the reason the project-secret route has it: a private key
+ * with push access to an organisation must not cross a connection that is not carrying
+ * it privately, and the control plane binds beyond localhost on purpose. The CLI is
+ * unaffected — it writes the file directly and never touches a socket.
+ *
+ * Nothing of the key is echoed. The response is the connection, which is public facts:
+ * the account, the login, the application name, the expiry.
+ */
+oauthRoutes.post('/github/app/:project', async (c) => {
+  const transport = secretWriteTransport()
+  if (!transport.allowed) return c.json({ error: transport.reason }, 403)
+
+  const project = c.req.param('project')
+  const known = await c.var.ctx.db.query.projects.findFirst({
+    where: eq(projects.slug, project),
+    columns: { id: true },
+  })
+  if (!known) return c.json({ error: UNKNOWN_PROJECT }, 404)
+
+  let body: unknown
+  try {
+    body = JSON.parse(await c.req.text())
+  } catch {
+    // The parser quotes its source and the source is a private key.
+    return c.json({ error: 'the request body was not valid JSON. Nothing was stored.' }, 400)
+  }
+
+  const fields = body as Record<string, unknown> | null
+  for (const name of ['appId', 'installationId', 'privateKey'] as const) {
+    if (typeof fields?.[name] !== 'string' || (fields[name] as string).trim() === '') {
+      return c.json(
+        { error: `expected {"appId": "…", "installationId": "…", "privateKey": "…"} — ${name} is missing.` },
+        400,
+      )
+    }
+  }
+
+  /**
+   * A paste that lost its line breaks is the failure this catches, and it is worth
+   * catching here rather than at `createSign`: a one-line PEM fails deep inside node's
+   * crypto with a message about a header, hours of confusion away from "you pasted this
+   * into a browser".
+   */
+  const privateKey = (fields!.privateKey as string).trim()
+  if (!privateKey.includes('\n')) {
+    return c.json(
+      {
+        error:
+          'that private key is a single line, so it is not a PEM — a pasted key keeps its ' +
+          'line breaks. Nothing was stored.',
+      },
+      400,
+    )
+  }
+
+  try {
+    const connection = await connectGithubApp(project, {
+      appId: normalizeSecretInput(fields!.appId as string),
+      installationId: normalizeSecretInput(fields!.installationId as string),
+      privateKey,
+    })
+    return c.json({ connected: connection })
+  } catch (err) {
+    if (err instanceof InvalidSecret) return c.json({ error: err.message }, 400)
+    /**
+     * GitHub refusing the credential is a 400, not a 500: the operator's input is what is
+     * wrong and they are the one who can fix it. `GithubAppError` already separates that
+     * from a transport fault, and forwarding its message is safe — it is built never to
+     * carry the key or the JWT, which `github-app.test.ts` asserts against a stub that
+     * reflects them back.
+     */
+    if (err instanceof GithubAppError) {
+      return c.json({ error: err.message }, err.kind === 'config' ? 400 : 502)
+    }
+    throw err
+  }
+})

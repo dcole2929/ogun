@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link, useSearchParams } from 'react-router'
 import { api, type LinearApp, type LinearOauth, type SystemInfo } from '../api.ts'
-import { Empty, Page } from '../ui.tsx'
+import { Empty, Page, when } from '../ui.tsx'
 
 /**
  * What this control plane is, and what the machine running it can actually do.
@@ -172,8 +172,14 @@ export function SettingsPage() {
         )}
       </div>
 
+      <h2>Applications</h2>
+      <Applications />
+
       <h2>Linear</h2>
       <LinearConnection />
+
+      <h2>GitHub</h2>
+      <GithubConnection />
 
       <h2>Project secrets</h2>
       <ProjectSecrets secrets={projectSecrets} writes={data.projectSecretWrites} />
@@ -608,6 +614,380 @@ function AdminToken() {
  * the field is cleared. The mutation closes over the field, and the field is cleared first
  * on success.
  */
+/**
+ * Every registered application, and who goes through each.
+ *
+ * The page had no notion of one. A credential shared by three projects rendered as three
+ * credentials — which is what the store itself used to do, holding a separate copy of the
+ * same client secret per project, with nothing keeping them in agreement. One GitHub App
+ * serves a whole organisation, so sharing is the normal case rather than the exception,
+ * and "rotate this and three projects change" is a fact the page has to be able to state.
+ *
+ * Read-only, deliberately. Registering an application means pasting a client secret or a
+ * private key, and `ogun connect` already asks for those with the echo off, proves them by
+ * spending them before storing anything, and names what it displaced. A second write path
+ * through a browser would be a second place for that reasoning to live, and the weaker of
+ * the two.
+ */
+function Applications() {
+  const { data, isLoading } = useQuery({
+    queryKey: ['applications'],
+    queryFn: api.applications,
+  })
+
+  if (isLoading) return <div className="card">loading…</div>
+  const rows = data?.applications ?? []
+
+  if (rows.length === 0) {
+    return (
+      <div className="card">
+        <p className="muted" style={{ margin: 0, fontSize: 13 }}>
+          No application is registered on this machine. One is what lets Ogun act as
+          itself rather than as you — <span className="mono">ogun connect &lt;integration&gt; --app</span>.
+        </p>
+      </div>
+    )
+  }
+
+  return (
+    <div className="card">
+      <table>
+        <thead>
+          <tr>
+            <th>Application</th>
+            <th>Provider</th>
+            <th>Identifies as</th>
+            <th>Used by</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((a) => (
+            <tr key={a.name}>
+              <td className="mono">{a.name}</td>
+              <td className="muted">
+                {a.provider ?? '—'}
+                {a.method ? <span className="muted"> · {a.method}</span> : null}
+              </td>
+              <td className="mono muted">{a.identifiesAs ?? '—'}</td>
+              <td>
+                {/**
+                 * The point of the table. An application nothing uses is a credential
+                 * sitting on disk for no reason, and one used by four projects is four
+                 * things that change when it is rotated — neither was visible before.
+                 */}
+                {a.malformed !== null ? (
+                  <span className="pill red" title={a.malformed}>
+                    unreadable
+                  </span>
+                ) : a.usedBy.length === 0 ? (
+                  <span className="muted">nothing — no project connects through it</span>
+                ) : (
+                  a.usedBy.join(', ')
+                )}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+/**
+ * GitHub, which is an App rather than a consent flow.
+ *
+ * Deliberately not a mirror of the Linear card. That one is about a browser round trip —
+ * a callback URL to paste, a redirect to approve — and GitHub's App has none of that: it
+ * is registered on github.com, installed on an account, and authenticates by signing a
+ * JWT with a private key it holds. The card's job is to say who Ogun is acting as and to
+ * get somebody to the two places that do the work.
+ *
+ * No form, and that is the same decision the applications table makes. The credential is
+ * a private key with push access to an organisation; `ogun connect github --app` takes it
+ * with the echo off, proves it by minting a token before anything is stored, and names
+ * every project it displaces. A textarea in a browser would be a second path to the same
+ * store with none of that, and the weaker of the two.
+ */
+function GithubConnection() {
+  const qc = useQueryClient()
+  const { data, isLoading } = useQuery({
+    queryKey: ['githubConnections'],
+    queryFn: api.githubConnections,
+  })
+  const system = useQuery({ queryKey: ['system'], queryFn: api.system })
+  const projects = useQuery({ queryKey: ['projects'], queryFn: api.projects })
+
+  if (isLoading || !data) return <div className="card">loading…</div>
+  const { connections } = data
+  const writes = system.data?.projectSecretWrites
+
+  return (
+    <div className="card">
+      <p className="muted" style={{ marginTop: 0, fontSize: 12 }}>
+        An App gives Ogun an identity of its own. A personal access token authenticates{' '}
+        <em>as you</em>, so its pull requests are yours, it cannot request changes on them —
+        GitHub refuses a review of your own pull request — and the loop guard that stops
+        Ogun acting on its own comments cannot tell your words from its own.
+      </p>
+
+      {connections.length === 0 ? (
+        <>
+          <p className="muted" style={{ fontSize: 12 }}>
+            Nothing on this machine is connected to GitHub. Three steps, and only the last
+            one is Ogun&rsquo;s:
+          </p>
+          <ol className="muted" style={{ fontSize: 12, lineHeight: 1.7 }}>
+            <li>
+              Register an App at{' '}
+              <a className="extlink" href={data.registerUrl} target="_blank" rel="noreferrer">
+                github.com/settings/apps/new
+              </a>
+              {' '}— or under an organisation, which is where it belongs if the repositories
+              are. Turn the webhook <strong>off</strong>: Ogun polls, because a control
+              plane behind NAT has no address an inbound hook could reach.
+            </li>
+            <li>
+              Give it <strong>Pull requests: read &amp; write</strong> and{' '}
+              <strong>Contents: read &amp; write</strong>, and nothing else. Install it on
+              the account, choosing <strong>All repositories</strong> if you would rather
+              not repeat this per repo.
+            </li>
+            <li>
+              Hand Ogun the three values. The private key is a file, so it is a path here
+              rather than a paste:
+              <pre className="cmd-block">
+                ogun connect github --app appId=… installationId=… privateKey=./key.pem
+              </pre>
+            </li>
+          </ol>
+        </>
+      ) : null}
+
+      <GithubAppForm
+        projects={(projects.data?.projects ?? []).map((p) => p.slug)}
+        writes={writes}
+        onConnected={() => void qc.invalidateQueries({ queryKey: ['githubConnections'] })}
+      />
+
+      {connections.length > 0 ? (
+        <table>
+          <thead>
+            <tr>
+              <th>Project</th>
+              <th>Acts as</th>
+              <th>Application</th>
+              <th>Token</th>
+            </tr>
+          </thead>
+          <tbody>
+            {connections.map((g) => (
+              <tr key={`${g.project}:${g.application}`}>
+                <td>{g.project}</td>
+                <td className="mono">
+                  {/**
+                   * The question this card exists to answer. `ogun[bot]` means the App is
+                   * doing the work; anything else means a credential is standing in for it
+                   * and the attribution, the review state and the loop guard are all a
+                   * person's rather than Ogun's.
+                   */}
+                  {g.actor.endsWith('[bot]') ? (
+                    g.actor
+                  ) : (
+                    <span className="pill yellow" title="not an App identity">
+                      {g.actor}
+                    </span>
+                  )}
+                </td>
+                <td className="mono muted">
+                  {g.application}
+                  {g.account ? <span className="muted"> · {g.account}</span> : null}
+                </td>
+                <td className="muted">
+                  {g.malformed !== undefined ? (
+                    <span className="pill red" title={g.malformed}>
+                      unreadable
+                    </span>
+                  ) : g.expiresAt === undefined ? (
+                    '—'
+                  ) : (
+                    /* An installation token lasts an hour and renews before use, so a
+                       past expiry here is ordinary rather than a fault. */
+                    when(new Date(g.expiresAt).toISOString())
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      ) : null}
+    </div>
+  )
+}
+
+/**
+ * The three values that make an App, from a browser.
+ *
+ * A **file picker as well as a textarea**, and the picker is the one that matters: the
+ * private key arrives as a `.pem` you downloaded, so the honest gesture is to hand over
+ * that file rather than to select 1,700 characters of it in a text editor. Paste stays
+ * for the case where the key lives in a password manager and never touched the disk.
+ *
+ * The file is read in the browser and sent as text; nothing is uploaded, because there is
+ * no upload endpoint and a multipart body would be a second shape for the one route to
+ * parse.
+ *
+ * `appId` and `installationId` are plain inputs rather than password fields. Neither is a
+ * secret — both are on the App's settings page and in every JWT Ogun signs — and masking
+ * them would mean an operator could not check what they pasted, which is the mistake the
+ * CLI's `--client-id` note already records.
+ */
+function GithubAppForm({
+  projects,
+  writes,
+  onConnected,
+}: {
+  projects: string[]
+  writes: SystemInfo['projectSecretWrites'] | undefined
+  onConnected: () => void
+}) {
+  /**
+   * Derived, not initialised — `useState(projects[0] ?? '')` runs once, and `projects`
+   * arrives from a query that had not resolved yet.
+   *
+   * The failure is invisible, which is why it shipped: a `<select value="">` whose options
+   * have no empty value *displays the first one*, so the control showed a project while
+   * the state behind it was still `''`. Everything looked filled, Connect stayed disabled,
+   * and nothing on screen said which field was unsatisfied.
+   *
+   * `picked` is null until somebody chooses, so the default follows the data instead of
+   * freezing whatever happened to be there on the first render.
+   */
+  const [picked, setPicked] = useState<string | null>(null)
+  const project = picked ?? projects[0] ?? ''
+  const [appId, setAppId] = useState('')
+  const [installationId, setInstallationId] = useState('')
+  const [privateKey, setPrivateKey] = useState('')
+  const [fileName, setFileName] = useState<string | null>(null)
+
+  const connect = useMutation({
+    mutationFn: () => api.connectGithubApp(project, { appId, installationId, privateKey }),
+    onSuccess: () => {
+      // Cleared on success and not before: a failed attempt keeps what was typed, because
+      // retyping an app id to fix a key is how somebody gives up on a form.
+      setAppId('')
+      setInstallationId('')
+      setPrivateKey('')
+      setFileName(null)
+      onConnected()
+    },
+  })
+
+  /**
+   * The same refusal the project-secret form shows, for the same reason: a private key
+   * with push access to an organisation must not cross a connection that is not carrying
+   * it privately. The CLI is unaffected — it writes the file and never opens a socket.
+   */
+  if (writes && !writes.allowed) {
+    return (
+      <p className="muted" style={{ fontSize: 12 }}>
+        {writes.reason} Connect from the control-plane machine instead:
+        <pre className="cmd-block">
+          ogun connect github --app appId=… installationId=… privateKey=./key.pem
+        </pre>
+      </p>
+    )
+  }
+
+  const ready = project !== '' && appId.trim() !== '' && installationId.trim() !== '' &&
+    privateKey.trim() !== ''
+
+  return (
+    <div className="form" style={{ marginTop: 14 }}>
+      <label>
+        <span>Project</span>
+        <select value={project} onChange={(e) => setPicked(e.target.value)}>
+          {projects.map((slug) => (
+            <option key={slug} value={slug}>
+              {slug}
+            </option>
+          ))}
+        </select>
+        <small>One App can serve several — connect each, or link them with the CLI.</small>
+      </label>
+      <label>
+        <span>App ID</span>
+        <input type="text" value={appId} onChange={(e) => setAppId(e.target.value)} />
+        <small>On the App&rsquo;s settings page. Not a secret.</small>
+      </label>
+      <label>
+        <span>Installation ID</span>
+        <input
+          type="text"
+          value={installationId}
+          onChange={(e) => setInstallationId(e.target.value)}
+        />
+        <small>
+          The number at the end of the URL after you install it:{' '}
+          <span className="mono">/settings/installations/<strong>12345678</strong></span>
+        </small>
+      </label>
+      <label className="wide">
+        <span>Private key</span>
+        <input
+          type="file"
+          accept=".pem,application/x-pem-file"
+          onChange={(e) => {
+            const file = e.target.files?.[0]
+            if (!file) return
+            setFileName(file.name)
+            void file.text().then(setPrivateKey)
+          }}
+        />
+        <textarea
+          rows={4}
+          value={privateKey}
+          placeholder="-----BEGIN RSA PRIVATE KEY-----"
+          onChange={(e) => {
+            setPrivateKey(e.target.value)
+            setFileName(null)
+          }}
+        />
+        <small>
+          {fileName === null
+            ? 'Choose the .pem you downloaded, or paste it. It is sent once and never shown again.'
+            : `${fileName} — read in this browser, not uploaded.`}
+        </small>
+      </label>
+
+      <div className="row wide" style={{ marginTop: 4 }}>
+        <button
+          className="primary"
+          disabled={!ready || connect.isPending}
+          onClick={() => connect.mutate()}
+        >
+          {connect.isPending ? 'minting a token…' : 'Connect'}
+        </button>
+        <span className="muted" style={{ fontSize: 12 }}>
+          {/* Said before the click, because "it stored nothing" after a failure reads as a
+              bug unless somebody already knew that was the rule. */}
+          proved by minting an installation token — nothing is stored if that fails
+        </span>
+      </div>
+      {connect.error && (
+        <p className="error wide" style={{ fontSize: 13 }}>
+          {String(connect.error)}
+        </p>
+      )}
+      {connect.data && (
+        <p className="wide" style={{ fontSize: 13 }}>
+          Connected as <span className="mono">{connect.data.connected.login}</span> on{' '}
+          <span className="mono">{connect.data.connected.account}</span>.
+        </p>
+      )}
+    </div>
+  )
+}
+
 function LinearConnection() {
   const qc = useQueryClient()
   const [search, setSearch] = useSearchParams()
@@ -829,20 +1209,9 @@ function LinearConnection() {
                       </button>
                       <button onClick={() => setConfirming(null)}>Cancel</button>
                     </span>
-                  ) : app.connected ? (
+                  ) : (
                     <button className="danger" onClick={() => setConfirming(app.project)}>
                       Disconnect
-                    </button>
-                  ) : (
-                    // No credentials sent: the application is already on the control-plane
-                    // machine, and asking for a client secret we are holding is how a
-                    // trailing space gets into one.
-                    <button
-                      className="primary"
-                      disabled={connectApp.isPending}
-                      onClick={() => connectApp.mutate({ project: app.project })}
-                    >
-                      Connect
                     </button>
                   )}
                 </td>
@@ -980,7 +1349,15 @@ function tokenState(app: LinearApp) {
       </span>
     )
   }
-  if (!app.connected) return <span className="pill yellow">not connected</span>
+  /**
+   * There is no "registered but not connected" state any more, so there is no pill for it.
+   *
+   * It was reachable while an application could be written before anything proved it: you
+   * registered, and a row sat unconnected until somebody finished the authorization.
+   * Nothing unproven reaches the store now — the credentials wait in memory and the
+   * application is written together with the grant — so a project either has a grant and
+   * appears here, or has neither and does not appear at all.
+   */
   const left = app.expiresAt === undefined ? null : app.expiresAt - Date.now()
   return (
     <span className="pill green" title="renewed by the poll that needs it">

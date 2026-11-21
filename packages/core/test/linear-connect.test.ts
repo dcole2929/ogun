@@ -7,15 +7,16 @@ import {
   connectWithAppToken,
   disconnectProject,
   finishConnection,
-  registeredApplication,
+  linkApplication,
+  linkedApplication,
 } from '../src/integrations/linear-connect.ts'
 import { LinearOAuthError } from '../src/integrations/linear-oauth.ts'
 import {
-  listOAuthApps,
+  listApplications,
+  listGrants,
   listProjectSecrets,
-  readOAuthApp,
+  readApplication,
   readProjectSecret,
-  setOAuthApp,
   setProjectSecret,
 } from '../src/config/secrets.ts'
 import { appTokenResponse, identityResponse, teamsResponse } from './linear-oauth-fixtures.ts'
@@ -23,7 +24,7 @@ import { appTokenResponse, identityResponse, teamsResponse } from './linear-oaut
 /**
  * Connecting and disconnecting as one operation, shared by the CLI and the Settings page.
  *
- * The wire itself is `linear-oauth-client.test.ts` and the store is `project-oauth.test.ts`.
+ * The wire itself is `linear-oauth-client.test.ts` and the store is `applications.test.ts`.
  * What is only here is the *sequence*: which write happens first, what a half-finished
  * connection leaves behind, and what a disconnection is allowed to leave in the file. Those
  * are the parts that would otherwise exist twice — once in a route and once in a command —
@@ -119,23 +120,43 @@ test('one call registers the application, takes a token, and records who it is',
   if (read.state !== 'granted') return
   assert.equal(read.grant.grantType, 'client_credentials')
   assert.equal(read.grant.refresh, undefined)
-  assert.deepEqual(read.grant.workspace, { id: 'org-1', name: 'Acme', urlKey: 'acme' })
-  t.diagnostic(`stored ${JSON.stringify(await listOAuthApps(store))}`)
+  assert.deepEqual(read.grant.account, { id: 'org-1', name: 'Acme', urlKey: 'acme' })
+
+  /**
+   * And the application is named after the workspace the token proved it reaches — not
+   * after the project, which is the naming the split out of `oauth[project]` exists to end.
+   * It is the handle `--link` takes, so the connection carries it too.
+   */
+  assert.equal(connection.application, 'linear:acme')
+  assert.equal(read.grant.app, 'linear:acme')
+  assert.deepEqual((await listApplications(store)).map((a) => a.name), ['linear:acme'])
+  t.diagnostic(`stored ${JSON.stringify(await listGrants(store))}`)
 })
 
-test('a token request that fails leaves the application registered, so a retry asks for nothing', async () => {
+test('a token request that fails stores nothing at all', async () => {
   /**
-   * The property: the client id and secret are written **before** the token is asked for.
+   * The property: **nothing is written until a token comes back.**
    *
-   * That looks backwards — it stores a client secret for a connection that may not work —
-   * and it is the right way round. A failed token request leaves the project `unconnected`,
-   * which is a state ADR-0014 already defines, already reports and already has a remedy
-   * for; the operator retries and is **not asked to paste anything**, because the
-   * application is there. Writing the application last would make a network blip cost a
-   * second trip to Linear's settings page for a value this machine could have kept.
+   * This reverses what this file asserted before, and the old property is worth quoting
+   * because it was a deliberate trade rather than an accident:
    *
-   * The failure has to surface as a `LinearOAuthError` rather than as a stored half-state
-   * reported as success, which is the other way to get this wrong.
+   * > *"the client id and secret are written **before** the token is asked for … A failed
+   * > token request leaves the project `unconnected` … the operator retries and is **not
+   * > asked to paste anything**, because the application is there. Writing the application
+   * > last would make a network blip cost a second trip to Linear's settings page for a
+   * > value this machine could have kept."*
+   *
+   * What it bought was a cheap retry. What it cost is the thing this repository has one
+   * sentence about: a client secret on disk that no poll will ever spend, reported by
+   * `connect list` and `doctor` as a thing that exists — *a credential nothing reads looks
+   * exactly like one that works*. And it cost the **name**, which is the half that made the
+   * old order untenable rather than merely unfortunate: an application is named after the
+   * account the credential proved it reaches, and before the exchange there is no such
+   * account.
+   *
+   * So the cost moved and is asserted here: the store is untouched, and a retry asks for
+   * the fields again. The failure still surfaces as a `LinearOAuthError` rather than as a
+   * half-state reported as success, which is the other way to get this wrong.
    */
   const { fn } = wire({ token: [500, '{"error":"Error","error_description":"upstream"}'] })
   const err = await connectWithAppToken('ogun', 'linear', credentials, deps(fn)).then(
@@ -144,12 +165,62 @@ test('a token request that fails leaves the application registered, so a retry a
   )
 
   assert.ok(err instanceof LinearOAuthError)
-  const read = await readProjectSecret('ogun', 'linear', store)
-  assert.equal(read.state, 'unconnected')
+  assert.equal((await readProjectSecret('ogun', 'linear', store)).state, 'absent')
+  assert.deepEqual(await listApplications(store), [])
+  assert.equal(await linkedApplication('ogun', 'linear', store), undefined)
+  // Not even an empty file: nothing wrote, so there is nothing to have written one.
+  assert.equal(await readFile(store, 'utf8').then(() => true, () => false), false)
+})
 
-  const stored = await registeredApplication('ogun', 'linear', store)
-  assert.equal(stored?.clientId, 'client-1')
-  assert.equal(stored?.clientSecret, SECRET)
+test('a second project links to one application without the secret being typed again', async () => {
+  /**
+   * The property: **an application is shared and a grant is not**, and linking proves the
+   * application rather than writing a pointer at it.
+   *
+   * The duplication this removes is the whole reason the store was split: keyed by project,
+   * a second project meant a second copy of the same client secret — two values that must
+   * agree, with nothing that makes them, and no way to tell which one a poll used.
+   *
+   * The mint is the other half, and it is not ceremony. *"Connected" has to mean "proved",
+   * not "a pointer was written"*: a link that only recorded a name would report a project
+   * as connected on credentials somebody may have rotated a month ago, and the first
+   * evidence would be a poll at 3am.
+   */
+  const first = wire()
+  await connectWithAppToken('ogun', 'linear', credentials, deps(first.fn))
+
+  const second = wire()
+  const linked = await linkApplication('other', 'linear', 'linear:acme', deps(second.fn))
+
+  assert.deepEqual(second.calls, ['token', 'identity', 'teams'], 'it spent the application')
+  assert.equal(linked.application, 'linear:acme')
+  assert.deepEqual(
+    (await listApplications(store)).map((a) => [a.name, a.usedBy]),
+    [['linear:acme', ['ogun', 'other']]],
+    'one application, two users, one copy of the secret',
+  )
+  // The secret appears exactly once in the file, which is the point.
+  assert.equal((await readFile(store, 'utf8')).split(SECRET).length - 1, 1)
+})
+
+test('--as overrides the derived name, for one account with two applications', async () => {
+  /**
+   * The property: the name is derived by default and overridable for the one shape that
+   * needs it.
+   *
+   * Both applications in one workspace derive to `linear:acme`, so without the override the
+   * second would replace the first — and `setApplication` would then drop the first's
+   * grants, which is correct and is not what anybody wanted. This is the escape hatch, and
+   * it is the only thing in the command that lets a person name a shared credential.
+   */
+  const { fn } = wire()
+  const connection = await connectWithAppToken('ogun', 'linear', credentials, {
+    ...deps(fn),
+    as: 'linear:acme-second',
+  })
+  assert.equal(connection.application, 'linear:acme-second')
+  assert.equal((await readApplication('linear:acme-second', store)).state, 'present')
+  assert.equal((await readApplication('linear:acme', store)).state, 'absent')
 })
 
 test('connecting retires the personal api key it supersedes, and says so', async () => {
@@ -264,9 +335,40 @@ test('a disconnect takes the client id and secret with it, and the api key too',
   assert.equal(gone.applicationForgotten, true)
   assert.deepEqual(calls, ['revoke'])
 
-  const file = JSON.parse(await readFile(store, 'utf8'))
-  assert.deepEqual(file.oauth ?? {}, {})
+  const file = JSON.parse(await readFile(store, 'utf8')) as {
+    grants?: Record<string, unknown>
+    applications?: Record<string, unknown>
+    secrets?: Record<string, unknown>
+  }
+  assert.deepEqual(file.grants ?? {}, {})
+  assert.deepEqual(file.applications ?? {}, {})
   assert.deepEqual(file.secrets?.ogun ?? {}, {})
+})
+
+test('a disconnect leaves an application another project is still using, and says who', async () => {
+  /**
+   * The property: the cascade the split made possible is **refused**, and reported.
+   *
+   * One application serves several projects now, so a disconnect that took the credentials
+   * with it unconditionally would take four working projects offline to satisfy one typed
+   * in the wrong directory. And a `disconnect` that said only "disconnected" while a client
+   * secret was still on the disk would be a half-truth — the half somebody removing a
+   * credential most needs.
+   */
+  const { fn } = wire()
+  await connectWithAppToken('ogun', 'linear', credentials, deps(fn))
+  await linkApplication('other', 'linear', 'linear:acme', deps(wire().fn))
+
+  const gone = await disconnectProject('ogun', 'linear', {}, { ...deps(fn), revokeUrl: REVOKE_URL })
+  assert.ok(gone.ok)
+  if (!gone.ok) return
+  assert.equal(gone.removed, true)
+  assert.equal(gone.applicationForgotten, false)
+  assert.deepEqual(gone.applicationSharedWith, ['other'])
+
+  assert.equal((await readApplication('linear:acme', store)).state, 'present')
+  assert.equal((await readProjectSecret('other', 'linear', store)).state, 'granted')
+  assert.equal((await readProjectSecret('ogun', 'linear', store)).state, 'absent')
 })
 
 test('keeping the application is refused on a client-credentials connection', async () => {
@@ -295,7 +397,8 @@ test('keeping the application is refused on a client-credentials connection', as
   if (refused.ok) return
   assert.equal(refused.reason, 'keeps-a-live-credential')
   assert.match(refused.detail, /not a disconnection/)
-  assert.equal((await readOAuthApp('ogun', 'linear', store)).state, 'present')
+  assert.equal((await readApplication('linear:acme', store)).state, 'present')
+  assert.equal((await readProjectSecret('ogun', 'linear', store)).state, 'granted')
 })
 
 test('keeping the application is allowed on a consent connection, and drops only the tokens', async () => {
@@ -307,17 +410,16 @@ test('keeping the application is allowed on a consent connection, and drops only
    * real intermediate state and is the difference between reconnecting with one command and
    * going back to Linear's settings page for a value somebody has to be an admin to read.
    */
-  await setOAuthApp(
-    'ogun',
-    'linear',
-    { clientId: 'client-1', clientSecret: SECRET, redirectUri: 'http://x/cb' },
-    store,
-  )
   const { fn } = wire()
   await finishConnection(
     'ogun',
     'linear',
-    'client-1',
+    {
+      clientId: 'client-1',
+      clientSecret: SECRET,
+      redirectUri: 'http://x/cb',
+      method: 'authorization_code',
+    },
     {
       accessToken: 'access-abcdefghijkl',
       refreshToken: 'refresh-abcdefghijkl',
@@ -338,7 +440,15 @@ test('keeping the application is allowed on a consent connection, and drops only
   assert.ok(kept.ok)
   if (!kept.ok) return
   assert.equal(kept.applicationForgotten, false)
-  assert.equal((await readProjectSecret('ogun', 'linear', store)).state, 'unconnected')
+  /**
+   * `absent` rather than `unconnected`, and the change is structural rather than a
+   * regression. The application is still in the store — asserted below — but an application
+   * is no longer *filed under a project*, so there is nothing that says this project is the
+   * one halfway through connecting it. `--link` is how it is picked up again, and the
+   * disconnect's own output names that command.
+   */
+  assert.equal((await readProjectSecret('ogun', 'linear', store)).state, 'absent')
+  assert.equal((await readApplication('linear:acme', store)).state, 'present')
 })
 
 test('a revoke that cannot reach linear still removes the local credential', async () => {
@@ -360,5 +470,6 @@ test('a revoke that cannot reach linear still removes the local credential', asy
   if (!gone.ok) return
   assert.equal(gone.removed, true)
   assert.equal(gone.revoked, false)
-  assert.equal((await readOAuthApp('ogun', 'linear', store)).state, 'absent')
+  assert.equal((await readApplication('linear:acme', store)).state, 'absent')
+  assert.equal((await readProjectSecret('ogun', 'linear', store)).state, 'absent')
 })

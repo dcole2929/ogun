@@ -610,3 +610,13 @@ td.mono > .extlink, td.mono { white-space: nowrap; }
   color: var(--accent); font: inherit; text-decoration: underline;
 }
 .linklike:hover:not(:disabled) { border: none; color: var(--accent); }
+
+/* A command somebody is meant to copy, inside a prose block. Not `.cmd`, which is a
+   timeline row with a prompt sigil — this one is a block of instructions and has no
+   pretend shell in front of it. */
+.cmd-block {
+  margin: 6px 0 0; padding: 8px 10px; border-radius: 6px;
+  background: var(--panel-2); border: 1px solid var(--line);
+  font-family: var(--mono); font-size: 12px;
+  white-space: pre-wrap; overflow-x: auto;
+}

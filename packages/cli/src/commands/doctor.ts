@@ -5,9 +5,11 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import {
+  applicationIdentifier,
   describeGrant,
   imageState,
-  listOAuthApps,
+  listApplications,
+  listGrants,
   listProjectSecrets,
   loadLocalConfig,
   localConfigPath,
@@ -106,13 +108,13 @@ export async function projectSecrets(path = localConfigPath()): Promise<Check> {
 }
 
 /**
- * Which projects are connected to Linear as an application, and how long each grant lasts
- * (ADR-0014).
+ * Which projects are connected to an integration as an application, which application each
+ * one goes through, and how long each grant lasts (ADR-0014).
  *
  * A separate check from `project secrets` above rather than a column on it, because the
  * two answer different questions and one of them is not a yes/no. A personal key is
- * present or it is not; a grant has an application, a workspace, a set of scopes and an
- * expiry, and the whole point of connecting is to be able to see *which workspace Ogun is
+ * present or it is not; a grant has an application, an account, a set of scopes and an
+ * expiry, and the whole point of connecting is to be able to see *which account Ogun is
  * acting in* and *as whom*. Folding that into "linear: set" would give back exactly the
  * information the flow exists to make visible.
  *
@@ -120,64 +122,117 @@ export async function projectSecrets(path = localConfigPath()): Promise<Check> {
  * states, for the same reason. `doctor` reads no repositories, so it cannot know which
  * projects have a `sources:` block that needs one.
  *
- * The line that earns this function is the shadowed key. A project with both a grant and a
- * personal key authenticates with the grant (`readProjectSecret` decides, once), and an
- * operator debugging a poll failure by rotating the key would be changing something
- * nothing reads. Saying it here is the cheapest possible place to say it.
+ * ### Two kinds of row, because the split made two kinds of thing
  *
- * Never fatal, and `warn` is reserved for the two states a person has to act on: an
- * application registered but never connected, and an entry this build cannot read. An
- * expired access token is *not* one of them — the next poll renews it, which is what
- * `describeGrant` says out loud.
+ * It was one row per project, built from a map keyed by project — so an application shared
+ * by four projects appeared four times, with no way to say it was one credential. Now
+ * there is a row per **grant** (is this project connected, and for how long) and a row per
+ * **idle application** (a credential on the disk that no project reads).
+ *
+ * That second kind is the one worth having `doctor` say. An application nothing points at
+ * is the exact shape this repository has one sentence about — *a credential nothing reads
+ * looks exactly like one that works* — and it is reachable: `ogun disconnect
+ * --keep-application` for the last project using it leaves one behind. Nothing else on the
+ * machine would ever mention it again.
+ *
+ * ### The name is no longer `linear` anything
+ *
+ * The function keeps its name because `doctor`'s own tests and its caller spell it, and
+ * what it reports is now every provider's grants. A `github ogun` row is a GitHub App
+ * installation, and the only per-provider thing left in here is the sentence about public
+ * teams, which is a fact about one Linear grant and is printed only for that grant.
+ *
+ * Never fatal, and `warn` is reserved for the states a person has to act on: an entry this
+ * build cannot read, and an application nothing uses. An expired access token is *not* one
+ * of them — the next poll renews it, which is what `describeGrant` says out loud.
  */
 export async function linearGrants(path = localConfigPath(), now = Date.now()): Promise<Check[]> {
-  const apps = await listOAuthApps(path).catch((err: Error) => err)
-  if (apps instanceof Error) {
-    return [{ name: 'linear oauth', ok: false, detail: apps.message, fatal: false }]
+  const grants = await listGrants(path).catch((err: Error) => err)
+  if (grants instanceof Error) {
+    return [{ name: 'connections', ok: false, detail: grants.message, fatal: false }]
   }
-  if (apps.length === 0) return []
+  const applications = await listApplications(path).catch(() => [])
+  if (grants.length === 0 && applications.length === 0) return []
 
   const keyed = new Set(
     (await listProjectSecrets(path).catch(() => [])).map((s) => `${s.project}/${s.name}`),
   )
 
-  return apps.map((app) => {
-    if (app.malformed !== undefined) {
+  const grantChecks = grants.map((grant): Check => {
+    if (grant.malformed !== undefined) {
       return {
-        name: `${app.provider} ${app.project}`,
+        name: `${grant.provider} ${grant.project}`,
         ok: false,
         // Named as an entry problem rather than a credential problem: the fix is to
         // reconnect this one project, and nothing else on the machine is affected.
-        detail: `the stored entry is not a shape this build can read (${app.malformed}) — reconnect`,
+        detail: `the stored entry is not a shape this build can read (${grant.malformed}) — reconnect`,
         fatal: false,
       }
     }
-    const health = describeGrant(app.expiresAt, now)
-    const where = app.workspace ? ` in ${app.workspace.name}` : ''
-    const asWhom = app.actor === 'app' ? 'as the app' : app.actor === 'user' ? 'as you' : ''
-    const shadowed = keyed.has(`${app.project}/${app.provider}`)
+    const health = describeGrant(grant.expiresAt, now)
+    const where = grant.account ? ` in ${grant.account.name}` : ''
+    const asWhom =
+      grant.actor === 'app' ? 'as the app' : grant.actor === 'user' ? 'as you' : `as ${grant.actor}`
+    /**
+     * The line that earns this function. A project with both a grant and a personal key
+     * authenticates with the grant (`readProjectSecret` decides, once), and an operator
+     * debugging a poll failure by rotating the key would be changing something nothing
+     * reads. This is the cheapest possible place to say so.
+     */
+    const shadowed = keyed.has(`${grant.project}/${grant.provider}`)
       ? ' — an api key is also stored for this project and is NOT being used'
       : ''
-    // Which grant, because the two differ in what they can SEE: a client-credentials
-    // token reaches the workspace's public teams and no others, which is the difference
-    // between "connected" and "connected and finding nothing".
+    // Which grant, because they differ in what they can SEE: a client-credentials token
+    // reaches the workspace's public teams and no others, which is the difference between
+    // "connected" and "connected and finding nothing".
     const how =
-      app.grantType === 'client_credentials'
+      grant.grantType === 'client_credentials'
         ? ', app token (public teams)'
-        : app.grantType === 'authorization_code'
+        : grant.grantType === 'authorization_code'
           ? ', by consent'
-          : ''
+          : grant.grantType === 'installation'
+            ? ', app installation'
+            : ''
     return {
-      name: `${app.provider} ${app.project}`,
-      ok: app.connected,
-      detail: app.connected
-        ? `${health.detail}${where}${asWhom ? `, ${asWhom}` : ''}${how}` +
-          `${app.scopes.length > 0 ? `, scopes: ${app.scopes.join(' ')}` : ''}${shadowed}`
-        : `application ${app.clientId} registered, never connected — ` +
-          `\`ogun connect ${app.provider} --project ${app.project}\``,
+      name: `${grant.provider} ${grant.project}`,
+      ok: true,
+      detail:
+        `${health.detail}${where}${asWhom ? `, ${asWhom}` : ''}${how}` +
+        `, through "${grant.app}"` +
+        `${grant.scopes.length > 0 ? `, scopes: ${grant.scopes.join(' ')}` : ''}${shadowed}`,
       fatal: false,
     }
   })
+
+  const applicationChecks = applications.flatMap((app): Check[] => {
+    if (app.state === 'malformed') {
+      return [
+        {
+          name: `application ${app.name}`,
+          ok: false,
+          detail:
+            `the stored application is not a shape this build can read (${app.reason}) — ` +
+            'register it again',
+          fatal: false,
+        },
+      ]
+    }
+    if (app.usedBy.length > 0) return []
+    return [
+      {
+        name: `application ${app.name}`,
+        ok: false,
+        detail:
+          `${applicationIdentifier(app.app)} is registered and no project holds a grant ` +
+          'from it, so nothing on this machine reads it — ' +
+          `\`ogun connect ${app.app.provider} --app --link ${app.name} --project <slug>\` ` +
+          `or \`ogun connect ${app.app.provider}\` again to remove it`,
+        fatal: false,
+      },
+    ]
+  })
+
+  return [...grantChecks, ...applicationChecks]
 }
 
 /**

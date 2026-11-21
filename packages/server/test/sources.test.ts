@@ -414,7 +414,9 @@ describe('a source', () => {
         state: 'granted',
         apiKeyIgnored: false,
         grant: {
-          clientId: 'client-1',
+          // The application the grant came from, by name — `clientId` before the store was
+          // split into shared applications and per-project grants.
+          app: 'linear:acme',
           access: sealSecret('access-stale'),
           refresh: sealSecret('refresh-1'),
           grantType: 'authorization_code' as const,
@@ -423,7 +425,7 @@ describe('a source', () => {
           obtainedAt: Date.now() - 25 * 60 * 60 * 1000,
           scopes: ['read'],
           actor: 'app',
-          workspace: { id: 'org-1', name: 'Acme', urlKey: 'acme' },
+          account: { id: 'org-1', name: 'Acme', urlKey: 'acme' },
         },
       }),
       grant: async () => ({
@@ -460,7 +462,7 @@ describe('a source', () => {
         state: 'granted',
         apiKeyIgnored: true,
         grant: {
-          clientId: 'client-1',
+          app: 'linear:acme',
           access: sealSecret('access-stale'),
           refresh: sealSecret('refresh-revoked'),
           grantType: 'authorization_code' as const,

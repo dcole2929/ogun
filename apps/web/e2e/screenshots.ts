@@ -216,6 +216,84 @@ const SHOTS: Shot[] = [
       )
     },
   },
+  /**
+   * Settings, which is where this change lives and which nothing photographed.
+   *
+   * Every other shot in this file is of a page that reads a list. Settings writes
+   * credentials, so its fixtures are the one place here where a careless value would be a
+   * real one — hence an app id and an installation id that are obviously not, and no
+   * private key anywhere in this file.
+   */
+  {
+    name: 'settings-applications',
+    path: '/settings',
+    routes: {
+      '/api/oauth/applications': {
+        applications: [
+          {
+            name: 'heirchive',
+            provider: 'github',
+            method: 'app',
+            identifiesAs: 'App 000000',
+            usedBy: ['heirchive-api', 'clawz'],
+            malformed: null,
+          },
+          {
+            name: 'linear',
+            provider: 'linear',
+            method: 'client_secret_post',
+            identifiesAs: 'Client 0000…0000',
+            usedBy: ['heirchive-api'],
+            malformed: null,
+          },
+        ],
+      },
+    },
+    fullPage: true,
+  },
+  /**
+   * The GitHub App form, open.
+   *
+   * This is the surface the change adds and the one that was reported broken: the Connect
+   * button never enabled, because the project select rendered its first option while its
+   * state still held the empty string it was initialised with. A shot of the form with a
+   * project chosen and the button live is the evidence that reads at a glance.
+   */
+  {
+    name: 'settings-github-app',
+    path: '/settings',
+    routes: {
+      '/api/oauth/github': {
+        connections: [],
+        registerUrl: 'https://github.com/settings/apps/new',
+      },
+    },
+    act: async (page) => {
+      // The fields carry no `name`; they are found by their label, as a person finds them.
+      const field = (label: string) =>
+        page.locator('label').filter({ hasText: label }).locator('input')
+      await field('App ID').fill('000000')
+      await field('Installation ID').fill('00000000')
+      await page
+        .locator('textarea')
+        .first()
+        .fill('-----BEGIN RSA PRIVATE KEY-----\n…\n-----END RSA PRIVATE KEY-----')
+
+      /**
+       * Wait for Connect to become live, which is the whole subject of the shot.
+       *
+       * It never did: `useState(projects[0] ?? '')` froze at `''` before the projects
+       * query resolved, and a `<select value="">` displays its first option — so the page
+       * showed a project chosen, and `ready` disagreed. Asserting the button is enabled
+       * before photographing it means this shot fails rather than quietly recording the
+       * bug coming back.
+       */
+      await page
+        .locator('button:has-text("Connect"):not([disabled])')
+        .last()
+        .waitFor({ timeout: 5_000 })
+    },
+  },
   {
     name: 'sidebar-wide',
     path: '/skills',

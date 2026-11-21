@@ -1,5 +1,6 @@
 import { readProjectSecret } from '@ogun/core'
 import type { ProjectSecret } from '@ogun/core'
+import { usableGithubGrant } from '../foreman/github-grant.ts'
 import { GithubUnavailable, type GithubCredential } from './github.ts'
 
 /**
@@ -44,6 +45,12 @@ export type GithubCredentialDeps = {
    * file can be tested without a network, which is the half that has no fixture.
    */
   identify?: (token: string) => Promise<string>
+  /**
+   * How an App installation token is kept alive. Injected for the same reason, and the
+   * reason is stronger here: no GitHub App exists for this repository, so a test of the
+   * precedence rules is the *only* kind of test this arm can have.
+   */
+  grant?: typeof usableGithubGrant
 }
 
 /**
@@ -91,24 +98,35 @@ export async function projectGithubCredential(
   const key = await (deps.secrets ?? readProjectSecret)(slug, 'github')
 
   /**
-   * The App arm, and it is a refusal rather than a silence.
+   * The App arm, and it is real now — `ogun connect github --app` writes the grant this
+   * reads, and `usableGithubGrant` mints from it.
    *
-   * `readProjectSecret` returns `granted` for any project with an OAuth application
-   * registered under this name, because that store is generic across integrations. No
-   * command writes one for GitHub yet — `ogun connect github` takes `--api-key` only — so
-   * this is unreachable today, and it says so plainly rather than falling through to the
-   * key beside it. Falling through would be the worse bug of the two: an operator who had
-   * connected an App and also left an old token in place would get the token, and their
-   * pull requests would keep being authored by a human while the UI said otherwise.
+   * It was a refusal, with this reasoning: *"No command writes one for GitHub yet — `ogun
+   * connect github` takes `--api-key` only — so this is unreachable today, and it says so
+   * plainly rather than falling through to the key beside it."* The refusal has gone and
+   * **the second half of that sentence is what survives**: it still does not fall through
+   * to a personal token sitting beside the grant. That was the worse of the two bugs and
+   * it is still available — an operator who connected an App and left an old token in
+   * place would get the token, and their pull requests would keep being authored by a
+   * human while every surface said otherwise. ADR-0014 settled this once for Linear (a
+   * grant beats a key, decided in one place) and this is the same answer.
+   *
+   * So a dead App connection **refuses** rather than quietly becoming a personal one. That
+   * is the rule `readProjectSecret` states for Linear and the reason it states it: quietly
+   * authenticating as a person hides a broken connection behind a working poll, and
+   * changes who GitHub attributes writes to without anybody asking.
    */
   if (key.state === 'granted') {
-    return {
-      state: 'refused',
-      detail:
-        `"${slug}" has a github application registered, and this build authenticates to ` +
-        'github with a personal access token only. The app path is not wired yet; until ' +
-        `it is, use \`ogun connect github --api-key --project ${slug}\``,
-    }
+    const usable = await (deps.grant ?? usableGithubGrant)(slug, key.grant)
+    if (usable.state === 'ready') return { state: 'ready', credential: usable.credential }
+    /**
+     * `refused` and `failed` are forwarded as they stand, with their `kind` intact, rather
+     * than being re-worded here. `usableGithubGrant` already draws the three distinctions
+     * this type carries — a key GitHub rejected is `refused`, the network is
+     * `failed/transport`, a token minted and not written is `failed/local` — and a second
+     * sentence wrapped around them is a second place for the remedies to drift apart.
+     */
+    return usable
   }
 
   if (key.state === 'present') {
@@ -161,12 +179,12 @@ function missingGithubKey(
   slug: string,
   key: Exclude<ProjectSecret, { state: 'present' } | { state: 'granted' }>,
 ): string {
-  const set = `\`ogun connect github --api-key --project ${slug}\``
+  const set = `\`ogun connect github --app --project ${slug}\` (or \`--api-key\`)`
   switch (key.state) {
     case 'unconnected':
       return (
-        `"${slug}" has a github application registered (client ${key.clientId}) and nobody ` +
-        `has finished the authorization. The app path is not wired yet — use ${set}`
+        `"${slug}" has a github application registered (app ${key.clientId}) and this ` +
+        `project holds no token from it. Run ${set} to take one`
       )
     case 'malformed':
       return (
