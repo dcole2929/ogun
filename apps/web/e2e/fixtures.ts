@@ -308,9 +308,75 @@ export const RUN_DETAIL = {
   artifacts: [],
 }
 
+/**
+ * `GET /api/system` — what the Settings page is built out of.
+ *
+ * Every value here is invented. This is the one page in the app whose subject is
+ * credentials, so a fixture copied from a real machine would put a real path, a real
+ * account name or a real client id into a PNG on a public branch. `0000` and
+ * `/home/dev/...` are obviously neither.
+ *
+ * `projectSecretWrites.allowed` is true because the forms this fixture exists to
+ * photograph do not render otherwise — the server refuses a key over a non-loopback
+ * transport, and the page hides the form rather than offering one that will 403.
+ */
+export const SYSTEM = {
+  controlPlane: {
+    bind: '127.0.0.1',
+    port: 7777,
+    tokenRequired: true,
+    addresses: ['http://127.0.0.1:7777'],
+    reachabilityWarning: null,
+    configPath: '/home/dev/.ogun/config.json',
+  },
+  host: {
+    git: '2.43.0',
+    docker: '27.3.1',
+    claude: '2.0.1',
+    codex: null,
+    baseImage: true,
+    claudeCredentials: true,
+    codexCredentials: false,
+    isRunner: true,
+    runnerName: 'this-machine',
+  },
+  projectSecrets: [{ project: 'heirchive-api', name: 'linear', state: 'present' as const }],
+  projectSecretWrites: {
+    allowed: true,
+    reason: null,
+    names: ['linear', 'github'],
+  },
+  checkouts: [
+    { slug: 'heirchive-api', path: '/home/dev/src/heirchive-api', present: true },
+    { slug: 'ogun', path: '/home/dev/src/ogun', present: true },
+  ],
+  counts: { projects: 2, runs: 128, openFindings: 3, queuedJobs: 0 },
+}
+
+/** `GET /api/oauth/github` with nothing connected — the state the App form is for. */
+export const GITHUB_SETTINGS = {
+  connections: [],
+  registerUrl: 'https://github.com/settings/apps/new',
+}
+
+/** `GET /api/oauth/linear`, which the Settings page reads beside the GitHub card. */
+export const LINEAR_OAUTH = {
+  apps: [],
+  redirectUri: 'http://127.0.0.1:7777/api/oauth/linear/callback',
+  registerUrl: 'https://linear.app/settings/api/applications/new',
+  scopes: ['read', 'write'],
+  actor: 'the app',
+  writesAllowed: true,
+  failures: {},
+}
+
 export const ROUTES: Record<string, unknown> = {
   '/api/projects': PROJECTS,
   '/api/system/status': STATUS,
+  '/api/system': SYSTEM,
+  '/api/oauth/github': GITHUB_SETTINGS,
+  '/api/oauth/linear': LINEAR_OAUTH,
+  '/api/oauth/applications': { applications: [] },
   '/api/skills': SKILLS,
   '/api/workers': WORKERS,
   '/api/findings': { findings: [] },
