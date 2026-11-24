@@ -128,6 +128,35 @@ export const claimedJobSchema = z.object({
    * recognise has no safe interpretation. Refusing the claim is the only honest answer.
    */
   bootstrap: z.enum(BOOTSTRAP_KINDS).optional(),
+  /**
+   * The pull request this job is a revision of (§4.13, ADR-0009).
+   *
+   * Absent on every ordinary job, which is the safe direction and what a runner older
+   * than this field sees: without it a run publishes a new branch and opens a new pull
+   * request, which is what every run did before revisions existed.
+   *
+   * Present, it changes three things at once, and they only make sense together: the
+   * workspace is pinned to `headSha` instead of the project's default branch, the patch
+   * is pushed to `branch` instead of a freshly minted one, and the result is said on the
+   * pull request rather than opened as a second one.
+   *
+   * `headSha` is the commit the review was written against, not "the branch tip now".
+   * Those differ when somebody pushes between the poll and the claim, and the difference
+   * has to be detectable: revising a commit the reviewer never saw, and then
+   * fast-forwarding over whatever they pushed, is how an agent silently reverts a human's
+   * work. The publish refuses rather than guesses.
+   */
+  changeRequest: z
+    .object({
+      /** `owner/name`, as the source polled it. */
+      repo: z.string(),
+      number: z.number().int().positive(),
+      /** The pull request's head branch — what the patch is pushed to. */
+      branch: z.string(),
+      /** The commit the review was written against. */
+      headSha: z.string(),
+    })
+    .optional(),
   timeoutMs: z.number().int().positive(),
   skillRef: z.string(),
   verify: z.unknown().optional(),

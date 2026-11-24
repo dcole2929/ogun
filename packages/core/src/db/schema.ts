@@ -739,6 +739,24 @@ export const sourceEmissions = pgTable(
      */
     outcome: text('outcome').notNull().default('emitted'),
     detail: text('detail'),
+    /**
+     * Where to put the answer, when the thing emitted was a request to revise a pull
+     * request: `{ repo, number, branch, headSha }`. Null for every ticket.
+     *
+     * **Addressing, not content** — the ADR-0004 line runs between them. `digest` above
+     * refuses to hold a ticket's body because a later caller would read it and believe it
+     * current; none of these four is a copy of anything a person wrote. `externalKey`
+     * already holds `owner/repo#42`, and `externalId` is a hash *of* `headSha` among
+     * other things, so the round's identity is here either way. This writes it down in a
+     * shape a later step can act on instead of one it would have to parse back out of a
+     * label.
+     *
+     * The alternative was re-reading the pull request at claim time. That is a second
+     * request to GitHub for facts this row already knew, and worse, it answers a
+     * different question: the tip *now* rather than the commit the review was written
+     * against. The gap between those two is exactly what the publish has to refuse on.
+     */
+    changeRequest: jsonb('change_request'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [

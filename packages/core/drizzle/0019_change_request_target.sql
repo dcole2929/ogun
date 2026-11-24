@@ -1,0 +1,1 @@
+ALTER TABLE "source_emissions" ADD COLUMN "change_request" jsonb;

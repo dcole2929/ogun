@@ -983,6 +983,22 @@ async function emitRequest(
        * the key and produced a new row.
        */
       digest: key,
+      /**
+       * Where the answer goes. Written here because this is the only moment that holds
+       * both the pull request and the run it became — the claim later joins on
+       * `cycleRunId` and finds this row, and nothing else on the way knows the branch.
+       *
+       * `headSha` is the commit the review was written against, which is the value
+       * `requestKey` already hashed to make this row's identity. Storing it whole means
+       * the publish can compare it against the branch tip at push time and refuse when
+       * somebody has pushed in between, rather than fast-forwarding over their work.
+       */
+      changeRequest: {
+        repo: input.request.repo,
+        number: input.request.number,
+        branch: input.request.branch,
+        headSha: input.request.headSha,
+      },
     })
     .onConflictDoNothing({
       target: [sourceEmissions.projectId, sourceEmissions.externalId],
