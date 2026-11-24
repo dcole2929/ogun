@@ -7,6 +7,19 @@ export type SandboxSpec = {
   permissions: 'observer' | 'reviewer' | 'modifier'
   runtime: 'claude' | 'codex'
   timeoutMs: number
+  /**
+   * Whether the project's own services should come up for this job.
+   *
+   * A field of its own rather than an entry in `env` below, which is the project's
+   * declared environment: that block is written by the repository and resolved from the
+   * pinned blob, and this is Ogun telling the image what kind of job it is about to run.
+   * Two different authors, two different lifetimes, one map would be the place they got
+   * confused.
+   *
+   * Undefined means yes — see `claimedJobSchema.services` for why absence has to read
+   * that way round.
+   */
+  services?: boolean
   env?: Record<string, string>
 }
 

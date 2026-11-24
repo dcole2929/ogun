@@ -33,6 +33,7 @@ const defaults: WorkerConfig = {
   model: 'worker',
   permissions: 'reviewer',
   sandbox: 'container',
+  services: true,
   onMissed: 'skip',
   enabled: true,
   timeoutMs: 1_800_000,
