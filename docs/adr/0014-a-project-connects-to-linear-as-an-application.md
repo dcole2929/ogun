@@ -132,7 +132,8 @@ else is holding the thing being rotated.
 
 **The trap that does apply** is the second one ADR-0010 named: two writers racing over a
 credential file. It is handled rather than argued away — the write goes through
-`storeOAuthGrant` and therefore `updateLocalConfig`'s lock, the same lock `ogun project
+`storeOAuthGrant` [amended: `storeGrant`, renamed with the map it writes — ADR-0017]
+and therefore `updateLocalConfig`'s lock, the same lock `ogun project
 add` and `ogun runner join` take, and which was itself recently fixed for a race where it
 deleted a live lock. Three further rules fall out of rotation and are each a test:
 
@@ -244,6 +245,16 @@ exactly like one that works, right up until the night it mattered", arriving thr
 listing that sentence is written under. The closed set therefore stays about *values used
 verbatim as credentials*.
 
+[amended] **It is `['linear', 'github']`.** The superseded sentence is *"`SECRET_NAMES`
+stays `['linear']`"*, and only the membership moved: `github` joined on this record's own
+test — a value used verbatim as a credential, by something that polls — when the control
+plane started reading the pull requests Ogun opened to find the ones somebody had asked it
+to revise. Not the same thing as the gateway's `OGUN_GATEWAY_GITHUB_TOKEN`, which is
+env-only and exists so a *sandbox* can read a public repository (ADR-0005). The argument the
+paragraph above is making is untouched: a client secret is still not a name in this set, and
+the reason is still that a value which authenticates nothing on its own must not be able to
+make a listing go green.
+
 **The grant lives in a second block of the same file**, `oauth`, keyed by project slug then
 provider — beside `secrets`, written through the same `updateLocalConfig` lock, read and
 written by the same module (`config/secrets.ts`), and declared in `localConfigSchema` for
@@ -251,6 +262,32 @@ the same reason `secrets` is: zod strips what a schema does not name, so an unde
 block would be silently deleted by the next `ogun project add`, and the symptom would be a
 Linear connection that stopped working on the day somebody registered an unrelated
 repository.
+
+[amended] **It is two blocks, `applications` and `grants`, and `oauth` is the shape an
+unconverted file still has.** The superseded sentence is the one above — *"The grant lives
+in a second block of the same file, `oauth`, keyed by project slug then provider"* — and
+what broke it is that the block held two things with different owners. An **application**
+is the credential registered with the provider and one of them serves every project that
+reaches that provider; a **grant** is one project's live token from one of those. Keyed
+together under `oauth[project][provider]`, a second project meant a second copy of the same
+client secret, which was already true on this machine. ADR-0017 is that split and carries
+the argument. Three things about it belong here because they are about *this* record's
+subject:
+
+- `applications` is keyed by a **name**, not by a project — `linear:acme`, derived from the
+  account the credential proved it reaches — and `grants[project][provider]` is flat with an
+  `app` field naming where its token came from. A grant can therefore be renewed without the
+  project holding the thing that renews it, which is the property decision 1 depends on.
+- The application records **`method`** (`client_credentials` or `authorization_code` for
+  Linear) rather than it being inferred from which fields are present. That is the same
+  decision `grantType` on the grant makes immediately below, one level up and arrived at
+  second: a mode read backwards out of which nullable fields happen to be set is a mode that
+  changes silently when a write truncates.
+- Everything this section settled about *where* the value lives survives: the same file, the
+  same lock, the same module, `localConfigSchema` declaring every block for the same zod
+  reason. `oauth` stays declared alongside the new two precisely because an unconverted file
+  still has one, and dropping it from the schema would delete a live connection on the next
+  `ogun project add`.
 
 [amended] **The grant gains `grantType`, and `refreshToken` becomes required only for
 `authorization_code`.** The record said a refresh token was required outright, and the
@@ -277,6 +314,34 @@ migration for `~/.ogun/config.json`, so that default *is* the migration. A `gran
 build does not recognise is `malformed` rather than defaulted, because a future third grant
 would have renewal rules this one has never heard of.
 
+[amended] **The third grant arrived and is recognised; the default for a missing
+`grantType` no longer matches this record, and the divergence is recorded rather than
+settled.** Two halves, and only the first is a decision.
+
+The third grant is `installation` — a GitHub App's token, renewed by signing a fresh JWT —
+so the set is now `authorization_code | client_credentials | installation` and an
+unrecognised value is still `malformed`. The rule that a future grant has renewal rules
+this build has never heard of held, and it is now enforced a second time one level out:
+`usableGrant` refuses an `installation` entry found under `grants.<project>.linear`
+rather than falling through to the refresh arm, where it would spend an empty refresh token
+and report whatever Linear said about it.
+
+The second half is **not** an amendment this record is making. The sentence above says an
+entry with no `grantType` is read as `authorization_code`; `parseGrant` in
+`config/secrets.ts` reads it as `client_credentials`. Both defaults have an argument. The
+one written here is about *the build that wrote the file* — a pre-`grantType` build refused
+a token with no refresh token in two places, so an authorization-code grant is the only
+thing it could have produced, and `migrateLegacyOAuth` still reasons exactly that way when
+it derives an application's `method` from a legacy entry. The other is about *the build
+that writes now* — `storeGrant` requires `grantType`, so an entry in `grants` without one
+did not come from this build at all. **Those two do not agree about a legacy
+authorization-code entry carried across by the migration**, which would be read as
+`client_credentials`, renewed by asking again rather than by refreshing, and so reduced
+from what an approver could see to the workspace's public teams — which is the silent
+reduction in reach `reuseLinked` refuses to perform on purpose. **Which default is intended
+could not be determined from the code or the commits, so nothing here is rewritten to match
+either, and a finding that the two disagree is a real finding.**
+
 [amended] **`redirectUri` may now be empty.** It was required to be a non-empty string,
 which was right while every connection had a browser in it. The default grant has none — so
 `ogun connect linear` on a machine with no control plane running has no address to record,
@@ -298,6 +363,18 @@ target number. The three that are new:
   key to fall back to. The fix is a browser rather than a terminal, and reporting it as
   `absent` would send somebody who has done most of the work off to paste a personal key
   instead.
+
+  [amended] **Nothing can create this state any more, and it is kept because files
+  outlive builds.** The order is now exchange → identify → name → write (ADR-0017), so an
+  application in the store is one that has been spent at least once and a project either
+  has a grant or has nothing. What still reaches `unconnected` is a machine that registered
+  an application under the old `oauth` shape and never finished the authorization. Because
+  an application is shared now, "is one registered?" has stopped being a question about a
+  project, so the state is recognised **by name** — `<provider>:<slug>`, which is the
+  fallback `migrateLegacyOAuth` uses when a legacy entry carried no workspace to name
+  itself after — and by that name only. Answering `unconnected` because *some other*
+  project registered a Linear application would send an operator to finish an authorization
+  for a project nobody meant to connect.
 - `malformed` is *this project's* entry being unreadable, kept apart from `unreadable`,
   which is the whole file. One means reconnect one project; the other means a config.json
   currently failing to parse for everything on the machine, where "set it again" sends
@@ -358,7 +435,16 @@ use is how someone spends an hour debugging the wrong one:
   which is when the question is usually asked. [amended: it was `ogun linear status`, and
   it now shows keys and grants in one table, because two listings that could not see each
   other made the answer to "is this connected" depend on which command you ran.]
-- The Settings card shows the same row.
+- The Settings card shows the same row. [amended: it shows two tables now, for the reason
+  `ogun connect list` does — an Applications table naming each application's provider, its
+  method, its non-secret identifiers and **which projects use it**, and the per-project rows
+  beneath it, each naming the application it goes through. A credential three projects
+  shared used to render as three credentials, which was the page describing the store's own
+  old shape. The table itself is **read-only** — `GET /api/oauth/applications` carries the
+  non-secret half only, on the same terms `connect list` prints it, because withholding it
+  would leave the page unable to say *which* application a project goes through, which is
+  the first question the moment two exist. And the "registered, not connected" pill is
+  gone, because that state cannot be reached any more.]
 - A `401` from Linear now names the credential — "linear rejected the oauth access token
   for Acme" versus "the personal api key" — because the client is built from a
   discriminated union that knows which one it holds.
@@ -483,6 +569,19 @@ use is how someone spends an hour debugging the wrong one:
 
 - **`~/.ogun/config.json` gains an `oauth` block, and no migration exists.** Nothing about
   this touches the database. The last migration is still `0016_run_rounds`.
+
+  [amended] **It gains `applications` and `grants` instead, and a migration does now exist
+  — for the file, not for the database.** The database half of the sentence is unchanged and
+  is the half it was about: nothing here touches postgres. What it did not anticipate is a
+  migration of the *config file*, which `migrateLegacyOAuth` is: a pure function applied
+  inside every write and read through by `readProjectSecret`, `readGrant`, `readApplication`
+  and `listApplications`, so an upgraded build answers correctly about a file nothing has
+  written yet and the file converts on the first connect, `project add` or token refresh
+  after the upgrade. It never overwrites an entry already in the new shape, so a
+  half-converted file converges rather than flapping. A command somebody has to remember to
+  run was the alternative, and it loses to the same argument this record makes about
+  defaults being the migration: the machine that needs converting is the one nobody is
+  sitting at.
 
 - **A new environment variable, `OGUN_PUBLIC_URL`.** The redirect URI is derived from the
   address the browser used, because `OGUN_BIND` is `0.0.0.0` on exactly the deployments
@@ -669,6 +768,85 @@ use is how someone spends an hour debugging the wrong one:
     than the removal of a row from a listing. The old spelling refuses with a line naming
     the new one.
 
+  [amended] **`--oauth` is gone again, and this time it is not coming back: the flag is
+  `--app`, and there are no per-provider credential flags at all.** The vocabulary is now:
+
+  ```
+  ogun connect <integration> --app [--as <name>] [--project <slug>] [field=value …]
+  ogun connect <integration> --app --link <name> [--project <slug>]
+  ogun connect <integration> --consent [field=value …]
+  ogun connect <integration> --api-key [<key>] [--replace] [--project <slug>]
+  ogun connect list [--project <slug>]
+  ogun disconnect <integration> [--project <slug>] [--keep-application]
+  ```
+
+  This reverses the bullet immediately above, which had itself reversed the bullet above
+  that, so the two superseded rulings are quoted rather than left to be reconstructed. The
+  first:
+
+  > *"The names describe what the credential is … and none of them is `--oauth`: two of
+  > the three are OAuth, so a flag by that name would be the ambiguity this change exists
+  > to remove, one level down."*
+
+  And its reversal, which is what is now superseded:
+
+  > *"`--oauth` is back, and `--consent` is a modifier inside it rather than a peer of it.
+  > … So the flag names *what you are connecting*, and the kind decides what else is
+  > required — `--oauth` always means a client id and a client secret, `--api-key` never
+  > does."*
+
+  The shape of that ruling is kept entirely. The flag still names what you are connecting,
+  `--consent` is still a modifier that implies it rather than a peer of it, and `--api-key`
+  still names something else. What does not survive is the **premise in its last clause**:
+  *"`--oauth` always means a client id and a client secret"* is false, and the second
+  provider is what proved it. RFC 6749 §2.1 defines public clients, which have a client id
+  and no secret at all; RFC 7591 §2 names five client authentication methods of which a
+  shared secret is one; and the provider that forced the issue is in none of them — a
+  GitHub App authenticating as itself signs a JWT with a private key and exchanges it for
+  an installation token, which is not an OAuth grant type. A flag called `--oauth` carrying
+  that would be a lie about what it connects. **`--app` names the thing the operator has**,
+  and the protocol it speaks is the provider's business. `github --consent` is refused for
+  the symmetrical reason `--api-key --consent` already was: an App acting as itself has
+  nobody to ask.
+
+  **And the credential values are `field=value`, which is the third shape they have had.**
+  The named flags this bullet argued for — `--client-id`, `--client-secret` — fixed the
+  real fault in the positionals and broke on the second provider: a GitHub App has an app
+  id, an installation id and a private key, none of them a client anything, so one flag per
+  credential is a flag table that grows a column per provider, each row valid for one value
+  of `<integration>` and an "unknown option" for every other. `field=value` keeps
+  everything the flags bought — each value labelled, order irrelevant, nothing a coin flip
+  — and makes the set of labels a fact about the *provider* rather than about the command:
+  `clientId`/`clientSecret` for linear, `appId`/`installationId`/`privateKey` for github.
+  **There are no per-provider flags, ever.** An unknown key is an error that lists the valid
+  ones, never echoes the value, and stores nothing — which is where the discoverability a
+  declared flag would have given gets delivered, at the moment somebody is looking rather
+  than on a help page they did not open.
+
+  `--oauth`, `--client-id`, `--client-secret` and `--app-token` are **removed rather than
+  deprecated**, which is this record's existing habit and its existing reason: a deprecation
+  stub is a permanent row in the flag table maintained past the point anybody remembers what
+  it was for, and the parser's "unknown option" already prints a usage line carrying
+  `field=value`, which is the whole of what the stub would have said.
+
+  Nothing about how a value *arrives* changed, and that part of the bullet above stands
+  unamended: a field left out is prompted for one at a time — public ones visibly, secrets
+  with the echo off — a pipe feeds those prompts in schema order, and an inline secret is
+  accepted with the warning ADR-0012's amendment argues for while a public field draws
+  none. One rule is new and is stated rather than inferred: for a field the schema types as
+  a **PEM**, a value containing a newline is the key itself and anything else is a path to
+  read, because a PEM always has newlines and a path never does.
+
+  **Two flags are new, and they exist because an application is shared** (ADR-0017).
+  `--as <name>` sets the application's name, overriding the derived `<provider>:<account>`,
+  for the one account that has two applications. `--link <name>` points a project at an
+  application already registered on this machine — no credentials typed twice, no second
+  copy of a private key — and **it still mints a token**, because "connected" has to mean
+  "proved" rather than "a pointer was written": a link that only recorded a name would
+  report a project as connected on credentials somebody may have rotated a month ago, and
+  the first evidence would be a poll at 3am. A bare `--link` lists what is available rather
+  than guessing.
+
   **The slug asymmetry does not survive, and it should not.** This record stated the rule
   as *"each command checks the slug against the best oracle it already depends on"*, which
   was sound while `ogun secret set` and `ogun linear app` were separate commands with
@@ -695,6 +873,27 @@ use is how someone spends an hour debugging the wrong one:
   the consent grant and is **refused** on a client-credentials connection, because a warning
   about a state that reverts itself within one poll interval is a warning nobody can act
   on.
+
+  [amended] **It removes the application only when no other project still holds a grant
+  from it, and it names the ones that do.** The rule above is unchanged for the project
+  being disconnected and for an application nobody else uses; what changed underneath it is
+  that an application is shared (ADR-0017), so "remove the credential nothing reads" and
+  "remove this project's credential" stopped being the same act. A cascade would take four
+  working projects offline to satisfy one `disconnect` typed in the wrong directory, and a
+  refusal that left the last project connected to a credential it had just abandoned would
+  be the live-credential-nobody-is-watching state this bullet exists to prevent. So the
+  application goes when the last grant from it goes, and is kept — with the projects still
+  using it named — when it does not. `--keep-application` keeps its meaning and its
+  refusal on a Linear client-credentials connection, and **is allowed for github**, where a
+  private key with no installation token beside it mints nothing until somebody signs a JWT
+  with it.
+
+  Two things about the revocation half, which this record describes as *"it revokes a token
+  at Linear"*. It is routed **by provider** now; before the second provider arrived every
+  disconnect went through Linear's revoke endpoint, which the day a GitHub grant existed
+  would have POSTed a GitHub installation token to `api.linear.app`. And **GitHub has no
+  endpoint that ends an installation token early** — a one-hour life is the whole of its
+  revocation story — so that is stated rather than a revoke being reported as done.
 
 - **The command was `ogun linear`, and its usage lines say what it asks for.** It shipped as
   `ogun project linear app <project>`, which is four words in front of a verb: `project` was
