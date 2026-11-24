@@ -11,6 +11,9 @@ import {
   LinearOAuthError,
   LINEAR_ACTOR,
   LINEAR_SCOPES,
+  isSecretName,
+  linkApplication,
+  linkGithubApplication,
   linkedApplication,
   applicationIdentifier,
   connectGithubApp,
@@ -1168,6 +1171,77 @@ oauthRoutes.get('/github', async (c) => {
  * Nothing of the key is echoed. The response is the connection, which is public facts:
  * the account, the login, the application name, the expiry.
  */
+/**
+ * `POST /api/oauth/:provider/link/:project` — `ogun connect <provider> --link <name>`.
+ *
+ * Point a project at an application this machine already holds, and mint it a grant from
+ * those credentials. No credential is in the request: the name of something already
+ * stored is not a secret, and the values it names never leave the machine they are on.
+ *
+ * ### Why the UI needs this and not just the CLI
+ *
+ * `ogun disconnect` removes a project's grant, and the Settings page then has no row for
+ * that project — no form, no button, nothing to click. The way back was to re-enter the
+ * application's credentials, and for a GitHub App that is not a thing an operator can do:
+ * **the private key is displayed once at generation and can never be retrieved.** A
+ * disconnect in the UI was therefore a one-way door onto a path only the CLI could
+ * reopen, and only for somebody who still had the .pem.
+ *
+ * So the door is the same one `--link` has always been. This adds no capability; it stops
+ * the web UI from being the surface that can take a project apart and not put it back.
+ *
+ * Not gated by `secretWriteTransport`, which the three routes above it are. That gate is
+ * about a credential crossing a network typed by a person, and there is none here — the
+ * body is a slug and a name, and both are already on the wire in `GET /applications`.
+ * Gating it would refuse the repair for a reason that does not apply to it, on exactly the
+ * remote control plane where the CLI is hardest to reach.
+ */
+oauthRoutes.post('/:provider/link/:project', async (c) => {
+  const provider = c.req.param('provider')
+  if (!isSecretName(provider)) {
+    return c.json({ error: `"${provider}" is not an integration this build knows` }, 404)
+  }
+
+  const project = c.req.param('project')
+  const known = await c.var.ctx.db.query.projects.findFirst({
+    where: eq(projects.slug, project),
+    columns: { id: true },
+  })
+  if (!known) return c.json({ error: UNKNOWN_PROJECT }, 404)
+
+  let body: unknown
+  try {
+    body = JSON.parse(await c.req.text())
+  } catch {
+    return c.json({ error: 'the request body was not valid JSON.' }, 400)
+  }
+  const name = (body as { application?: unknown } | null)?.application
+  if (typeof name !== 'string' || name.trim() === '') {
+    return c.json({ error: 'expected {"application": "<name>"}.' }, 400)
+  }
+
+  try {
+    const connection =
+      provider === 'github'
+        ? await linkGithubApplication(project, name.trim())
+        : await linkApplication(project, provider, name.trim())
+    return c.json({ connected: connection })
+  } catch (err) {
+    /**
+     * Both error types carry a `kind`, and both separate "the operator named something
+     * that cannot work" from "the provider could not be reached" — so the status follows
+     * the error rather than the provider. A `config` error here is most often the one
+     * `linkApplication` raises on purpose: a consent connection cannot be relinked as
+     * client-credentials, because that is a silent reduction in reach.
+     */
+    if (err instanceof GithubAppError || err instanceof LinearOAuthError) {
+      return c.json({ error: err.message }, err.kind === 'config' ? 400 : 502)
+    }
+    if (err instanceof InvalidSecret) return c.json({ error: err.message }, 400)
+    throw err
+  }
+})
+
 oauthRoutes.post('/github/app/:project', async (c) => {
   const transport = secretWriteTransport()
   if (!transport.allowed) return c.json({ error: transport.reason }, 403)

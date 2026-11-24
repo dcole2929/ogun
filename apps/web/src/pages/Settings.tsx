@@ -629,11 +629,80 @@ function AdminToken() {
  * through a browser would be a second place for that reasoning to live, and the weaker of
  * the two.
  */
+/**
+ * "Use this application for another project too" — `ogun connect <p> --link <name>`.
+ *
+ * Shows nothing when every project already connects through this application, because an
+ * empty picker beside a full list is a control that can only disappoint. The link itself
+ * carries no credential: the name of something already stored is not a secret, and the
+ * values it names never leave the machine holding them.
+ */
+function LinkProject({
+  application,
+  provider,
+  usedBy,
+  projects,
+  onLinked,
+}: {
+  application: string
+  provider: string
+  usedBy: string[]
+  projects: string[]
+  onLinked: () => void
+}) {
+  const [picked, setPicked] = useState<string | null>(null)
+  const available = projects.filter((p) => !usedBy.includes(p))
+  /**
+   * `picked ?? available[0]`, never `useState(available[0])`. The projects query resolves
+   * after the first render, so state initialised from it freezes at the empty value while
+   * the `<select>` displays its first option — a form that looks ready and refuses to
+   * submit, which is the exact bug the GitHub App form shipped with.
+   */
+  const project = picked ?? available[0] ?? ''
+
+  const link = useMutation({
+    mutationFn: () => api.linkApplication(provider, project, application),
+    onSuccess: () => {
+      setPicked(null)
+      onLinked()
+    },
+  })
+
+  if (available.length === 0) return null
+
+  return (
+    <div className="link-project">
+      <select
+        value={project}
+        onChange={(e) => setPicked(e.target.value)}
+        disabled={link.isPending}
+      >
+        {available.map((slug) => (
+          <option key={slug} value={slug}>
+            {slug}
+          </option>
+        ))}
+      </select>
+      <button onClick={() => link.mutate()} disabled={link.isPending || project === ''}>
+        {link.isPending ? 'linking…' : 'Link a project'}
+      </button>
+      {/**
+       * The refusal worth rendering: a Linear connection made through consent cannot be
+       * relinked as client-credentials, because that reaches public teams only. The
+       * server says so in a sentence and this shows it rather than a status code.
+       */}
+      {link.error ? <p className="error">{String(link.error)}</p> : null}
+    </div>
+  )
+}
+
 function Applications() {
+  const qc = useQueryClient()
   const { data, isLoading } = useQuery({
     queryKey: ['applications'],
     queryFn: api.applications,
   })
+  const projects = useQuery({ queryKey: ['projects'], queryFn: api.projects })
 
   if (isLoading) return <div className="card">loading…</div>
   const rows = data?.applications ?? []
@@ -684,6 +753,30 @@ function Applications() {
                 ) : (
                   a.usedBy.join(', ')
                 )}
+                {/**
+                 * The way back in. `disconnect` takes a project's row off this page, and
+                 * without this the only route to reconnecting it is re-entering the
+                 * application's credentials — which for a GitHub App nobody can do,
+                 * because the private key is shown once at generation and never again.
+                 *
+                 * On the row rather than in the provider cards because this is where the
+                 * question is already answered: the column beside it says which projects
+                 * use this application, so "and this one too" belongs next to the list it
+                 * extends.
+                 */}
+                {a.malformed === null && a.provider !== null ? (
+                  <LinkProject
+                    application={a.name}
+                    provider={a.provider}
+                    usedBy={a.usedBy}
+                    projects={projects.data?.projects.map((p) => p.slug) ?? []}
+                    onLinked={() => {
+                      void qc.invalidateQueries({ queryKey: ['applications'] })
+                      void qc.invalidateQueries({ queryKey: ['githubConnections'] })
+                      void qc.invalidateQueries({ queryKey: ['linearOauth'] })
+                    }}
+                  />
+                ) : null}
               </td>
             </tr>
           ))}
