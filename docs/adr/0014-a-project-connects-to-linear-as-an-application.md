@@ -315,8 +315,8 @@ build does not recognise is `malformed` rather than defaulted, because a future 
 would have renewal rules this one has never heard of.
 
 [amended] **The third grant arrived and is recognised; the default for a missing
-`grantType` no longer matches this record, and the divergence is recorded rather than
-settled.** Two halves, and only the first is a decision.
+`grantType` drifted away from this record and has been brought back to it.** Two halves,
+and only the first is a decision this record is making.
 
 The third grant is `installation` — a GitHub App's token, renewed by signing a fresh JWT —
 so the set is now `authorization_code | client_credentials | installation` and an
@@ -326,21 +326,30 @@ this build has never heard of held, and it is now enforced a second time one lev
 rather than falling through to the refresh arm, where it would spend an empty refresh token
 and report whatever Linear said about it.
 
-The second half is **not** an amendment this record is making. The sentence above says an
-entry with no `grantType` is read as `authorization_code`; `parseGrant` in
-`config/secrets.ts` reads it as `client_credentials`. Both defaults have an argument. The
-one written here is about *the build that wrote the file* — a pre-`grantType` build refused
-a token with no refresh token in two places, so an authorization-code grant is the only
-thing it could have produced, and `migrateLegacyOAuth` still reasons exactly that way when
-it derives an application's `method` from a legacy entry. The other is about *the build
-that writes now* — `storeGrant` requires `grantType`, so an entry in `grants` without one
-did not come from this build at all. **Those two do not agree about a legacy
-authorization-code entry carried across by the migration**, which would be read as
-`client_credentials`, renewed by asking again rather than by refreshing, and so reduced
-from what an approver could see to the workspace's public teams — which is the silent
-reduction in reach `reuseLinked` refuses to perform on purpose. **Which default is intended
-could not be determined from the code or the commits, so nothing here is rewritten to match
-either, and a finding that the two disagree is a real finding.**
+The second half was a disagreement rather than an amendment, and it has since been
+resolved **in this record's favour**: the code was wrong.
+
+`parseGrant` read a missing `grantType` as `client_credentials` for one release. The
+sentence above says `authorization_code`, and so did the reader `parseGrant` replaced, and
+so does `migrateLegacyOAuth` in the comment where it derives an application's `method`
+from a legacy entry. The migration derived that answer correctly and then carried the
+grant through untouched — so one migration produced an application saying
+`authorization_code` beside a grant that read as `client_credentials`. Two halves of one
+conversion, disagreeing about one credential.
+
+It was a reduction in reach and not a difference in taste. A consent grant read as
+client-credentials is renewed by `appTokenGrant` rather than `refreshGrant`, which mints a
+token reaching the workspace's **public teams only** — a poll that authenticates perfectly
+and finds nothing, which is the silent reduction `reuseLinked` refuses to perform on
+purpose, arriving by default instead.
+
+Both halves are fixed. `migrateLegacyOAuth` derives the type once and **writes it onto the
+grant**, so the fact is on disk and no reader decides it; and `parseGrant`'s default is
+`authorization_code` again, for configs the broken build already migrated and for
+hand-edits. Not `malformed`, which was the other candidate: an *unrecognised* value means a
+future build knows something this one does not, while an *absent* one means a past build
+knew less — and refusing the second locks somebody out of a credential that is sitting
+there, readable, over a field their build never had.
 
 [amended] **`redirectUri` may now be empty.** It was required to be a non-empty string,
 which was right while every connection had a browser in it. The default grant has none — so

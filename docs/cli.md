@@ -826,9 +826,12 @@ year later where a `--yes` would only say somebody was tired of being asked.
 It fires only when there is a value to destroy: not on a first set, and not on a blank entry,
 which is a repair rather than a replace. `ogun connect <integration> --api-key` takes the
 same flag and calls the same function, because two doors onto one row that disagreed about
-overwriting would be worse than either rule. `--replace` is refused beside `--oauth`: a
-reconnect reuses the application registered here and replaces a token that was going to
-expire anyway, so nothing there cannot be got again.
+overwriting would be worse than either rule. `--replace` is refused beside an
+application connection — the flag is about a stored api key and an application connection
+has none to destroy. Reconnecting reuses what is registered here and takes a fresh token,
+and the token it replaces was going to expire on its own, so nothing there cannot be got
+again. Refused rather than ignored: somebody who typed it believes a reconnect is gated,
+and finding out it never was is the kind of thing found out afterwards.
 
 `<key>` is a positional where `connect`'s credentials are flags, and the rule behind both is
 one sentence: a lone value can be positional; several credential values of the same shape

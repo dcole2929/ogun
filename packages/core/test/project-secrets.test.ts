@@ -8,8 +8,11 @@ import { loadLocalConfig, updateLocalConfig } from '../src/config/machine.ts'
 import {
   clearProjectSecret,
   InvalidSecret,
+  readGrant,
+  listApplications,
   isSecretName,
   listProjectSecrets,
+  migrateLegacyOAuth,
   normalizeSecretInput,
   readProjectSecret,
   sealSecret,
@@ -323,4 +326,113 @@ test('only names Ogun actually reads are accepted', () => {
   // as an unauthenticated poller.
   assert.equal(isSecretName('linear'), true)
   assert.equal(isSecretName('linaer'), false)
+})
+
+// ── what an absent grantType means ─────────────────────────────────────────
+
+/**
+ * A legacy consent grant stays a consent grant across the migration.
+ *
+ * The regression: `migrateLegacyOAuth` derives the *application's* `method` from the
+ * grant — correctly, and with the reasoning written out — and then carried the grant
+ * itself through untouched. A pre-`grantType` entry therefore produced an application
+ * saying `authorization_code` and a grant that `parseGrant` read as `client_credentials`,
+ * because that was its default for an absent field. One migration, two halves,
+ * disagreeing about one credential.
+ *
+ * It is a reduction and not a cosmetic disagreement. `usableGrant` renews a
+ * client-credentials grant with `appTokenGrant` rather than `refreshGrant`, and that
+ * token reaches **public teams only** — a poll that authenticates perfectly and finds
+ * nothing, which is the failure `reuseLinked` refuses to cause on purpose.
+ */
+test('a legacy grant with no grantType migrates as the consent grant it was', async (t) => {
+  const path = await withStore(t, {
+    oauth: {
+      ogun: {
+        linear: {
+          clientId: 'cid-legacy',
+          clientSecret: 'csecret-legacy',
+          redirectUri: 'http://127.0.0.1:7777/api/oauth/linear/callback',
+          grant: {
+            // No `grantType` — the field did not exist when this was written. The refresh
+            // token is what says which grant it is: that build refused a token without
+            // one, so an authorization-code grant is the only thing it could have made.
+            accessToken: 'lin_oauth_aaaaaaaaaaaaaaaaaaaaaaaa',
+            refreshToken: 'lin_refresh_bbbbbbbbbbbbbbbbbbbb',
+            expiresAt: Date.now() + 3_600_000,
+            obtainedAt: Date.now(),
+            scopes: ['read', 'write'],
+            actor: 'app',
+          },
+        },
+      },
+    },
+  })
+
+  const grant = await readGrant('ogun', 'linear', path)
+  assert.equal(grant.state, 'present', inspect(grant))
+  assert.equal(
+    grant.state === 'present' ? grant.grant.grantType : undefined,
+    'authorization_code',
+    'a consent grant read as client_credentials renews into public teams only',
+  )
+
+  // And the application derived from the same entry agrees, which is the invariant the
+  // bug broke: these two are one fact and must not be read differently.
+  const apps = await listApplications(path)
+  const found = apps.find((a) => a.state === 'present' && a.app.provider === 'linear')
+  assert.equal(
+    found?.state === 'present' ? found.app.method : undefined,
+    'authorization_code',
+    'the application and its grant are one fact and must not read differently',
+  )
+})
+
+/**
+ * The migration writes the value down rather than leaving it to a reader's default.
+ *
+ * Deriving it correctly in two places would also have worked, and would have left the
+ * same bug one refactor away — the application's `method` was derived correctly all
+ * along, and the grant beside it still came out wrong. The fix that holds is that the
+ * fact is on disk afterwards, so there is nothing left for a reader to decide.
+ *
+ * Driven through the pure function rather than a write, because the migration runs inside
+ * the credential writers and the reads rather than inside `updateLocalConfig` — so "any
+ * write migrates" is not true, and a test that assumed it would pass for the wrong reason.
+ */
+test('the migration writes grantType explicitly', () => {
+  const legacy = {
+    projects: {},
+    secrets: {},
+    applications: {},
+    grants: {},
+    oauth: {
+      ogun: {
+        linear: {
+          clientId: 'cid-legacy',
+          clientSecret: 'csecret-legacy',
+          redirectUri: 'http://127.0.0.1:7777/api/oauth/linear/callback',
+          grant: {
+            accessToken: 'lin_oauth_aaaaaaaaaaaaaaaaaaaaaaaa',
+            refreshToken: 'lin_refresh_bbbbbbbbbbbbbbbbbbbb',
+            expiresAt: Date.now() + 3_600_000,
+            obtainedAt: Date.now(),
+            scopes: ['read'],
+            actor: 'app',
+          },
+        },
+      },
+    },
+  } as unknown as Parameters<typeof migrateLegacyOAuth>[0]
+
+  const migrated = migrateLegacyOAuth(legacy)
+  const grant = migrated.grants.ogun?.linear as { grantType?: string } | undefined
+  assert.equal(
+    grant?.grantType,
+    'authorization_code',
+    'the migrated grant carries its type rather than relying on a default',
+  )
+
+  // Idempotent, which is what lets it run on every read without rewriting anything.
+  assert.deepEqual(migrateLegacyOAuth(migrated), migrated)
 })

@@ -730,6 +730,21 @@ export const api = {
       `/api/oauth/github/app/${project}`,
       { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(app) },
     ),
+  /**
+   * `ogun connect <provider> --link <name>`, from the browser.
+   *
+   * No credential in the body — a slug and the name of something already stored, both of
+   * which `applications()` has already put on this page. What it is for: `disconnect`
+   * removes a project's row, and without this the only way back is re-entering the
+   * application's credentials, which for a GitHub App is impossible because the private
+   * key is shown once and never again.
+   */
+  linkApplication: (provider: string, project: string, application: string) =>
+    json<{ connected: unknown }>(`/api/oauth/${provider}/link/${project}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ application }),
+    }),
   linearOauth: () => json<LinearOauth>('/api/oauth/linear'),
   /**
    * The client secret from Linear's registration form. The other request that carries one,

@@ -868,6 +868,31 @@ export function migrateLegacyOAuth(config: LocalConfig): LocalConfig {
       const name = deriveApplicationName(provider, account)
 
       const { grant: _grant, ...application } = raw
+
+      /**
+       * What this entry's grant *is*, derived once and used twice.
+       *
+       * It was derived once and used once. The application below took it as `method` and
+       * the grant was carried through untouched — so a legacy consent entry produced an
+       * application saying `authorization_code` and a grant that `parseGrant` then read
+       * as `client_credentials`, because that is its default for an absent field. One
+       * migration, two halves, disagreeing about the same credential.
+       *
+       * For Linear the grant's type *is* the method, which is what made the one-place
+       * derivation correct and the omission invisible: both readers had an answer, and
+       * only one of them had the right one.
+       */
+      const derived: 'client_credentials' | 'authorization_code' =
+        /**
+         * A grant with **no** `grantType` is `authorization_code`, which was
+         * `parseOAuthApp`'s default and is so for its reason: the build that wrote those
+         * entries refused a token with no refresh token in two places, so an
+         * authorization-code grant is the only thing it could have produced.
+         */
+        grant === undefined || grant.grantType === 'client_credentials'
+          ? 'client_credentials'
+          : 'authorization_code'
+
       if (applications[name] === undefined) {
         /**
          * The method, from the **grant** when the old entry carried one.
@@ -885,24 +910,24 @@ export function migrateLegacyOAuth(config: LocalConfig): LocalConfig {
          * method the build which wrote those entries used by default, and there is nothing
          * else to read it from.
          */
-        const method =
-          raw.method ??
-          /**
-           * A grant with **no** `grantType` is `authorization_code` too, which is
-           * `parseOAuthApp`'s own default and for its reason: the build that wrote those
-           * entries refused a token with no refresh token in two places, so an
-           * authorization-code grant is the only thing it could have produced.
-           */
-          (grant === undefined || grant.grantType === 'client_credentials'
-            ? 'client_credentials'
-            : 'authorization_code')
+        const method = raw.method ?? derived
         applications[name] = { ...application, provider, method }
       }
       if (grant !== undefined && grants[slug]?.[provider] === undefined) {
         const { workspace: _ws, ...rest } = grant
         grants[slug] = {
           ...(grants[slug] ?? {}),
-          [provider]: { ...rest, app: name, ...(workspace ? { account: workspace } : {}) },
+          [provider]: {
+            ...rest,
+            /**
+             * Written down rather than left to a reader's default. An explicit value is
+             * the same fact the application's `method` records, and recording it here is
+             * what stops the two from ever being read differently again.
+             */
+            grantType: rest.grantType ?? derived,
+            app: name,
+            ...(workspace ? { account: workspace } : {}),
+          },
         }
       }
       moved = true
@@ -1049,7 +1074,30 @@ function parseGrant(raw: unknown): { ok: true; grant: Grant } | { ok: false; rea
   if (typeof expiresAt !== 'number' || !Number.isFinite(expiresAt)) {
     return { ok: false, reason: 'expiresAt is missing or not a number' }
   }
-  const grantType = raw.grantType === undefined ? 'client_credentials' : raw.grantType
+  /**
+   * An absent `grantType` is `authorization_code`, which is what the reader this one
+   * replaced said and what ADR-0014 records.
+   *
+   * It said `client_credentials` for one release, and that is a reduction rather than a
+   * mistake in taste: a consent grant read as client-credentials is renewed by
+   * `appTokenGrant` instead of `refreshGrant`, which mints a token reaching **public
+   * teams only**. A poll that authenticates perfectly and finds nothing — the exact
+   * failure `reuseLinked` refuses to cause on purpose, arriving by default instead.
+   *
+   * Nothing this build writes reaches here without the field: `storeGrant` requires it,
+   * and `migrateLegacyOAuth` now writes it explicitly. What is left is a config migrated
+   * by the build that had the reduction, and a hand-edit — and for both, the fact the
+   * absence encodes is the same one the old reader read it as: the build that wrote those
+   * entries refused a token with no refresh token in two places, so an authorization-code
+   * grant is the only thing it could have produced.
+   *
+   * Not `malformed`, which was the other candidate and is what this module does with an
+   * *unrecognised* value. The difference is that an unknown value means a future build
+   * knows something this one does not, while an absent one means a past build knew less —
+   * and refusing the second locks somebody out of a credential that is sitting right
+   * there, readable, on the strength of a field their build never had.
+   */
+  const grantType = raw.grantType === undefined ? 'authorization_code' : raw.grantType
   if (
     grantType !== 'authorization_code' &&
     grantType !== 'client_credentials' &&

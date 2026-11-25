@@ -221,10 +221,16 @@ least once, and the name on it describes an account the credential actually reac
   both tokens and both expiries intact, idempotent on a second pass — came out of the
   verification **byte-identical**: nothing was written to convert it.
 
-- **The default for a missing `grantType` disagrees with ADR-0014, and it is not settled
-  here.** That record says an entry with no `grantType` is read as `authorization_code`;
-  `parseGrant` reads it as `client_credentials`. The disagreement is only reachable through
-  the legacy path this ADR introduced — `migrateLegacyOAuth` derives an application's `method`
-  from such an entry by the reasoning ADR-0014 wrote, and then the grant it carried across is
-  parsed by the other rule. See ADR-0014's amendment for both arguments. **A finding that the
-  two disagree is a real finding.**
+- **The legacy path introduced here carried a grant across without its `grantType`**, and
+  that was a reduction in reach rather than an untidiness. `migrateLegacyOAuth` derives an
+  application's `method` from such an entry by ADR-0014's reasoning and derived it
+  correctly; the grant beside it was carried through untouched and then read by
+  `parseGrant`'s default, which was `client_credentials`. One conversion, two halves,
+  disagreeing about one credential — and a consent grant read as client-credentials renews
+  via `appTokenGrant` into the workspace's public teams only.
+
+  Fixed by deriving once and **writing the value onto the grant**, so nothing downstream
+  decides it, and by restoring `parseGrant`'s default to `authorization_code` for configs
+  the broken build already migrated. The shape of the bug is worth keeping: the map split
+  is what created a second reader of a field that previously had one, and a field with two
+  readers and one writer is where this kind of divergence lives. See ADR-0014.

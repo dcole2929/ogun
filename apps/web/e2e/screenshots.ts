@@ -227,6 +227,16 @@ const SHOTS: Shot[] = [
   {
     name: 'settings-applications',
     path: '/settings',
+    act: async (page) => {
+      /**
+       * The control exists and is live. Asserted before the shot rather than left to the
+       * eye, because "an application can take another project" is the claim the picture
+       * is making, and a disabled button photographs the same as an enabled one at this
+       * size.
+       */
+      const link = page.locator('.link-project button:not([disabled])')
+      await link.first().waitFor({ timeout: 5_000 })
+    },
     routes: {
       '/api/oauth/applications': {
         applications: [
@@ -235,7 +245,8 @@ const SHOTS: Shot[] = [
             provider: 'github',
             method: 'app',
             identifiesAs: 'App 000000',
-            usedBy: ['heirchive-api', 'clawz'],
+            // Not every project, so the row has one left to offer.
+            usedBy: ['heirchive-api'],
             malformed: null,
           },
           {
