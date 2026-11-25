@@ -752,6 +752,17 @@ export function buildRunArgs(opts: ContainerOptions, image: string): string[] {
 
   args.push('--env', `OGUN_PERMISSIONS=${opts.permissions}`)
 
+  /**
+   * Only when the answer is no.
+   *
+   * `.ogun/project-entrypoint.sh` reads this as `${OGUN_PROJECT_SERVICES:-1}`, so an
+   * unset variable and a `1` mean the same thing — and a project image written before
+   * this existed, which checks nothing, keeps starting its stack either way. The signal
+   * can only ever take services away from a job that said it does not need them, which
+   * is what makes it safe to ship ahead of any image that reads it.
+   */
+  if (opts.services === false) args.push('--env', 'OGUN_PROJECT_SERVICES=0')
+
   args.push(image)
   return args
 }

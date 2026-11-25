@@ -281,6 +281,9 @@ jobsRoutes.post('/claim', async (c) => {
         // it, and which lens grades its patch. A worker indexed before this field existed
         // has none, and none means the ordinary modifier path.
         ...(config.bootstrap === undefined ? {} : { bootstrap: config.bootstrap }),
+        // Only when the worker opted *out*. Sending `true` would be the same as sending
+        // nothing and would put a field on every job to say "as usual".
+        ...(config.services === false ? { services: false } : {}),
         // Parsed by `claimedJobSchema`, so a row written by a build that stored a
         // different shape is refused at the claim rather than reaching a runner that
         // would push somewhere on the strength of it.

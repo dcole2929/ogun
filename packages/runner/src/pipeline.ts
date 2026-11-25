@@ -584,6 +584,13 @@ export async function executeJob(
       permissions: job.permissions as 'observer' | 'reviewer' | 'modifier',
       runtime: spec.provider,
       timeoutMs: job.timeoutMs,
+      /**
+       * The worker's answer, carried on the claim. One sandbox serves the agent *and*
+       * the verification pass that follows it, so this is decided once here rather than
+       * per exec — and it has to be, because the gate runs the project's suite and a
+       * suite denied its database fails on a refused connection.
+       */
+      ...(job.services === false ? { services: false } : {}),
       image: process.env.OGUN_IMAGE_OVERRIDE ?? imageFor(job),
       // The project's answer, from the blob at the pinned base — not a constant, and not
       // anything the agent about to run in here could have written. `sandboxDowngrade`

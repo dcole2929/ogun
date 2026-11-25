@@ -33,6 +33,7 @@ const defaults: WorkerConfig = {
   model: 'worker',
   permissions: 'reviewer',
   sandbox: 'container',
+  services: true,
   onMissed: 'skip',
   enabled: true,
   timeoutMs: 1_800_000,
@@ -103,6 +104,23 @@ describe('config store', () => {
     const yaml = workerToYamlBlock('busy', { ...defaults, runtime: 'codex', model: 'reviewer' })
     assert.match(yaml, /runtime: codex/)
     assert.match(yaml, /model: reviewer/)
+  })
+
+  /**
+   * `services:` follows the same rule as everything else here, and it matters more than
+   * for most: `true` is what every worker does, so writing it would put a line in every
+   * block to say "as usual" and make the one worker that opted out harder to find in a
+   * file people read.
+   */
+  test('services is written only when a worker opts out', async () => {
+    assert.equal(
+      workerToYamlBlock('reader', { ...defaults, services: false }),
+      '  reader:\n    skill: review\n    services: false',
+    )
+    assert.ok(
+      !workerToYamlBlock('ordinary', { ...defaults, services: true }).includes('services'),
+      'the default stays out of the file',
+    )
   })
 })
 

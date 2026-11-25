@@ -461,6 +461,19 @@ function WorkerCard({
             <Pill value={w.permissions} />
             <span className="pill">{w.runtime}</span>
             <span className="pill">{w.sandbox}</span>
+            {/*
+              Shown only when it is off, like `disabled` beside it. A pill on every
+              ordinary worker saying "yes, the usual" is noise that makes the one row
+              that differs harder to find, not easier.
+            */}
+            {w.config.services === false && (
+              <span
+                className="pill"
+                title="the project's database and services do not start for this worker's jobs"
+              >
+                no services
+              </span>
+            )}
             {!w.enabled && <span className="pill yellow">disabled</span>}
             {row.breaker?.openedAt ? (
               <span className="pill red">breaker open</span>

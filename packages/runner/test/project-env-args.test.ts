@@ -65,3 +65,40 @@ test('no env means no stray --env beyond what Ogun sets for itself', () => {
   )
   assert.deepEqual(names, ['OGUN_PERMISSIONS'])
 })
+
+/**
+ * The services signal is sent only to take them away.
+ *
+ * `.ogun/project-entrypoint.sh` reads it as `${OGUN_PROJECT_SERVICES:-1}`, so unset and
+ * `1` mean the same thing — and a project image written before this existed, which checks
+ * nothing, keeps starting its stack either way. Sending `1` would put a variable on every
+ * container to say "as usual", and would make an absent one look like a decision.
+ */
+const withServices = (services?: boolean): string[] =>
+  buildRunArgs(
+    {
+      name: 'ogun-test',
+      hostWorkspace: '/tmp/ws',
+      guestWorkspace: GUEST_WORKSPACE,
+      permissions: 'reviewer',
+      runtime: 'claude',
+      timeoutMs: 1000,
+      image: 'ogun/base:latest',
+      ...(services === undefined ? {} : { services }),
+    } as Parameters<typeof buildRunArgs>[0],
+    'ogun/base:latest',
+  )
+
+test('a worker that needs no services says so, and one that does says nothing', () => {
+  assert.deepEqual(
+    envValues(withServices(false), 'OGUN_PROJECT_SERVICES'),
+    ['0'],
+    'the only value ever sent is the one that withholds',
+  )
+  assert.deepEqual(envValues(withServices(true), 'OGUN_PROJECT_SERVICES'), [])
+  assert.deepEqual(
+    envValues(withServices(undefined), 'OGUN_PROJECT_SERVICES'),
+    [],
+    'absent means yes, so an older runner and an older image both keep working',
+  )
+})

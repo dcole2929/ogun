@@ -128,6 +128,32 @@ export const workerSchema = z.object({
   model: z.string().default('worker'),
   permissions: z.enum(PERMISSION_PROFILES).default('reviewer'),
   sandbox: z.enum(SANDBOX_KINDS).default('container'),
+  /**
+   * Whether this worker's job needs the project's own services running — the database and
+   * whatever sits on top of it, started by `.ogun/project-entrypoint.sh`.
+   *
+   * ### Why this is a knob and not a derivation
+   *
+   * A project image brings its stack up eagerly, on every container start, because a
+   * `tests.command` that started its own services would pay for them twice — once for the
+   * agent and again on the runner's verification pass. That is the right trade for a
+   * worker that runs the suite. It is pure cost for one that does not: a triage run reads
+   * a ticket, a review run reads a diff, and neither has ever opened a connection, yet
+   * both wait for postgres to accept one and for every migration in the repository to
+   * replay before their agent starts.
+   *
+   * ### Why the default is `true`
+   *
+   * The two ways to be wrong are not symmetric. A worker that gets services it never uses
+   * pays seconds. A worker denied services it needs fails its suite on a refused
+   * connection — a gate that rejects a correct patch, and whose error says nothing about
+   * a config key somebody did not write.
+   *
+   * So the default preserves what every project does today, and the saving is opt-in. It
+   * also means the signal only ever *narrows*: a project image that ignores it keeps
+   * starting its stack, which is what makes this safe to ship before any project reads it.
+   */
+  services: z.boolean().default(true),
   /** Overrides the skill's own default_prompt. Usually absent. */
   prompt: z.string().optional(),
   schedule: z.string().optional(),
@@ -218,6 +244,37 @@ export const workerSchema = z.object({
    * than nothing because it reads like a protection. A note on the timeline would say
    * "this was not applied"; a refusal says "this was never a thing you could ask for".
    */
+  /**
+   * `services: false` is refused on a modifier, because a modifier runs the suite.
+   *
+   * The sandbox is created once and serves both halves of the job — the agent, and the
+   * verification pass that judges what it wrote. A modifier's patch is only publishable
+   * once `tests.command` has passed in that same container, and the pipeline already
+   * refuses a modifier whose project declares no command at all. So a modifier that
+   * switched its services off would be asking for its own gate to run against a stack
+   * that is not up, and the failure arrives as a refused connection inside a suite —
+   * which reads as a broken test, days from the line that caused it.
+   *
+   * Caught here rather than in the runner for the reason every other cross-field check in
+   * this file is: `ogun project sync` is where somebody is already looking at this file.
+   */
+  .check((ctx) => {
+    const worker = ctx.value
+    if (worker.services !== false) return
+    if (worker.permissions === 'modifier') {
+      ctx.issues.push({
+        code: 'custom',
+        input: worker,
+        path: ['services'],
+        message:
+          '`services: false` cannot go with `permissions: modifier`. A modifier\'s patch ' +
+          'is judged by `tests.command` in this same sandbox, so switching the project\'s ' +
+          'services off would point its own gate at a database that is not running — and ' +
+          'that failure arrives as a refused connection inside a test, not as a config ' +
+          'error. Drop `services: false`, or give this worker weaker permissions',
+      })
+    }
+  })
   .check((ctx) => {
     const worker = ctx.value
     if (!worker.connections || worker.connections.length === 0) return
