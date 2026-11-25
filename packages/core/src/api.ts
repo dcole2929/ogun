@@ -138,6 +138,7 @@ export const claimedJobSchema = z.object({
    * the stack, and a job claimed by one is slow rather than broken.
    */
   services: z.boolean().optional(),
+  /**
    * The pull request this job is a revision of (§4.13, ADR-0009).
    *
    * Absent on every ordinary job, which is the safe direction and what a runner older

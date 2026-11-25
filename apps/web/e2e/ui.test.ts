@@ -509,18 +509,6 @@ describe('the run timeline', () => {
 })
 
 /**
- * A modifier cannot switch off the services its own gate needs.
- *
- * The schema refuses it, and a form that let somebody tick the box and then showed them a
- * validation error would be teaching the rule the expensive way. The box is forced on and
- * disabled, and the sentence under it says why — a modifier's patch is judged by
- * `tests.command` in this same sandbox, so switching services off would point its own
- * gate at a database that is not running.
- */
-describe('the services checkbox follows the permission profile', () => {
-  let h: Harness
-  before(async () => {
-    h = await open('/workers', {})
  * The way back from a disconnect.
  *
  * `ogun disconnect` takes a project's row off the Settings page, and until now the only
@@ -570,37 +558,6 @@ describe('linking a project to an application that is already registered', () =>
   })
   after(() => h.stop())
 
-  const openEditor = async (page: Page, worker: string): Promise<void> => {
-    await page
-      .locator('.card')
-      .filter({ hasText: worker })
-      .getByRole('button', { name: 'Edit' })
-      .first()
-      .click()
-    await page.locator('label.inline').filter({ hasText: 'services' }).first().waitFor()
-  }
-
-  test('a reviewer may turn services off; a modifier may not', async () => {
-    const { page } = h
-    await openEditor(page, 'scope-a-ticket')
-    const box = page.locator('label.inline').filter({ hasText: 'services' }).locator('input')
-    assert.equal(await box.isDisabled(), false, 'a reviewer owns the choice')
-    assert.equal(await box.isChecked(), false, 'and this fixture opted out')
-
-    // Changing the profile to modifier takes the choice away in place, rather than on save.
-    await page
-      .locator('label')
-      .filter({ hasText: 'Permissions' })
-      .locator('select')
-      .selectOption('modifier')
-    assert.equal(await box.isDisabled(), true, 'a modifier does not get the choice')
-    assert.equal(await box.isChecked(), true, 'and is shown as having services')
-
-    const help = await page
-      .locator('.checkbox-field small')
-      .first()
-      .textContent()
-    assert.match(help ?? '', /judged by/, 'the reason is on screen, not in a later error')
   /**
    * The picker offers the projects this application does *not* already serve. An empty
    * one beside a full list is a control that can only disappoint, so the row that serves
@@ -644,5 +601,53 @@ describe('linking a project to an application that is already registered', () =>
     assert.equal(posted.length, 1, `expected one link request, got ${posted.length}`)
     assert.match(posted[0]?.url ?? '', /\/api\/oauth\/github\/link\/ogun$/)
     assert.deepEqual(JSON.parse(posted[0]?.body ?? '{}'), { application: 'heirchive' })
+  })
+})
+
+/**
+ * A modifier cannot switch off the services its own gate needs.
+ *
+ * The schema refuses it, and a form that let somebody tick the box and then showed them a
+ * validation error would be teaching the rule the expensive way. The box is forced on and
+ * disabled, and the sentence under it says why — a modifier's patch is judged by
+ * `tests.command` in this same sandbox, so switching services off would point its own
+ * gate at a database that is not running.
+ */
+describe('the services checkbox follows the permission profile', () => {
+  let h: Harness
+  before(async () => {
+    h = await open('/workers', {})
+    await settle(h.page)
+  })
+  after(() => h.stop())
+
+  const openEditor = async (page: Page, worker: string): Promise<void> => {
+    await page
+      .locator('.card')
+      .filter({ hasText: worker })
+      .getByRole('button', { name: 'Edit' })
+      .first()
+      .click()
+    await page.locator('label.inline').filter({ hasText: 'services' }).first().waitFor()
+  }
+
+  test('a reviewer may turn services off; a modifier may not', async () => {
+    const { page } = h
+    await openEditor(page, 'scope-a-ticket')
+    const box = page.locator('label.inline').filter({ hasText: 'services' }).locator('input')
+    assert.equal(await box.isDisabled(), false, 'a reviewer owns the choice')
+    assert.equal(await box.isChecked(), false, 'and this fixture opted out')
+
+    // Changing the profile to modifier takes the choice away in place, rather than on save.
+    await page
+      .locator('label')
+      .filter({ hasText: 'Permissions' })
+      .locator('select')
+      .selectOption('modifier')
+    assert.equal(await box.isDisabled(), true, 'a modifier does not get the choice')
+    assert.equal(await box.isChecked(), true, 'and is shown as having services')
+
+    const help = await page.locator('.checkbox-field small').first().textContent()
+    assert.match(help ?? '', /judged by/, 'the reason is on screen, not in a later error')
   })
 })

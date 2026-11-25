@@ -633,6 +633,9 @@ td.mono > .extlink, td.mono { white-space: nowrap; }
   display: flex;
   flex-direction: column;
   gap: 4px;
+}
+
+/*
  * The per-application "link a project" control, which sits inside the Used by cell.
  *
  * Its own row below the project list rather than inline with it: the list is prose that
