@@ -84,6 +84,8 @@ type Recorded = {
   published: Array<{ branch: string; base: string; title: string; body: string }>
   /** Recorded so that "the publisher comments on nothing" is asserted and not assumed. */
   commented: Array<{ number: number; body: string }>
+  /** The revision path: which branch was moved, and what it was required to be at. */
+  revised: Array<{ branch: string; expect: string }>
 }
 
 /**
@@ -92,7 +94,7 @@ type Recorded = {
  * ref appeared on a remote and not that a spy was called.
  */
 const fakeRemote = (opts: { open?: number } = {}): { remote: PublishRemote; calls: Recorded } => {
-  const calls: Recorded = { counted: 0, published: [], commented: [] }
+  const calls: Recorded = { counted: 0, published: [], commented: [], revised: [] }
   return {
     calls,
     remote: {
@@ -104,6 +106,21 @@ const fakeRemote = (opts: { open?: number } = {}): { remote: PublishRemote; call
         calls.published.push({ branch, base, title, body })
         await git(from, ['push', '--quiet', 'origin', `HEAD:refs/heads/${branch}`])
         return { url: `https://github.test/ogun/pull/${calls.published.length}` }
+      },
+      /**
+       * A real `push --force-with-lease`, like `publish`'s real push — so a test that
+       * says "the branch moved" means a ref moved on a remote, and a test that says the
+       * lease held means git enforced it rather than a spy agreeing to.
+       */
+      async revise({ from, branch, expect }) {
+        calls.revised.push({ branch, expect })
+        await git(from, [
+          'push',
+          '--quiet',
+          `--force-with-lease=refs/heads/${branch}:${expect}`,
+          'origin',
+          `HEAD:refs/heads/${branch}`,
+        ])
       },
       async comment({ number, body }) {
         calls.commented.push({ number, body })
@@ -580,15 +597,18 @@ test('an ordinary pull request says nothing about building an image', async () =
 })
 
 /**
- * `PublishRemote.comment` exists and `publishPatch` does not use it, which is a decision
- * rather than an omission — so it is asserted here rather than left to be rediscovered.
+ * `publishPatch` comments on nothing *on the ordinary path*, which is a decision rather
+ * than an omission — so it is asserted here rather than left to be rediscovered. The
+ * revision path does comment, and is two tests below; what this one protects is that the
+ * other ninety-nine runs out of a hundred stay silent.
  *
  * A comment is a notification on somebody's pull request, and the publisher is the wrong
  * place to decide to send one: it runs unattended, after the report, on every modifier
  * that produced a patch. Both halves are covered — a run that publishes and a run that is
  * refused — because the tempting wiring is the refusal ("tell them why there is no pull
  * request"), and the pull request a refused modifier run would be commenting on does not
- * exist.
+ * exist. That argument is untouched by revisions: a revision comments because it has a
+ * pull request to comment on, which is the thing these two cases lack.
  */
 test('the publisher comments on nothing, whether it publishes or refuses', async () => {
   const { calls, go } = await publishing()
@@ -599,4 +619,107 @@ test('the publisher comments on nothing, whether it publishes or refuses', async
   const refused = await go({ tests: { run: true, passed: false } })
   assert.equal(refused.pr, undefined)
   assert.deepEqual(calls.commented, [], 'a refusal posted a comment nobody asked for')
+})
+
+/**
+ * Revising a pull request, which is the path `comment` was written for and had no caller
+ * on until now.
+ *
+ * What a revision has to be, and what it had been doing instead: the commits belong on
+ * the branch the pull request already has, and the result belongs on that pull request.
+ * Before this, a run answering a review minted `ogun/<worker>/<new-run>` and opened a
+ * second pull request — built on the default branch, so without the first one's commits.
+ * Two rival pull requests, and nothing linking either to the review that asked.
+ */
+test('a revision moves the pull request branch and says so there', async () => {
+  const { fixture, calls, go } = await publishing()
+
+  // The pull request's branch, as it exists on the remote before the revision.
+  const prBranch = 'ogun/fixer/aaaabbbbcccc'
+  await run('git', ['-C', fixture.repo, 'push', '-q', 'origin', `${fixture.baseSha}:refs/heads/${prBranch}`])
+
+  const result = await go({
+    changeRequest: {
+      repo: 'owner/name',
+      number: 42,
+      branch: prBranch,
+      headSha: fixture.baseSha,
+    },
+  })
+
+  assert.ok(result.pr, `refused: ${result.refused}`)
+  assert.equal(result.pr.branch, prBranch, 'the branch is the pull request’s, not a new one')
+  assert.match(result.pr.url, /\/owner\/name\/pull\/42$/)
+
+  // No second pull request. This is the bug, stated as an assertion.
+  assert.equal(calls.published.length, 0, 'a revision opens no pull request')
+  assert.equal(calls.revised.length, 1)
+  assert.equal(calls.revised[0]?.expect, fixture.baseSha, 'the lease names the reviewed commit')
+
+  // The branch on the remote actually moved, and moved to the revision.
+  const moved = (
+    await run('git', ['-C', fixture.repo, 'ls-remote', 'origin', `refs/heads/${prBranch}`])
+  ).stdout.trim()
+  assert.ok(moved.length > 0, 'the branch still exists on the remote')
+  assert.ok(!moved.startsWith(fixture.baseSha), 'and is no longer at the commit it started from')
+
+  // And the reviewer was told, on the pull request they are reading.
+  assert.equal(calls.commented.length, 1)
+  assert.equal(calls.commented[0]?.number, 42)
+  assert.match(calls.commented[0]?.body ?? '', /Revised by `fixer`/)
+  // The fact that settles "does this answer *my* review": what it was built on.
+  assert.ok(
+    (calls.commented[0]?.body ?? '').includes(fixture.baseSha.slice(0, 12)),
+    'the comment names the commit the review was written against',
+  )
+})
+
+/**
+ * The lease, which is the only check here that is actually load-bearing.
+ *
+ * The pipeline refuses earlier when the branch has moved, and that check is a courtesy —
+ * it saves an agent twenty minutes, and it is not atomic. Between it and the push a
+ * person can land a commit, and a plain `--force` would throw their work away without
+ * either of them finding out. `--force-with-lease=<branch>:<sha>` makes the refusal git's
+ * and makes it race-free.
+ */
+test('a revision refuses to push over work that landed mid-run', async () => {
+  const { fixture, calls, go } = await publishing()
+
+  const prBranch = 'ogun/fixer/ddddeeeeffff'
+  await run('git', ['-C', fixture.repo, 'push', '-q', 'origin', `${fixture.baseSha}:refs/heads/${prBranch}`])
+
+  // Somebody pushes to the pull request after the review was written, which is the state
+  // the run cannot see because it started before this happened.
+  const intruder = join(fixture.root, 'intruder')
+  await run('git', ['clone', '-q', '-b', prBranch, fixture.origin, intruder])
+  await writeFile(join(intruder, 'theirs.ts'), 'export const mine = true\n')
+  await git(intruder, ['add', '-A'])
+  await commit(intruder, 'A change somebody else made')
+  await git(intruder, ['push', '-q', 'origin', prBranch])
+  const theirs = (await git(intruder, ['rev-parse', 'HEAD'])).stdout.trim()
+
+  await assert.rejects(
+    () =>
+      go({
+        changeRequest: {
+          repo: 'owner/name',
+          number: 42,
+          branch: prBranch,
+          // Still the commit the review was written against, which is the point.
+          headSha: fixture.baseSha,
+        },
+      }),
+    'the push is refused rather than discarding their commit',
+  )
+
+  // Their work is still there.
+  const tip = (
+    await run('git', ['-C', fixture.repo, 'ls-remote', 'origin', `refs/heads/${prBranch}`])
+  ).stdout.trim()
+  assert.ok(tip.startsWith(theirs), 'the branch is still at the commit they pushed')
+
+  // And nothing was said on the pull request, because nothing was done to it. A comment
+  // claiming a revision that was refused is worse than silence.
+  assert.equal(calls.commented.length, 0, 'no comment claims a revision that did not happen')
 })

@@ -44,6 +44,51 @@ remote with a draft pull request on it. Everything else — every gate, the scra
 `git am`, the branch name, the PR body — is ordinary local work that needs no secret. There
 is one implementation, `githubCli`, shelling out to the host's `git` and `gh`.
 
+[amended] **It is a four-method interface.** The superseded phrase is *"one two-method
+interface"*; the count is the only thing that changed, and it changed twice, both times in
+the direction this record predicted it would. `comment` says something on a pull request;
+`revise` puts commits onto one that already exists. Saying something on a pull request
+is a third write to the same remote with the same credential, so it belongs on the seam for
+exactly the reason the next-to-last bullet below rejects an ambient `gh`: a caller reaching
+for `gh pr comment` where it stood would scatter the credential's shape and make the
+installation-token implementation a rewrite rather than a file. The one new input that
+reaches a command line — a pull request number — is proved to be a positive safe integer
+before it becomes argv, which is `branchFor`'s argument about branch names applied to it:
+`gh pr comment -5` is an option and not a pull request, and `--` is not something `gh`
+promises to honour in front of a positional.
+
+~~**Nothing calls `comment` yet, and that is a decision rather than an unfinished edge.**
+`publishPatch` does not use it, and a test asserts that it does not — on the publishing
+path and on the refusing path both, because the tempting wiring is the refusal ("tell them
+why there is no pull request") and a refused modifier run has no pull request of ours to
+comment on. A declined run never reaches the publisher at all. The one job kind that
+arrives with an existing pull request is a `change-request` — a pull request somebody asked
+Ogun to revise — and its number does not reach the runner: `claimedJobSchema` has no field
+for it and `requestBrief` renders it into attacker-authored prose inside the agent's prompt,
+which will never be parsed back out. Wiring it is a change to the job wire and a decision
+about the artefact, not a change to `publish.ts`.~~
+
+[superseded] **`comment` has one caller: a revision.** The paragraph above is struck
+rather than edited, because it was right about everything except how long it would last,
+and the change it named is the change that happened — `claimedJobSchema` grew
+`changeRequest: { repo, number, branch, headSha }`, carrying the number as far as the
+runner without going near `requestBrief`'s prose. The structured field exists precisely so
+that nothing has to be parsed back out of a prompt an outsider wrote.
+
+Its two other claims still stand and are still the reason there is exactly one caller: a
+refused modifier run has no pull request of ours to comment on, and a declined run never
+reaches the publisher. Posting on somebody's pull request remains a side effect a caller
+decides to want.
+
+What the record did not anticipate is that the artefact decision would move the *other*
+methods too. A revision does not open a pull request — the one being revised is the
+answer — so `publishPatch` splits at the end: `revise` moves the branch, then `comment`
+says what changed. In that order, because a comment is a claim about the branch, and the
+one situation this guards against (somebody pushing mid-run) is exactly when a person is
+reading the thread. The push uses `--force-with-lease=<branch>:<headSha>`, so the refusal
+is git's and is atomic; the pipeline's earlier check is a courtesy that saves an agent
+twenty minutes and is not load-bearing.
+
 **A second implementation is expected, and the condition is named: a runner that is not
 the machine you are sitting at.** `gh`'s credential is a person's, it is long-lived, and it
 reaches every repository that person can. That is a fair trade while the runner is your own
@@ -77,7 +122,10 @@ about the container applied one level out, and has no condition yet.
 - **A full provider abstraction — GitHub, GitLab, Gitea behind an interface.** Rejected —
   two methods with one implementation is a seam; the same two methods with a factory, a
   registry and a config key is a framework for a second provider nobody has asked for. The
-  seam is where the credential is, not where a hypothetical forge is.
+  seam is where the credential is, not where a hypothetical forge is. [amended: three
+  methods now, per the amendment above. The count is not what this argument rests on — a
+  method is admitted because it needs the credential, which is why `comment` is here and
+  why nothing else has arrived.]
 - **Rebase onto the current default branch before opening the PR.** Rejected — a pull
   request from a slightly stale base is what every human contributor opens, and resolving
   conflicts unattended at 3am against a tree nobody reviewed is not a thing this should be

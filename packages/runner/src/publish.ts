@@ -122,14 +122,39 @@ export type PublishRemote = {
    * site" ADR-0009 rejected — undiscoverable, and one more thing to unpick the day the
    * installation token arrives. Three methods, still one credential path.
    *
-   * **Nothing calls this yet, and that is deliberate rather than unfinished.** Posting on
-   * somebody's pull request is a side effect a person has to decide to want, and the
-   * obvious call sites cannot have it for free: a decline and a gate-refused patch are
-   * both rounds in which no pull request of ours exists to comment on, and the one job
-   * kind that does arrive with one — a `change-request`, a pull request somebody asked
-   * Ogun to revise — does not carry its number as far as the runner. Wiring it is a
-   * change to the job wire and a decision about the artefact, not a change to this file.
+   * Called on one path: a revision, after its commits are on the branch (§4.13). That
+   * was the change to the job wire this comment used to predict — `changeRequest` on a
+   * claimed job, carrying the number as far as the runner.
+   *
+   * Still only that one path, and for the reason it always gave: a decline and a
+   * gate-refused patch are both rounds in which no pull request of ours exists to comment
+   * on. Posting on somebody's pull request stays a side effect a caller decides to want.
    */
+  /**
+   * Put new commits on a pull request that already exists.
+   *
+   * `publish`'s sibling, and separate from it because the two differ in the only way that
+   * matters here: `publish` creates a branch and refuses to overwrite one, while this one
+   * is *required* to move a branch somebody else can see. Folding them into one method
+   * with a flag would put "never overwrite" and "overwrite exactly this" behind the same
+   * argument list, which is the kind of seam that eventually overwrites the wrong thing.
+   *
+   * `expect` is the commit the branch must still be at. It becomes
+   * `--force-with-lease=<branch>:<expect>`, so the refusal is git's and is atomic against
+   * the remote — the pipeline's earlier check is a courtesy that saves an agent's time,
+   * and this is the one that is actually load-bearing. A plain `--force` here would
+   * silently discard whatever a person pushed while the revision was running.
+   */
+  revise(input: {
+    /** The project's checkout on this host. How the remote and its credential are found. */
+    repo: string
+    /** The scratch worktree holding the applied commits. Its HEAD is what goes up. */
+    from: string
+    /** The pull request's head branch. */
+    branch: string
+    /** The commit that branch must still point at, or the push is refused. */
+    expect: string
+  }): Promise<void>
   comment(input: {
     /** The project's checkout on this host. How the remote and its credential are found. */
     repo: string
@@ -220,6 +245,15 @@ export async function publishPatch(input: {
   workerName: string
   /** What the pull request targets, and what must never be pushed to. */
   defaultBranch: string
+  /**
+   * The pull request this run revises, when it revises one (§4.13).
+   *
+   * Absent is the ordinary path and the one every run took before revisions existed: mint
+   * a branch, open a draft pull request. Present, the commits go onto `branch` and the
+   * result is said on `number` — no second pull request is opened, because the first one
+   * is the answer.
+   */
+  changeRequest?: { repo: string; number: number; branch: string; headSha: string }
   /** The commit the workspace was pinned to and the patch was made against. */
   baseSha: string
   /** Path to the `git format-patch` mbox `extractPatch` wrote. */
@@ -251,7 +285,14 @@ export async function publishPatch(input: {
   // Narrowed by `refuseBefore`, which returns a reason when it is absent.
   const policies = input.policies!
 
-  const branch = branchFor({ workerName: input.workerName, runId: input.runId })
+  /**
+   * A revision pushes to the branch the pull request already has; everything else mints
+   * one. `branchFor` is not consulted in the revision case, because a new name is exactly
+   * what must not happen — a fresh branch is a fresh pull request, which is the bug.
+   */
+  const branch = input.changeRequest
+    ? input.changeRequest.branch
+    : branchFor({ workerName: input.workerName, runId: input.runId })
 
   /**
    * The prefix already makes this impossible, and it is checked anyway. **Kept
@@ -357,11 +398,21 @@ export async function publishPatch(input: {
      * step, so the count is as fresh as it can be. Closing a pull request while a run is
      * in flight should make room for it.
      */
-    const open = await input.remote.countOpenPullRequests({
-      repo: input.repo,
-      branchPrefix: BRANCH_PREFIX,
-    })
-    if (open >= policies.maxOpenPullRequests) {
+    /**
+     * Skipped when revising, because the cap counts pull requests and a revision opens
+     * none — it moves one that is already open and already counted.
+     *
+     * Applying it here would be worse than redundant. A project at its cap would stop
+     * being able to *fix* the pull requests that are holding the cap, which is the one
+     * action guaranteed to bring the number down.
+     */
+    const open = input.changeRequest
+      ? 0
+      : await input.remote.countOpenPullRequests({
+          repo: input.repo,
+          branchPrefix: BRANCH_PREFIX,
+        })
+    if (!input.changeRequest && open >= policies.maxOpenPullRequests) {
       return {
         refused:
           `${open} ogun pull request(s) are already open and policies.maxOpenPullRequests ` +
@@ -377,6 +428,43 @@ export async function publishPatch(input: {
     const subjects = (await gitIn(worktree, ['log', '--reverse', '--format=%s', range])).stdout
       .split('\n')
       .filter(Boolean)
+
+    /**
+     * A revision moves the branch and says so; it does not open anything.
+     *
+     * The push comes first and the comment second, in that order and not the other,
+     * because the comment is a claim about the branch. A comment that lands and a push
+     * that is then refused leaves a pull request saying it was revised when it was not —
+     * and the refusal this is guarding against, somebody pushing mid-run, is exactly the
+     * situation where a person is reading the thread.
+     */
+    if (input.changeRequest) {
+      const { number, headSha, repo: slug } = input.changeRequest
+      await input.remote.revise({
+        repo: input.repo,
+        from: worktree,
+        branch,
+        expect: headSha,
+      })
+      /**
+       * Not swallowed. A revision whose comment failed is a revision nobody was told
+       * about, and the push has already happened — so the honest outcome is a failed
+       * publish naming a branch that did move, rather than a success that quietly lost
+       * the only notification a reviewer gets.
+       */
+      await input.remote.comment({
+        repo: input.repo,
+        number,
+        body: revisionComment({
+          workerName: input.workerName,
+          runId: input.runId,
+          from: headSha,
+          commits: subjects.length,
+          log,
+        }),
+      })
+      return { pr: { branch, url: pullRequestUrl(slug, number) } }
+    }
 
     const { url } = await input.remote.publish({
       repo: input.repo,
@@ -543,6 +631,60 @@ function titleFor(subjects: string[], workerName: string): string {
  * and which nothing here can rewrite without destroying the artefact. That is a real
  * remaining gap and it is recorded in ADR-0009 rather than hidden here.
  */
+/**
+ * `https://github.com/<repo>/pull/<n>` — constructed, not carried.
+ *
+ * The emission knows the pull request's url and could have stored it, and deliberately
+ * does not: a stored url is a second copy of something GitHub already decides, and this
+ * one is a pure function of two values the row holds anyway. The same argument `runs.ts`
+ * makes for building a Linear issue's url out of its workspace key and identifier.
+ */
+function pullRequestUrl(slug: string, number: number): string {
+  /**
+   * `owner/name`, which is **not** `publishPatch`'s `repo`. That one is a path on this
+   * host, and the two sit one scope apart under the same word — this parameter is named
+   * `slug` because the first version of this function took the wrong one and produced
+   * `https://github.com//tmp/ogun-publish-xxxx/repo/pull/42`.
+   */
+  return `https://github.com/${slug}/pull/${number}`
+}
+
+/**
+ * What a reviewer reads on the pull request when Ogun has answered them.
+ *
+ * Deliberately not `bodyFor`. That one introduces a pull request to somebody who has not
+ * seen it — it says what the branch is, what the base was, what the worker is for. A
+ * person reading this already has all of that on screen; what they do not have is what
+ * changed since they asked, which is the only thing here.
+ *
+ * It names the commit the revision started from, because that is the fact that settles
+ * the question a reviewer actually has — whether this answers the review they wrote or
+ * one written against some other state of the branch.
+ */
+function revisionComment(input: {
+  workerName: string
+  runId: string
+  from: string
+  commits: number
+  log: string
+}): string {
+  const n = input.commits
+  return [
+    `Revised by \`${input.workerName}\` — ${n} commit${n === 1 ? '' : 's'} on top of ` +
+      `\`${input.from.slice(0, 12)}\`, the commit the review was written against.`,
+    '',
+    '<details><summary>What changed</summary>',
+    '',
+    '```',
+    input.log.trim(),
+    '```',
+    '',
+    '</details>',
+    '',
+    `<sub>run ${input.runId}</sub>`,
+  ].join('\n')
+}
+
 function bodyFor(input: {
   workerName: string
   runId: string
@@ -739,6 +881,27 @@ export function githubCli(): PublishRemote {
       }
     },
 
+    async revise({ from, branch, expect }) {
+      /**
+       * `--force-with-lease=<ref>:<sha>` rather than `--force-with-lease` on its own.
+       *
+       * The bare form compares against *this* repository's remote-tracking ref, which is
+       * whatever the last fetch left behind — so a stale tracking ref makes it pass when
+       * the remote has moved, which is the exact case it exists to catch. Naming the sha
+       * explicitly means the comparison is against the commit the review was written
+       * against, and nothing local can weaken it.
+       *
+       * Fully qualified on the destination for the reason `publish` gives: `HEAD:branch`
+       * would consult the remote's refs and could resolve somewhere other than a branch.
+       */
+      await hostGit(from, [
+        'push',
+        '--quiet',
+        `--force-with-lease=refs/heads/${branch}:${expect}`,
+        'origin',
+        `HEAD:refs/heads/${branch}`,
+      ])
+    },
     async comment({ repo, number, body }) {
       /**
        * The number is proved to be a number before it is argv, for the reason `branchFor`

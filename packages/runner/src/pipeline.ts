@@ -43,6 +43,7 @@ import { MAX_MODIFIER_ROUNDS, retryDecision, retryPrompt } from './retry.ts'
 import {
   gitIn,
   materializeWorkspace,
+  redactUrlCredentials,
   resolveHeadSha,
   stageAll,
   sweepGateArtifacts,
@@ -259,8 +260,52 @@ export async function executeJob(
       )
     }
 
+    /**
+     * A revision starts from the commit that was reviewed, not from the default branch.
+     *
+     * This is the whole difference between revising a pull request and writing a second
+     * one. The brief says "you are revising a pull request you opened" and names the
+     * branch; handing that agent a workspace pinned to `main` gives it none of the
+     * commits it is being asked to change, so the best it can do is rewrite them from
+     * scratch and the result competes with the pull request it was meant to fix.
+     */
     let baseSha: string | undefined
-    if (localPath) {
+    if (job.changeRequest) {
+      const { branch, headSha, number } = job.changeRequest
+      if (localPath) {
+        /**
+         * Host-side, before the container exists. The sandbox has no remote and no
+         * credential (§4.6, ADR-0010); fetching is the runner's job, as pushing is.
+         */
+        try {
+          await gitIn(localPath, ['fetch', 'origin', branch])
+        } catch (err) {
+          return await fail(
+            `could not fetch "${branch}" for #${number}: ` +
+              redactUrlCredentials(err instanceof Error ? err.message : String(err)),
+          )
+        }
+      }
+      /**
+       * Refuse now if somebody has pushed since the review was written.
+       *
+       * The push later uses `--force-with-lease` and would refuse anyway, which is the
+       * check that actually matters because it is atomic. This one exists to refuse
+       * *before* an agent spends twenty minutes on a revision that cannot land — and to
+       * say why in a sentence, rather than as a git error after the work is done.
+       */
+      const tip = localPath
+        ? await resolveHeadSha(localPath, `origin/${branch}`).catch(() => null)
+        : null
+      if (tip && tip !== headSha) {
+        return await fail(
+          `#${number} has moved since the review: "${branch}" is at ${tip.slice(0, 12)}, ` +
+            `the review was written against ${headSha.slice(0, 12)}. Nothing was changed. ` +
+            'The next poll sees the new head as a new round and will pick it up.',
+        )
+      }
+      baseSha = headSha
+    } else if (localPath) {
       try {
         baseSha = await resolveHeadSha(localPath, job.projectDefaultBranch)
       } catch {
@@ -276,7 +321,9 @@ export async function executeJob(
       ...(job.remoteUrl ? { remoteUrl: job.remoteUrl } : {}),
       scratch: config.scratch,
       runId: job.runId,
-      ref: baseSha ?? job.projectDefaultBranch,
+      // A revision with no local checkout clones the pull request's branch by name; the
+      // detach below pins it, and `baseSha` is the commit the review was written against.
+      ref: baseSha ?? job.changeRequest?.branch ?? job.projectDefaultBranch,
     })
     cleanup = workspace.cleanup
 
@@ -1406,6 +1453,10 @@ async function publishIfReady(input: {
       tests: input.tests,
       ...(input.policies ? { policies: input.policies } : {}),
       ...(input.bootstrap ? { bootstrap: input.bootstrap } : {}),
+      // Present only on a revision, and it changes the ending: the commits go onto the
+      // pull request's own branch and the result is said there, rather than a new branch
+      // and a second pull request answering the first (§4.13).
+      ...(input.job.changeRequest ? { changeRequest: input.job.changeRequest } : {}),
       // The only place a credential enters this pipeline. `publishPatch` takes it as a
       // parameter so every gate above it can be tested without one (ADR-0009).
       remote: githubCli(),

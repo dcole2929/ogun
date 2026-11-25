@@ -344,7 +344,11 @@ behaviour for a credential anyway: a secret that migrates itself is a secret in 
     the one moment somebody is looking at the screen. A nearest-match "did you mean" was
     considered and is not worth twelve lines while `SECRET_NAMES` has one element — listing
     the set *is* the did-you-mean. When it grows past what fits on a line, it becomes worth
-    them.
+    them. [amended: it has two elements, `linear` and `github`. `github` joined on this
+    record's own test — a value used verbatim as a credential, by something that polls,
+    since the control plane reads pull requests Ogun opened to find the ones somebody asked
+    it to revise. Two names still fit on a line, so the decision stands and only the count
+    moved.]
 
   **What happens to the overlap**, which is real and is acknowledged rather than designed
   away. `ogun connect linear --api-key` and `ogun secret set linear <key>` both put a
@@ -375,6 +379,19 @@ behaviour for a credential anyway: a secret that migrates itself is a secret in 
   same file at 0600, `readProjectSecret` is unchanged, and `packages/gateway` reads grants
   through the same retrieval it always did. What changed is which command may write which
   name, and what each one says while doing it.
+
+  [amended] **The grant half of that shape did move, and `secrets` did not.** The sentence
+  above was written while `oauth` held both an application and the token it had produced.
+  It now reads: `secrets` is one of **four** blocks in the same file at 0600 — `secrets`,
+  `applications`, `grants`, and `oauth` kept as the shape an unconverted file still has.
+  ADR-0017 is the split and the argument for it. What survives unchanged, which is the half
+  this record is about, is **where the value lives and who may read it**: the same file at
+  0600 on the machine that polls, the same `updateLocalConfig` lock, the same module as the
+  only reader and writer, nothing in postgres, nothing on the wire to a runner, nothing in
+  a container. `readProjectSecret` is still the one function that answers "what does a poll
+  authenticate with" and still total; what it gained is a read through the migration, so a
+  config.json nobody has written since the upgrade answers about a live connection rather
+  than reporting it absent.
 
   [amended] **A value passed as an argument is now accepted with a warning, where it used
   to be refused.** This reverses a decision this record made deliberately and tested, so it
@@ -556,7 +573,9 @@ behaviour for a credential anyway: a secret that migrates itself is a secret in 
   credential.
 
 - **`secrets` has to stay declared in `localConfigSchema`, and deleting it is silent.**
-  [ADR-0014 added an `oauth` block beside it, under the same rule and for the same reason.]
+  [ADR-0014 added an `oauth` block beside it, under the same rule and for the same reason;
+  ADR-0017 added `applications` and `grants` under it too, and `oauth` stays declared
+  because an unconverted file still has one.]
   `updateLocalConfig` is a read-modify-write through that schema and zod strips what it does
   not name, so an undeclared block would be dropped by the next `ogun project add` or
   `ogun runner join`. The symptom would be a Linear key that stopped working on the day
