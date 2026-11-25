@@ -2,7 +2,7 @@ import { strict as assert } from 'node:assert'
 import { after, before, describe, test } from 'node:test'
 import type { Page } from 'playwright'
 import { open, settle, type Harness } from './harness.ts'
-import { ALL_CLEAR, RUN_WITH_EVENTS, RUNS } from './fixtures.ts'
+import { ALL_CLEAR, RUN_WITH_EVENTS, RUNS, SYSTEM } from './fixtures.ts'
 
 /**
  * The tray is a toggle, and these tests share one browser for speed — so a test that
@@ -521,6 +521,51 @@ describe('the services checkbox follows the permission profile', () => {
   let h: Harness
   before(async () => {
     h = await open('/workers', {})
+ * The way back from a disconnect.
+ *
+ * `ogun disconnect` takes a project's row off the Settings page, and until now the only
+ * route to reconnecting it was re-entering the application's credentials. For a GitHub
+ * App that is not something an operator can do: **the private key is shown once at
+ * generation and can never be retrieved.** So a disconnect in the UI was a one-way door
+ * onto a path only the CLI could reopen, and only for somebody who still had the .pem.
+ *
+ * `--link` has always been the way back. These assert that the browser has it too.
+ */
+describe('linking a project to an application that is already registered', () => {
+  let h: Harness
+  /** What the page posted, so "it links" means a request with the right body. */
+  let posted: Array<{ url: string; body: string }>
+
+  before(async () => {
+    posted = []
+    h = await open('/settings', {
+      '/api/system': SYSTEM,
+      '/api/oauth/applications': {
+        applications: [
+          {
+            name: 'heirchive',
+            provider: 'github',
+            method: 'app',
+            identifiesAs: 'App 000000',
+            // One project short of all of them, so there is something to offer.
+            usedBy: ['heirchive-api'],
+            malformed: null,
+          },
+          {
+            name: 'every-project',
+            provider: 'github',
+            method: 'app',
+            identifiesAs: 'App 111111',
+            usedBy: ['heirchive-api', 'ogun'],
+            malformed: null,
+          },
+        ],
+      },
+    })
+    await h.page.route('**/api/oauth/*/link/*', async (route) => {
+      posted.push({ url: route.request().url(), body: route.request().postData() ?? '' })
+      await route.fulfill({ status: 200, contentType: 'application/json', body: '{"connected":{}}' })
+    })
     await settle(h.page)
   })
   after(() => h.stop())
@@ -556,5 +601,48 @@ describe('the services checkbox follows the permission profile', () => {
       .first()
       .textContent()
     assert.match(help ?? '', /judged by/, 'the reason is on screen, not in a later error')
+  /**
+   * The picker offers the projects this application does *not* already serve. An empty
+   * one beside a full list is a control that can only disappoint, so the row that serves
+   * everything shows nothing at all.
+   */
+  test('the picker offers only the projects not already served', async () => {
+    const { page } = h
+    const table = page.locator('table:has(th:text-is("Application"))')
+    const rows = table.locator('tbody tr')
+    const withRoom = rows.filter({ hasText: 'heirchive' }).first()
+    const options = await withRoom.locator('.link-project option').allTextContents()
+    assert.deepEqual(options, ['ogun'], 'exactly the project it does not serve')
+
+    const full = rows.filter({ hasText: 'every-project' }).first()
+    assert.equal(
+      await full.locator('.link-project').count(),
+      0,
+      'an application serving every project offers no picker',
+    )
+  })
+
+  /**
+   * And the button is live on first paint. It is a `picked ?? available[0]` rather than
+   * `useState(available[0])` for this reason: the projects query resolves after the first
+   * render, so state seeded from it freezes empty while the `<select>` shows its first
+   * option — a form that looks ready and refuses to submit, which is the bug the GitHub
+   * App form shipped with.
+   */
+  test('the button is live without touching the picker, and posts the link', async () => {
+    const { page } = h
+    const button = page
+      .locator('table:has(th:text-is("Application"))')
+      .locator('.link-project button')
+      .first()
+    assert.equal(await button.isDisabled(), false, 'enabled before anything is chosen')
+
+    await button.click()
+    await page.waitForFunction(() => true)
+    await settle(page)
+
+    assert.equal(posted.length, 1, `expected one link request, got ${posted.length}`)
+    assert.match(posted[0]?.url ?? '', /\/api\/oauth\/github\/link\/ogun$/)
+    assert.deepEqual(JSON.parse(posted[0]?.body ?? '{}'), { application: 'heirchive' })
   })
 })

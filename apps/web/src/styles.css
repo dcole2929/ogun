@@ -633,4 +633,29 @@ td.mono > .extlink, td.mono { white-space: nowrap; }
   display: flex;
   flex-direction: column;
   gap: 4px;
+ * The per-application "link a project" control, which sits inside the Used by cell.
+ *
+ * Its own row below the project list rather than inline with it: the list is prose that
+ * wraps, and a select and a button wrapping into the middle of "heirchive-api, clawz"
+ * reads as part of the sentence. `margin-top` rather than a gap on the cell, so a row
+ * with no control left to offer keeps its original height.
+ */
+.link-project {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.link-project select {
+  flex: 0 1 auto;
+  min-width: 9rem;
+  max-width: 16rem;
+}
+
+.link-project .error {
+  /* Full width, because the one error this renders is two sentences and a command. */
+  flex-basis: 100%;
+  margin: 4px 0 0;
 }

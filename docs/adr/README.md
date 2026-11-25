@@ -108,3 +108,4 @@ wrong is a proposed ADR that supersedes it, not a finding.
 - [ADR-0014 — A project connects to Linear as an application](0014-a-project-connects-to-linear-as-an-application.md)
 - [ADR-0015 — A ticket becomes a plan, then a patch, and the review of it is a lens](0015-a-ticket-becomes-a-plan-then-a-patch.md)
 - [ADR-0016 — A project can be containerised by the machine that needs it, and the image is the gate](0016-a-project-can-be-containerised-by-the-machine-that-needs-it.md)
+- [ADR-0017 — An application is shared, and a grant is not](0017-an-application-is-shared-and-a-grant-is-not.md)

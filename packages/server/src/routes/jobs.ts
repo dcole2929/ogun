@@ -20,7 +20,7 @@ import {
 import { policiesByProject } from '../foreman/policies.ts'
 import { markCoverage } from '../foreman/cycles.ts'
 
-const { findings, jobs, projects, runners, runs, stagedFindings, workers } = schema
+const { findings, jobs, projects, runners, runs, sourceEmissions, stagedFindings, workers } = schema
 
 const globalLimits = {
   ...DEFAULT_LIMITS,
@@ -232,6 +232,25 @@ jobsRoutes.post('/claim', async (c) => {
     if (!run) continue
 
     const config = found.worker.config as Record<string, unknown>
+
+    /**
+     * The pull request this job revises, if it revises one.
+     *
+     * Found through the cycle run rather than carried on the job, because a cycle run is
+     * what a source emits and a job is one node inside it: every node of a revision cycle
+     * answers the same pull request, and a column on `jobs` would be that fact copied per
+     * node with nothing keeping the copies equal.
+     *
+     * Null for every ticket and for every scheduled run, which is the shape the field is
+     * optional for — absent means "publish the ordinary way", which is what every job did
+     * before revisions existed.
+     */
+    const [emission] = await db
+      .select({ changeRequest: sourceEmissions.changeRequest })
+      .from(sourceEmissions)
+      .where(eq(sourceEmissions.cycleRunId, found.job.cycleRunId))
+      .limit(1)
+
     out.push(
       claimedJobSchema.parse({
         jobId: found.job.id,
@@ -265,6 +284,10 @@ jobsRoutes.post('/claim', async (c) => {
         // Only when the worker opted *out*. Sending `true` would be the same as sending
         // nothing and would put a field on every job to say "as usual".
         ...(config.services === false ? { services: false } : {}),
+        // Parsed by `claimedJobSchema`, so a row written by a build that stored a
+        // different shape is refused at the claim rather than reaching a runner that
+        // would push somewhere on the strength of it.
+        ...(emission?.changeRequest ? { changeRequest: emission.changeRequest } : {}),
         timeoutMs: Number(config.timeoutMs ?? 30 * 60_000),
         skillRef: found.worker.skillRef,
         verify: config.verify,
