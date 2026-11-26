@@ -48,14 +48,6 @@ const workerFields = z.object({
   /** What happens when the machine was asleep at the scheduled time (§4.2). */
   onMissed: z.enum(['skip', 'runOnce']).default('skip'),
   timeoutMs: z.number().int().positive().optional(),
-  /**
-   * Whether the project's own services come up for this worker's jobs.
-   *
-   * `default(true)` rather than `optional()`, so an edit that does not mention it writes
-   * the default back rather than leaving whatever was there — which is what every other
-   * field in this schema does, and what the form below posts on every save.
-   */
-  services: z.boolean().default(true),
   enabled: z.boolean().default(true),
 })
 
@@ -465,10 +457,6 @@ const toWorkerConfig = (input: z.infer<typeof workerFields> & Record<string, unk
     model: input.model,
     permissions: input.permissions,
     sandbox: input.sandbox,
-    // Written only when it is `false`. `true` is the schema's default, so writing it
-    // would put a line in every worker to say "as usual" — and this file is read by
-    // people, not only by the parser.
-    ...(input.services === false ? { services: false } : {}),
     enabled: input.enabled,
     ...(input.prompt ? { prompt: input.prompt } : {}),
     ...(input.schedule ? { schedule: input.schedule } : {}),

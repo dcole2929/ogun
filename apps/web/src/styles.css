@@ -620,21 +620,6 @@ td.mono > .extlink, td.mono { white-space: nowrap; }
   font-family: var(--mono); font-size: 12px;
   white-space: pre-wrap; overflow-x: auto;
 }
-
-/**
- * A checkbox with a sentence under it, inside the two-column worker form.
- *
- * Without this the `<small>` is a grid child of its own and lands in the *other* column,
- * where it reads as an explanation of whatever happens to sit beside it. Spanning the
- * full width keeps the sentence under the box it is about.
- */
-.form .checkbox-field {
-  grid-column: 1 / -1;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
 /*
  * The per-application "link a project" control, which sits inside the Used by cell.
  *
