@@ -129,16 +129,6 @@ export const claimedJobSchema = z.object({
    */
   bootstrap: z.enum(BOOTSTRAP_KINDS).optional(),
   /**
-   * Whether this job needs the project's own services — see `workerSchema.services`.
-   *
-   * Optional on the wire and **absent means true**, which is the opposite of how
-   * `connections` and `bootstrap` read their absence and is deliberate. Those two grant
-   * something, so absent must mean "nothing granted". This one withholds something, so
-   * absent must mean "nothing withheld" — a runner older than this field keeps starting
-   * the stack, and a job claimed by one is slow rather than broken.
-   */
-  services: z.boolean().optional(),
-  /**
    * The pull request this job is a revision of (§4.13, ADR-0009).
    *
    * Absent on every ordinary job, which is the safe direction and what a runner older

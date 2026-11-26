@@ -96,29 +96,6 @@ const SHOTS: Shot[] = [
     path: '/workers',
     status: ALL_CLEAR,
   },
-  /**
-   * The worker form, open on a reviewer, showing the services checkbox.
-   *
-   * A reviewer rather than a modifier because this is the row where the box is *live*.
-   * A modifier's is forced on and disabled — its patch is judged by `tests.command` in
-   * the same sandbox, so switching services off would point its own gate at a database
-   * that is not running.
-   */
-  {
-    name: 'worker-services',
-    path: '/workers',
-    act: async (page) => {
-      await page
-        .locator('.card')
-        .filter({ hasText: 'scope-a-ticket' })
-        .getByRole('button', { name: 'Edit' })
-        .click()
-      // The box is the subject of the shot, so it is waited for rather than assumed.
-      const box = page.locator('label.inline').filter({ hasText: 'services' }).locator('input')
-      await box.waitFor({ timeout: 5_000 })
-      await box.scrollIntoViewIfNeeded()
-    },
-  },
   {
     name: 'worker-focused',
     path: '/workers?focus=security-review',

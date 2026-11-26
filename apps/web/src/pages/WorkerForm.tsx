@@ -69,7 +69,6 @@ export function WorkerForm({
   const [sandbox, setSandbox] = useState(existing?.sandbox ?? 'container')
   const [prompt, setPrompt] = useState(String(existing?.config?.prompt ?? ''))
   const [enabled, setEnabled] = useState(existing?.enabled ?? true)
-  const [services, setServices] = useState(existing?.config.services !== false)
   const [schedule, setSchedule] = useState<ScheduleValue>({
     cron: String(existing?.config?.schedule ?? ''),
     onMissed: (existing?.config?.onMissed as 'skip' | 'runOnce') ?? 'skip',
@@ -97,11 +96,6 @@ export function WorkerForm({
         model,
         permissions,
         sandbox,
-        // A modifier's gate runs the project's suite in the same sandbox, so the server
-        // refuses `services: false` beside it. Posting the box's state there would make
-        // the form unsubmittable with an error about a checkbox that is disabled on
-        // screen; posting what is actually true is both honest and accepted.
-        services: permissions === 'modifier' ? true : services,
         enabled,
         // An empty string is how you clear a prompt override; omitting it would keep
         // the old one on an edit. Same for the schedule.
@@ -268,51 +262,6 @@ export function WorkerForm({
             cycle instead.
           </p>
         )}
-
-        {/*
-          Opting out of the project's services, which is a cost question and not a
-          capability one — so it sits beside Enabled rather than up with the sandbox.
-
-          A project image starts its stack on every container start: for heirchive-api
-          that is postgres, gotrue, storage and postgrest, plus a replay of every
-          migration in the repository, before the agent's first token. A worker that reads
-          a ticket or a diff pays all of it and opens no connection.
-        */}
-        <div className="checkbox-field">
-        <label className="inline">
-          <input
-            type="checkbox"
-            checked={permissions === 'modifier' ? true : services}
-            disabled={permissions === 'modifier'}
-            onChange={(e) => setServices(e.target.checked)}
-          />
-          <span>Needs the project&rsquo;s services</span>
-        </label>
-        <small className="muted">
-          {permissions === 'modifier' ? (
-            <>
-              Always on for a modifier. Its patch is judged by{' '}
-              <span className="mono">tests.command</span> in this same sandbox, so turning
-              services off would point its own gate at a database that is not running — and
-              that arrives as a refused connection inside a test, not as an error about this
-              box.
-            </>
-          ) : services ? (
-            <>
-              On. The project&rsquo;s database and anything on top of it come up before the
-              agent starts. Turn this off for a worker that only reads — a triage or review
-              run waits for the whole stack and never opens a connection.
-            </>
-          ) : (
-            <>
-              Off. Jobs for this worker start without the project&rsquo;s stack. A project
-              image that does not read{' '}
-              <span className="mono">OGUN_PROJECT_SERVICES</span> starts it anyway, so this
-              saves nothing until that image checks.
-            </>
-          )}
-        </small>
-        </div>
 
         <label className="inline">
           <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} />

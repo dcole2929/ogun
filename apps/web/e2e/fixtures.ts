@@ -31,8 +31,6 @@ const worker = (
     permissions?: string
     sandbox?: string
     skillOrigin?: string | null
-    /** `false` puts the "no services" pill on the row; absent is the ordinary worker. */
-    services?: boolean
   } = {},
 ) => ({
   worker: {
@@ -45,7 +43,7 @@ const worker = (
     sandbox: over.sandbox ?? 'container',
     enabled: true,
     versionHash: 'h',
-    config: over.services === undefined ? {} : { services: over.services },
+    config: {},
   },
   project: { slug: project },
   skillOrigin: over.skillOrigin === undefined ? 'builtin' : over.skillOrigin,
@@ -59,8 +57,7 @@ const worker = (
 export const WORKERS = {
   workers: [
     worker('adversarial-review', 'ogun'),
-    // Reads a ticket and opens no connection — the case the pill is for.
-    worker('scope-a-ticket', 'ogun', { permissions: 'observer', services: false }),
+    worker('scope-a-ticket', 'ogun', { permissions: 'observer' }),
     worker('local-thing', 'ogun', { sandbox: 'worktree', skillOrigin: 'project' }),
     worker('security-review', 'heirchive-api'),
     worker('plan-a-ticket', 'heirchive-api'),

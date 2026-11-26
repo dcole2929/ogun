@@ -1,6 +1,7 @@
 import { strict as assert } from 'node:assert'
 import { test } from 'node:test'
 import { buildRunArgs, GUEST_WORKSPACE } from '../src/sandbox/container.ts'
+import { imageFor, runsInProjectImage } from '../src/pipeline.ts'
 
 /**
  * `env:` puts a project's own variables into `docker run`, and `docker run` resolves a
@@ -101,4 +102,44 @@ test('a worker that needs no services says so, and one that does says nothing', 
     [],
     'absent means yes, so an older runner and an older image both keep working',
   )
+})
+
+/**
+ * Which jobs get the project's services, and why it is not a setting.
+ *
+ * It was one: `services: true | false` on the worker, defaulting to true, refused on a
+ * modifier. That check was the tell — the field had exactly one legal value per
+ * permission profile, which is a derivation wearing a knob's clothes.
+ *
+ * The rule is already written down in `imageFor`: a modifier that is not bootstrapping
+ * runs in the project's image, and everything else runs in `ogun/base`. The project's
+ * image is where the project's stack lives, and the job that needs that stack is the job
+ * that runs `tests.command` — which `verify.ts` makes mandatory for a modifier and gives
+ * to nobody else.
+ *
+ * So one predicate answers both, and a job cannot be handed the project's image with its
+ * database switched off.
+ */
+test('the project image and the project services are one decision', () => {
+  const job = (over: { permissions?: string; bootstrap?: string }) =>
+    ({ permissions: 'reviewer', projectSlug: 'acme', ...over }) as Parameters<typeof imageFor>[0]
+
+  // A modifier runs the suite, in the project's image, with the stack up.
+  assert.equal(runsInProjectImage(job({ permissions: 'modifier' })), true)
+  assert.match(imageFor(job({ permissions: 'modifier' })), /acme/)
+
+  // A reviewer reads a diff in ogun/base. There is no stack in there to start.
+  for (const permissions of ['reviewer', 'observer']) {
+    assert.equal(runsInProjectImage(job({ permissions })), false, permissions)
+    assert.ok(!imageFor(job({ permissions })).includes('acme'), permissions)
+  }
+
+  /**
+   * And the one that would be easy to get wrong in either direction: a worker whose job
+   * is to *create* the project image has none to run in yet, so its suite runs inside the
+   * image its own patch proposes. The outer container is `ogun/base`.
+   */
+  const bootstrapping = job({ permissions: 'modifier', bootstrap: 'project-image' })
+  assert.equal(runsInProjectImage(bootstrapping), false)
+  assert.ok(!imageFor(bootstrapping).includes('acme'))
 })

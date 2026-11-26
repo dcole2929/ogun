@@ -585,12 +585,14 @@ export async function executeJob(
       runtime: spec.provider,
       timeoutMs: job.timeoutMs,
       /**
-       * The worker's answer, carried on the claim. One sandbox serves the agent *and*
-       * the verification pass that follows it, so this is decided once here rather than
-       * per exec — and it has to be, because the gate runs the project's suite and a
-       * suite denied its database fails on a refused connection.
+       * Derived, not declared. The same predicate that picks the image decides whether
+       * the stack inside it starts, so a job cannot be given the project's image with its
+       * database switched off.
+       *
+       * Decided once for the sandbox rather than per exec, because one sandbox serves the
+       * agent *and* the verification pass that runs the suite in it.
        */
-      ...(job.services === false ? { services: false } : {}),
+      ...(runsInProjectImage(job) ? {} : { services: false }),
       image: process.env.OGUN_IMAGE_OVERRIDE ?? imageFor(job),
       // The project's answer, from the blob at the pinned base — not a constant, and not
       // anything the agent about to run in here could have written. `sandboxDowngrade`
@@ -1694,12 +1696,31 @@ function describeExtraction(change: PatchExtraction): string {
  * non-modifier gets, and its patch is proved by the `project-image` lens instead —
  * host-side, in an image built out of the patch itself (ADR-0016).
  */
+/**
+ * Whether this job runs in the project's own image — and therefore whether the project's
+ * own services have to come up for it.
+ *
+ * One predicate for two questions, because they have one answer. The project image exists
+ * to hold the project's toolchain and its stack; the job that needs that stack is the job
+ * that runs `tests.command`; and the tests lens is mandatory for a modifier and absent for
+ * everything else (`verify.ts`). A reviewer reads a diff in `ogun/base`, where there is no
+ * stack to start and nothing that would use one.
+ *
+ * Named rather than written twice, because the version of this that drifts is the one
+ * where a job runs in the project image with its database switched off, and finds out
+ * inside somebody's test suite.
+ *
+ * A `bootstrap: project-image` worker is excluded by the same clause for the same reason
+ * it gets the base image: the project has no image yet, which is the whole reason that
+ * worker exists. Its suite runs inside the image its own patch proposes.
+ */
+export const runsInProjectImage = (
+  job: Pick<ClaimedJob, 'permissions'> & { bootstrap?: string },
+): boolean => job.permissions === 'modifier' && !job.bootstrap
+
 export const imageFor = (
   job: Pick<ClaimedJob, 'permissions' | 'projectSlug'> & { bootstrap?: string },
-): string =>
-  job.permissions === 'modifier' && !job.bootstrap
-    ? projectImage(job.projectSlug)
-    : baseImage()
+): string => (runsInProjectImage(job) ? projectImage(job.projectSlug) : baseImage())
 
 async function trackedPaths(workspace: string): Promise<Set<string>> {
   // Through `gitIn`, like every git call made after the container has exited: `ls-files`
