@@ -699,6 +699,34 @@ describe('syncing a sources: block', () => {
     const result = await sync({
       tickets: { kind: 'linear', cycle: 'evaluator', team: 'ENG', filter: { status: ['Todo'] } },
     })
-    assert.deepEqual(result.sources, [{ name: 'tickets', cycle: 'evaluator' }])
+    assert.deepEqual(result.sources, [{ name: 'tickets', cycle: 'evaluator', kind: 'linear' }])
+  })
+
+  /**
+   * The summary `ogun project sync` prints names the kind each source actually is.
+   *
+   * It printed the word `linear` for every source, because it was written when there was
+   * one kind — and `sourceSchema`'s own comment said "It becomes one the day there are
+   * two", which it did. A github source announcing itself as linear is wrong about the
+   * one fact somebody reads that line to check, at the only moment a source reports
+   * anything outside a `source_polls` row they have to go looking for.
+   */
+  test('the sync summary carries each source\u2019s own kind', async () => {
+    const result = await sync({
+      tickets: { kind: 'linear', cycle: 'evaluator', team: 'ENG', filter: { status: ['Todo'] } },
+      reviews: {
+        kind: 'github',
+        cycle: 'evaluator',
+        conditions: { repos: ['owner/name'], label: 'ogun-revise' },
+      },
+    })
+    assert.deepEqual(
+      [...result.sources].sort((a, b) => a.name.localeCompare(b.name)),
+      [
+        { name: 'reviews', cycle: 'evaluator', kind: 'github' },
+        { name: 'tickets', cycle: 'evaluator', kind: 'linear' },
+      ],
+    )
   })
 })
+

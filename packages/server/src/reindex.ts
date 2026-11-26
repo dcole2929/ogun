@@ -81,7 +81,7 @@ export type ReindexResult = {
    */
   registeredRunners: number
   /** Sources indexed from `sources:`, and the cycle each one feeds (§4.13, ADR-0013). */
-  sources: Array<{ name: string; cycle: string }>
+  sources: Array<{ name: string; cycle: string; kind: string }>
 }
 
 /**
@@ -354,7 +354,7 @@ async function syncSources(
   db: Db,
   projectId: string,
   defined: Record<string, SourceConfig>,
-): Promise<Array<{ name: string; cycle: string }>> {
+): Promise<Array<{ name: string; cycle: string; kind: string }>> {
   for (const [name, source] of Object.entries(defined)) {
     const values = {
       projectId,
@@ -381,7 +381,11 @@ async function syncSources(
       ),
     )
 
-  return Object.entries(defined).map(([name, source]) => ({ name, cycle: source.cycle }))
+  return Object.entries(defined).map(([name, source]) => ({
+    name,
+    cycle: source.cycle,
+    kind: source.kind,
+  }))
 }
 
 /**

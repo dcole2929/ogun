@@ -120,7 +120,7 @@ export async function projectSync(args: string[], serverUrl: string): Promise<vo
     overriddenSchedules?: string[]
     unmetRequirements?: Array<{ worker: string; missing: string[] }>
     registeredRunners?: number
-    sources?: Array<{ name: string; cycle: string }>
+    sources?: Array<{ name: string; cycle: string; kind?: string }>
   }
 
   console.log(green(`synced ${payload.slug}`))
@@ -161,7 +161,7 @@ export async function projectSync(args: string[], serverUrl: string): Promise<vo
    * polls, refuses, and does it again in five minutes.
    */
   for (const source of result.sources ?? []) {
-    console.log(dim(`source ${cyan(source.name)}: linear → ${source.cycle}`))
+    console.log(dim(`source ${cyan(source.name)}: ${source.kind ?? '?'} → ${source.cycle}`))
   }
   /**
    * Said here because it is the only place it can be said.
