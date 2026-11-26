@@ -143,27 +143,52 @@ const fold = (s: string): string => s.trim().toLowerCase()
 /**
  * The identity of one round of review.
  *
- * `<repo>#<number>@<headSha>:<latest comment id>` — the three things that have to change
- * for the work to be genuinely new:
+ * `<repo>#<number>:<latest comment id>` — the two things that have to change for the work
+ * to be genuinely new:
  *
  *  - **the pull request**, obviously;
- *  - **the head commit**, so that a second round against a branch Ogun has since revised
- *    is a different job from the first — without this, a reviewer asking for one more
- *    change after Ogun pushed would collide with the round that produced that push;
- *  - **the newest comment**, so that a reviewer adding a second thought re-emits where
- *    re-applying the label alone would not.
+ *  - **the newest comment Ogun did not write**, so that a reviewer adding a second
+ *    thought re-emits where re-applying the label alone would not.
  *
  * The comment id rather than a count: a count goes down when somebody deletes a comment,
  * and a key that can repeat a value it has already used is a key that silently drops
  * work.
  *
+ * ### The head commit was here, and it was a loop
+ *
+ * It was included so that "a second round against a branch Ogun has since revised is a
+ * different job from the first". That case is real and the comment id already covers it:
+ * a reviewer asking for one more change *writes a comment*, and a new comment id is a new
+ * key on its own.
+ *
+ * What the head commit added was a difference in the one case where nobody asked for
+ * anything — **Ogun's own push**. A revision moves the branch, so the next poll computed
+ * a key nothing had claimed, admitted the same review comments again, revised again, and
+ * pushed again. Every five minutes, with the agent, the container, the suite and a
+ * force-push each time, and the circuit breaker silent because every one of those runs
+ * succeeded.
+ *
+ * `loopGuard` stops Ogun acting on its own *words*; this is the same rule for its own
+ * *commits*, and the cheapest form of it is not to key on commits at all. The head sha a
+ * revision must not push over is still carried — on the job, where it is compared under
+ * `--force-with-lease` — which is a different question from whether there is new work.
+ *
+ * Before revisions landed in place, a run answering a review opened a *new* pull request
+ * and never moved this one's head. The key was correct for that behaviour and became
+ * wrong the moment the push moved.
+ *
  * Hashed only for length. The readable form goes in `externalKey`, so the ledger is still
  * greppable by pull request number.
  */
 export function requestKey(request: ChangeRequest): string {
+  /**
+   * Call this on a **loop-guarded** request, as `pollGithub` does. The newest comment has
+   * to be the newest one somebody else wrote: Ogun comments on every revision it lands,
+   * and keying on that would re-emit on its own voice.
+   */
   const newest = request.comments.at(-1)?.id ?? 'none'
   return createHash('sha256')
-    .update([request.repo, request.number, request.headSha, newest].join('\u0000'))
+    .update([request.repo, request.number, newest].join('\u0000'))
     .digest('hex')
     .slice(0, 24)
 }

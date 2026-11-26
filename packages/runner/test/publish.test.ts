@@ -86,6 +86,8 @@ type Recorded = {
   commented: Array<{ number: number; body: string }>
   /** The revision path: which branch was moved, and what it was required to be at. */
   revised: Array<{ branch: string; expect: string }>
+  /** Labels cleared, so "the done signal was sent" is asserted rather than assumed. */
+  unlabelled: Array<{ number: number; label: string }>
 }
 
 /**
@@ -93,8 +95,18 @@ type Recorded = {
  * is a seam: no `gh`, no token, no network — but a real `git push`, so "published" means a
  * ref appeared on a remote and not that a spy was called.
  */
-const fakeRemote = (opts: { open?: number } = {}): { remote: PublishRemote; calls: Recorded } => {
-  const calls: Recorded = { counted: 0, published: [], commented: [], revised: [] }
+const fakeRemote = (
+  opts: { open?: number; failUnlabel?: boolean } = {},
+): { remote: PublishRemote; calls: Recorded } => {
+  const calls: Recorded = {
+    counted: 0,
+    published: [],
+    commented: [],
+    revised: [],
+    unlabelled: [],
+  }
+  /** Set by a test that needs the label removal to fail after the work has landed. */
+  const failUnlabel = opts.failUnlabel ?? false
   return {
     calls,
     remote: {
@@ -122,6 +134,10 @@ const fakeRemote = (opts: { open?: number } = {}): { remote: PublishRemote; call
           `HEAD:refs/heads/${branch}`,
         ])
       },
+      async unlabel({ number, label }) {
+        if (failUnlabel) throw new Error('gh: HTTP 403 Resource not accessible by integration')
+        calls.unlabelled.push({ number, label })
+      },
       async comment({ number, body }) {
         calls.commented.push({ number, body })
       },
@@ -133,7 +149,7 @@ type Argument = Parameters<typeof publishPatch>[0]
 
 /** Everything `publishPatch` needs that is not about the case under test. */
 const publishing = async (
-  world: { open?: number } = {},
+  world: { open?: number; failUnlabel?: boolean } = {},
 ): Promise<{
   fixture: Awaited<ReturnType<typeof factory>>
   calls: Recorded
@@ -722,4 +738,91 @@ test('a revision refuses to push over work that landed mid-run', async () => {
   // And nothing was said on the pull request, because nothing was done to it. A comment
   // claiming a revision that was refused is worse than silence.
   assert.equal(calls.commented.length, 0, 'no comment claims a revision that did not happen')
+})
+
+/**
+ * The label comes off when the revision lands, and it is the last thing to happen.
+ *
+ * A labelled pull request is one Ogun owes a revision; an unlabelled one has been
+ * answered. That is the only state on this surface a person reads rather than an output,
+ * and without clearing it the label says "pending" forever on work that is done.
+ */
+test('a revision clears the label that asked for it', async () => {
+  const { fixture, calls, go } = await publishing()
+  const prBranch = 'ogun/fixer/111122223333'
+  await run('git', [
+    '-C', fixture.repo, 'push', '-q', 'origin', `${fixture.baseSha}:refs/heads/${prBranch}`,
+  ])
+
+  const result = await go({
+    changeRequest: {
+      repo: 'owner/name',
+      number: 42,
+      branch: prBranch,
+      headSha: fixture.baseSha,
+      label: 'ogun-revise',
+    },
+  })
+
+  assert.ok(result.pr, `refused: ${result.refused}`)
+  assert.deepEqual(calls.unlabelled, [{ number: 42, label: 'ogun-revise' }])
+  assert.equal(result.warning, undefined, 'nothing to warn about when it worked')
+})
+
+/**
+ * A label that cannot be removed does not fail a revision that landed.
+ *
+ * By that point the commits are on the branch and the reviewer has been told. Failing the
+ * run would record a revision that happened as one that did not, and the patch is not
+ * re-publishable anyway — the branch has already moved to it.
+ *
+ * It is safe to merely warn because the label is **not** what stops a re-trigger. The
+ * emission key does, and no longer moves when Ogun pushes. A stale label means somebody
+ * sees "pending" on an answered pull request, which is a sentence on the timeline, not a
+ * loop.
+ */
+test('a label that cannot be removed is a warning, not a failed revision', async () => {
+  const { fixture, calls, go } = await publishing({ failUnlabel: true })
+  const prBranch = 'ogun/fixer/444455556666'
+  await run('git', [
+    '-C', fixture.repo, 'push', '-q', 'origin', `${fixture.baseSha}:refs/heads/${prBranch}`,
+  ])
+
+  const result = await go({
+    changeRequest: {
+      repo: 'owner/name',
+      number: 42,
+      branch: prBranch,
+      headSha: fixture.baseSha,
+      label: 'ogun-revise',
+    },
+  })
+
+  assert.ok(result.pr, 'the revision still counts as published')
+  assert.equal(calls.revised.length, 1, 'the branch moved')
+  assert.equal(calls.commented.length, 1, 'and the reviewer was told')
+  assert.match(result.warning ?? '', /could not be removed/)
+  assert.match(result.warning ?? '', /ogun-revise/)
+})
+
+/** A job carrying no label — an older control plane — publishes and touches nothing. */
+test('a revision with no label leaves labels alone', async () => {
+  const { fixture, calls, go } = await publishing()
+  const prBranch = 'ogun/fixer/777788889999'
+  await run('git', [
+    '-C', fixture.repo, 'push', '-q', 'origin', `${fixture.baseSha}:refs/heads/${prBranch}`,
+  ])
+
+  const result = await go({
+    changeRequest: {
+      repo: 'owner/name',
+      number: 42,
+      branch: prBranch,
+      headSha: fixture.baseSha,
+    },
+  })
+
+  assert.ok(result.pr, `refused: ${result.refused}`)
+  assert.deepEqual(calls.unlabelled, [])
+  assert.equal(result.warning, undefined)
 })

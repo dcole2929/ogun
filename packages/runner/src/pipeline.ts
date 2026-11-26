@@ -1480,6 +1480,15 @@ async function publishIfReady(input: {
     })
 
     /**
+     * After the line that says the work landed, because it is about the pull request
+     * rather than about the run — and the run succeeded. Today this is a revision whose
+     * label could not be removed: the commits are on the branch and the reviewer has been
+     * told, and the only thing wrong is that the pull request still looks like it is
+     * waiting. The timeline is the one place that can be said.
+     */
+    if (published.warning) note(published.warning)
+
+    /**
      * Told to the control plane last, because it is the only part that can be caught up
      * afterwards. The pull request exists whatever happens here; a `changes` row that
      * still says null is wrong but recoverable from GitHub, where the branch name carries

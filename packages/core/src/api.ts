@@ -165,6 +165,19 @@ export const claimedJobSchema = z.object({
       branch: z.string(),
       /** The commit the review was written against. */
       headSha: z.string(),
+      /**
+       * The label that admitted this request, removed from the pull request once the
+       * revision lands (§4.13).
+       *
+       * Carried rather than looked up, because the publisher is on the runner and the
+       * label is in the source's block of a config.yaml on the control plane. It is also
+       * the honest shape: the label this job must clear is the one that *admitted this
+       * job*, not whatever the source happens to be gated on by the time it finishes.
+       *
+       * Optional, so a job claimed from a build that did not send it still publishes —
+       * it simply leaves the label alone, which is what every revision did before.
+       */
+      label: z.string().optional(),
     })
     .optional(),
   timeoutMs: z.number().int().positive(),

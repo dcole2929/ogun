@@ -915,6 +915,7 @@ async function pollChangeRequests(
       cycleId: input.cycleId,
       nodeKeys: input.nodeKeys,
       request,
+      label: config.conditions.label,
       credentials: await fleetCredentials(db),
     })
     if (outcome.emitted) emitted.push(requestLabel(request))
@@ -963,6 +964,8 @@ async function emitRequest(
     cycleId: string
     nodeKeys: string[]
     request: AdmittedRequest
+    /** `conditions.label` — what admitted this request, and what the publisher clears. */
+    label: string
     credentials: Awaited<ReturnType<typeof fleetCredentials>>
   },
 ): Promise<{ emitted: boolean; detail?: string }> {
@@ -998,6 +1001,9 @@ async function emitRequest(
         number: input.request.number,
         branch: input.request.branch,
         headSha: input.request.headSha,
+        // The label that admitted *this* request, so the publisher clears the one that
+        // asked for the work rather than whatever the source is gated on by then.
+        label: input.label,
       },
     })
     .onConflictDoNothing({
