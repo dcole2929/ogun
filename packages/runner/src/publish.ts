@@ -66,6 +66,16 @@ export type Publication = {
   pr?: { branch: string; url: string }
   /** Always set when `pr` is absent. Written to be read by a person, on the run timeline. */
   refused?: string
+  /**
+   * Something that went wrong *after* the work landed, and so is not a refusal.
+   *
+   * One case today: a revision whose label could not be removed. The commits are on the
+   * branch and the reviewer has been told, so the run succeeded — but a person looking at
+   * that pull request sees a label saying work is pending, and the only place that can be
+   * explained is here. A third state, because flattening it into either of the two above
+   * would report a landed revision as a failure or lose the sentence entirely.
+   */
+  warning?: string
 }
 
 /**
@@ -154,6 +164,20 @@ export type PublishRemote = {
     branch: string
     /** The commit that branch must still point at, or the push is refused. */
     expect: string
+  }): Promise<void>
+  /**
+   * Take a label off a pull request.
+   *
+   * The "done" signal, and the only write here a person reads as state rather than as
+   * output: a labelled pull request is one Ogun owes a revision, and an unlabelled one
+   * has been answered. It is not what stops a revision re-triggering — the emission key
+   * does that, and has to, because a label removal can fail.
+   */
+  unlabel(input: {
+    /** The project's checkout on this host. How the remote and its credential are found. */
+    repo: string
+    number: number
+    label: string
   }): Promise<void>
   comment(input: {
     /** The project's checkout on this host. How the remote and its credential are found. */
@@ -253,7 +277,14 @@ export async function publishPatch(input: {
    * result is said on `number` — no second pull request is opened, because the first one
    * is the answer.
    */
-  changeRequest?: { repo: string; number: number; branch: string; headSha: string }
+  changeRequest?: {
+    repo: string
+    number: number
+    branch: string
+    headSha: string
+    /** Cleared when the revision lands. Absent on a job from a build that sent none. */
+    label?: string
+  }
   /** The commit the workspace was pinned to and the patch was made against. */
   baseSha: string
   /** Path to the `git format-patch` mbox `extractPatch` wrote. */
@@ -463,7 +494,40 @@ export async function publishPatch(input: {
           log,
         }),
       })
-      return { pr: { branch, url: pullRequestUrl(slug, number) } }
+      /**
+       * And take the label off, last, because it is the "done" signal and nothing after
+       * it would be done.
+       *
+       * Caught rather than allowed to propagate, which is the opposite of the two calls
+       * above it and is the difference between output and state. The push and the comment
+       * are the work; if either fails the revision did not happen and the run should say
+       * so. By here the commits are on the branch and the reviewer has been told — a
+       * failure to clear a label cannot un-publish that, and failing the run would record
+       * a revision that landed as one that did not.
+       *
+       * It is safe to merely warn because the label is not what stops a re-trigger. The
+       * emission key does that: Ogun's own push no longer changes it, so a stale label
+       * means somebody sees "pending" on a pull request that is answered, not a loop.
+       */
+      let labelWarning: string | undefined
+      if (input.changeRequest.label !== undefined) {
+        try {
+          await input.remote.unlabel({
+            repo: input.repo,
+            number,
+            label: input.changeRequest.label,
+          })
+        } catch (err) {
+          labelWarning =
+            `the revision landed, but "${input.changeRequest.label}" could not be removed ` +
+            `from #${number}: ${err instanceof Error ? err.message.slice(-300) : String(err)}`
+        }
+      }
+
+      return {
+        pr: { branch, url: pullRequestUrl(slug, number) },
+        ...(labelWarning ? { warning: labelWarning } : {}),
+      }
     }
 
     const { url } = await input.remote.publish({
@@ -901,6 +965,24 @@ export function githubCli(): PublishRemote {
         'origin',
         `HEAD:refs/heads/${branch}`,
       ])
+    },
+    async unlabel({ repo, number, label }) {
+      // The same guard `comment` makes, for the same reason: a number out of a database
+      // row reaching argv as `-5` is an option rather than a pull request.
+      if (!Number.isSafeInteger(number) || number <= 0) {
+        throw new Error(`refusing to edit "${number}", which is not a pull request number`)
+      }
+      /**
+       * `--remove-label=<value>` rather than two argv elements, because a label is a
+       * string somebody else chose. As a separate element, a label named `--add-label`
+       * is read by `gh` as an option; joined with `=` there is nowhere for it to be one.
+       * `--` does not help here and is worse than nothing: it would be taken as the
+       * flag's *value*.
+       */
+      await run('gh', ['pr', 'edit', String(number), `--remove-label=${label}`], {
+        cwd: repo,
+        env: GH_ENV,
+      })
     },
     async comment({ repo, number, body }) {
       /**

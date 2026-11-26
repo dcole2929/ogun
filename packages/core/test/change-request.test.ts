@@ -117,23 +117,48 @@ describe('the identity of a round of review', () => {
     assert.equal(requestKey(request()), requestKey(request()))
   })
 
-  test('a new comment is a new round, and so is a new commit', () => {
-    /**
-     * Both halves matter and they fail in opposite directions. Without the comment, a
-     * reviewer's second thought never reaches an agent — "Ogun ignored my review".
-     * Without the head sha, a second round after Ogun has pushed collides with the round
-     * that produced that push, and the revision is silently dropped.
-     */
-    const base = requestKey(request())
+  test('a new comment is a new round', () => {
+    // Without this, a reviewer's second thought never reaches an agent — which reads as
+    // "Ogun ignored my review".
     assert.notEqual(
-      base,
+      requestKey(request()),
       requestKey(request({ comments: [comment(), comment({ id: 'issue-2' })] })),
       'a second comment is a second round',
     )
-    assert.notEqual(
-      base,
+  })
+
+  /**
+   * **Ogun's own push is not a new round**, and this is the test that was inverted.
+   *
+   * The head sha used to be in the key, so that "a second round against a branch Ogun has
+   * since revised is a different job from the first". That case is real and the comment
+   * id already covers it: a reviewer asking for one more change writes a comment, and a
+   * new comment id is a new key on its own — the test above.
+   *
+   * What the head sha added was a difference in the one case where nobody asked for
+   * anything. A revision moves the branch, so the next poll computed a key nothing had
+   * claimed, admitted the same review comments again, revised again, and pushed again —
+   * every five minutes, with the agent, the container, the suite and a force-push each
+   * time, and the breaker silent because every one of those runs succeeded.
+   *
+   * `loopGuard` stops Ogun acting on its own words. This is the same rule for its own
+   * commits.
+   */
+  test('a branch Ogun has revised is not, by itself, a new round', () => {
+    assert.equal(
+      requestKey(request()),
       requestKey(request({ headSha: 'b'.repeat(40) })),
-      'a revised branch is a new round',
+      'a moved head with nothing new said is the round that moved it',
+    )
+
+    // And the two together still are, because the comment is what asks for work.
+    assert.notEqual(
+      requestKey(request()),
+      requestKey(request({
+        headSha: 'b'.repeat(40),
+        comments: [comment(), comment({ id: 'issue-2' })],
+      })),
+      'a reviewer speaking again after a revision is a new round',
     )
   })
 
